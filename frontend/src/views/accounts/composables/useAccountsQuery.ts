@@ -1,15 +1,19 @@
 import type { BaseTableSort } from '@/components/base/BaseTable/columns'
 import { useDocumentVisibility, useIntervalFn, watchDebounced } from '@vueuse/core'
 
-import { computed, onMounted, shallowRef, watch } from 'vue'
-import { getAccounts } from '@/api'
+import { computed, onMounted, onScopeDispose, shallowRef, watch } from 'vue'
+import { getAccounts, refreshAccountQuota } from '@/api'
+import { toast } from '@/components/base/BaseToast'
 import { usePagedQuery } from '@/composables/usePagedQuery'
+import { refreshAccountPage } from '../utils/refreshAccountPage'
 
 type AccountRow = Awaited<ReturnType<typeof getAccounts>>['items'][number]
 
 export function useAccountsQuery() {
   const refreshing = shallowRef(false)
   const lastRefreshedAt = shallowRef('')
+  const refreshMessage = shallowRef('')
+  let syncController: AbortController | undefined
   const visibility = useDocumentVisibility()
   const searchQuery = shallowRef('')
   const providerQuery = shallowRef('')
@@ -40,7 +44,6 @@ export function useAccountsQuery() {
       }, options),
     onSuccess: (result) => {
       accountSummary.value = result.summary
-      lastRefreshedAt.value = new Date().toLocaleTimeString()
     },
   })
 
@@ -48,8 +51,37 @@ export function useAccountsQuery() {
     if (query.loading.value || refreshing.value)
       return
     refreshing.value = true
+    const controller = new AbortController()
+    syncController = controller
+    refreshMessage.value = ''
     try {
-      await query.execute({ background: true, silent })
+      const result = await refreshAccountPage(
+        [...query.items.value],
+        accountId => refreshAccountQuota({ accountId }, { silent: true, signal: controller.signal }),
+        controller.signal,
+      )
+      if (controller.signal.aborted)
+        return
+      // 即使额度接口报错也要回读：后端可能已保存令牌失效等最新状态。
+      const loaded = await query.execute({ background: true, silent })
+      if (controller.signal.aborted)
+        return
+      if (result.succeeded > 0 && loaded)
+        lastRefreshedAt.value = new Date().toLocaleTimeString()
+      if (!loaded)
+        refreshMessage.value = '账号列表回读失败，请重试'
+      else if (result.failed.length)
+        refreshMessage.value = `已同步 ${result.succeeded} 个，${result.failed.length} 个未同步：${result.failed.join('、')}；请在账号额度面板重试查看原因`
+      else if (result.succeeded === 0)
+        refreshMessage.value = '当前页没有可同步上游额度的启用账号，已重读本地状态'
+      else if (result.skipped)
+        refreshMessage.value = `已同步 ${result.succeeded} 个；${result.skipped} 个停用或不支持额度查询的账号仅重读本地状态`
+      if (!silent) {
+        if (result.failed.length || !loaded)
+          toast.warning(refreshMessage.value)
+        else
+          toast.success(refreshMessage.value || `已同步当前页 ${result.succeeded} 个账号的状态与额度`)
+      }
     }
     finally {
       refreshing.value = false
@@ -63,6 +95,8 @@ export function useAccountsQuery() {
   watch(visibility, (value) => {
     if (value === 'visible')
       void refreshAccounts(true)
+    else
+      syncController?.abort()
   })
 
   const accountPagination = computed(() => ({
@@ -70,6 +104,13 @@ export function useAccountsQuery() {
     pageSize: query.pageSize.value,
     total: query.total.value,
   }))
+
+  watch([query.page, query.pageSize, searchQuery, providerQuery, statusQuery, groupQuery, sort], () => {
+    // 翻页或切换筛选后，不把上一页的同步结果显示成当前页已更新。
+    syncController?.abort()
+    lastRefreshedAt.value = ''
+    refreshMessage.value = ''
+  })
 
   function handlePageChange(page: number) {
     query.page.value = page
@@ -113,9 +154,11 @@ export function useAccountsQuery() {
     void query.execute()
   })
 
-  onMounted(() => {
-    void query.execute()
+  onMounted(async () => {
+    if (await query.execute() && visibility.value === 'visible')
+      void refreshAccounts(true)
   })
+  onScopeDispose(() => syncController?.abort())
 
   return {
     page: query.page,
@@ -124,6 +167,7 @@ export function useAccountsQuery() {
     loading: query.loading,
     refreshing,
     lastRefreshedAt,
+    refreshMessage,
     refreshAccounts,
     accounts: query.items,
     loadAccounts: query.execute,

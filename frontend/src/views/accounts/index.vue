@@ -43,6 +43,7 @@ const { visibleColumns, columnOptions, setColumnVisible, setColumnOrder, resetCo
 const {
   refreshing,
   lastRefreshedAt,
+  refreshMessage,
   refreshAccounts,
   loading,
   accounts,
@@ -202,14 +203,17 @@ const {
       description="维护账号池，查看可用性、配额与使用状态"
     >
       <template #actions>
-        <span class="text-cp-xs text-cp-text-secondary">每 30 秒自动刷新 · {{ lastRefreshedAt || '加载中' }}</span>
+        <span class="text-cp-xs text-cp-text-secondary">当前页每 30 秒同步 · {{ lastRefreshedAt || '尚未同步上游' }}</span>
         <BaseButton variant="secondary" :loading="refreshing" :disabled="loading || refreshing" @click="refreshAccounts()">
           <RefreshCw class="size-4" />
-          刷新列表
+          同步状态与额度
         </BaseButton>
       </template>
     </BasePageHeader>
 
+    <p v-if="refreshMessage" role="status" class="mb-3 text-cp-sm text-cp-text-secondary">
+      {{ refreshMessage }}
+    </p>
     <AccountOverviewCards :summary="accountSummary" />
 
     <BaseCard
