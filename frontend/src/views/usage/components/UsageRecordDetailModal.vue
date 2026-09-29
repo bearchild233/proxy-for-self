@@ -1,0 +1,506 @@
+<script setup lang="ts">
+import type { EChartsOption } from 'echarts'
+import type { UsageViewModel } from '../utils/records'
+
+import { computed } from 'vue'
+import BaseButton from '@/components/base/BaseButton.vue'
+import BaseModal from '@/components/base/BaseModal/index.vue'
+import { defineTableColumns } from '@/components/base/BaseTable/columns'
+import BaseTable from '@/components/base/BaseTable/index.vue'
+import BaseChart from '@/components/charts/BaseChart.vue'
+import { chartTooltipStyle } from '@/components/charts/tooltip'
+import { useChartPalette } from '@/composables/useChartPalette'
+import { displayValue, fieldLabelClass, fieldValueBaseClass, fieldValueClass } from '../utils/detail'
+import { formatDuration } from '../utils/format'
+import {
+  usageAccountText,
+  usageBilling,
+  usageBillingText,
+  usageClientIp,
+  usageLatencyDetails,
+  usageModelDisplay,
+  usageReasoningEffort,
+  usageTokenDetails,
+  usageTransportType,
+  usageUserAgent,
+  visibleRequestText,
+  visibleResponseText,
+} from '../utils/records'
+import RequestDiagnosticsPanel from './RequestDiagnosticsPanel.vue'
+import UsageDetailCodePanel from './UsageDetailCodePanel.vue'
+import UsageDetailFieldGrid from './UsageDetailFieldGrid.vue'
+import UsageStatusCodeBadge from './UsageStatusCodeBadge.vue'
+
+const props = defineProps<{
+  record: UsageViewModel | null
+}>()
+
+const open = defineModel<boolean>({ default: false })
+
+const { palette } = useChartPalette()
+
+const requestText = computed(() => props.record ? visibleRequestText(props.record) : '')
+const responseText = computed(() => props.record ? visibleResponseText(props.record) : '')
+const modelDisplay = computed(() => props.record
+  ? usageModelDisplay(props.record)
+  : { primary: '—', secondary: '' })
+const tokenDetails = computed(() => props.record ? usageTokenDetails(props.record) : null)
+const billing = computed(() => props.record ? usageBilling(props.record) : null)
+const latencyDetails = computed(() => props.record ? usageLatencyDetails(props.record) : null)
+
+const panelClass = 'min-w-0 rounded-cp-card bg-cp-fill-quaternary px-4 py-3.5'
+const panelTitleClass = 'm-0 text-cp-sm leading-none font-heavy text-cp-text-secondary'
+
+const accountDisplay = computed(() => props.record ? usageAccountText(props.record) : '—')
+const finalAttemptIndex = computed(() => {
+  const attempts = props.record?.attempts ?? []
+  const last = attempts[attempts.length - 1]
+  return last?.attemptIndex ?? props.record?.attemptCount
+})
+const overviewItems = computed(() => [
+  { label: '端点', value: props.record?.route, mono: true },
+  { label: '客户端传输', value: usageTransportType(props.record?.clientTransport), mono: true },
+  { label: '上游传输', value: usageTransportType(props.record?.upstreamTransport), mono: true },
+  { label: '总耗时', value: props.record?.latencyMsDisplay, mono: true },
+  {
+    label: latencyDetails.value?.firstOutputLabel ?? '首字',
+    value: latencyDetails.value?.firstOutputDisplay ?? '—',
+    mono: true,
+  },
+  { label: '总 Token', value: tokenDetails.value?.totalTokensDisplay, mono: true },
+])
+
+const modelRouteItems = computed(() => [
+  { label: '端点', value: props.record?.route, mono: true },
+  { label: '推理强度', value: props.record ? usageReasoningEffort(props.record) : '—' },
+  { label: '请求模型', value: modelDisplay.value.primary, mono: true },
+  {
+    label: '上游模型',
+    value: modelDisplay.value.secondary || props.record?.upstreamModel,
+    mono: true,
+  },
+  { label: '存储模型', value: props.record?.model, mono: true },
+  { label: '上游返回模型', value: props.record?.upstreamResponseModel, mono: true },
+])
+
+const clientUpstreamItems = computed(() => [
+  { label: '客户端 IP', value: props.record ? usageClientIp(props.record) : '—', mono: true },
+  { label: '服务档位', value: props.record?.serviceTier, mono: true },
+  { label: '事件类型', value: props.record?.kind, mono: true },
+  { label: '尝试序号', value: finalAttemptIndex.value },
+  {
+    label: 'User-Agent',
+    value: props.record ? usageUserAgent(props.record) : '',
+    mono: true,
+    wrap: true,
+    fullWidth: true,
+  },
+])
+
+const identifierItems = computed(() => [
+  { label: '请求 ID', value: props.record?.requestId, mono: true, wrap: true, fullWidth: true },
+  { label: '响应 ID', value: props.record?.responseId, mono: true, wrap: true },
+  { label: '上游请求 ID', value: props.record?.upstreamRequestId, mono: true, wrap: true },
+  { label: '账号 ID', value: props.record?.accountId, mono: true, wrap: true },
+  { label: '客户端 Key ID', value: props.record?.clientApiKeyId, mono: true, wrap: true },
+])
+
+interface AttemptRow {
+  id: string
+  attemptIndex: number
+  outcome: string
+  provider: string
+  model: string | null
+  transport: string
+  statusCode: number | null
+  accountLabel: string
+  accountId: string | null
+  latencyMs: number | null
+}
+
+const attemptColumns = defineTableColumns<AttemptRow>([
+  { key: 'attemptIndex', label: '序号', kind: 'index' },
+  { key: 'outcome', label: '结果', kind: 'status', size: 'sm' },
+  { key: 'provider', label: '平台', kind: 'meta', size: 'sm' },
+  { key: 'model', label: '模型', kind: 'mono', size: 'lg' },
+  { key: 'transport', label: '上游传输', kind: 'status', size: 'md' },
+  { key: 'statusCode', label: '状态', kind: 'status', size: 'sm' },
+  { key: 'accountLabel', label: '账号', kind: 'mono', size: '2xl' },
+  { key: 'latencyMs', label: '耗时', kind: 'numeric', size: 'sm' },
+])
+
+const attemptRows = computed<AttemptRow[]>(() =>
+  (props.record?.attempts ?? []).map(attempt => ({
+    id: attempt.id,
+    attemptIndex: attempt.attemptIndex,
+    outcome: attempt.outcome,
+    provider: attempt.provider,
+    model: attempt.model,
+    transport: attempt.transport,
+    statusCode: attempt.statusCode,
+    accountLabel: attempt.accountEmail || attempt.accountName || attempt.accountId || '—',
+    accountId: attempt.accountId,
+    latencyMs: attempt.latencyMs,
+  })),
+)
+
+function attemptOutcomeText(outcome: string) {
+  const labels: Record<string, string> = {
+    succeeded: '成功',
+    failed: '失败',
+    cancelled: '取消',
+    incomplete: '未完成',
+    running: '进行中',
+  }
+  return labels[outcome] ?? outcome
+}
+
+function attemptOutcomeClass(outcome: string) {
+  if (outcome === 'succeeded')
+    return 'text-cp-success-text'
+  if (outcome === 'failed')
+    return 'text-cp-error-text'
+  return 'text-cp-text-secondary'
+}
+
+const billingItems = computed(() => {
+  const value = billing.value
+  if (!value) {
+    return [{
+      label: '总费用',
+      value: props.record ? usageBillingText(props.record) : '—',
+      mono: true,
+    }]
+  }
+
+  return [
+    { label: '总费用', value: value.totalAmountDisplay, mono: true },
+    ...(value.image
+      ? [
+          { label: '图像输入费用', value: value.image.inputAmountDisplay, mono: true },
+          { label: '图像缓存费用', value: value.image.cacheReadAmountDisplay, mono: true },
+          { label: '图像输入单价', value: value.image.inputPriceDisplay, mono: true },
+          { label: '图像缓存单价', value: value.image.cacheReadPriceDisplay, mono: true },
+        ]
+      : []),
+    { label: value.image ? '文本输入' : '输入', value: value.inputAmountDisplay, mono: true },
+    { label: value.image ? '图像输出' : '输出', value: value.outputAmountDisplay, mono: true },
+    { label: value.image ? '文本缓存读取' : '缓存读取', value: value.cacheReadAmountDisplay, mono: true },
+    { label: '缓存写入', value: value.cacheWriteAmountDisplay, mono: true },
+    { label: '标准费用', value: value.standardAmountDisplay, mono: true },
+    { label: value.image ? '文本输入单价' : '输入单价', value: value.inputPriceDisplay, mono: true },
+    { label: value.image ? '图像输出单价' : '输出单价', value: value.outputPriceDisplay, mono: true },
+    { label: value.image ? '文本缓存单价' : '缓存单价', value: value.cacheReadPriceDisplay, mono: true },
+    { label: '缓存写入单价', value: value.cacheWritePriceDisplay, mono: true },
+    { label: '服务档位', value: value.serviceTierDisplay },
+    { label: '倍率', value: value.multiplierDisplay, mono: true },
+  ]
+})
+
+const tokenChartItems = computed(() => [
+  {
+    label: '输入',
+    value: Number(tokenDetails.value?.inputTokens || 0),
+    display: tokenDetails.value?.inputTokensDisplay ?? '—',
+    color: palette.value.info,
+  },
+  {
+    label: '输出',
+    value: Number(tokenDetails.value?.outputTokens || 0),
+    display: tokenDetails.value?.outputTokensDisplay ?? '—',
+    color: palette.value.success,
+  },
+  {
+    label: '缓存读取',
+    value: Number(tokenDetails.value?.cachedTokens || 0),
+    display: tokenDetails.value?.cachedTokensDisplay ?? '—',
+    color: palette.value.warning,
+  },
+  {
+    label: '缓存写入',
+    value: Number(tokenDetails.value?.cacheWriteTokens || 0),
+    display: tokenDetails.value?.cacheWriteTokensDisplay ?? '—',
+    color: palette.value.danger,
+  },
+  {
+    label: '推理',
+    value: Number(tokenDetails.value?.reasoningTokens || 0),
+    display: tokenDetails.value?.reasoningTokensDisplay ?? '—',
+    color: palette.value.reasoning,
+  },
+])
+
+const tokenDonutOption = computed<EChartsOption>(() => {
+  const items = tokenChartItems.value.filter(item => item.value > 0)
+
+  return {
+    tooltip: {
+      trigger: 'item',
+      ...chartTooltipStyle(palette.value, { padding: [9, 12] }),
+      formatter: (params: unknown) => {
+        if (typeof params !== 'object' || params === null)
+          return ''
+        const name = 'name' in params && typeof params.name === 'string' ? params.name : ''
+        const marker = 'marker' in params && typeof params.marker === 'string' ? params.marker : ''
+        const item = tokenChartItems.value.find(entry => entry.label === name)
+        if (!item)
+          return ''
+        return `${marker}${item.label}: ${item.display}`
+      },
+    },
+    series: [
+      {
+        type: 'pie',
+        radius: ['62%', '78%'],
+        center: ['50%', '50%'],
+        startAngle: 90,
+        minAngle: items.length ? 3 : 360,
+        avoidLabelOverlap: true,
+        silent: !items.length,
+        label: { show: false },
+        labelLine: { show: false },
+        data: items.length
+          ? items.map(item => ({
+              name: item.label,
+              value: item.value,
+              itemStyle: { color: item.color },
+            }))
+          : [
+              {
+                name: '暂无',
+                value: 1,
+                itemStyle: { color: palette.value.surfaceMuted },
+              },
+            ],
+        emphasis: { scale: false },
+      },
+    ],
+  }
+})
+</script>
+
+<template>
+  <BaseModal
+    v-model="open"
+    title="使用记录详情"
+    description="单次请求的完整链路信息"
+    tone="info"
+    size="xl"
+  >
+    <div v-if="record" class="grid min-w-0 gap-3">
+      <section :class="panelClass">
+        <dl
+          class="grid min-w-0 grid-cols-2 gap-x-6 gap-y-4 sm:grid-cols-4 lg:grid-cols-[minmax(0,2fr)_100px_minmax(0,1fr)_180px]"
+        >
+          <div class="col-span-2 min-w-0 lg:col-span-1">
+            <dt :class="fieldLabelClass">
+              账号
+            </dt>
+            <dd
+              class="mt-1.5 mb-0 min-w-0 break-all font-mono text-cp-sm leading-snug font-heavy text-cp-text"
+              :title="displayValue(accountDisplay)"
+            >
+              {{ displayValue(accountDisplay) }}
+            </dd>
+          </div>
+
+          <div class="min-w-0">
+            <dt :class="fieldLabelClass">
+              状态码
+            </dt>
+            <dd :class="fieldValueClass(true)" :title="displayValue(record.statusCode)">
+              {{ displayValue(record.statusCode) }}
+            </dd>
+          </div>
+
+          <div class="min-w-0">
+            <dt :class="fieldLabelClass">
+              消息
+            </dt>
+            <dd :class="fieldValueClass()" :title="displayValue(record.message)">
+              {{ displayValue(record.message) }}
+            </dd>
+          </div>
+
+          <div class="col-span-2 min-w-0 lg:col-span-1">
+            <dt :class="fieldLabelClass">
+              时间
+            </dt>
+            <dd :class="fieldValueClass(true)" :title="displayValue(record.createdAtDisplay)">
+              {{ displayValue(record.createdAtDisplay) }}
+            </dd>
+          </div>
+        </dl>
+
+        <dl
+          class="mt-4 grid min-w-0 grid-cols-2 gap-x-6 gap-y-4 sm:grid-cols-3 lg:grid-cols-[minmax(160px,1.4fr)_repeat(5,minmax(0,1fr))]"
+        >
+          <div v-for="item in overviewItems" :key="item.label" class="min-w-0">
+            <dt :class="fieldLabelClass">
+              {{ item.label }}
+            </dt>
+            <dd :class="fieldValueClass(item.mono)" :title="displayValue(item.value)">
+              {{ displayValue(item.value) }}
+            </dd>
+          </div>
+        </dl>
+      </section>
+
+      <section class="grid min-w-0 gap-3 lg:grid-cols-2">
+        <section :class="panelClass">
+          <h3 :class="panelTitleClass">
+            模型与路由
+          </h3>
+          <UsageDetailFieldGrid :items="modelRouteItems" />
+        </section>
+
+        <section :class="panelClass">
+          <h3 :class="panelTitleClass">
+            客户端与上游
+          </h3>
+          <UsageDetailFieldGrid :items="clientUpstreamItems" />
+        </section>
+      </section>
+
+      <section :class="panelClass">
+        <h3 :class="panelTitleClass">
+          请求标识
+        </h3>
+        <UsageDetailFieldGrid :items="identifierItems" />
+      </section>
+
+      <section class="grid min-w-0 gap-3 lg:grid-cols-2">
+        <section class="flex min-h-0 flex-col" :class="panelClass">
+          <h3 :class="panelTitleClass">
+            Token
+          </h3>
+          <div
+            class="mt-3 grid min-h-38 min-w-0 flex-1 grid-cols-1 content-center items-center gap-3 sm:grid-cols-[150px_minmax(0,1fr)]"
+          >
+            <div class="relative mx-auto w-38 sm:mx-0">
+              <BaseChart :option="tokenDonutOption" :height="152" />
+              <div class="pointer-events-none absolute inset-0 flex items-center justify-center">
+                <div class="grid text-center">
+                  <span class="text-cp-xs leading-none font-bold text-cp-text-quaternary">
+                    总计
+                  </span>
+                  <strong
+                    class="mt-1 font-mono text-[16px] leading-none font-extrabold tabular-nums text-cp-text"
+                  >
+                    {{ tokenDetails?.totalTokensDisplay ?? '—' }}
+                  </strong>
+                </div>
+              </div>
+            </div>
+
+            <dl class="grid min-w-0 grid-cols-2 gap-x-4 gap-y-3">
+              <div v-for="item in tokenChartItems" :key="item.label" class="min-w-0">
+                <dt class="flex min-w-0 items-center gap-1.5" :class="fieldLabelClass">
+                  <i
+                    class="size-1.75 shrink-0 rounded-full"
+                    :style="{ backgroundColor: item.color }"
+                  />
+                  <span class="truncate">{{ item.label }}</span>
+                </dt>
+                <dd
+                  class="font-mono tabular-nums" :class="[fieldValueBaseClass]"
+                  :title="displayValue(item.display)"
+                >
+                  {{ displayValue(item.display) }}
+                </dd>
+              </div>
+            </dl>
+          </div>
+        </section>
+
+        <section :class="panelClass">
+          <h3 :class="panelTitleClass">
+            费用
+          </h3>
+          <UsageDetailFieldGrid :items="billingItems" />
+        </section>
+      </section>
+
+      <section v-if="attemptRows.length" :class="panelClass">
+        <h3 :class="panelTitleClass">
+          尝试链路
+        </h3>
+        <BaseTable
+          class="attempt-table mt-2.5 h-auto! min-w-0 font-mono tabular-nums"
+          :columns="attemptColumns"
+          :rows="attemptRows"
+          density="compact"
+          row-key="id"
+        >
+          <template #outcome="{ row }">
+            <span :class="attemptOutcomeClass(row.outcome)">
+              {{ attemptOutcomeText(row.outcome) }}
+            </span>
+          </template>
+          <template #statusCode="{ row }">
+            <UsageStatusCodeBadge
+              :status-code="typeof row.statusCode === 'number' ? row.statusCode : null"
+            />
+          </template>
+          <template #accountLabel="{ row }">
+            <span
+              class="block max-w-full truncate font-mono text-cp-sm font-bold text-cp-text"
+              :title="row.accountId || ''"
+            >
+              {{ row.accountLabel }}
+            </span>
+          </template>
+          <template #latencyMs="{ row }">
+            <span class="font-mono font-bold tabular-nums text-cp-text">
+              {{ formatDuration(row.latencyMs) }}
+            </span>
+          </template>
+        </BaseTable>
+      </section>
+
+      <section
+        v-if="requestText || responseText"
+        class="grid min-h-0 grid-cols-1 gap-3 lg:grid-cols-2"
+      >
+        <div v-if="requestText" class="min-h-0" :class="[panelClass]">
+          <UsageDetailCodePanel title="请求内容" max-height="180px" :content="requestText" />
+        </div>
+
+        <div v-if="responseText" class="min-h-0" :class="[panelClass]">
+          <UsageDetailCodePanel title="响应内容" max-height="180px" :content="responseText" />
+        </div>
+      </section>
+
+      <section v-if="record.providerMetadata" class="min-h-0" :class="[panelClass]">
+        <UsageDetailCodePanel
+          title="元数据"
+          max-height="min(32dvh, 340px)"
+          :content="JSON.stringify(record.providerMetadata, null, 2)"
+        />
+      </section>
+    </div>
+
+    <RequestDiagnosticsPanel v-if="open && record" :request-id="record.requestId" />
+
+    <template #footer>
+      <BaseButton variant="primary" @click="open = false">
+        关闭
+      </BaseButton>
+    </template>
+  </BaseModal>
+</template>
+
+<style scoped>
+.attempt-table :deep(thead th) {
+  background-color: transparent;
+  box-shadow: none;
+}
+
+.attempt-table :deep(tbody tr) {
+  background-color: transparent;
+}
+
+.attempt-table :deep(tbody td) {
+  background-color: var(--cp-color-fill-tertiary);
+}
+</style>

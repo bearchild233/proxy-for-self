@@ -1,0 +1,971 @@
+mod handlers;
+mod import_tasks;
+mod presenter;
+
+mod personal_info {
+    use chrono::{TimeZone as _, Utc};
+    use gateway_admin::model::{
+        AdminError,
+        provider_credentials::{AccountPersonalInfo, ProviderSubscription},
+    };
+    use gateway_api::admin::accounts::{AccountPersonalInfoData, AccountSubscriptionData};
+    use serde_json::json;
+
+    #[test]
+    fn subscription_response_exposes_only_display_fields_and_preserves_unknowns() {
+        let observed = Utc.with_ymd_and_hms(2026, 9, 14, 0, 0, 0).unwrap();
+        let response = AccountSubscriptionData::from(ProviderSubscription {
+            starts_at: None,
+            expires_at: observed,
+            will_renew: None,
+            billing_period: None,
+            billing_currency: Some("USD".to_owned()),
+            observed_at: observed,
+        });
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            json!({
+                "startsAt": null, "expiresAt": "2026-09-14T00:00:00+00:00",
+                "willRenew": null, "billingPeriod": null, "billingCurrency": "USD",
+                "observedAt": "2026-09-14T00:00:00+00:00"
+            })
+        );
+    }
+
+    #[test]
+    fn personal_info_response_preserves_subscription_when_profile_fails() {
+        let observed = Utc.with_ymd_and_hms(2026, 9, 14, 0, 0, 0).unwrap();
+        let response = AccountPersonalInfoData::from(AccountPersonalInfo {
+            profile: Err(AdminError::bad_gateway("上游服务请求失败")),
+            subscription: Some(ProviderSubscription {
+                starts_at: None,
+                expires_at: observed,
+                will_renew: None,
+                billing_period: None,
+                billing_currency: None,
+                observed_at: observed,
+            }),
+        });
+        let value = serde_json::to_value(response).unwrap();
+        assert!(value["profile"].is_null());
+        assert_eq!(value["profileError"], "上游服务请求失败");
+        assert_eq!(
+            value["subscription"]["expiresAt"],
+            "2026-09-14T00:00:00+00:00"
+        );
+        assert_eq!(value.as_object().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn personal_info_response_preserves_unknown_subscription_and_profile_error() {
+        let response = AccountPersonalInfoData::from(AccountPersonalInfo {
+            profile: Err(AdminError::unavailable("Provider 服务暂不可用")),
+            subscription: None,
+        });
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            json!({
+                "profile": null,
+                "profileError": "Provider 服务暂不可用",
+                "subscription": null,
+            })
+        );
+    }
+}
+
+mod query {
+    use gateway_admin::model::accounts::{AccountSortField, AccountStatus, SortDirection};
+    use gateway_api::admin::accounts::ListQuery;
+    use serde_json::json;
+
+    #[test]
+    fn account_query_should_parse_provider_status_and_sort_once() {
+        let query: ListQuery = serde_json::from_value(json!({
+            "page": 3,
+            "pageSize": 20,
+            "provider": "xai",
+            "search": "  operator  ",
+            "status": "normal",
+            "sortBy": "lastUsedAt",
+            "sortDirection": "desc"
+        }))
+        .expect("deserialize account query");
+        let query = query.validate().expect("validate account query");
+        assert_eq!(query.page, 3);
+        assert_eq!(query.page_size.get(), 20);
+        assert!(matches!(
+            query.provider_kind,
+            Some(ref provider) if provider.as_str() == "xai"
+        ));
+        assert_eq!(query.search.as_deref(), Some("operator"));
+        assert_eq!(query.status, Some(AccountStatus::Normal));
+        assert_eq!(
+            query.sort.expect("sort").field,
+            AccountSortField::LastUsedAt
+        );
+        assert_eq!(
+            query.sort.expect("copy sort").direction,
+            SortDirection::Desc
+        );
+    }
+
+    #[test]
+    fn account_query_should_parse_rate_limited_status() {
+        let query: ListQuery = serde_json::from_value(json!({
+            "status": "rate_limited"
+        }))
+        .expect("deserialize account query");
+
+        assert_eq!(
+            query.validate().expect("validate account query").status,
+            Some(AccountStatus::RateLimited)
+        );
+    }
+
+    #[test]
+    fn account_query_should_reject_unbounded_page_size() {
+        let query: ListQuery =
+            serde_json::from_value(json!({"pageSize": 201})).expect("deserialize account query");
+        assert_eq!(
+            query.validate().expect_err("reject page size").field(),
+            "pageSize"
+        );
+    }
+
+    #[test]
+    fn account_query_should_reject_incomplete_sort() {
+        let query: ListQuery =
+            serde_json::from_value(json!({"sortBy": "usage"})).expect("deserialize account query");
+        assert_eq!(query.validate().expect_err("reject sort").field(), "sort");
+    }
+
+    #[test]
+    fn account_query_should_reject_unknown_fields() {
+        assert!(serde_json::from_value::<ListQuery>(json!({"id": "cred_1"})).is_err());
+    }
+}
+
+mod profile_statistics {
+    use chrono::NaiveDate;
+    use gateway_admin::model::provider_credentials::{
+        ProviderProfileActivityInsights, ProviderProfileDailyUsage, ProviderProfileInvocation,
+        ProviderProfileStatistics, ProviderProfileStatisticsSummary,
+    };
+    use gateway_api::admin::accounts::{AccountProfileAvatarQuery, AccountProfileStatisticsData};
+    use serde_json::json;
+
+    #[test]
+    fn profile_statistics_response_preserves_nullable_official_fields() {
+        let response = AccountProfileStatisticsData::from(ProviderProfileStatistics {
+            display_name: Some("Ada".to_owned()),
+            username: Some("ada".to_owned()),
+            image_url: Some("https://example.test/avatar.png".to_owned()),
+            has_stats_error: false,
+            summary: ProviderProfileStatisticsSummary {
+                total_text_tokens: Some(409_500_000),
+                peak_tokens: Some(267_000_000),
+                longest_task_duration_ms: Some(51_900_000),
+                current_streak_days: Some(16),
+                longest_streak_days: Some(32),
+            },
+            daily_usage: Some(vec![ProviderProfileDailyUsage {
+                date: NaiveDate::from_ymd_opt(2026, 8, 25).expect("usage date"),
+                tokens: 42,
+            }]),
+            activity_insights: ProviderProfileActivityInsights {
+                fast_mode_percent: Some(0.0),
+                reasoning_effort: Some("high".to_owned()),
+                reasoning_effort_percent: Some(48.0),
+                skills_explored: Some(8),
+                total_skills_used: Some(61),
+                total_threads: Some(2_391),
+                invocations: Some(vec![ProviderProfileInvocation {
+                    invocation_type: "plugin".to_owned(),
+                    plugin_id: Some("plugin_1".to_owned()),
+                    plugin_name: Some("example".to_owned()),
+                    skill_id: None,
+                    skill_name: None,
+                    usage_count: Some(29),
+                }]),
+            },
+        });
+        let value = serde_json::to_value(response).expect("serialize profile statistics");
+
+        assert_eq!(value["displayName"], "Ada");
+        assert_eq!(value["summary"]["totalTextTokens"], 409_500_000);
+        assert_eq!(
+            value["dailyUsage"][0],
+            json!({"date": "2026-08-25", "tokens": 42})
+        );
+        assert_eq!(
+            value["activityInsights"]["invocations"][0]["type"],
+            "plugin"
+        );
+        assert_eq!(
+            value["activityInsights"]["invocations"][0]["usageCount"],
+            29
+        );
+        assert!(value.get("cycle").is_none());
+        assert!(value.get("models").is_none());
+        assert!(value.get("estimatedCost").is_none());
+    }
+
+    #[test]
+    fn profile_avatar_query_accepts_only_bounded_cache_versions() {
+        let valid: AccountProfileAvatarQuery = serde_json::from_value(json!({
+            "accountId": "acct_openai",
+            "version": "k9m2z1"
+        }))
+        .expect("decode avatar query");
+        valid.validate().expect("validate avatar query");
+
+        for version in ["", "contains-dash", "x23456789012345678901234567890123"] {
+            let query: AccountProfileAvatarQuery = serde_json::from_value(json!({
+                "accountId": "acct_openai",
+                "version": version
+            }))
+            .expect("decode invalid avatar query");
+            assert_eq!(
+                query.validate().expect_err("reject version").field(),
+                "version"
+            );
+        }
+        assert!(
+            serde_json::from_value::<AccountProfileAvatarQuery>(json!({
+                "accountId": "acct_openai",
+                "sourceUrl": "https://example.test/avatar"
+            }))
+            .is_err()
+        );
+    }
+}
+
+mod profile_avatar {
+    use axum::body::to_bytes;
+    use bytes::Bytes;
+    use futures::stream;
+    use gateway_admin::model::provider_credentials::ProviderProfileAvatar;
+    use gateway_api::admin::accounts::profile_avatar_response;
+
+    #[tokio::test]
+    async fn profile_avatar_response_preserves_stream_metadata_and_private_cache() {
+        let response = profile_avatar_response(ProviderProfileAvatar {
+            content_type: Some("image/svg+xml".to_owned()),
+            content_length: Some(6),
+            etag: Some("\"v1\"".to_owned()),
+            body: Box::pin(stream::iter([Ok(Bytes::from_static(b"avatar"))])),
+        });
+
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["content-type"], "image/svg+xml");
+        assert_eq!(response.headers()["content-length"], "6");
+        assert_eq!(response.headers()["etag"], "\"v1\"");
+        assert_eq!(response.headers()["cache-control"], "private, max-age=3600");
+        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+        assert_eq!(
+            response.headers()["cross-origin-resource-policy"],
+            "same-origin"
+        );
+        assert_eq!(
+            response.headers()["content-security-policy"],
+            "sandbox; default-src 'none'"
+        );
+        assert_eq!(
+            to_bytes(response.into_body(), 16)
+                .await
+                .expect("avatar response body"),
+            Bytes::from_static(b"avatar")
+        );
+    }
+}
+
+mod batch_update {
+    use gateway_api::admin::accounts::{BatchUpdateAccountsRequest, UpdateAccountRequest};
+    use serde_json::json;
+
+    #[test]
+    fn batch_update_should_accept_complete_atomic_payload() {
+        let request: BatchUpdateAccountsRequest = serde_json::from_value(json!({
+            "accountIds": ["acct_openai", "acct_xai"],
+            "enabled": false,
+            "concurrencyLimit": null,
+            "weight": 1,
+            "groupIds": ["grp_00000000000000000000000000000001"]
+        }))
+        .expect("deserialize batch update");
+
+        request.validate().expect("validate batch update");
+    }
+
+    #[test]
+    fn batch_update_should_reject_duplicate_or_invalid_account_ids() {
+        for account_ids in [
+            json!(["acct_same", "acct_same"]),
+            json!(["not-an-account"]),
+            json!([]),
+        ] {
+            let request: BatchUpdateAccountsRequest = serde_json::from_value(json!({
+                "accountIds": account_ids,
+                "enabled": true,
+                "concurrencyLimit": 8,
+                "weight": 100,
+                "groupIds": []
+            }))
+            .expect("deserialize invalid batch update");
+            assert_eq!(
+                request.validate().expect_err("reject account IDs").field(),
+                "accountIds"
+            );
+        }
+    }
+
+    #[test]
+    fn batch_update_model_access_preserves_omitted_settings_and_rejects_unknown_fields() {
+        let request: BatchUpdateAccountsRequest = serde_json::from_value(json!({
+            "accountIds": ["acct_test"], "modelAccess": {"mode":"allowlist","models":["test-luna"]}
+        }))
+        .expect("policy-only update");
+        request.validate().expect("valid update");
+        assert!(request.enabled.is_none());
+        assert!(request.weight.is_none());
+        assert!(request.group_ids.is_none());
+        assert!(request.concurrency_limit.is_none());
+        assert!(
+            serde_json::from_value::<BatchUpdateAccountsRequest>(json!({
+                "accountIds": ["acct_test"], "enabled": true, "legacy": true
+            }))
+            .is_err()
+        );
+        let empty: BatchUpdateAccountsRequest =
+            serde_json::from_value(json!({"accountIds":["acct_test"]})).expect("empty mutation");
+        assert!(empty.validate().is_err());
+    }
+
+    #[test]
+    fn batch_update_should_reject_invalid_scheduling_bounds_and_distinguish_clear_from_preserve() {
+        for (concurrency_limit, weight, field) in [
+            (json!(0), json!(1), "concurrencyLimit"),
+            (json!(4294967296_u64), json!(1), "concurrencyLimit"),
+            (json!(null), json!(0), "weight"),
+            (json!(null), json!(101), "weight"),
+        ] {
+            let request: BatchUpdateAccountsRequest = serde_json::from_value(json!({
+                "accountIds": ["acct_test"], "concurrencyLimit": concurrency_limit, "weight": weight,
+            })).expect("deserialize bounds");
+            assert_eq!(
+                request.validate().expect_err("reject bounds").field(),
+                field
+            );
+        }
+        let cleared: BatchUpdateAccountsRequest = serde_json::from_value(json!({
+            "accountIds": ["acct_test"], "concurrencyLimit": null
+        }))
+        .expect("clear concurrency override");
+        cleared.validate().expect("valid clear");
+        assert_eq!(cleared.concurrency_limit, Some(None));
+        assert!(cleared.weight.is_none());
+    }
+
+    #[test]
+    fn single_update_should_require_the_same_complete_scheduling_contract() {
+        let request: UpdateAccountRequest = serde_json::from_value(json!({
+            "accountId": "acct_test",
+            "enabled": true,
+            "concurrencyLimit": 4294967295_u64,
+            "weight": 100,
+            "groupIds": []
+        }))
+        .expect("deserialize single update");
+        request.validate().expect("validate single update");
+
+        assert!(
+            serde_json::from_value::<UpdateAccountRequest>(json!({
+                "accountId": "acct_test",
+                "enabled": true,
+                "weight": 1,
+                "groupIds": []
+            }))
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn single_update_should_accept_optional_unicode_and_multiline_notes() {
+    use gateway_api::admin::accounts::UpdateAccountRequest;
+    use serde_json::json;
+    for notes in [
+        json!(null),
+        json!(""),
+        json!("团队备用\n第二行\t说明"),
+        json!("备".repeat(500)),
+    ] {
+        let request: UpdateAccountRequest = serde_json::from_value(json!({
+            "accountId": "acct_notes", "enabled": true, "concurrencyLimit": null,
+            "weight": 1, "groupIds": [], "notes": notes
+        }))
+        .unwrap();
+        request.validate().expect("accept bounded notes");
+    }
+}
+
+#[test]
+fn single_update_should_reject_oversized_notes_and_control_characters() {
+    use gateway_api::admin::accounts::UpdateAccountRequest;
+    use serde_json::json;
+    for notes in [
+        "备".repeat(501),
+        "备注\0".to_owned(),
+        "备注\u{001b}".to_owned(),
+    ] {
+        let request: UpdateAccountRequest = serde_json::from_value(json!({
+            "accountId": "acct_notes", "enabled": true, "concurrencyLimit": null,
+            "weight": 1, "groupIds": [], "notes": notes
+        }))
+        .unwrap();
+        assert_eq!(request.validate().unwrap_err().field(), "notes");
+    }
+}
+
+mod response {
+    use gateway_api::admin::accounts::AccountUsageView;
+    use gateway_api::admin::presenter::format_decimal_currency;
+
+    #[test]
+    fn account_usage_view_should_keep_unobserved_numbers_null() {
+        let view = AccountUsageView {
+            window_label_display: "周/月额度窗口".to_owned(),
+            request_count: None,
+            request_count_display: "-".to_owned(),
+            input_tokens: None,
+            input_tokens_display: "-".to_owned(),
+            output_tokens: None,
+            output_tokens_display: "-".to_owned(),
+            cached_tokens: None,
+            cached_tokens_display: "-".to_owned(),
+            reasoning_tokens: None,
+            reasoning_tokens_display: "-".to_owned(),
+            image_input_tokens: None,
+            image_input_tokens_display: "-".to_owned(),
+            image_output_tokens: None,
+            image_output_tokens_display: "-".to_owned(),
+            image_request_count: None,
+            image_request_count_display: "-".to_owned(),
+            image_request_failed_count: None,
+            image_request_failed_count_display: "-".to_owned(),
+            total_tokens: None,
+            total_tokens_display: "-".to_owned(),
+            created_tokens: None,
+            created_tokens_display: "-".to_owned(),
+            read_tokens: None,
+            read_tokens_display: "-".to_owned(),
+            last_used_at: None,
+            last_used_at_display: "-".to_owned(),
+            cost_estimate_status: "unknown".to_owned(),
+            known_cost_count: None,
+            partial_cost_count: None,
+            unknown_cost_count: None,
+            costs: Vec::new(),
+            models: Vec::new(),
+        };
+        let value = serde_json::to_value(view).expect("serialize account usage");
+        assert_eq!(value["windowLabelDisplay"], "周/月额度窗口");
+        assert!(value["inputTokens"].is_null());
+        assert!(value["totalTokens"].is_null());
+        assert!(value["reasoningTokens"].is_null());
+        assert_eq!(value["reasoningTokensDisplay"], "-");
+        assert_eq!(value["createdTokensDisplay"], "-");
+    }
+
+    #[test]
+    fn account_usage_currency_should_limit_usd_to_four_fraction_digits() {
+        assert_eq!(format_decimal_currency("0.1204956", "USD"), "$0.1205");
+        assert_eq!(format_decimal_currency("0.99996", "USD"), "$1.00");
+        assert_eq!(format_decimal_currency("0.0300", "USD"), "$0.03");
+        assert_eq!(format_decimal_currency("12.3456", "USD"), "$12.35");
+        assert_eq!(format_decimal_currency("0.1204956", "CNY"), "CNY 0.1204956");
+    }
+}
+
+mod actions {
+    use base64::Engine as _;
+    use gateway_admin::model::{
+        Revision,
+        accounts::AccountConnectionTestEvent as DomainConnectionTestEvent,
+        provider_credentials::{
+            CredentialDeletionResult, CredentialImportResult, CredentialMutationResult,
+        },
+    };
+    use gateway_api::admin::accounts::{
+        AccountActionRequest, AccountConnectionTestEvent, AccountDeletionData,
+        AccountDeletionRequest, AccountExportData, AccountExportQuery, AccountIdQuery,
+        AccountImportData, AccountImportRequest, AccountMutationData, AccountRefreshRequest,
+        AccountResetCreditConsumeRequest, AccountTestQuery, CompleteAccountAuthorizationRequest,
+        RotateAccountRequest, StartAccountAuthorizationRequest,
+    };
+    use gateway_core::{
+        account::ProviderAccountId, engine::probe::AccountProbeErrorSource,
+        error::GatewayErrorKind, upstream::UpstreamSendState,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn export_should_require_explicit_unique_ids_and_confirmation() {
+        let valid: AccountExportQuery = serde_json::from_value(json!({
+            "accountIds": "acct_1,acct_2",
+            "confirm": "export_sensitive_accounts"
+        }))
+        .expect("decode export query");
+        assert_eq!(
+            valid
+                .into_ids()
+                .expect("valid export")
+                .into_iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>(),
+            ["acct_1".to_owned(), "acct_2".to_owned()]
+        );
+
+        for query in [
+            json!({ "accountIds": "", "confirm": "export_sensitive_accounts" }),
+            json!({ "accountIds": "acct_1,acct_1", "confirm": "export_sensitive_accounts" }),
+            json!({ "accountIds": "acct_1", "confirm": "yes" }),
+        ] {
+            assert!(
+                serde_json::from_value::<AccountExportQuery>(query)
+                    .expect("decode invalid export query")
+                    .into_ids()
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn account_actions_should_require_frozen_account_ids_and_reject_unknown_revision() {
+        let id: AccountIdQuery =
+            serde_json::from_value(json!({ "accountId": "acct_1" })).expect("decode ID query");
+        assert!(id.validate().is_ok());
+        let action: AccountActionRequest =
+            serde_json::from_value(json!({ "accountId": "legacy-id" })).expect("decode action");
+        assert_eq!(action.validate().unwrap_err().field(), "accountId");
+        let refresh: AccountRefreshRequest = serde_json::from_value(json!({
+            "accountId": "acct_1"
+        }))
+        .expect("decode refresh");
+        assert!(refresh.validate().is_ok());
+        assert!(
+            serde_json::from_value::<AccountRefreshRequest>(json!({
+                "accountId": "acct_1",
+                "expectedConfigRevision": 0
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn reset_credit_consume_should_require_canonical_v4_idempotency_key() {
+        let valid: AccountResetCreditConsumeRequest = serde_json::from_value(json!({
+            "accountId": "acct_1",
+            "creditId": "credit_1",
+            "redeemRequestId": "8fbf302d-11df-4bd5-82e4-08e4b3df7874"
+        }))
+        .expect("decode reset-credit consume");
+        valid.validate().expect("validate reset-credit consume");
+
+        for (redeem_request_id, field) in [
+            ("019c0000-0000-7000-8000-000000000000", "redeemRequestId"),
+            ("8FBF302D-11DF-4BD5-82E4-08E4B3DF7874", "redeemRequestId"),
+            ("invalid", "redeemRequestId"),
+        ] {
+            let request: AccountResetCreditConsumeRequest = serde_json::from_value(json!({
+                "accountId": "acct_1",
+                "redeemRequestId": redeem_request_id
+            }))
+            .expect("decode invalid reset-credit consume");
+            assert_eq!(request.validate().expect_err("reject UUID").field(), field);
+        }
+
+        let invalid_credit: AccountResetCreditConsumeRequest = serde_json::from_value(json!({
+            "accountId": "acct_1",
+            "creditId": " ",
+            "redeemRequestId": "8fbf302d-11df-4bd5-82e4-08e4b3df7874"
+        }))
+        .expect("decode invalid credit");
+        assert_eq!(
+            invalid_credit
+                .validate()
+                .expect_err("reject credit")
+                .field(),
+            "creditId"
+        );
+    }
+
+    #[test]
+    fn api_key_rotation_settings_must_target_the_same_account_and_remain_valid() {
+        let mut request = json!({
+            "provider": "openai",
+            "accountId": "acct_api",
+            "baseUrl": "https://api.example.invalid/v1",
+            "transport": "http",
+            "settings": {
+                "accountId": "acct_api",
+                "enabled": true,
+                "concurrencyLimit": null,
+                "weight": 1,
+                "groupIds": []
+            }
+        });
+        serde_json::from_value::<RotateAccountRequest>(request.clone())
+            .expect("decode combined save")
+            .validate()
+            .expect("blank replacement key preserves the existing key");
+        request["settings"]["accountId"] = json!("acct_other");
+        assert_eq!(
+            serde_json::from_value::<RotateAccountRequest>(request.clone())
+                .unwrap()
+                .validate()
+                .unwrap_err()
+                .field(),
+            "settings.accountId"
+        );
+        request["settings"]["accountId"] = json!("acct_api");
+        request["settings"]["concurrencyLimit"] = json!(0);
+        assert!(
+            serde_json::from_value::<RotateAccountRequest>(request)
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn credential_recovery_requests_should_not_accept_client_revision_fences() {
+        let authorization: StartAccountAuthorizationRequest = serde_json::from_value(json!({
+            "provider": "openai",
+            "name": "reauthorize",
+            "accountId": "acct_1"
+        }))
+        .expect("decode reauthorization");
+        assert!(authorization.validate().is_ok());
+        assert!(
+            serde_json::from_value::<StartAccountAuthorizationRequest>(json!({
+                "provider": "openai",
+                "name": "reauthorize",
+                "accountId": "acct_1",
+                "expectedCredentialRevision": 1
+            }))
+            .is_err()
+        );
+
+        let rotation: RotateAccountRequest = serde_json::from_value(json!({
+            "provider": "openai",
+            "accountId": "acct_1",
+            "accessToken": "header.payload.signature",
+            "refreshToken": "refresh-token",
+            "idToken": "id-header.id-payload.id-signature"
+        }))
+        .expect("decode rotation");
+        assert!(rotation.validate().is_ok());
+        assert!(
+            serde_json::from_value::<RotateAccountRequest>(json!({
+                "provider": "openai",
+                "accountId": "acct_1",
+                "expectedCredentialRevision": 1,
+                "accessToken": "header.payload.signature"
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn credential_mutation_response_should_not_expose_internal_revision() {
+        let response = AccountMutationData::from(CredentialMutationResult {
+            config_revision: Revision::new(8).expect("config revision"),
+            account_id: ProviderAccountId::new("acct_1").expect("account ID"),
+            credential_revision: Some(Revision::new(9).expect("credential revision")),
+        });
+
+        assert_eq!(
+            serde_json::to_value(response).expect("serialize credential mutation"),
+            json!({ "accountId": "acct_1" })
+        );
+    }
+
+    #[test]
+    fn account_import_should_use_provider_and_opaque_data_fields() {
+        let valid: AccountImportRequest = serde_json::from_value(json!({
+            "provider": "openai",
+            "data": {
+                "providerOwnedUnknownField": {"nested": [1, 2, 3]},
+                "accounts": [{"credentials": {"access_token": "provider-validates-this"}}]
+            }
+        }))
+        .expect("decode account import");
+        assert!(valid.validate().is_ok());
+
+        let invalid: AccountImportRequest = serde_json::from_value(json!({
+            "provider": "xai",
+            "data": []
+        }))
+        .expect("decode invalid account import");
+        assert_eq!(invalid.validate().unwrap_err().field(), "data");
+        assert!(
+            serde_json::from_value::<AccountImportRequest>(json!({
+                "provider": "openai",
+                "document": {}
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<AccountImportRequest>(json!({
+                "provider": "openai",
+                "expectedConfigRevision": 7,
+                "data": {}
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<AccountImportRequest>(json!({
+                "provider": "openai",
+                "data": {},
+                "groupIds": []
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn oauth_complete_should_not_accept_group_assignment() {
+        let flow_id = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7_u8; 32]);
+        let request: CompleteAccountAuthorizationRequest = serde_json::from_value(json!({
+            "provider": "openai",
+            "flowId": flow_id,
+            "callbackUrl": "http://localhost/callback?code=ok"
+        }))
+        .expect("decode OAuth completion");
+        assert!(request.validate().is_ok());
+        assert!(
+            serde_json::from_value::<CompleteAccountAuthorizationRequest>(json!({
+                "provider": "xai",
+                "flowId": "flow_test",
+                "callbackUrl": "http://localhost/callback?code=ok",
+                "groupIds": []
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn account_deletion_should_validate_one_provider_batch_and_emit_account_ids() {
+        let request: AccountDeletionRequest = serde_json::from_value(json!({
+            "provider": "xai",
+            "accountIds": ["acct_1", "acct_2"]
+        }))
+        .expect("decode account deletion");
+        assert!(request.validate().is_ok());
+
+        let duplicate: AccountDeletionRequest = serde_json::from_value(json!({
+            "provider": "xai",
+            "accountIds": ["acct_1", "acct_1"]
+        }))
+        .expect("decode duplicate account deletion");
+        assert_eq!(duplicate.validate().unwrap_err().field(), "accountIds");
+
+        let response = AccountDeletionData::from(CredentialDeletionResult {
+            config_revision: Revision::new(9).expect("revision"),
+            account_ids: vec![
+                ProviderAccountId::new("acct_1").expect("account ID"),
+                ProviderAccountId::new("acct_2").expect("account ID"),
+            ],
+        });
+        assert_eq!(
+            serde_json::to_value(response).expect("serialize account deletion"),
+            json!({
+                "deletedCount": 2,
+                "accountIds": ["acct_1", "acct_2"]
+            })
+        );
+    }
+
+    #[test]
+    fn account_import_response_should_emit_account_ids() {
+        let response = AccountImportData::from_result(CredentialImportResult {
+            config_revision: Revision::new(8).expect("revision"),
+            credential_ids: vec![ProviderAccountId::new("acct_imported").expect("account ID")],
+        });
+        assert_eq!(
+            serde_json::to_value(response).expect("serialize account import"),
+            json!({
+                "importedCount": 1,
+                "accountIds": ["acct_imported"]
+            })
+        );
+    }
+
+    #[test]
+    fn connection_test_should_require_model_in_query() {
+        let query: AccountTestQuery = serde_json::from_value(json!({
+            "accountId": "acct_1",
+            "modelId": " "
+        }))
+        .expect("decode connection test query");
+        assert_eq!(query.validate().unwrap_err().field(), "modelId");
+    }
+
+    #[test]
+    fn connection_test_events_should_preserve_the_existing_frontend_contract() {
+        let events = [
+            DomainConnectionTestEvent::Started {
+                model: "grok-4.5".to_owned(),
+            },
+            DomainConnectionTestEvent::Request {
+                model: "grok-4.5".to_owned(),
+                input_text: "Reply with exactly OK.".to_owned(),
+                stream: true,
+                store: false,
+            },
+            DomainConnectionTestEvent::Content {
+                text: "OK".to_owned(),
+            },
+            DomainConnectionTestEvent::Completed {},
+            DomainConnectionTestEvent::Failed {
+                source: AccountProbeErrorSource::Upstream,
+                gateway_error_code: GatewayErrorKind::RateLimited,
+                send_state: Some(UpstreamSendState::Sent),
+                message: "upstream unavailable".to_owned(),
+                provider_error_code: Some("usage_exhausted".to_owned()),
+                provider_error_type: Some("invalid_request_error".to_owned()),
+                upstream_status: Some(429),
+                upstream_content_type: Some("application/json".to_owned()),
+                upstream_body: Some(r#"{"error":{"type":"usage_limit_reached"}}"#.to_owned()),
+            },
+        ]
+        .map(|event| AccountConnectionTestEvent::from(event).data);
+
+        assert_eq!(
+            events,
+            [
+                json!({ "type": "test_start", "model": "grok-4.5", "text": "正在连接上游 Responses" }),
+                json!({
+                    "type": "request",
+                    "payload": {
+                        "model": "grok-4.5",
+                        "input": [{
+                            "role": "user",
+                            "content": [{
+                                "type": "input_text",
+                                "text": "Reply with exactly OK."
+                            }]
+                        }],
+                        "stream": true,
+                        "store": false
+                    }
+                }),
+                json!({ "type": "content", "text": "OK" }),
+                json!({ "type": "test_complete", "success": true }),
+                json!({
+                    "type": "error",
+                    "source": "upstream",
+                    "gatewayErrorCode": "rate_limited",
+                    "sendState": "sent",
+                    "error": "upstream unavailable",
+                    "providerErrorCode": "usage_exhausted",
+                    "providerErrorType": "invalid_request_error",
+                    "upstreamStatus": 429,
+                    "upstreamContentType": "application/json",
+                    "upstreamBody": r#"{"error":{"type":"usage_limit_reached"}}"#
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn provider_export_document_should_serialize_but_never_debug_secret() {
+        let secret = "provider-refresh-token-must-not-enter-debug";
+        let document = AccountExportData::new(json!({ "refresh_token": secret }));
+        assert!(!format!("{document:?}").contains(secret));
+        assert_eq!(
+            serde_json::to_value(document).expect("serialize export"),
+            json!({ "refresh_token": secret })
+        );
+    }
+}
+
+mod import_settings {
+    use gateway_api::admin::accounts::{AccountImportRequest, CompleteAccountAuthorizationRequest};
+    use serde_json::json;
+
+    #[test]
+    fn import_and_oauth_apply_the_same_settings_validation() {
+        for (field, value) in [
+            ("concurrencyLimit", json!(0)),
+            ("concurrencyLimit", json!(4_294_967_296_u64)),
+            ("weight", json!(0)),
+            ("weight", json!(101)),
+            ("groupIds", json!(["invalid-group"])),
+            ("notes", json!("备".repeat(501))),
+            ("notes", json!("备注\u{0000}")),
+            ("notes", json!("备注\u{001b}")),
+        ] {
+            let mut settings =
+                json!({"enabled": false, "concurrencyLimit": null, "weight": 1, "groupIds": []});
+            settings[field] = value;
+            let import: AccountImportRequest = serde_json::from_value(
+                json!({"provider": "openai", "data": {}, "settings": settings}),
+            )
+            .expect("import request");
+            let oauth: CompleteAccountAuthorizationRequest = serde_json::from_value(json!({"provider": "xai", "flowId": "flow-test", "callbackUrl": "code", "settings": settings})).expect("OAuth request");
+            assert_eq!(
+                import.validate().expect_err("invalid settings").field(),
+                field
+            );
+            assert_eq!(
+                oauth.validate().expect_err("invalid settings").field(),
+                field
+            );
+        }
+    }
+
+    #[test]
+    fn import_and_oauth_accept_optional_unicode_and_multiline_notes() {
+        for notes in [
+            json!(null),
+            json!(""),
+            json!("团队备用\n下月续费\t"),
+            json!("备".repeat(500)),
+        ] {
+            let settings = json!({"enabled": true, "concurrencyLimit": null, "weight": 1, "groupIds": [], "notes": notes});
+            let import: AccountImportRequest = serde_json::from_value(
+                json!({"provider": "openai", "data": {}, "settings": settings}),
+            )
+            .unwrap();
+            let oauth: CompleteAccountAuthorizationRequest = serde_json::from_value(json!({"provider": "xai", "flowId": "flow-test", "callbackUrl": "code", "settings": settings})).unwrap();
+            import.validate().expect("import notes");
+            oauth.validate().expect("OAuth notes");
+        }
+    }
+
+    #[test]
+    fn import_settings_require_a_complete_explicit_configuration() {
+        let settings =
+            json!({"enabled": false, "concurrencyLimit": null, "weight": 100, "groupIds": []});
+        let request: AccountImportRequest =
+            serde_json::from_value(json!({"provider": "openai", "data": {}, "settings": settings}))
+                .expect("settings");
+        assert!(request.validate().is_ok());
+        for field in ["enabled", "concurrencyLimit", "weight", "groupIds"] {
+            let mut incomplete = settings.clone();
+            incomplete
+                .as_object_mut()
+                .expect("settings object")
+                .remove(field);
+            assert!(
+                serde_json::from_value::<AccountImportRequest>(
+                    json!({"provider": "openai", "data": {}, "settings": incomplete})
+                )
+                .is_err(),
+                "missing {field}"
+            );
+        }
+    }
+}

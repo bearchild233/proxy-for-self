@@ -1,0 +1,17 @@
+proxy-for-self
+
+Rust gateway and Vue admin derived from zyycn/codex-proxy-rs,
+baseline 60e0d4ee92266d7a3bb9ffe83e60c4963c8f6cbf, Apache-2.0 (LICENSE).
+Contains modified account/key routing, encrypted credential storage, Native
+continuation, Excel worker integration, UI and lifecycle handling.
+
+plugins/excel-bridge derives from Kaixxrua/excel-codex-bridge,
+baseline 168ed925548d6149a9dde15651b40211a926a3c9, Unlicense.
+Only the private worker and its protocol/image/model dependencies are retained.
+Desktop launchers, login capture, SUB2API service and updater are omitted.
+The retained adapters have been modified for gateway-bound credentials.
+License texts: licenses/ and plugins/excel-bridge/LICENSE.
+
+Dependency versions remain pinned in Cargo.lock and frontend/pnpm-lock.yaml;
+third-party dependency licenses remain applicable.
+Original internal crate/module names are retained for compatibility.

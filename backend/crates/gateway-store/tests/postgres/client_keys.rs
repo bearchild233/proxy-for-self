@@ -1,0 +1,787 @@
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
+
+use chrono::{TimeZone as _, Utc};
+use gateway_admin::{
+    model::client_keys::{
+        ClientKeyListQuery as AdminClientKeyListQuery, ClientKeyPageSize,
+        ClientKeySort as AdminClientKeySort, ClientKeySortField as AdminClientKeySortField,
+        SortDirection as AdminSortDirection,
+    },
+    ports::store::ClientKeyStore as _,
+};
+use gateway_core::{
+    engine::execution::ClientApiKeyUsageSink as _, lifecycle::CancellationToken,
+    policy::ClientApiKeyId, task::DaemonTask as _,
+};
+use gateway_store::postgres::{
+    ClientApiKeyCursor, ClientApiKeyCursorValue, ClientApiKeyListQuery, ClientApiKeyRepository,
+    ClientApiKeySort, ClientApiKeySortDirection, ClientApiKeySortField, NewClientApiKey,
+    PgAdminClientKeyStore, PgClientApiKeyRepository, PgClientApiKeyUsageSink,
+};
+
+use super::TestDatabase;
+
+#[tokio::test]
+async fn migrated_keys_persist_exactly_and_keep_short_keys_masked() {
+    use gateway_admin::model::{MutationActor, MutationContext, client_keys::NewClientKey};
+    use gateway_core::policy::RateLimits;
+    use gateway_store::postgres::{PgRuntimeSnapshotRepository, RuntimeSnapshotRepository};
+
+    let Some(database) = TestDatabase::create("migrated_keys").await else {
+        return;
+    };
+    let store = PgAdminClientKeyStore::new(database.pool.clone());
+    let context = MutationContext {
+        actor: MutationActor::System,
+        request_id: "migration-test".to_owned(),
+    };
+    let long_key: String = (0..160)
+        .map(|_| uuid::Uuid::new_v4().simple().to_string())
+        .collect();
+    let values = [
+        "q".to_owned(),
+        "abc".to_owned(),
+        "sk-legacy/key+value=:!@\\".to_owned(),
+        long_key,
+    ];
+    for (index, key) in values.iter().enumerate() {
+        let id = ClientApiKeyId::new(format!("key_migrated_{index}")).unwrap();
+        let (_, record) = store
+            .create_client_key(
+                NewClientKey {
+                    openai_client_profile_override: None,
+                    xai_client_profile_override: None,
+                    id: id.clone(),
+                    name: format!("Migrated {index}"),
+                    label: None,
+                    group_ids: Vec::new(),
+                    limits: RateLimits {
+                        max_concurrency: 3,
+                        requests_per_minute: 25,
+                    },
+                    budget: Default::default(),
+                    plaintext: key.clone(),
+                },
+                &context,
+            )
+            .await
+            .unwrap();
+        assert_eq!(record.prefix.len(), 10.min(key.len() / 2));
+        assert_ne!(record.prefix, *key);
+        let revealed = store.reveal_client_key(&id).await.unwrap().unwrap();
+        assert_eq!(revealed.expose_for_response(), key);
+    }
+    let snapshot = PgRuntimeSnapshotRepository::new(database.pool.clone())
+        .load_runtime_snapshot()
+        .await
+        .unwrap();
+    assert_eq!(snapshot.client_api_keys.len(), values.len());
+    for key in &values {
+        let record = snapshot
+            .client_api_keys
+            .iter()
+            .find(|item| item.plaintext_key.expose_for_auth() == key)
+            .unwrap();
+        assert_eq!(record.limits.max_concurrency, 3);
+    }
+    database.close().await;
+}
+
+#[tokio::test]
+async fn duplicate_migrated_keys_conflict_atomically_without_extra_audits() {
+    use gateway_admin::{
+        model::{MutationActor, MutationContext, client_keys::NewClientKey},
+        ports::store::AdminStoreErrorKind,
+    };
+    use gateway_core::policy::RateLimits;
+
+    let Some(database) = TestDatabase::create("duplicate_keys").await else {
+        return;
+    };
+    let store = PgAdminClientKeyStore::new(database.pool.clone());
+    let context = MutationContext {
+        actor: MutationActor::System,
+        request_id: "duplicate-test".to_owned(),
+    };
+    let key = "legacy-key-case-sensitive!";
+    let command = |id: &str| NewClientKey {
+        openai_client_profile_override: None,
+        xai_client_profile_override: None,
+        id: ClientApiKeyId::new(id).unwrap(),
+        name: id.to_owned(),
+        label: None,
+        group_ids: Vec::new(),
+        limits: RateLimits::unlimited(),
+        budget: Default::default(),
+        plaintext: key.to_owned(),
+    };
+    let (first, second) = tokio::join!(
+        store.create_client_key(command("key_first"), &context),
+        store.create_client_key(command("key_second"), &context)
+    );
+    assert_ne!(first.is_ok(), second.is_ok());
+    let error = first.err().or_else(|| second.err()).unwrap();
+    assert_eq!(error.kind(), AdminStoreErrorKind::Conflict);
+    assert!(!format!("{error:?}").contains(key));
+    let counts: (i64, i64) = sqlx::query_as(
+        "select (select count(*) from client_api_keys), (select count(*) from admin_audit_events)",
+    )
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(counts, (1, 1));
+    let mut different_case = command("key_case_sensitive");
+    different_case.plaintext = key.to_uppercase();
+    store
+        .create_client_key(different_case, &context)
+        .await
+        .unwrap();
+    database.close().await;
+}
+
+#[test]
+fn generated_client_key_format_remains_valid() {
+    let key = NewClientApiKey {
+        openai_client_profile_override: None,
+        xai_client_profile_override: None,
+        budget: Default::default(),
+        id: "key-1".to_owned(),
+        name: "default".to_owned(),
+        label: None,
+        group_ids: Vec::new(),
+        key: format!("sk_{}", "a".repeat(43)),
+        max_concurrency: 0,
+        requests_per_minute: 0,
+    };
+    assert!(key.validate().is_ok());
+}
+
+#[tokio::test]
+async fn client_key_names_are_checked_atomically_on_create_and_rename() {
+    use gateway_admin::{
+        model::{
+            MutationActor, MutationContext,
+            client_keys::{NewClientKey, UpdateClientKey},
+        },
+        ports::store::AdminStoreErrorKind,
+    };
+    use gateway_core::policy::RateLimits;
+
+    let Some(database) = TestDatabase::create("duplicate_key_names").await else {
+        return;
+    };
+    let store = PgAdminClientKeyStore::new(database.pool.clone());
+    let context = MutationContext {
+        actor: MutationActor::System,
+        request_id: "duplicate-name-test".to_owned(),
+    };
+    let create = |id: &str, name: &str| NewClientKey {
+        openai_client_profile_override: None,
+        xai_client_profile_override: None,
+        id: ClientApiKeyId::new(id).unwrap(),
+        name: name.to_owned(),
+        label: None,
+        group_ids: Vec::new(),
+        limits: RateLimits::unlimited(),
+        budget: Default::default(),
+        plaintext: format!("synthetic-credential-{id}"),
+    };
+    let update = |id: ClientApiKeyId, name: &str| UpdateClientKey {
+        openai_client_profile_override: None,
+        xai_client_profile_override: None,
+        id,
+        name: name.to_owned(),
+        label: None,
+        group_ids: Vec::new(),
+        limits: RateLimits::unlimited(),
+        daily_limit_usd: None,
+        weekly_limit_usd: None,
+    };
+    let (first, second) = tokio::join!(
+        store.create_client_key(create("key_name_first", "Production"), &context),
+        store.create_client_key(create("key_name_second", " production "), &context),
+    );
+    let (winner, conflict) = match (first, second) {
+        (Ok((_, record)), Err(error)) | (Err(error), Ok((_, record))) => (record, error),
+        results => panic!("expected one committed create: {results:?}"),
+    };
+    assert_eq!(conflict.kind(), AdminStoreErrorKind::DuplicateName);
+    assert_eq!(winner.name.trim(), winner.name);
+    let counts: (i64, i64) = sqlx::query_as(
+        "select (select count(*) from client_api_keys), (select count(*) from admin_audit_events)",
+    )
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(counts, (1, 1));
+
+    let (revision, _) = store
+        .update_client_key(update(winner.id.clone(), "PRODUCTION"), &context)
+        .await
+        .unwrap();
+    let (_, other) = store
+        .create_client_key(create("key_name_other", "Staging"), &context)
+        .await
+        .unwrap();
+    let error = store
+        .update_client_key(update(other.id.clone(), " production "), &context)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), AdminStoreErrorKind::DuplicateName);
+    let unchanged = store.reveal_client_key(&other.id).await.unwrap().unwrap();
+    assert_eq!(unchanged.record.name, "Staging");
+    let persisted_revision: i64 =
+        sqlx::query_scalar("select config_revision from runtime_settings where id = 1")
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+    assert_eq!(persisted_revision as u64, revision.get() + 1);
+
+    let (first, second) = tokio::join!(
+        store.update_client_key(update(winner.id, "Shared"), &context),
+        store.update_client_key(update(other.id, "SHARED"), &context),
+    );
+    assert_ne!(first.is_ok(), second.is_ok());
+    assert_eq!(
+        first.err().or_else(|| second.err()).unwrap().kind(),
+        AdminStoreErrorKind::DuplicateName
+    );
+    database.close().await;
+}
+
+#[tokio::test]
+async fn client_key_search_matches_names_and_labels_but_never_credential_values() {
+    let Some(database) = TestDatabase::create("key_name_search").await else {
+        return;
+    };
+    let generated = format!("sk_{}", "K".repeat(43));
+    for (id, name, key) in [
+        ("key_generated", "Production", generated.as_str()),
+        ("key_custom", "生产_%专用", "legacy-token+/123"),
+    ] {
+        sqlx::query(
+            "insert into client_api_keys (id, name, label, key, created_at, updated_at)
+            values ($1, $2, 'backend label', $3, now(), now())",
+        )
+        .bind(id)
+        .bind(name)
+        .bind(key)
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    }
+    let repository = PgClientApiKeyRepository::new(database.pool.clone());
+    for (search, expected) in [
+        ("PROD", 1),
+        ("生产_%", 1),
+        ("生产X", 0),
+        ("backend", 2),
+        (generated.as_str(), 0),
+        (&generated[..10], 0),
+        ("legacy-token+/123", 0),
+        ("legacy-", 0),
+    ] {
+        let page = repository
+            .list_client_api_keys(ClientApiKeyListQuery {
+                cursor: None,
+                page_size: 10,
+                search: Some(search.to_owned()),
+                sort: ClientApiKeySort::default(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.total, expected, "search: {search}");
+        assert_eq!(page.items.len() as u64, expected);
+    }
+    database.close().await;
+}
+
+#[tokio::test]
+async fn client_key_list_uses_safe_keyset_search_and_filtered_total() {
+    let Some(database) = TestDatabase::create("client_key_page").await else {
+        return;
+    };
+    for (index, label) in ["alpha", "needle", "omega"].into_iter().enumerate() {
+        let id = format!("key_page_{index}");
+        let key = format!(
+            "sk_{}",
+            char::from(b'a' + index as u8).to_string().repeat(43)
+        );
+        sqlx::query(
+            "insert into client_api_keys (
+               id, name, label, key, enabled, max_concurrency, requests_per_minute,
+               created_at, updated_at
+             ) values ($1, $2, $2, $3, true, 0, 0,
+                       now() - ($4::bigint * interval '1 minute'), now())",
+        )
+        .bind(id)
+        .bind(label)
+        .bind(key)
+        .bind(index as i64)
+        .execute(&database.pool)
+        .await
+        .expect("seed paged client key");
+    }
+    let repository = PgClientApiKeyRepository::new(database.pool.clone());
+    let first = repository
+        .list_client_api_keys(ClientApiKeyListQuery {
+            cursor: None,
+            page_size: 2,
+            search: None,
+            sort: ClientApiKeySort::default(),
+        })
+        .await
+        .expect("first client key page");
+    assert_eq!(first.total, 3);
+    assert_eq!(first.items.len(), 2);
+    assert!(first.next_cursor.is_some());
+    let second = repository
+        .list_client_api_keys(ClientApiKeyListQuery {
+            cursor: first.next_cursor,
+            page_size: 2,
+            search: None,
+            sort: ClientApiKeySort::default(),
+        })
+        .await
+        .expect("second client key page");
+    assert_eq!(second.total, 3);
+    assert_eq!(second.items.len(), 1);
+
+    let searched = repository
+        .list_client_api_keys(ClientApiKeyListQuery {
+            cursor: None,
+            page_size: 10,
+            search: Some("needle".to_owned()),
+            sort: ClientApiKeySort::default(),
+        })
+        .await
+        .expect("searched client key page");
+    assert_eq!(searched.total, 1);
+    assert_eq!(searched.items[0].label.as_deref(), Some("needle"));
+    assert_eq!(searched.items[0].prefix.len(), 10);
+    database.close().await;
+}
+
+#[test]
+fn client_key_cursor_is_bound_to_one_sort_contract() {
+    let created_sort = ClientApiKeySort::default();
+    assert!(
+        ClientApiKeyListQuery {
+            cursor: None,
+            page_size: u16::MAX,
+            search: None,
+            sort: created_sort,
+        }
+        .validate()
+        .is_ok()
+    );
+    let cursor = ClientApiKeyCursor::new(
+        created_sort,
+        ClientApiKeyCursorValue::CreatedAt(chrono::Utc::now()),
+        "key-cursor",
+    )
+    .expect("valid cursor");
+    let query = ClientApiKeyListQuery {
+        cursor: Some(cursor),
+        page_size: 10,
+        search: None,
+        sort: ClientApiKeySort {
+            field: ClientApiKeySortField::Name,
+            direction: ClientApiKeySortDirection::Asc,
+        },
+    };
+    assert!(query.validate().is_err());
+    assert!(
+        ClientApiKeyCursor::new(
+            created_sort,
+            ClientApiKeyCursorValue::Enabled(true),
+            "key-cursor",
+        )
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn admin_client_key_adapter_should_preserve_the_full_nonzero_u16_page_size() {
+    let Some(database) = TestDatabase::create("admin_client_key_max_page").await else {
+        return;
+    };
+    let page = PgAdminClientKeyStore::new(database.pool.clone())
+        .list_client_keys(AdminClientKeyListQuery {
+            cursor: None,
+            page_size: ClientKeyPageSize::new(u16::MAX).expect("maximum page size"),
+            search: None,
+            sort: AdminClientKeySort {
+                field: AdminClientKeySortField::CreatedAt,
+                direction: AdminSortDirection::Desc,
+            },
+        })
+        .await
+        .expect("maximum Client Key page size");
+
+    assert_eq!(page.total, 0);
+    assert!(page.items.is_empty());
+    database.close().await;
+}
+
+#[tokio::test]
+async fn client_key_database_sort_is_stable_and_keeps_null_last_used_at_last() {
+    let Some(database) = TestDatabase::create("client_key_sort").await else {
+        return;
+    };
+    for (index, (id, name, enabled, created_at, last_used_at)) in [
+        ("key_sort_a", "Zulu", false, "2026-01-01T00:00:00Z", None),
+        (
+            "key_sort_b",
+            "alpha",
+            true,
+            "2026-01-02T00:00:00Z",
+            Some("2026-01-03T00:00:00Z"),
+        ),
+        (
+            "key_sort_c",
+            "Beta",
+            false,
+            "2026-01-03T00:00:00Z",
+            Some("2026-01-01T00:00:00Z"),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        sqlx::query(
+            "insert into client_api_keys (
+               id, name, key, enabled, max_concurrency, requests_per_minute,
+               last_used_at, created_at, updated_at
+             ) values ($1, $2, $3, $4, 0, 0, $5::timestamptz, $6::timestamptz,
+                       $6::timestamptz)",
+        )
+        .bind(id)
+        .bind(name)
+        .bind(format!(
+            "sk_{}",
+            char::from(b'a' + index as u8).to_string().repeat(43)
+        ))
+        .bind(enabled)
+        .bind(last_used_at)
+        .bind(created_at)
+        .execute(&database.pool)
+        .await
+        .expect("seed sorted client key");
+    }
+    let repository = PgClientApiKeyRepository::new(database.pool.clone());
+    for (sort, expected) in [
+        (
+            ClientApiKeySort {
+                field: ClientApiKeySortField::Name,
+                direction: ClientApiKeySortDirection::Asc,
+            },
+            vec!["key_sort_b", "key_sort_c", "key_sort_a"],
+        ),
+        (
+            ClientApiKeySort {
+                field: ClientApiKeySortField::Enabled,
+                direction: ClientApiKeySortDirection::Desc,
+            },
+            vec!["key_sort_b", "key_sort_c", "key_sort_a"],
+        ),
+        (
+            ClientApiKeySort {
+                field: ClientApiKeySortField::CreatedAt,
+                direction: ClientApiKeySortDirection::Desc,
+            },
+            vec!["key_sort_c", "key_sort_b", "key_sort_a"],
+        ),
+        (
+            ClientApiKeySort {
+                field: ClientApiKeySortField::LastUsedAt,
+                direction: ClientApiKeySortDirection::Asc,
+            },
+            vec!["key_sort_c", "key_sort_b", "key_sort_a"],
+        ),
+        (
+            ClientApiKeySort {
+                field: ClientApiKeySortField::LastUsedAt,
+                direction: ClientApiKeySortDirection::Desc,
+            },
+            vec!["key_sort_b", "key_sort_c", "key_sort_a"],
+        ),
+    ] {
+        let mut cursor = None;
+        let mut ids = Vec::new();
+        loop {
+            let page = repository
+                .list_client_api_keys(ClientApiKeyListQuery {
+                    cursor,
+                    page_size: 1,
+                    search: None,
+                    sort,
+                })
+                .await
+                .expect("sorted client key page");
+            ids.extend(page.items.into_iter().map(|item| item.id));
+            let Some(next) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next);
+        }
+        assert_eq!(ids, expected);
+    }
+    database.close().await;
+}
+
+#[tokio::test]
+async fn client_key_usage_touch_should_preserve_the_latest_observed_timestamp() {
+    let Some(database) = TestDatabase::create("client_key_usage_touch").await else {
+        return;
+    };
+    sqlx::query(
+        "insert into client_api_keys (
+           id, name, key, enabled, max_concurrency, requests_per_minute,
+           created_at, updated_at
+         ) values ('key_usage_touch', 'usage', $1, true, 0, 0, now(), now())",
+    )
+    .bind(format!("sk_{}", "t".repeat(43)))
+    .execute(&database.pool)
+    .await
+    .expect("seed client key");
+    let repository = PgClientApiKeyRepository::new(database.pool.clone());
+    let first = Utc
+        .with_ymd_and_hms(2026, 7, 24, 0, 0, 0)
+        .single()
+        .expect("first timestamp");
+    let latest = Utc
+        .with_ymd_and_hms(2026, 7, 24, 0, 0, 1)
+        .single()
+        .expect("latest timestamp");
+    repository
+        .touch_client_api_keys(&BTreeMap::from([("key_usage_touch".to_owned(), first)]))
+        .await
+        .expect("record first API Key use");
+    repository
+        .touch_client_api_keys(&BTreeMap::from([("key_usage_touch".to_owned(), latest)]))
+        .await
+        .expect("record latest API Key use");
+
+    let record = repository
+        .get_client_api_key("key_usage_touch")
+        .await
+        .expect("load API Key")
+        .expect("client key exists");
+    assert_eq!(record.last_used_at, Some(latest));
+    database.close().await;
+}
+
+#[tokio::test]
+async fn client_key_usage_daemon_should_flush_pending_touch_on_shutdown() {
+    let Some(database) = TestDatabase::create("client_key_usage_daemon").await else {
+        return;
+    };
+    sqlx::query(
+        "insert into client_api_keys (
+           id, name, key, enabled, max_concurrency, requests_per_minute,
+           created_at, updated_at
+         ) values ('key_usage_daemon', 'usage', $1, true, 0, 0, now(), now())",
+    )
+    .bind(format!("sk_{}", "u".repeat(43)))
+    .execute(&database.pool)
+    .await
+    .expect("seed client key");
+
+    let (sink, writer) =
+        PgClientApiKeyUsageSink::with_flush_delay(database.pool.clone(), Duration::from_secs(60));
+    let writer = Arc::new(writer);
+    let cancellation = CancellationToken::new();
+    let task = {
+        let writer = Arc::clone(&writer);
+        let cancellation = cancellation.clone();
+        tokio::spawn(async move { writer.run(cancellation).await })
+    };
+    sink.record_used(&ClientApiKeyId::new("key_usage_daemon").expect("valid client API Key ID"));
+    cancellation.cancel();
+    task.await
+        .expect("join client key usage daemon")
+        .expect("stop client key usage daemon");
+
+    let last_used_at: Option<chrono::DateTime<Utc>> = sqlx::query_scalar(
+        "select last_used_at from client_api_keys where id = 'key_usage_daemon'",
+    )
+    .fetch_one(&database.pool)
+    .await
+    .expect("load client key last-used timestamp");
+    assert!(last_used_at.is_some());
+    database.close().await;
+}
+
+#[tokio::test]
+async fn dedicated_reveal_returns_plaintext_without_debug_exposure() {
+    let Some(database) = TestDatabase::create("client_key_reveal").await else {
+        return;
+    };
+    let plaintext = format!("sk_{}", "r".repeat(43));
+    sqlx::query(
+        "insert into client_api_keys (
+           id, name, key, enabled, max_concurrency, requests_per_minute,
+           created_at, updated_at
+         ) values ('key_reveal', 'reveal', $1, true, 1, 2, now(), now())",
+    )
+    .bind(&plaintext)
+    .execute(&database.pool)
+    .await
+    .expect("seed revealed client key");
+    let revealed = PgClientApiKeyRepository::new(database.pool.clone())
+        .reveal_client_api_key("key_reveal")
+        .await
+        .expect("reveal client key")
+        .expect("revealed key exists");
+    assert_eq!(revealed.key, plaintext);
+    assert!(!format!("{revealed:?}").contains(&plaintext));
+    database.close().await;
+}
+
+#[test]
+fn client_key_debug_redacts_plaintext() {
+    let secret = format!("sk_{}", "s".repeat(43));
+    let key = NewClientApiKey {
+        openai_client_profile_override: None,
+        xai_client_profile_override: None,
+        budget: Default::default(),
+        id: "key-1".to_owned(),
+        name: "default".to_owned(),
+        label: None,
+        group_ids: Vec::new(),
+        key: secret.clone(),
+        max_concurrency: 0,
+        requests_per_minute: 0,
+    };
+    assert!(!format!("{key:?}").contains(&secret));
+}
+
+#[tokio::test]
+async fn session_key_status_checks_the_exact_current_enabled_record() {
+    let Some(database) = TestDatabase::create("session_key_status").await else {
+        return;
+    };
+    let store = PgAdminClientKeyStore::new(database.pool.clone());
+    let key = ClientApiKeyId::new("key-session-test").unwrap();
+    assert!(!store.is_enabled(&key).await.unwrap());
+    sqlx::query("insert into client_api_keys (id, name, key, enabled, created_at, updated_at) values ($1, 'Session test', 'synthetic-session-status-key', true, now(), now())")
+        .bind(key.as_str()).execute(&database.pool).await.unwrap();
+    assert!(store.is_enabled(&key).await.unwrap());
+    assert!(
+        !store
+            .is_enabled(&ClientApiKeyId::new("other-key").unwrap())
+            .await
+            .unwrap()
+    );
+    sqlx::query("update client_api_keys set enabled = false where id = $1")
+        .bind(key.as_str())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    assert!(!store.is_enabled(&key).await.unwrap());
+    sqlx::query("delete from client_api_keys where id = $1")
+        .bind(key.as_str())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    assert!(!store.is_enabled(&key).await.unwrap());
+    database.close().await;
+}
+
+#[tokio::test]
+async fn key_profile_override_roundtrips_and_explicit_clear_restores_inheritance() {
+    use gateway_admin::model::{
+        MutationActor, MutationContext,
+        client_keys::{NewClientKey, UpdateClientKey},
+    };
+    use gateway_core::{account::OpaqueProviderData, policy::RateLimits};
+    use gateway_store::postgres::{PgRuntimeSnapshotRepository, RuntimeSnapshotRepository};
+    let Some(database) = TestDatabase::create("key_profiles").await else {
+        return;
+    };
+    let store = PgAdminClientKeyStore::new(database.pool.clone());
+    let context = MutationContext {
+        actor: MutationActor::System,
+        request_id: "profile-test".to_owned(),
+    };
+    let profile = OpaqueProviderData::new(
+        serde_json::json!({"client":"cli","platform":"linux","versionMode":"latest"})
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    let id = ClientApiKeyId::new("key_profile").unwrap();
+    let (_, record) = store
+        .create_client_key(
+            NewClientKey {
+                id: id.clone(),
+                name: "profile".to_owned(),
+                label: None,
+                group_ids: vec![],
+                limits: RateLimits::unlimited(),
+                budget: Default::default(),
+                plaintext: "synthetic-profile-test-key".to_owned(),
+                openai_client_profile_override: Some(profile.clone()),
+                xai_client_profile_override: Some(profile.clone()),
+            },
+            &context,
+        )
+        .await
+        .unwrap();
+    assert_eq!(record.openai_client_profile_override, Some(profile.clone()));
+    assert_eq!(record.xai_client_profile_override, Some(profile.clone()));
+    let update = |override_value| UpdateClientKey {
+        id: id.clone(),
+        name: "profile".to_owned(),
+        label: None,
+        group_ids: vec![],
+        limits: RateLimits::unlimited(),
+        daily_limit_usd: None,
+        weekly_limit_usd: None,
+        openai_client_profile_override: override_value,
+        xai_client_profile_override: None,
+    };
+    let (_, unchanged) = store
+        .update_client_key(update(None), &context)
+        .await
+        .unwrap();
+    assert_eq!(
+        unchanged.openai_client_profile_override,
+        Some(profile.clone())
+    );
+    assert_eq!(unchanged.xai_client_profile_override, Some(profile.clone()));
+    let snapshot = PgRuntimeSnapshotRepository::new(database.pool.clone())
+        .load_runtime_snapshot()
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot.client_api_keys[0].request_profiles.values().next(),
+        Some(&profile)
+    );
+    assert_eq!(
+        snapshot.client_api_keys[0]
+            .request_profiles
+            .get(&gateway_core::routing::ProviderKind::new("xai").unwrap()),
+        Some(&profile)
+    );
+    let mut clear_xai = update(None);
+    clear_xai.xai_client_profile_override = Some(None);
+    let (_, cleared_xai) = store.update_client_key(clear_xai, &context).await.unwrap();
+    assert_eq!(cleared_xai.xai_client_profile_override, None);
+    assert_eq!(
+        cleared_xai.openai_client_profile_override,
+        Some(profile.clone())
+    );
+    let (_, cleared) = store
+        .update_client_key(update(Some(None)), &context)
+        .await
+        .unwrap();
+    assert_eq!(cleared.openai_client_profile_override, None);
+    let snapshot = PgRuntimeSnapshotRepository::new(database.pool.clone())
+        .load_runtime_snapshot()
+        .await
+        .unwrap();
+    assert!(snapshot.client_api_keys[0].request_profiles.is_empty());
+    database.close().await;
+}

@@ -1,0 +1,58 @@
+# Rust
+/backend/**/target/
+*.profraw
+*.profdata
+
+# Frontend
+/frontend/node_modules/
+/frontend/dist/
+/frontend/.vite/
+/.pnpm-store/
+/frontend/.pnpm-store/
+*.tsbuildinfo
+
+# Release artifacts
+/dist/
+
+# Runtime data
+/.runtime/
+*.log
+
+# Local configuration and secrets
+/deploy/config.yaml
+
+# Editors and operating systems
+/.idea/
+/.vscode/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Local tools and worktrees
+/.codegraph/
+/.codex-ws-audit/
+/.reasonix/
+/.claude
+/.worktrees/
+/worktrees/
+/.cargo/
+*.tmp
+
+# Private and generated files
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.build/
+.env
+.env.*
+!.env.example
+**/secrets/
+**/config.local.*
+*.dump
+*.tar.gz
+plugins/excel-bridge/build/
+plugins/excel-bridge/dist/

@@ -1,0 +1,2336 @@
+use super::*;
+use provider_openai::transport::{
+    protocol::websocket::{OpeningAuditSnapshot, WebSocketAuditArtifact},
+    websocket::write_websocket_audit_artifact_for_dir,
+};
+
+mod diagnostics;
+mod fingerprint;
+mod metadata;
+
+fn rate_limit_event(used_percent: u64) -> String {
+    json!({
+        "type": "codex.rate_limits",
+        "rate_limits": {
+            "primary": {
+                "used_percent": used_percent,
+                "window_minutes": 43200,
+                "reset_at": 1893456000 + used_percent as i64,
+            }
+        }
+    })
+    .to_string()
+}
+
+fn primary_used_percent_values(headers: &[(String, String)]) -> Vec<&str> {
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            (name == "x-codex-primary-used-percent").then_some(value.as_str())
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn websocket_audit_artifact_should_require_explicit_directory() {
+    let dir = tempfile::tempdir().expect("temp dir");
+
+    let artifact = WebSocketAuditArtifact {
+        transport_mode: "websocket_required".to_string(),
+        fallback_allowed: false,
+        opening: Some(OpeningAuditSnapshot {
+            header_order: vec!["authorization".to_string()],
+            ..OpeningAuditSnapshot::default()
+        }),
+        payload: None,
+    };
+
+    let disabled = write_websocket_audit_artifact_for_dir(None, &artifact)
+        .await
+        .expect("disabled audit should be ok");
+
+    assert!(disabled.is_none());
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+
+    let written = write_websocket_audit_artifact_for_dir(Some(dir.path()), &artifact)
+        .await
+        .expect("enabled audit should write")
+        .expect("enabled audit path");
+    let file_name = written
+        .file_name()
+        .and_then(|value| value.to_str())
+        .expect("audit file name");
+    assert!(
+        file_name.contains("+0800"),
+        "expected China-time audit file name, got {file_name}"
+    );
+    let body = std::fs::read_to_string(&written).expect("audit file");
+    let json = serde_json::from_str::<serde_json::Value>(&body).expect("audit json");
+
+    assert!(json["opening"]["header_order"][0].as_str().is_some());
+}
+
+#[test]
+fn websocket_responses_endpoint_should_convert_http_base_url_to_ws_endpoint() {
+    assert_eq!(
+        responses_websocket_endpoint("https://chatgpt.com/backend-api"),
+        "wss://chatgpt.com/backend-api/codex/responses"
+    );
+    assert_eq!(
+        responses_websocket_endpoint("http://127.0.0.1:8080"),
+        "ws://127.0.0.1:8080/codex/responses"
+    );
+}
+
+#[tokio::test]
+async fn codex_backend_client_should_decode_permessage_deflate_context_takeover_frames() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut websocket = accept_codex_test_websocket_with(stream, |request, response| {
+            let extensions = request
+                .headers()
+                .get("sec-websocket-extensions")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default();
+            assert!(extensions.contains("permessage-deflate"));
+            response.headers_mut().insert(
+                "sec-websocket-extensions",
+                "permessage-deflate".parse().unwrap(),
+            );
+        })
+        .await;
+
+        let delta = json!({
+            "type": "response.output_text.delta",
+            "delta": "hello from websocket"
+        })
+        .to_string();
+        let completed = json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_6f8d0c2b5a4e4a0d9c1b7e3f2a8d5c6b",
+                "object": "response",
+                "output": [],
+                "usage": {
+                    "input_tokens": 3,
+                    "output_tokens": 1,
+                    "total_tokens": 4
+                }
+            }
+        })
+        .to_string();
+
+        let Some(Ok(Message::Text(_payload))) = websocket.next().await else {
+            panic!("client should send response.create payload");
+        };
+
+        for payload in [delta, completed] {
+            websocket.send(Message::Text(payload.into())).await.unwrap();
+        }
+    });
+    let pool = Arc::new(CodexWebSocketPool::new(Duration::from_mins(1)));
+    let backend = CodexBackendClient::new(
+        reqwest::Client::builder().no_proxy().build().unwrap(),
+        format!("http://{addr}"),
+        test_wire_profile(),
+    )
+    .with_websocket_pool(pool);
+    let mut request = codex_request("gpt-5.5", "be brief", Vec::new());
+    request.set_previous_response_id(Some("resp_previous".to_string()));
+    request.previous_response_scope = Some(PreviousResponseScope::Persisted);
+
+    let response = backend
+        .create_response(
+            &request,
+            request_context("req_live_deflate", Some("chatgpt-account")),
+        )
+        .await
+        .expect("deflated websocket response should decode");
+    server.await.unwrap();
+
+    assert!(response.body.contains("hello from websocket"));
+    assert!(
+        response
+            .body
+            .contains("resp_6f8d0c2b5a4e4a0d9c1b7e3f2a8d5c6b")
+    );
+}
+
+#[test]
+fn websocket_connection_should_prepare_response_create_payload_text() {
+    let request = codex_request(
+        "gpt-5.5",
+        "be brief",
+        vec![json!({
+            "role": "user",
+            "content": "hello",
+        })],
+    );
+
+    let prepared = CodexWebSocketConnection::responses_create_request(
+        "https://chatgpt.com/backend-api",
+        "test-websocket-key",
+        vec![(
+            "authorization".to_string(),
+            "Bearer access-token".to_string(),
+        )],
+        &request,
+    )
+    .expect("payload should serialize");
+    let payload: serde_json::Value =
+        serde_json::from_str(prepared.payload_text()).expect("payload should be json");
+
+    assert_eq!(
+        prepared.connection().endpoint(),
+        "wss://chatgpt.com/backend-api/codex/responses"
+    );
+    assert_eq!(payload["type"], "response.create");
+    assert_eq!(payload["model"], "gpt-5.5");
+    assert_eq!(payload["instructions"], "be brief");
+    assert_eq!(payload["input"][0]["content"], "hello");
+    assert!(payload.get("stream").is_none());
+    assert!(payload.get("store").is_none());
+}
+
+#[tokio::test]
+async fn backend_websocket_should_stream_upstream_for_non_streaming_client_request() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut websocket = accept_codex_test_websocket(stream).await;
+        let Some(Ok(Message::Text(payload))) = websocket.next().await else {
+            panic!("client should send response.create");
+        };
+        let payload: Value = serde_json::from_str(payload.as_str()).unwrap();
+        websocket
+            .send(Message::Text(
+                json!({
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_non_streaming",
+                        "object": "response",
+                        "status": "completed",
+                        "output": [],
+                        "usage": {"input_tokens": 3, "output_tokens": 1, "total_tokens": 4}
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        payload
+    });
+    let request = CodexResponsesRequest::from_body(
+        json!({
+            "model": "gpt-test",
+            "instructions": "collect this response",
+            "input": [],
+            "stream": false,
+            "previous_response_id": "resp_previous"
+        })
+        .as_object()
+        .unwrap()
+        .clone(),
+    );
+    let backend = CodexBackendClient::new(
+        reqwest::Client::builder().no_proxy().build().unwrap(),
+        format!("http://{address}"),
+        test_wire_profile(),
+    );
+    let response = timeout(
+        Duration::from_secs(5),
+        backend.create_response(
+            &request,
+            request_context("req_non_streaming_ws", Some("acct-non-streaming")),
+        ),
+    )
+    .await
+    .unwrap()
+    .expect("upstream WebSocket response");
+    let payload = server.await.unwrap();
+    assert_eq!(response.transport, CodexBackendTransport::WebSocket);
+    assert!(response.body.contains("resp_non_streaming"));
+    assert_eq!(payload["stream"], true);
+    assert_eq!(payload["previous_response_id"], "resp_previous");
+    assert!(
+        !request.stream(),
+        "downstream delivery remains non-streaming"
+    );
+}
+
+#[test]
+fn websocket_connection_should_prepare_capture_payload_with_canonical_field_order() {
+    let mut request = codex_request_with_prompt_cache_key(
+        "gpt-5.5",
+        "private capture instructions",
+        vec![json!({
+            "role": "user",
+            "content": "private capture prompt",
+        })],
+        "session-1",
+    );
+    request.set_client_metadata(Some(json!({
+        "thread_id": "capture-thread-secret",
+        "safe": "capture",
+    })));
+
+    let prepared = CodexWebSocketConnection::responses_create_request(
+        "https://chatgpt.com/backend-api",
+        "test-websocket-key",
+        vec![(
+            "authorization".to_string(),
+            "Bearer access-token".to_string(),
+        )],
+        &request,
+    )
+    .expect("payload should serialize");
+
+    assert_substrings_appear_in_order(
+        prepared.payload_text(),
+        &[
+            "\"type\":\"response.create\"",
+            "\"model\":\"gpt-5.5\"",
+            "\"instructions\":\"private capture instructions\"",
+            "\"input\":",
+            "\"prompt_cache_key\":\"session-1\"",
+            "\"client_metadata\":",
+        ],
+    );
+}
+
+#[tokio::test]
+async fn websocket_execute_response_create_request_should_collect_completed_sse() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut websocket = accept_codex_test_websocket(stream).await;
+        let message = websocket.next().await.unwrap().unwrap();
+        let payload = serde_json::from_str::<serde_json::Value>(&message.into_text().unwrap())
+            .expect("client payload should be json");
+        websocket
+            .send(Message::Text(
+                json!({
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_ws_live",
+                        "object": "response",
+                        "output": [],
+                        "usage": {
+                            "input_tokens": 5,
+                            "output_tokens": 2,
+                            "total_tokens": 7
+                        }
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        websocket.close(None).await.unwrap();
+        payload
+    });
+    let request = codex_request("gpt-5.5", "be brief", Vec::new());
+    let prepared = CodexWebSocketConnection::responses_create_request(
+        &format!("http://{addr}"),
+        "dGhlIHNhbXBsZSBub25jZQ==",
+        vec![(
+            "authorization".to_string(),
+            "Bearer access-token".to_string(),
+        )],
+        &request,
+    )
+    .expect("payload should serialize");
+
+    let response = execute_response_create_request(&prepared)
+        .await
+        .expect("websocket exchange should succeed");
+    let payload = server.await.unwrap();
+
+    assert_eq!(payload["type"], "response.create");
+    assert!(response.body.contains("event: response.completed"));
+    assert!(response.body.contains("\"id\":\"resp_ws_live\""));
+    assert_eq!(response.usage.expect("usage").input_tokens, 5);
+}
+
+#[tokio::test]
+async fn websocket_exchange_should_accept_upstream_frame_above_removed_private_limit() {
+    const REMOVED_FRAME_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        // Do not negotiate compression: the wire frame itself must exceed the former limit.
+        let mut websocket =
+            accept_codex_test_websocket_with(stream, |_request, _response| {}).await;
+        let _message = websocket.next().await.unwrap().unwrap();
+        let oversized_event = json!({
+            "type": "response.output_text.delta",
+            "delta": "x".repeat(REMOVED_FRAME_LIMIT_BYTES + 1),
+        })
+        .to_string();
+        assert!(oversized_event.len() > REMOVED_FRAME_LIMIT_BYTES);
+        websocket
+            .send(Message::Text(oversized_event.into()))
+            .await
+            .unwrap();
+        websocket
+            .send(Message::Text(
+                json!({
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_after_oversized_frame",
+                        "object": "response",
+                        "output": [],
+                        "usage": {
+                            "input_tokens": 1,
+                            "output_tokens": 1,
+                            "total_tokens": 2
+                        }
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+    });
+    let request = codex_request("gpt-5.5", "be brief", Vec::new());
+    let prepared = CodexWebSocketConnection::responses_create_request(
+        &format!("http://{addr}"),
+        "dGhlIHNhbXBsZSBub25jZQ==",
+        vec![(
+            "authorization".to_string(),
+            "Bearer access-token".to_string(),
+        )],
+        &request,
+    )
+    .expect("payload should serialize");
+
+    let response = execute_response_create_request(&prepared)
+        .await
+        .expect("upstream frame above the former private limit should remain forwardable");
+    server.await.unwrap();
+
+    assert!(response.body.len() > REMOVED_FRAME_LIMIT_BYTES);
+    assert!(response.body.contains("resp_after_oversized_frame"));
+}
+
+#[tokio::test]
+async fn websocket_execute_response_create_request_should_return_business_coded_response_failed_as_terminal_sse_fact()
+ {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut websocket = accept_codex_test_websocket(stream).await;
+        let _message = websocket.next().await.unwrap().unwrap();
+        websocket
+            .send(Message::Text(
+                json!({
+                    "type": "response.failed",
+                    "response": {
+                        "error": {
+                            "code": "rate_limit_exceeded",
+                            "message": "Rate limit reached. Please try again in 11.054s."
+                        }
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        websocket.close(None).await.unwrap();
+    });
+    let request = codex_request("gpt-5.5", "be brief", Vec::new());
+    let prepared = CodexWebSocketConnection::responses_create_request(
+        &format!("http://{addr}"),
+        "dGhlIHNhbXBsZSBub25jZQ==",
+        vec![(
+            "authorization".to_string(),
+            "Bearer access-token".to_string(),
+        )],
+        &request,
+    )
+    .expect("payload should serialize");
+
+    let response = execute_response_create_request(&prepared)
+        .await
+        .expect("response.failed should remain a terminal SSE fact");
+    server.await.unwrap();
+
+    assert!(response.body.contains("event: response.failed"));
+    assert!(response.body.contains("\"code\":\"rate_limit_exceeded\""));
+    assert!(
+        response
+            .body
+            .contains("Rate limit reached. Please try again in 11.054s.")
+    );
+}
+
+#[tokio::test]
+async fn websocket_execute_response_create_request_should_return_unknown_response_failed_as_terminal_sse_fact()
+ {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut websocket = accept_codex_test_websocket(stream).await;
+        let _message = websocket.next().await.unwrap().unwrap();
+        websocket
+            .send(Message::Text(
+                json!({
+                    "type": "response.failed",
+                    "response": {
+                        "id": "resp_model_refusal",
+                        "status": "failed",
+                        "error": {
+                            "code": "model_refusal",
+                            "message": "The model refused the request"
+                        }
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        websocket.close(None).await.unwrap();
+    });
+    let prepared = prepared_websocket_request(&format!("http://{addr}"));
+
+    let response = execute_response_create_request(&prepared)
+        .await
+        .expect("unknown response.failed should remain a terminal SSE fact");
+    server.await.unwrap();
+
+    assert!(response.body.contains("event: response.failed"));
+    assert!(response.body.contains("\"id\":\"resp_model_refusal\""));
+    assert!(response.body.contains("\"code\":\"model_refusal\""));
+}
+
+#[tokio::test]
+async fn websocket_execute_response_create_request_should_preserve_opening_error_status_body_and_retry_after()
+ {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_http_request(&mut stream).await;
+        assert!(request.starts_with("GET /codex/responses HTTP/1.1"));
+        assert!(request.contains("authorization: Bearer access-token"));
+        let mut body = vec![b'x'; 3 * 1024 + 17];
+        body.extend_from_slice(b"\0\xffraw-opening-tail");
+        let head = format!(
+            "HTTP/1.1 429 Too Many Requests\r\nretry-after: 33\r\nx-request-id: req-ws-opening\r\nx-future-error: first\r\nx-future-error: second\r\nset-cookie: account-secret=value\r\ncontent-type: application/problem+json; profile=codex\r\ncontent-length: {}\r\nconnection: close, x-hop-secret\r\nx-hop-secret: hop-secret\r\n\r\n",
+            body.len()
+        );
+        let mut response = head.into_bytes();
+        response.extend_from_slice(&body);
+        stream.write_all(&response).await.unwrap();
+        body
+    });
+    let prepared = prepared_websocket_request(&format!("http://{addr}"));
+
+    let error = execute_response_create_request(&prepared)
+        .await
+        .expect_err("failed opening should surface upstream status");
+    let expected_body = server.await.unwrap();
+
+    let CodexClientError::Upstream {
+        status,
+        retry_after_seconds,
+        body,
+        client_response,
+        ..
+    } = error
+    else {
+        panic!("expected upstream opening error");
+    };
+    assert_eq!(status, reqwest::StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(retry_after_seconds, Some(33));
+    assert_eq!(body.len(), String::from_utf8_lossy(&expected_body).len());
+    assert!(body.ends_with("\0\u{fffd}raw-opening-tail"));
+    let client_response = client_response.expect("raw opening response");
+    assert_eq!(client_response.status(), 429);
+    assert_eq!(
+        client_response.content_type(),
+        Some(b"application/problem+json; profile=codex".as_slice())
+    );
+    assert_eq!(client_response.body().len(), expected_body.len());
+    assert_eq!(client_response.body().as_ref(), expected_body.as_slice());
+    let future_values = client_response
+        .client_headers()
+        .iter()
+        .filter(|(name, _)| name == "x-future-error")
+        .map(|(_, value)| value.as_ref())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        future_values,
+        vec![b"first".as_slice(), b"second".as_slice()]
+    );
+    assert!(
+        client_response
+            .client_headers()
+            .iter()
+            .any(|(name, value)| { name == "retry-after" && value.as_ref() == b"33" })
+    );
+    assert!(
+        client_response
+            .client_headers()
+            .iter()
+            .any(|(name, value)| { name == "x-request-id" && value.as_ref() == b"req-ws-opening" })
+    );
+    for excluded in [
+        "content-type",
+        "content-length",
+        "set-cookie",
+        "connection",
+        "x-hop-secret",
+    ] {
+        assert!(
+            client_response
+                .client_headers()
+                .iter()
+                .all(|(name, _)| name != excluded),
+            "unexpected forwarded header {excluded}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn websocket_business_events_should_not_be_consumed_by_internal_observers() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut websocket = accept_codex_test_websocket(stream).await;
+        let _message = websocket.next().await.unwrap().unwrap();
+        for event in [
+            json!({
+                "type": "future.business.rate_limits",
+                "rate_limits": {
+                    "primary": {
+                        "used_percent": 99,
+                        "window_minutes": 5,
+                        "reset_at": 1893456300
+                    }
+                }
+            }),
+            json!({
+                "type": "future.business.metadata",
+                "metadata": {"turn_state": "business-value"}
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_after_business_events",
+                    "object": "response",
+                    "output": [],
+                    "usage": {
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                        "total_tokens": 2
+                    }
+                }
+            }),
+        ] {
+            websocket
+                .send(Message::Text(event.to_string().into()))
+                .await
+                .unwrap();
+        }
+        websocket.close(None).await.unwrap();
+    });
+    let prepared = prepared_websocket_request(&format!("http://{addr}"));
+
+    let response = execute_response_create_request(&prepared)
+        .await
+        .expect("business events should remain on the wire");
+    server.await.unwrap();
+
+    assert!(response.body.contains("event: future.business.rate_limits"));
+    assert!(response.body.contains("event: future.business.metadata"));
+    assert_eq!(response.turn_state, None);
+    assert!(response.rate_limit_headers.is_empty());
+}
+
+#[tokio::test]
+async fn websocket_opening_error_should_convert_http_date_retry_after_to_seconds() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let retry_at = (chrono::Utc::now() + chrono::TimeDelta::seconds(120))
+        .format("%a, %d %b %Y %H:%M:%S GMT")
+        .to_string();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let _request = read_http_request(&mut stream).await;
+        let body = r#"{"error":{"message":"rate limited"}}"#;
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 429 Too Many Requests\r\nretry-after: {retry_at}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+    });
+    let prepared = prepared_websocket_request(&format!("http://{addr}"));
+
+    let error = execute_response_create_request(&prepared)
+        .await
+        .expect_err("failed opening should surface upstream status");
+    server.await.unwrap();
+
+    let CodexClientError::Upstream {
+        status,
+        retry_after_seconds,
+        ..
+    } = error
+    else {
+        panic!("expected upstream opening error");
+    };
+    assert_eq!(status, reqwest::StatusCode::TOO_MANY_REQUESTS);
+    let seconds = retry_after_seconds.expect("http-date retry-after should yield seconds");
+    assert!(
+        (1..=120).contains(&seconds),
+        "expected remaining seconds within 120s, got {seconds}"
+    );
+}
+
+#[tokio::test]
+async fn websocket_execute_response_create_request_should_reject_binary_event() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut websocket = accept_codex_test_websocket(stream).await;
+        let _message = websocket.next().await.unwrap().unwrap();
+        websocket
+            .send(Message::Binary(b"unexpected-binary".to_vec().into()))
+            .await
+            .unwrap();
+        let _client_close = websocket.next().await;
+    });
+    let mut request = codex_request("gpt-test", "be brief", Vec::new());
+    request.set_previous_response_id(Some("resp_binary_previous".to_owned()));
+    let prepared = CodexWebSocketConnection::responses_create_request(
+        &format!("http://{addr}"),
+        "dGhlIHNhbXBsZSBub25jZQ==",
+        vec![("authorization".to_owned(), "Bearer access-token".to_owned())],
+        &request,
+    )
+    .expect("prepare continuation WebSocket request");
+
+    let error = execute_response_create_request(&prepared)
+        .await
+        .expect_err("binary websocket events should be rejected");
+    server.await.unwrap();
+
+    let CodexClientError::WebSocket(error) = error else {
+        panic!("binary websocket event should remain a typed WebSocket error");
+    };
+    let CodexWebSocketExchangeError::PostSendAmbiguous {
+        message,
+        source: Some(source),
+    } = error
+    else {
+        panic!("binary websocket event should remain post-send ambiguous");
+    };
+    assert!(message.contains("unexpected binary websocket event"));
+    assert_eq!(
+        source
+            .connection_observation()
+            .map(|observation| observation.exit_reason()),
+        Some("unexpected_binary_event")
+    );
+    let CodexWebSocketExchangeError::ConnectionObserved { source, .. } = *source else {
+        panic!("binary websocket event should carry its connection observation");
+    };
+    assert!(matches!(
+        *source,
+        CodexWebSocketExchangeError::UnexpectedBinaryEvent
+    ));
+}
+
+#[tokio::test]
+async fn websocket_execute_response_create_request_should_return_wrapped_error_as_terminal_sse_fact()
+ {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut websocket = accept_codex_test_websocket(stream).await;
+        let _message = websocket.next().await.unwrap().unwrap();
+        websocket
+            .send(Message::Text(
+                json!({
+                    "type": "error",
+                    "status": 409,
+                    "headers": {
+                        "retry-after": ["17"]
+                    },
+                    "error": {
+                        "code": "conflict",
+                        "message": "wrapped conflict"
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        websocket.close(None).await.unwrap();
+    });
+    let prepared = prepared_websocket_request(&format!("http://{addr}"));
+
+    let response = execute_response_create_request(&prepared)
+        .await
+        .expect("wrapped error should remain a terminal SSE fact");
+    server.await.unwrap();
+
+    assert!(response.body.contains("event: error"));
+    assert!(response.body.contains("\"status\":409"));
+    assert!(response.body.contains("\"retry-after\":[\"17\"]"));
+    assert!(response.body.contains("wrapped conflict"));
+}
+
+#[tokio::test]
+async fn websocket_execute_response_create_request_should_return_connection_limit_as_terminal_sse_fact()
+ {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut websocket = accept_codex_test_websocket(stream).await;
+        let _message = websocket.next().await.unwrap().unwrap();
+        websocket
+            .send(Message::Text(
+                json!({
+                    "type": "response.failed",
+                    "response": {
+                        "id": "resp_connection_limit",
+                        "error": {
+                            "code": "websocket_connection_limit_reached",
+                            "message": "connection limit reached"
+                        }
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        websocket.close(None).await.unwrap();
+    });
+    let prepared = prepared_websocket_request(&format!("http://{addr}"));
+
+    let response = execute_response_create_request(&prepared)
+        .await
+        .expect("connection limit should remain a terminal SSE fact");
+    server.await.unwrap();
+
+    assert!(response.body.contains("event: response.failed"));
+    assert!(response.body.contains("websocket_connection_limit_reached"));
+}
+
+#[tokio::test]
+async fn websocket_execute_response_create_request_should_forward_typed_events_without_filtering() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut websocket = accept_codex_test_websocket(stream).await;
+        let _message = websocket.next().await.unwrap().unwrap();
+        // 透明代理：缺官方必需字段的 delta 事件不再被丢弃，原样转发。
+        websocket
+            .send(Message::Text(
+                json!({
+                    "type": "response.output_text.delta"
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        websocket
+            .send(Message::Text(
+                json!({
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_after_invalid",
+                        "object": "response"
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        websocket.close(None).await.unwrap();
+    });
+    let request = codex_request("gpt-5.5", "be brief", Vec::new());
+    let prepared = CodexWebSocketConnection::responses_create_request(
+        &format!("http://{addr}"),
+        "dGhlIHNhbXBsZSBub25jZQ==",
+        vec![(
+            "authorization".to_string(),
+            "Bearer access-token".to_string(),
+        )],
+        &request,
+    )
+    .expect("payload should serialize");
+
+    let response = execute_response_create_request(&prepared)
+        .await
+        .expect("websocket exchange should succeed");
+    server.await.unwrap();
+
+    assert!(response.body.contains("event: response.output_text.delta"));
+    assert!(response.body.contains("event: response.completed"));
+    assert!(response.body.contains("\"id\":\"resp_after_invalid\""));
+}
+
+#[tokio::test]
+async fn websocket_execute_response_create_request_should_capture_internal_metadata_and_rate_limit_events()
+ {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut websocket = accept_codex_test_websocket(stream).await;
+        let _message = websocket.next().await.unwrap().unwrap();
+        websocket
+            .send(Message::Text(
+                json!({
+                    "type": "codex.rate_limits",
+                    "rate_limits": {
+                        "primary": {
+                            "used_percent": 100,
+                            "window_minutes": 5,
+                            "reset_at": 1893456300
+                        }
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        websocket
+            .send(Message::Text(
+                json!({
+                    "type": "response.metadata",
+                    "headers": {
+                        "x-codex-turn-state": ["turn-from-metadata"],
+                        "x-openai-model": ["gpt-internal-report"]
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        websocket
+            .send(Message::Text(
+                json!({
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_internal_events",
+                        "object": "response",
+                        "output": [],
+                        "usage": {
+                            "input_tokens": 1,
+                            "output_tokens": 1,
+                            "total_tokens": 2
+                        }
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        websocket.close(None).await.unwrap();
+    });
+    let prepared = prepared_websocket_request(&format!("http://{addr}"));
+
+    let response = execute_response_create_request(&prepared)
+        .await
+        .expect("internal events should update metadata without forwarding");
+    server.await.unwrap();
+
+    assert_eq!(response.turn_state.as_deref(), Some("turn-from-metadata"));
+    assert_eq!(
+        response.reported_model.as_deref(),
+        Some("gpt-internal-report")
+    );
+    assert!(!response.body.contains("codex.rate_limits"));
+    assert!(!response.body.contains("response.metadata"));
+    assert!(response.body.contains("event: response.completed"));
+    assert!(
+        response
+            .rate_limit_headers
+            .iter()
+            .any(|(name, value)| name == "x-codex-primary-used-percent" && value == "100")
+    );
+    assert!(
+        response
+            .rate_limit_headers
+            .iter()
+            .any(|(name, value)| name == "x-codex-primary-reset-at" && value == "1893456300")
+    );
+}
+
+#[tokio::test]
+async fn websocket_codex_metadata_should_capture_first_turn_state_without_changing_forwarding() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut websocket = accept_codex_test_websocket(stream).await;
+        let _message = websocket.next().await.unwrap().unwrap();
+        websocket
+            .send(Message::Text(
+                json!({
+                    "type": "codex.response.metadata",
+                    "headers": {"x-codex-turn-state": "turn-first"}
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        websocket
+            .send(Message::Text(
+                json!({
+                    "type": "response.metadata",
+                    "headers": {"x-codex-turn-state": ["turn-second"]}
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        websocket
+            .send(Message::Text(
+                completed_websocket_response("resp_metadata_alias", 1, 1).into(),
+            ))
+            .await
+            .unwrap();
+    });
+    let prepared = prepared_websocket_request(&format!("http://{addr}"));
+
+    let response = execute_response_create_request(&prepared)
+        .await
+        .expect("metadata aliases should preserve a completed response");
+    server.await.unwrap();
+
+    assert_eq!(response.turn_state.as_deref(), Some("turn-first"));
+    assert!(response.body.contains("event: codex.response.metadata"));
+    assert!(!response.body.contains("event: response.metadata\n"));
+    assert!(response.body.contains("event: response.completed"));
+}
+
+#[tokio::test]
+async fn reused_websocket_should_not_leak_turn_state_into_the_next_response() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut websocket = accept_codex_test_websocket(stream).await;
+        let _first = websocket.next().await.unwrap().unwrap();
+        websocket
+            .send(Message::Text(
+                json!({
+                    "type": "codex.response.metadata",
+                    "headers": {"x-codex-turn-state": "turn-from-first-response", "openai-model": "first-response-model"}
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        websocket
+            .send(Message::Text(
+                completed_websocket_response("resp_turn_state_first", 1, 1).into(),
+            ))
+            .await
+            .unwrap();
+
+        let _second = websocket.next().await.unwrap().unwrap();
+        websocket
+            .send(Message::Text(
+                completed_websocket_response("resp_turn_state_second", 1, 1).into(),
+            ))
+            .await
+            .unwrap();
+    });
+    let pool = Arc::new(CodexWebSocketPool::new(Duration::from_mins(1)));
+    let backend = CodexBackendClient::new(
+        reqwest::Client::builder().no_proxy().build().unwrap(),
+        format!("http://{addr}"),
+        test_wire_profile(),
+    )
+    .with_websocket_pool(pool);
+    let request = pooled_websocket_request("conversation-turn-state-reset");
+
+    let first = backend
+        .create_response(
+            &request,
+            request_context("req_turn_state_first", Some("chatgpt-account")),
+        )
+        .await
+        .expect("first response should complete");
+    let second = backend
+        .create_response(
+            &request,
+            request_context("req_turn_state_second", Some("chatgpt-account")),
+        )
+        .await
+        .expect("second response should reuse the WebSocket");
+    server.await.unwrap();
+
+    assert_eq!(
+        first.turn_state.as_deref(),
+        Some("turn-from-first-response")
+    );
+    assert!(
+        second
+            .websocket_pool_decision
+            .is_some_and(WebSocketPoolDecision::is_reuse)
+    );
+    assert_eq!(
+        first.reported_model.as_deref(),
+        Some("first-response-model")
+    );
+    assert_eq!(second.reported_model, None);
+    assert_eq!(second.turn_state, None);
+    assert!(
+        second
+            .response_metadata
+            .client_headers
+            .iter()
+            .all(|(name, _)| { !name.eq_ignore_ascii_case("x-codex-turn-state") })
+    );
+}
+
+#[tokio::test]
+async fn websocket_request_should_project_trusted_turn_state_and_remove_stale_metadata() {
+    for (case, turn_state) in [("trusted", Some("trusted-turn-state")), ("cleared", None)] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_codex_test_websocket(stream).await;
+            let message = websocket.next().await.unwrap().unwrap();
+            let payload = serde_json::from_str::<Value>(&message.into_text().unwrap())
+                .expect("response.create payload");
+            websocket
+                .send(Message::Text(
+                    completed_websocket_response("resp_turn_state_projection", 1, 1).into(),
+                ))
+                .await
+                .unwrap();
+            payload
+        });
+        let mut body = codex_request_body("gpt-5.5", "be brief", Vec::new());
+        body.insert("generate".to_owned(), json!(false));
+        body.insert("store".to_owned(), json!(false));
+        let mut request = CodexResponsesRequest::from_body(body);
+        request.turn_state = turn_state.map(str::to_owned);
+        request.local_conversation_id = Some(format!("turn-state-projection-{case}"));
+        request.set_client_metadata(Some(json!({
+            "x-codex-turn-state": "stale-client-value",
+            "keep": "preserved"
+        })));
+        let backend = CodexBackendClient::new(
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            format!("http://{addr}"),
+            test_wire_profile(),
+        )
+        .with_websocket_pool(Arc::new(CodexWebSocketPool::new(Duration::from_mins(1))));
+        let mut context = request_context(case, Some("chatgpt-account"));
+        context.turn_state = turn_state;
+
+        let response = backend
+            .create_response(&request, context)
+            .await
+            .unwrap_or_else(|error| panic!("required WebSocket request should complete: {error}"));
+        let payload = server.await.unwrap();
+
+        assert_eq!(response.transport, CodexBackendTransport::WebSocket);
+        assert_eq!(
+            payload.pointer("/client_metadata/keep"),
+            Some(&json!("preserved"))
+        );
+        assert_eq!(
+            payload.pointer("/client_metadata/x-codex-turn-state"),
+            turn_state.map(|turn_state| json!(turn_state)).as_ref(),
+            "case {case}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn codex_backend_client_should_not_reuse_websocket_rate_limit_headers() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut websocket = accept_codex_test_websocket(stream).await;
+
+        let _first_message = websocket.next().await.unwrap().unwrap();
+        websocket
+            .send(Message::Text(rate_limit_event(10).into()))
+            .await
+            .unwrap();
+        websocket
+            .send(Message::Text(
+                completed_websocket_response("resp_rate_limit_first", 3, 1).into(),
+            ))
+            .await
+            .unwrap();
+
+        let _second_message = websocket.next().await.unwrap().unwrap();
+        websocket
+            .send(Message::Text(rate_limit_event(20).into()))
+            .await
+            .unwrap();
+        websocket
+            .send(Message::Text(
+                completed_websocket_response("resp_rate_limit_second", 5, 2).into(),
+            ))
+            .await
+            .unwrap();
+        websocket.close(None).await.unwrap();
+    });
+    let pool = Arc::new(CodexWebSocketPool::new(Duration::from_mins(1)));
+    let backend = CodexBackendClient::new(
+        reqwest::Client::builder().no_proxy().build().unwrap(),
+        format!("http://{addr}"),
+        test_wire_profile(),
+    )
+    .with_websocket_pool(pool);
+    let request = pooled_websocket_request("conversation-rate-limit-reuse");
+
+    let first = backend
+        .create_response(
+            &request,
+            request_context("req_rate_limit_first", Some("chatgpt-account")),
+        )
+        .await
+        .expect("first pooled websocket response should succeed");
+    let second = backend
+        .create_response(
+            &request,
+            request_context("req_rate_limit_second", Some("chatgpt-account")),
+        )
+        .await
+        .expect("second pooled websocket response should reuse connection");
+    server.await.unwrap();
+
+    assert_eq!(
+        primary_used_percent_values(&first.rate_limit_headers),
+        vec!["10"]
+    );
+    assert_eq!(
+        primary_used_percent_values(&second.rate_limit_headers),
+        vec!["20"]
+    );
+}
+
+#[tokio::test]
+async fn websocket_execute_response_create_request_should_forward_incomplete_response() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut websocket = accept_codex_test_websocket(stream).await;
+        let _message = websocket.next().await.unwrap().unwrap();
+        websocket
+            .send(Message::Text(
+                json!({
+                    "type": "response.incomplete",
+                    "response": {
+                        "id": "resp_incomplete",
+                        "incomplete_details": {
+                            "reason": "max_output_tokens"
+                        }
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        websocket.close(None).await.unwrap();
+    });
+    let request = codex_request("gpt-5.5", "be brief", Vec::new());
+    let prepared = CodexWebSocketConnection::responses_create_request(
+        &format!("http://{addr}"),
+        "dGhlIHNhbXBsZSBub25jZQ==",
+        vec![(
+            "authorization".to_string(),
+            "Bearer access-token".to_string(),
+        )],
+        &request,
+    )
+    .expect("payload should serialize");
+
+    let exchange = execute_response_create_request(&prepared)
+        .await
+        .expect("response.incomplete should remain a terminal Responses event");
+    server.await.unwrap();
+
+    assert!(exchange.body.contains("event: response.incomplete"));
+    assert!(exchange.body.contains("max_output_tokens"));
+}
+
+#[tokio::test]
+async fn websocket_execute_response_create_request_should_forward_invalid_completed_response() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut websocket = accept_codex_test_websocket(stream).await;
+        let _message = websocket.next().await.unwrap().unwrap();
+        websocket
+            .send(Message::Text(
+                json!({
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_invalid_completed",
+                        "object": "response",
+                        "usage": {
+                            "input_tokens": "bad",
+                            "output_tokens": 1,
+                            "total_tokens": 1
+                        }
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        websocket.close(None).await.unwrap();
+    });
+    let request = codex_request("gpt-5.5", "be brief", Vec::new());
+    let prepared = CodexWebSocketConnection::responses_create_request(
+        &format!("http://{addr}"),
+        "dGhlIHNhbXBsZSBub25jZQ==",
+        vec![(
+            "authorization".to_string(),
+            "Bearer access-token".to_string(),
+        )],
+        &request,
+    )
+    .expect("payload should serialize");
+
+    let exchange = execute_response_create_request(&prepared)
+        .await
+        .expect("invalid response.completed must remain forwardable");
+    server.await.unwrap();
+
+    assert!(exchange.body.contains("event: response.completed"));
+    assert!(exchange.body.contains("\"input_tokens\":\"bad\""));
+    assert!(!exchange.body.contains("response.failed"));
+}
+
+#[tokio::test]
+async fn websocket_execute_response_create_request_should_forward_completed_without_response() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut websocket = accept_codex_test_websocket(stream).await;
+        let _message = websocket.next().await.unwrap().unwrap();
+        websocket
+            .send(Message::Text(
+                json!({
+                    "type": "response.completed"
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        websocket.close(None).await.unwrap();
+    });
+    let request = codex_request("gpt-5.5", "be brief", Vec::new());
+    let prepared = CodexWebSocketConnection::responses_create_request(
+        &format!("http://{addr}"),
+        "dGhlIHNhbXBsZSBub25jZQ==",
+        vec![(
+            "authorization".to_string(),
+            "Bearer access-token".to_string(),
+        )],
+        &request,
+    )
+    .expect("payload should serialize");
+
+    let exchange = execute_response_create_request(&prepared)
+        .await
+        .expect("completion without response must remain forwardable");
+    server.await.unwrap();
+
+    assert!(exchange.body.contains("event: response.completed"));
+    assert!(exchange.usage.is_none());
+    assert!(!exchange.body.contains("response.failed"));
+}
+
+#[tokio::test]
+async fn websocket_execute_response_create_request_should_return_error_terminal_as_sse_fact() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut websocket = accept_codex_test_websocket(stream).await;
+        let _message = websocket.next().await.unwrap().unwrap();
+        websocket
+            .send(Message::Text(
+                json!({
+                    "type": "error",
+                    "status": 200,
+                    "error": {
+                        "code": "invalid_request",
+                        "message": "No tool output found for function call call_missing"
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        websocket.close(None).await.unwrap();
+    });
+    let request = codex_request("gpt-5.5", "be brief", Vec::new());
+    let prepared = CodexWebSocketConnection::responses_create_request(
+        &format!("http://{addr}"),
+        "dGhlIHNhbXBsZSBub25jZQ==",
+        vec![(
+            "authorization".to_string(),
+            "Bearer access-token".to_string(),
+        )],
+        &request,
+    )
+    .expect("payload should serialize");
+
+    let response = execute_response_create_request(&prepared)
+        .await
+        .expect("error frame should remain a terminal SSE fact");
+    server.await.unwrap();
+
+    assert!(response.body.contains("event: error"));
+    assert!(response.body.contains("invalid_request"));
+    assert!(response.body.contains("No tool output found"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn codex_backend_client_should_timeout_when_upstream_is_silent() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let mut websockets = Vec::new();
+        for _ in 0..2 {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_codex_test_websocket(stream).await;
+            let _message = websocket.next().await.unwrap().unwrap();
+            websockets.push(websocket);
+        }
+        futures::future::pending::<()>().await;
+    });
+    let backend = CodexBackendClient::new(
+        reqwest::Client::builder().no_proxy().build().unwrap(),
+        format!("http://{addr}"),
+        test_wire_profile(),
+    );
+    let mut request = codex_request("gpt-5.5", "be brief", Vec::new());
+    request.set_previous_response_id(Some("resp_previous".to_string()));
+    request.previous_response_scope = Some(PreviousResponseScope::Persisted);
+
+    let error = backend
+        .create_response(
+            &request,
+            request_context("req_silent_websocket", Some("chatgpt-account")),
+        )
+        .await
+        .expect_err("silent upstream should time out");
+    server.abort();
+
+    std::assert_matches!(
+        error,
+        CodexClientError::WebSocket(CodexWebSocketExchangeError::PostSendAmbiguous {
+            message,
+            ..
+        })
+            if message.contains("300s")
+    );
+}
+
+#[tokio::test]
+async fn websocket_stream_should_allow_silence_below_idle_timeout() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (created_tx, created_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut websocket = accept_codex_test_websocket(stream).await;
+        let _message = websocket.next().await.unwrap().unwrap();
+        websocket
+            .send(Message::Text(
+                json!({
+                    "type": "response.created",
+                    "response": {"id": "resp_structural", "status": "in_progress"}
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        created_tx.send(()).unwrap();
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        websocket
+            .send(Message::Text(
+                completed_websocket_response("resp_structural", 3, 1).into(),
+            ))
+            .await
+            .unwrap();
+        websocket.close(None).await.unwrap();
+    });
+    let prepared = prepared_websocket_request(&format!("http://{addr}"));
+    let response_task =
+        tokio::spawn(async move { execute_response_create_request(&prepared).await });
+
+    created_rx.await.unwrap();
+    tokio::task::yield_now().await;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(30)).await;
+    let response = response_task
+        .await
+        .expect("websocket task should finish")
+        .expect("structural events and model output share the same idle timeout");
+    server.await.unwrap();
+
+    assert!(response.body.contains("event: response.created"));
+    assert!(response.body.contains("resp_structural"));
+}
+
+#[tokio::test]
+async fn websocket_connection_limit_should_be_reported_without_transport_retry() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut websocket = accept_codex_test_websocket(stream).await;
+        websocket.next().await.unwrap().unwrap();
+        websocket.send(Message::Text(json!({
+            "type":"error", "status":400,
+            "error":{"type":"invalid_request_error", "code":"websocket_connection_limit_reached", "message":"connection expired"}
+        }).to_string().into())).await.unwrap();
+        assert!(
+            timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+    });
+    let prepared = prepared_websocket_request(&format!("http://{addr}"));
+    let error = execute_response_create_request(&prepared)
+        .await
+        .expect_err("transport reports rejection");
+    assert!(matches!(
+        error,
+        CodexClientError::WebSocket(CodexWebSocketExchangeError::ConnectionLimitReached(_))
+    ));
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn websocket_execute_response_create_request_should_reply_to_server_ping_before_terminal() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut websocket = accept_codex_test_websocket(stream).await;
+        let _message = websocket.next().await.unwrap().unwrap();
+        websocket
+            .send(Message::Ping("codex-ping".as_bytes().to_vec().into()))
+            .await
+            .unwrap();
+        let pong = timeout(Duration::from_secs(1), websocket.next())
+            .await
+            .expect("client should reply to server ping before terminal response")
+            .expect("client should send a websocket frame")
+            .expect("client frame should be valid");
+        assert_eq!(pong, Message::Pong("codex-ping".as_bytes().to_vec().into()));
+        websocket
+            .send(Message::Text(
+                json!({
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_after_ping",
+                        "object": "response",
+                        "output": [],
+                        "usage": {
+                            "input_tokens": 2,
+                            "output_tokens": 1,
+                            "total_tokens": 3
+                        }
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        websocket.close(None).await.unwrap();
+    });
+    let request = codex_request("gpt-5.5", "be brief", Vec::new());
+    let prepared = CodexWebSocketConnection::responses_create_request(
+        &format!("http://{addr}"),
+        "dGhlIHNhbXBsZSBub25jZQ==",
+        vec![(
+            "authorization".to_string(),
+            "Bearer access-token".to_string(),
+        )],
+        &request,
+    )
+    .expect("payload should serialize");
+
+    let response = execute_response_create_request(&prepared)
+        .await
+        .expect("websocket exchange should succeed after ping/pong");
+    server.await.unwrap();
+
+    assert!(response.body.contains("event: response.completed"));
+    assert!(response.body.contains("\"id\":\"resp_after_ping\""));
+    assert_eq!(response.usage.expect("usage").input_tokens, 2);
+}
+
+#[tokio::test]
+async fn codex_backend_client_stream_should_reject_binary_websocket_event() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut websocket = accept_codex_test_websocket(stream).await;
+        let _message = websocket.next().await.unwrap().unwrap();
+        websocket
+            .send(Message::Binary(b"unexpected-binary".to_vec().into()))
+            .await
+            .unwrap();
+        websocket.close(None).await.unwrap();
+    });
+    let mut request = codex_request("gpt-5.5", "be brief", Vec::new());
+    request.set_previous_response_id(Some("resp_previous".to_string()));
+    request.previous_response_scope = Some(PreviousResponseScope::Persisted);
+    request.force_http_sse = false;
+    let backend = CodexBackendClient::new(
+        reqwest::Client::builder().no_proxy().build().unwrap(),
+        format!("http://{addr}"),
+        test_wire_profile(),
+    );
+
+    let mut response = backend
+        .create_response_stream(
+            &request,
+            request_context("req_stream_binary", Some("chatgpt-account")),
+        )
+        .await
+        .expect("stream should open before consuming websocket frames");
+    let error = response
+        .body
+        .next()
+        .await
+        .expect("binary frame should produce a stream item")
+        .expect_err("binary frame should fail the stream");
+    server.await.unwrap();
+
+    std::assert_matches!(
+        error,
+        CodexClientError::WebSocket(CodexWebSocketExchangeError::PostSendAmbiguous {
+            message,
+            ..
+        })
+            if message.contains("unexpected binary websocket event")
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn codex_backend_client_stream_should_keep_socket_after_structural_activity() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accepted_connections = Arc::new(AtomicUsize::new(0));
+    let accepted_connections_for_server = Arc::clone(&accepted_connections);
+    let server = tokio::spawn(async move {
+        let (first_stream, _) = listener.accept().await.unwrap();
+        accepted_connections_for_server.fetch_add(1, Ordering::SeqCst);
+        let mut first_websocket = accept_codex_test_websocket(first_stream).await;
+        let _first_message = first_websocket.next().await.unwrap().unwrap();
+        first_websocket
+            .send(Message::Text(
+                json!({
+                    "type": "response.created",
+                    "response": {
+                        "id": "resp_no_pool_first_token_stalled",
+                        "object": "response"
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        first_websocket
+            .send(Message::Text(
+                json!({
+                    "type": "response.output_text.delta",
+                    "delta": "delayed output"
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        first_websocket
+            .send(Message::Text(
+                completed_websocket_response("resp_no_pool_delayed", 3, 1).into(),
+            ))
+            .await
+            .unwrap();
+        first_websocket.close(None).await.unwrap();
+    });
+    let backend = CodexBackendClient::new(
+        reqwest::Client::builder().no_proxy().build().unwrap(),
+        format!("http://{addr}"),
+        test_wire_profile(),
+    );
+    let request = pooled_websocket_request("conversation-structural-no-pool");
+
+    let response = backend
+        .create_response_stream(
+            &request,
+            request_context("req_structural_no_pool", Some("chatgpt-account")),
+        )
+        .await
+        .expect("structural activity should keep the websocket stream open");
+    let decision = response.websocket_pool_decision;
+    let mut stream = response.body;
+    let mut body = String::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.expect("delayed websocket stream chunk should be valid");
+        body.push_str(std::str::from_utf8(&chunk).unwrap());
+    }
+    server.await.unwrap();
+
+    assert!(body.contains("resp_no_pool_first_token_stalled"));
+    assert!(body.contains("delayed output"));
+    assert!(body.contains("resp_no_pool_delayed"));
+    assert!(decision.is_none());
+    assert_eq!(accepted_connections.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn codex_backend_client_stream_should_error_when_websocket_closes_before_terminal() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut websocket = accept_codex_test_websocket(stream).await;
+        let _message = websocket.next().await.unwrap().unwrap();
+        websocket
+            .send(Message::Text(
+                json!({
+                    "type": "response.output_text.delta",
+                    "delta": "partial"
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        websocket
+            .send(Message::Text(
+                json!({
+                    "type": "secret@example.com",
+                    "payload": "must not become a diagnostic event type"
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        websocket.close(None).await.unwrap();
+    });
+    let mut request = codex_request("gpt-5.5", "be brief", Vec::new());
+    request.set_previous_response_id(Some("resp_previous".to_string()));
+    request.previous_response_scope = Some(PreviousResponseScope::Persisted);
+    request.force_http_sse = false;
+    let backend = CodexBackendClient::new(
+        reqwest::Client::builder().no_proxy().build().unwrap(),
+        format!("http://{addr}"),
+        test_wire_profile(),
+    );
+
+    let mut response = backend
+        .create_response_stream(
+            &request,
+            request_context("req_stream_mid_close", Some("chatgpt-account")),
+        )
+        .await
+        .expect("websocket stream should open");
+    let first = response
+        .body
+        .next()
+        .await
+        .expect("stream should yield partial frame")
+        .expect("partial frame should be valid");
+    assert!(std::str::from_utf8(&first).unwrap().contains("partial"));
+    let error = loop {
+        match response.body.next().await {
+            Some(Ok(_)) => {}
+            Some(Err(error)) => break error,
+            None => panic!("stream should yield close-before-terminal error"),
+        }
+    };
+    server.await.unwrap();
+
+    let CodexClientError::WebSocket(CodexWebSocketExchangeError::PostSendAmbiguous {
+        source: Some(source),
+        ..
+    }) = &error
+    else {
+        panic!("close-before-terminal should preserve its typed source: {error:?}");
+    };
+    let close = source
+        .close_before_terminal()
+        .unwrap_or_else(|| panic!("post-send ambiguity should retain its close: {source:?}"));
+    assert_eq!(close.last_event_type(), Some("response.output_text.delta"));
+
+    std::assert_matches!(
+        error,
+        CodexClientError::WebSocket(CodexWebSocketExchangeError::PostSendAmbiguous {
+            message,
+            ..
+        })
+            if message.contains("closed before terminal event")
+    );
+}
+
+#[tokio::test]
+async fn codex_backend_client_stream_should_preserve_burst_during_downstream_backpressure() {
+    const BURST_FRAMES: usize = 256;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (terminal_drained_tx, terminal_drained_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut websocket = accept_codex_test_websocket(stream).await;
+        let _message = websocket.next().await.unwrap().unwrap();
+        let (mut sink, mut source) = websocket.split();
+        // 服务端持续读取控制帧，让 tungstenite 正常回 Pong。若客户端在本地入站背压
+        // 期间仍执行 Pong deadline，它仍会因为暂时读不到已返回的 Pong 而误杀连接。
+        let control_frames = tokio::spawn(async move {
+            while let Some(message) = source.next().await {
+                match message.unwrap() {
+                    Message::Ping(_) | Message::Pong(_) => {}
+                    Message::Close(_) => break,
+                    other => panic!("unexpected client frame during response: {other:?}"),
+                }
+            }
+        });
+        sink.send(Message::Text(
+            json!({
+                "type": "response.output_text.delta",
+                "delta": "initial;"
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+        for index in 0..BURST_FRAMES {
+            let frame = json!({
+                "type": "response.output_text.delta",
+                "delta": format!("chunk-{index};")
+            })
+            .to_string();
+            if sink.send(Message::Text(frame.into())).await.is_err() {
+                control_frames.abort();
+                return;
+            }
+        }
+        let _ = sink
+            .send(Message::Text(
+                completed_websocket_response("resp_backpressure", 3, 257).into(),
+            ))
+            .await;
+        terminal_drained_rx
+            .await
+            .expect("client should drain the terminal response before server close");
+        let _ = sink.send(Message::Close(None)).await;
+        control_frames.abort();
+    });
+    let pool = Arc::new(CodexWebSocketPool::with_config(CodexWebSocketPoolConfig {
+        ping_interval: Some(Duration::from_millis(5)),
+        ping_timeout: Duration::from_millis(20),
+        liveness_timeout: None,
+        ..websocket_pool_config_for_tests(None, None, None)
+    }));
+    let backend = CodexBackendClient::new(
+        reqwest::Client::builder().no_proxy().build().unwrap(),
+        format!("http://{addr}"),
+        test_wire_profile(),
+    )
+    .with_websocket_pool(pool);
+    let request = pooled_websocket_request("conversation-backpressure");
+
+    let mut response = backend
+        .create_response_stream(
+            &request,
+            request_context("req_stream_backpressure", Some("chatgpt-account")),
+        )
+        .await
+        .expect("websocket stream should open after the first output frame");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let body = timeout(Duration::from_secs(5), async {
+        let mut body = String::new();
+        while let Some(chunk) = response.body.next().await {
+            let chunk = chunk.expect("backpressured websocket frame should remain valid");
+            body.push_str(std::str::from_utf8(&chunk).unwrap());
+        }
+        body
+    })
+    .await
+    .expect("backpressured websocket stream should finish");
+    terminal_drained_tx.send(()).unwrap();
+    server.await.unwrap();
+
+    assert_eq!(
+        body.matches("event: response.output_text.delta").count(),
+        BURST_FRAMES + 1
+    );
+    assert!(body.contains("initial;"));
+    assert!(body.contains("chunk-0;"));
+    assert!(body.contains("chunk-255;"));
+    assert!(body.contains("resp_backpressure"));
+}
+
+#[tokio::test]
+async fn codex_backend_client_stream_should_cancel_while_inbound_is_backpressured() {
+    const BURST_FRAMES: usize = 256;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (burst_sent_tx, burst_sent_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut websocket = accept_codex_test_websocket(stream).await;
+        let _message = websocket.next().await.unwrap().unwrap();
+        websocket
+            .send(Message::Text(
+                json!({
+                    "type": "response.output_text.delta",
+                    "delta": "initial;"
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        for index in 0..BURST_FRAMES {
+            websocket
+                .send(Message::Text(
+                    json!({
+                        "type": "response.output_text.delta",
+                        "delta": format!("chunk-{index};")
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+        }
+        burst_sent_tx.send(()).unwrap();
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                match websocket.next().await {
+                    Some(Ok(Message::Close(_))) => return,
+                    Some(Ok(_)) => continue,
+                    Some(Err(error)) => panic!("websocket close should be graceful: {error}"),
+                    None => panic!("websocket ended without a close frame"),
+                }
+            }
+        })
+        .await
+        .expect("client cancellation should reach a backpressured pump");
+    });
+    let backend = CodexBackendClient::new(
+        reqwest::Client::builder().no_proxy().build().unwrap(),
+        format!("http://{addr}"),
+        test_wire_profile(),
+    );
+    let request = pooled_websocket_request("conversation-backpressure-cancel");
+
+    let response = backend
+        .create_response_stream(
+            &request,
+            request_context("req_stream_backpressure_cancel", Some("chatgpt-account")),
+        )
+        .await
+        .expect("websocket stream should open after the first output frame");
+    burst_sent_rx
+        .await
+        .expect("server should finish the inbound burst");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    drop(response.body);
+    server.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn codex_backend_client_stream_should_wait_for_terminal_after_active_websocket_gap() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut websocket = accept_codex_test_websocket(stream).await;
+        let _message = websocket.next().await.unwrap().unwrap();
+        websocket
+            .send(Message::Text(
+                json!({
+                    "type": "response.output_text.delta",
+                    "delta": "partial"
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        websocket
+            .send(Message::Text(
+                completed_websocket_response("resp_after_active_gap", 3, 1).into(),
+            ))
+            .await
+            .unwrap();
+        websocket.close(None).await.unwrap();
+    });
+    let mut request = codex_request("gpt-5.5", "be brief", Vec::new());
+    request.set_previous_response_id(Some("resp_previous".to_string()));
+    request.previous_response_scope = Some(PreviousResponseScope::Persisted);
+    request.force_http_sse = false;
+    let backend = CodexBackendClient::new(
+        reqwest::Client::builder().no_proxy().build().unwrap(),
+        format!("http://{addr}"),
+        test_wire_profile(),
+    );
+
+    let mut response = backend
+        .create_response_stream(
+            &request,
+            request_context("req_stream_active_gap", Some("chatgpt-account")),
+        )
+        .await
+        .expect("websocket stream should open");
+    let first = response
+        .body
+        .next()
+        .await
+        .expect("stream should yield partial frame")
+        .expect("partial frame should be valid");
+    assert!(std::str::from_utf8(&first).unwrap().contains("partial"));
+    tokio::time::advance(Duration::from_secs(30)).await;
+    tokio::task::yield_now().await;
+    let terminal = response
+        .body
+        .next()
+        .await
+        .expect("stream should yield terminal frame after active gap")
+        .expect("terminal frame should be valid");
+    server.await.unwrap();
+
+    assert!(
+        std::str::from_utf8(&terminal)
+            .unwrap()
+            .contains("resp_after_active_gap")
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn codex_backend_client_stream_should_timeout_when_active_websocket_stalls() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut websocket = accept_codex_test_websocket(stream).await;
+        let _message = websocket.next().await.unwrap().unwrap();
+        websocket
+            .send(Message::Text(
+                json!({
+                    "type": "response.output_text.delta",
+                    "delta": "partial"
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        futures::future::pending::<()>().await;
+    });
+    let mut request = codex_request("gpt-5.5", "be brief", Vec::new());
+    request.set_previous_response_id(Some("resp_previous".to_string()));
+    request.previous_response_scope = Some(PreviousResponseScope::Persisted);
+    request.force_http_sse = false;
+    let backend = CodexBackendClient::new(
+        reqwest::Client::builder().no_proxy().build().unwrap(),
+        format!("http://{addr}"),
+        test_wire_profile(),
+    );
+
+    let mut response = backend
+        .create_response_stream(
+            &request,
+            request_context("req_stream_active_stall", Some("chatgpt-account")),
+        )
+        .await
+        .expect("websocket stream should open");
+    let first = response
+        .body
+        .next()
+        .await
+        .expect("stream should yield partial frame")
+        .expect("partial frame should be valid");
+    assert!(std::str::from_utf8(&first).unwrap().contains("partial"));
+    tokio::time::advance(Duration::from_secs(5 * 60)).await;
+    tokio::task::yield_now().await;
+    let error = response
+        .body
+        .next()
+        .await
+        .expect("stream should yield idle timeout after active stall")
+        .expect_err("active stall should time out");
+    server.abort();
+
+    std::assert_matches!(
+        error,
+        CodexClientError::WebSocket(CodexWebSocketExchangeError::PostSendAmbiguous {
+            message,
+            ..
+        })
+            if message.contains("300s")
+    );
+}
+
+#[tokio::test]
+async fn codex_backend_client_should_use_websocket_when_previous_response_id_is_present() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut websocket = accept_codex_test_websocket_with(stream, |_request, response| {
+            response.headers_mut().insert(
+                "sec-websocket-extensions",
+                "permessage-deflate".parse().unwrap(),
+            );
+            response
+                .headers_mut()
+                .insert("x-codex-turn-state", "turn-ws-client".parse().unwrap());
+            response.headers_mut().insert(
+                "set-cookie",
+                "cf_clearance=client-ws; Domain=.chatgpt.com; Path=/"
+                    .parse()
+                    .unwrap(),
+            );
+            response
+                .headers_mut()
+                .insert("x-ratelimit-remaining-requests", "17".parse().unwrap());
+        })
+        .await;
+        let message = websocket.next().await.unwrap().unwrap();
+        let payload = serde_json::from_str::<serde_json::Value>(&message.into_text().unwrap())
+            .expect("client payload should be json");
+        websocket
+            .send(Message::Text(
+                json!({
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_ws_client",
+                        "object": "response",
+                        "output": [],
+                        "usage": {
+                            "input_tokens": 3,
+                            "output_tokens": 1,
+                            "total_tokens": 4
+                        }
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        websocket.close(None).await.unwrap();
+        payload
+    });
+    let mut request = codex_request("gpt-5.5", "be brief", Vec::new());
+    request.set_previous_response_id(Some("resp_previous".to_string()));
+    request.previous_response_scope = Some(PreviousResponseScope::Persisted);
+    let pool = Arc::new(CodexWebSocketPool::new(Duration::from_mins(1)));
+    let backend = CodexBackendClient::new(
+        reqwest::Client::builder().no_proxy().build().unwrap(),
+        format!("http://{addr}"),
+        test_wire_profile(),
+    )
+    .with_websocket_pool(pool);
+
+    let response = backend
+        .create_response(
+            &request,
+            CodexRequestContext {
+                trace: None,
+                authorization: "Bearer access-token",
+                account_id: Some("chatgpt-account"),
+                request_id: "req_ws_client",
+                turn_state: None,
+                turn_metadata: None,
+                beta_features: None,
+                include_timing_metrics: None,
+                version: None,
+                codex_window_id: None,
+                parent_thread_id: None,
+                cookie_header: None,
+                installation_id: None,
+                session_id: None,
+                thread_id: None,
+                client_request_id: None,
+                turn_id: None,
+                account_selection: Default::default(),
+            },
+        )
+        .await
+        .expect("websocket response should succeed");
+    let payload = server.await.unwrap();
+
+    assert_eq!(payload["type"], "response.create");
+    assert_eq!(payload["previous_response_id"], "resp_previous");
+    assert!(response.body.contains("event: response.completed"));
+    assert!(response.body.contains("\"id\":\"resp_ws_client\""));
+    assert_eq!(response.usage.expect("usage").input_tokens, 3);
+    assert_eq!(response.turn_state.as_deref(), Some("turn-ws-client"));
+    assert_eq!(
+        response.set_cookie_headers,
+        vec!["cf_clearance=client-ws; Domain=.chatgpt.com; Path=/".to_string()]
+    );
+    assert!(
+        response
+            .rate_limit_headers
+            .iter()
+            .any(|(name, value)| name == "x-ratelimit-remaining-requests" && value == "17")
+    );
+}
+
+#[tokio::test]
+async fn diagnostics_capture_metadata_and_unknown_events_before_normal_close() {
+    use gateway_core::diagnostics::TraceContext;
+    use tokio_tungstenite::tungstenite::protocol::{CloseFrame, frame::coding::CloseCode};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut websocket = accept_codex_test_websocket(stream).await;
+        websocket.next().await.unwrap().unwrap();
+        for event in [
+            json!({"type": "future.metadata", "detail": "private-data"}),
+            json!({"type": "codex.response.metadata", "headers": {
+                "x-request-id": "upstream-metadata-request", "x-codex-turn-state": "opaque-turn-secret",
+            }}),
+        ] {
+            websocket
+                .send(Message::Text(event.to_string().into()))
+                .await
+                .unwrap();
+        }
+        websocket
+            .close(Some(CloseFrame {
+                code: CloseCode::Normal,
+                reason: "".into(),
+            }))
+            .await
+            .unwrap();
+    });
+    let trace = TraceContext::new("req_metadata_close");
+    let attempt = trace.attempt(2);
+    let mut request = codex_request("gpt-5.5", "be brief", Vec::new());
+    request.set_previous_response_id(Some("resp_previous".to_owned()));
+    request.previous_response_scope = Some(PreviousResponseScope::Persisted);
+    request.force_http_sse = false;
+    let backend = CodexBackendClient::new(
+        reqwest::Client::builder().no_proxy().build().unwrap(),
+        format!("http://{addr}"),
+        test_wire_profile(),
+    );
+    let result = backend
+        .create_response_stream(
+            &request,
+            request_context("req_metadata_close", Some("chatgpt-account")).with_trace(&attempt),
+        )
+        .await;
+    let mut failed = result.is_err();
+    if let Ok(response) = result {
+        let mut body = response.body;
+        while let Some(chunk) = body.next().await {
+            if chunk.is_err() {
+                failed = true;
+                break;
+            }
+        }
+    }
+    assert!(failed, "close before terminal must fail the exchange");
+    server.await.unwrap();
+    let snapshot = trace.snapshot().unwrap();
+    let events = snapshot["events"].as_array().unwrap();
+    let metadata = events
+        .iter()
+        .find(|event| event["data"]["eventType"] == "codex.response.metadata")
+        .unwrap();
+    assert_eq!(metadata["attemptIndex"], 2);
+    assert_eq!(metadata["exchangeId"], 1);
+    assert_eq!(
+        metadata["data"]["metadata"]["headers"]["x-request-id"],
+        "upstream-metadata-request"
+    );
+    // 未知事件名可能来自用户内容；仍记录事件，但按默认诊断合同仅保留摘要。
+    let unknown_event = gateway_core::diagnostics::body_fingerprint(b"future.metadata");
+    assert!(
+        events
+            .iter()
+            .any(|event| event["data"]["eventType"] == unknown_event)
+    );
+    let close = events
+        .iter()
+        .find(|event| event["stage"] == "upstream.close")
+        .unwrap();
+    assert_eq!(close["data"]["code"], 1000);
+    assert_eq!(close["data"]["lastEventType"], "codex.response.metadata");
+    assert_eq!(close["data"]["terminalSeen"], false);
+    assert!(!snapshot.to_string().contains("opaque-turn-secret"));
+    assert!(!snapshot.to_string().contains("private-data"));
+}

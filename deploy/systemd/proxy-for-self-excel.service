@@ -1,0 +1,14 @@
+[Unit]
+Description=proxy-for-self Excel worker
+Requires=proxy-for-self-excel.socket
+After=proxy-for-self-excel.socket
+[Service]
+User=proxy-for-self
+Group=proxy-for-self
+WorkingDirectory=/opt/proxy-for-self/current
+ExecStart=/opt/proxy-for-self/worker-venv/bin/proxy-for-self-excel --fd 3 --max-concurrency 2 --idle-timeout 120
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=630
+UMask=0077
+NoNewPrivileges=true

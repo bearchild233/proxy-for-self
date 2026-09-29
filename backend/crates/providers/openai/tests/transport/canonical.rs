@@ -1,0 +1,1158 @@
+use gateway_core::event::{ContentKind, FinishReason, GatewayEvent, ProviderEvent};
+
+use provider_openai::transport::canonical::{
+    CodexCanonicalDecoder, CodexCanonicalError, CodexCanonicalFailure, CodexCanonicalOutcome,
+};
+use provider_openai::transport::protocol::websocket::websocket_event_to_sse_frame;
+use serde_json::json;
+
+#[test]
+fn response_model_observation_prefers_reported_headers_without_changing_wire() {
+    for websocket in [false, true] {
+        let mut decoder = CodexCanonicalDecoder::new("requested")
+            .with_reported_model(Some("opening-model"))
+            .with_raw_sse_passthrough();
+        for (value, expected) in [
+            (
+                json!({"type":"response.created","response":{"id":"resp_model","model":"body-model"}}),
+                "opening-model",
+            ),
+            (
+                json!({"type":"codex.response.metadata","headers":{"X-OpenAI-Model":["metadata-model"]}}),
+                "metadata-model",
+            ),
+            (
+                json!({"type":"response.completed","headers":{"openai-model":"top-level"},"response":{"id":"resp_model","model":"final-body-model","headers":{"OpenAI-Model":"terminal-model"}}}),
+                "terminal-model",
+            ),
+        ] {
+            let raw = value.to_string();
+            let frame = if websocket {
+                websocket_event_to_sse_frame(&raw).expect("WS event")
+            } else {
+                format!("data: {raw}\n\n")
+            };
+            let events = decoder
+                .push(frame.as_bytes())
+                .expect("decode model observation");
+            assert_eq!(decoder.response_model(), Some(expected));
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event.wire_event().is_some_and(|wire| wire.data() == &value))
+            );
+        }
+    }
+}
+
+#[test]
+fn response_model_observation_uses_explicit_body_and_never_request_fallback() {
+    let mut decoder = CodexCanonicalDecoder::new("requested");
+    decoder
+        .push(b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_model\"}}\n\n")
+        .expect("response model event");
+    assert_eq!(decoder.response_model(), None);
+    decoder.push(b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_model\",\"model\":\"returned\"}}\n\n").expect("response model event");
+    assert_eq!(decoder.response_model(), Some("returned"));
+}
+
+const METADATA_PREFIX_FIXTURE: &str = include_str!("fixtures/metadata_only_prefix.sse");
+
+#[test]
+fn decoder_should_not_forward_codex_rate_limit_metadata_fixture_as_openai_wire() {
+    let events = CodexCanonicalDecoder::new("fallback")
+        .with_raw_sse_passthrough()
+        .push(METADATA_PREFIX_FIXTURE.as_bytes())
+        .expect("metadata fixture should remain open-world");
+    let wire_types = events
+        .iter()
+        .filter_map(ProviderEvent::wire_event)
+        .filter_map(|wire| wire.event_type())
+        .collect::<Vec<_>>();
+
+    assert_eq!(wire_types, vec!["response.created", "response.metadata"]);
+    assert!(matches!(
+        canonical_facts(&events).as_slice(),
+        [GatewayEvent::Started(_)]
+    ));
+}
+
+#[test]
+fn raw_sse_passthrough_should_drop_rate_limit_control_without_timing_side_effects() {
+    let frame = concat!(
+        "event: codex.rate_limits\n",
+        "data: {\"type\":\"codex.rate_limits\",\"rate_limits\":{\"primary\":{\"used_percent\":90}}}\n\n",
+    );
+    let mut decoder = CodexCanonicalDecoder::new("fallback").with_raw_sse_passthrough();
+
+    let events = decoder
+        .push(frame.as_bytes())
+        .expect("quota control frame should be accepted");
+    let signals = decoder.take_timing_signals();
+
+    assert!(events.is_empty());
+    assert!(!signals.protocol_progress);
+    assert!(!signals.output_start);
+    assert!(!signals.semantic_output);
+}
+
+#[test]
+fn decoder_should_preserve_empty_opaque_response_id_in_canonical_facts() {
+    let body = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"\",\"model\":\"gpt-test\"}}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"\",\"model\":\"gpt-test\",\"status\":\"completed\",\"output\":[]}}\n\n",
+    );
+
+    let events = CodexCanonicalDecoder::new("fallback")
+        .push(body.as_bytes())
+        .expect("empty opaque response ID remains representable");
+    let facts = canonical_facts(&events);
+
+    assert!(matches!(
+        facts.as_slice(),
+        [GatewayEvent::Started(started), GatewayEvent::Completed(completed)]
+            if started.response_id().is_empty() && completed.response_id().is_empty()
+    ));
+}
+
+#[test]
+fn raw_sse_passthrough_should_keep_original_bytes_alongside_canonical_facts() {
+    let heartbeat = ": keep-alive\r\n\r\n";
+    let created = concat!(
+        "id: evt_created\r\n",
+        "event: response.created\r\n",
+        "retry: 250\r\n",
+        "data: { \"type\": \"response.created\", \"response\": { \"id\": \"resp_raw\", \"model\": \"gpt-test\" } }\r\n\r\n",
+    );
+    let body = format!("{heartbeat}{created}");
+
+    let events = CodexCanonicalDecoder::new("fallback")
+        .with_raw_sse_passthrough()
+        .push(body.as_bytes())
+        .expect("raw SSE should remain deliverable");
+    let heartbeat_wire = events[0].wire_event().expect("heartbeat wire");
+    let created_wire = events[1].wire_event().expect("created wire");
+
+    assert!(!heartbeat_wire.has_json_data());
+    assert_eq!(
+        heartbeat_wire.raw_sse_frame().map(AsRef::as_ref),
+        Some(heartbeat.as_bytes())
+    );
+    assert!(created_wire.has_json_data());
+    assert_eq!(
+        created_wire.raw_sse_frame().map(AsRef::as_ref),
+        Some(created.as_bytes())
+    );
+    assert!(matches!(
+        events[1].canonical_facts(),
+        [GatewayEvent::Started(metadata)] if metadata.response_id() == "resp_raw"
+    ));
+}
+
+#[test]
+fn websocket_raw_passthrough_should_preserve_upstream_number_bytes() {
+    // OpenAI 线路透明代理：WebSocket 上游帧经 reducer→SSE→decoder(raw 透传) 后，
+    // data 段必须与上游原文逐字节一致，不得经 serde 往返改写数值/精度。
+    // `1e3` 若被重序列化会变成 `1000.0`——用它作为字节改写的探针。
+    let upstream = r#"{"type":"response.created","response":{"id":"resp_ws_raw","model":"gpt-test","x_precision":1e3}}"#;
+    let frame = websocket_event_to_sse_frame(upstream)
+        .expect("client-visible WS event yields an SSE frame");
+
+    let events = CodexCanonicalDecoder::new("fallback")
+        .with_raw_sse_passthrough()
+        .push(frame.as_bytes())
+        .expect("WS-derived SSE frame should remain deliverable");
+    let wire = events
+        .iter()
+        .filter_map(ProviderEvent::wire_event)
+        .find(|wire| wire.has_json_data())
+        .expect("response.created wire");
+    let raw = wire
+        .raw_sse_frame()
+        .map(AsRef::as_ref)
+        .expect("raw frame bytes");
+    let raw = std::str::from_utf8(raw).expect("utf8 raw frame");
+
+    assert!(
+        raw.contains("1e3"),
+        "raw frame must keep upstream `1e3` verbatim: {raw}"
+    );
+    assert!(
+        !raw.contains("1000.0"),
+        "raw frame must not re-serialize the number via serde: {raw}"
+    );
+    assert!(matches!(
+        wire_for_response_created(&events),
+        [GatewayEvent::Started(metadata)] if metadata.response_id() == "resp_ws_raw"
+    ));
+}
+
+fn wire_for_response_created(events: &[ProviderEvent]) -> &[GatewayEvent] {
+    events
+        .iter()
+        .find(|event| {
+            event.wire_event().and_then(|wire| wire.event_type()) == Some("response.created")
+        })
+        .map_or(&[], ProviderEvent::canonical_facts)
+}
+
+#[test]
+fn raw_sse_passthrough_should_forward_unparseable_frames_without_failure() {
+    let raw = b"retry: later\ndata: opaque\n\n";
+
+    let events = CodexCanonicalDecoder::new("fallback")
+        .with_raw_sse_passthrough()
+        .push(raw)
+        .expect("unparseable frame must not abort transparent transport");
+    let wire = events[0].wire_event().expect("raw wire event");
+
+    assert!(!wire.has_json_data());
+    assert_eq!(
+        wire.raw_sse_frame().map(AsRef::as_ref),
+        Some(raw.as_slice())
+    );
+}
+
+#[test]
+fn raw_sse_passthrough_should_preserve_long_event_metadata() {
+    let event_name = "x".repeat(300);
+    let frame = format!("event: {event_name}\ndata: {{\"type\":\"noise\",\"marker\":1}}\n\n");
+
+    let events = CodexCanonicalDecoder::new("fallback")
+        .with_raw_sse_passthrough()
+        .push(frame.as_bytes())
+        .expect("opaque event metadata must not abort transparent transport");
+    let wire = events[0].wire_event().expect("wire event");
+
+    assert_eq!(
+        wire.raw_sse_frame().map(AsRef::as_ref),
+        Some(frame.as_bytes())
+    );
+    assert!(wire.has_json_data());
+    assert_eq!(wire.event_type(), Some(event_name.as_str()));
+}
+
+#[test]
+fn decoder_should_preserve_long_event_metadata_without_raw_frame() {
+    let event_name = "y".repeat(300);
+    let frame = format!("event: {event_name}\ndata: {{\"type\":\"noise\",\"marker\":1}}\n\n");
+
+    let events = CodexCanonicalDecoder::new("fallback")
+        .push(frame.as_bytes())
+        .expect("opaque event metadata must not drop the event");
+    let wire = events[0].wire_event().expect("wire event");
+
+    assert_eq!(wire.event_type(), Some(event_name.as_str()));
+    assert!(wire.has_json_data());
+    assert_eq!(wire.data()["marker"], serde_json::json!(1));
+}
+
+#[test]
+fn decoder_should_bill_the_sent_model_independently_of_the_response_model() {
+    for (sent, returned, expected_cost) in [
+        ("gpt-5.6-sol", Some("gpt-6-sol"), Some(6_875_000)),
+        ("gpt-5.6-sol", Some("gpt-6-astra"), Some(6_875_000)),
+        ("gpt-5.6-sol", Some("gpt-5.6-sol"), Some(6_875_000)),
+        ("gpt-5.6-sol", None, Some(6_875_000)),
+        ("gpt-6-sol", Some("gpt-5.6-sol"), None),
+    ] {
+        let created =
+            json!({"type":"response.created","response":{"id":"resp_model_cost","model":returned}});
+        let completed = json!({
+            "type":"response.completed",
+            "response":{
+                "id":"resp_model_cost","model":returned,"status":"completed","output":[],
+                "usage":{"input_tokens":100,"output_tokens":10,"input_tokens_details":{"cached_tokens":25},"total_tokens":110}
+            }
+        });
+        let body = format!("data: {created}\n\ndata: {completed}\n\n");
+        let mut decoder = CodexCanonicalDecoder::new(sent).with_raw_sse_passthrough();
+        let events = decoder.push(body.as_bytes()).expect("model cost response");
+        let cost = canonical_facts(&events)
+            .into_iter()
+            .find_map(|event| match event {
+                GatewayEvent::CalculatedCost(cost) => Some(cost.total().amount().scaled()),
+                _ => None,
+            });
+        assert_eq!(cost, expected_cost, "{sent} -> {returned:?}");
+        assert_eq!(decoder.response_model(), returned);
+        assert!(canonical_facts(&events).into_iter().any(|event| matches!(
+            event,
+            GatewayEvent::Completed(meta) if meta.model() == Some(returned.unwrap_or(sent))
+        )));
+        let raw: Vec<u8> = events
+            .iter()
+            .filter_map(|event| event.wire_event().and_then(|wire| wire.raw_sse_frame()))
+            .flat_map(|frame| frame.iter().copied())
+            .collect();
+        assert_eq!(raw, body.as_bytes());
+    }
+}
+
+#[test]
+fn decoder_should_emit_calculated_cost_for_complete_known_model_usage() {
+    let body = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_cost\",\"model\":\"gpt-5.4\"}}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_cost\",\"model\":\"gpt-5.4\",\"status\":\"completed\",\"usage\":{\"input_tokens\":100,\"output_tokens\":10,\"input_tokens_details\":{\"cached_tokens\":25,\"cache_write_tokens\":0},\"total_tokens\":110}}}\n\n",
+    );
+    let events = CodexCanonicalDecoder::new("gpt-5.4")
+        .push(body.as_bytes())
+        .expect("canonical priced response");
+
+    assert!(canonical_facts(&events).into_iter().any(|event| matches!(
+        event,
+        GatewayEvent::CalculatedCost(cost)
+            if cost.total().amount().scaled() == 3_437_500
+    )));
+}
+
+#[test]
+fn decoder_should_bill_requested_service_tier_despite_default_response() {
+    let body = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_fast_cost\",\"model\":\"gpt-5.4\",\"service_tier\":\"default\"}}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_fast_cost\",\"model\":\"gpt-5.4\",\"status\":\"completed\",\"usage\":{\"input_tokens\":100,\"output_tokens\":10,\"input_tokens_details\":{\"cached_tokens\":25,\"cache_write_tokens\":0},\"total_tokens\":110}}}\n\n",
+    );
+    let mut decoder =
+        CodexCanonicalDecoder::new("gpt-5.4").with_requested_service_tier(Some("priority"));
+    let events = decoder
+        .push(body.as_bytes())
+        .expect("canonical priority response");
+
+    assert_eq!(decoder.response_service_tier(), Some("default"));
+    assert!(canonical_facts(&events).into_iter().any(|event| matches!(
+        event,
+        GatewayEvent::CalculatedCost(cost)
+            if cost.total().amount().scaled() == 6_875_000
+    )));
+}
+
+#[test]
+fn decoder_should_bill_standard_when_request_omits_service_tier() {
+    let body = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_response_tier_cost\",\"model\":\"gpt-5.4\",\"service_tier\":\"priority\"}}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_response_tier_cost\",\"model\":\"gpt-5.4\",\"status\":\"completed\",\"usage\":{\"input_tokens\":100,\"output_tokens\":10,\"input_tokens_details\":{\"cached_tokens\":25,\"cache_write_tokens\":0},\"total_tokens\":110}}}\n\n",
+    );
+    let mut decoder = CodexCanonicalDecoder::new("gpt-5.4");
+    let events = decoder
+        .push(body.as_bytes())
+        .expect("canonical response-tier priority response");
+
+    assert_eq!(decoder.response_service_tier(), Some("priority"));
+    assert!(canonical_facts(&events).into_iter().any(|event| matches!(
+        event,
+        GatewayEvent::CalculatedCost(cost)
+            if cost.total().amount().scaled() == 3_437_500
+    )));
+}
+
+#[test]
+fn decoder_should_add_standard_web_search_call_cost() {
+    let body = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_search_cost\",\"model\":\"gpt-5.4\"}}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_search_cost\",\"model\":\"gpt-5.4\",\"status\":\"completed\",\"output\":[{\"type\":\"web_search_call\",\"id\":\"ws_1\",\"status\":\"completed\",\"action\":{\"type\":\"search\"}}],\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0}}}\n\n",
+    );
+    let tools = vec![json!({ "type": "web_search" })];
+    let events = CodexCanonicalDecoder::new("gpt-5.4")
+        .with_request_tool_pricing("gpt-5.4", Some(&tools))
+        .push(body.as_bytes())
+        .expect("canonical web search response");
+
+    assert!(canonical_facts(&events).into_iter().any(|event| matches!(
+        event,
+        GatewayEvent::CalculatedCost(cost)
+            if cost.total().amount().scaled() == 100_000_000
+    )));
+}
+
+#[test]
+fn decoder_should_use_non_reasoning_preview_web_search_price() {
+    let body = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_preview_search_cost\",\"model\":\"gpt-4o\"}}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_preview_search_cost\",\"model\":\"gpt-4o\",\"status\":\"completed\",\"output\":[{\"type\":\"web_search_call\",\"id\":\"ws_1\",\"status\":\"completed\",\"action\":{\"type\":\"search\"}}],\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0}}}\n\n",
+    );
+    let tools = vec![json!({ "type": "web_search_preview" })];
+    let events = CodexCanonicalDecoder::new("gpt-4o")
+        .with_request_tool_pricing("gpt-4o", Some(&tools))
+        .push(body.as_bytes())
+        .expect("canonical preview web search response");
+
+    assert!(canonical_facts(&events).into_iter().any(|event| matches!(
+        event,
+        GatewayEvent::CalculatedCost(cost)
+            if cost.total().amount().scaled() == 250_000_000
+    )));
+}
+
+#[test]
+fn astra_decoder_should_use_reasoning_preview_web_search_price() {
+    let body = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_preview_search_cost\",\"model\":\"gpt-6-astra\"}}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_preview_search_cost\",\"model\":\"gpt-6-astra\",\"status\":\"completed\",\"output\":[{\"type\":\"web_search_call\",\"id\":\"ws_1\",\"status\":\"completed\",\"action\":{\"type\":\"search\"}}],\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0}}}\n\n",
+    );
+    let tools = vec![json!({ "type": "web_search_preview" })];
+    let events = CodexCanonicalDecoder::new("gpt-6-astra")
+        .with_request_tool_pricing("gpt-6-astra", Some(&tools))
+        .push(body.as_bytes())
+        .expect("canonical preview web search response");
+
+    assert!(canonical_facts(&events).into_iter().any(|event| matches!(
+        event,
+        GatewayEvent::CalculatedCost(cost)
+            if cost.total().amount().scaled() == 100_000_000
+    )));
+}
+
+#[test]
+fn decoder_should_fail_closed_for_fixed_block_web_search_content() {
+    let body = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_fixed_search_cost\",\"model\":\"gpt-4o-mini\"}}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_fixed_search_cost\",\"model\":\"gpt-4o-mini\",\"status\":\"completed\",\"output\":[{\"type\":\"web_search_call\",\"id\":\"ws_1\",\"status\":\"completed\",\"action\":{\"type\":\"search\"}}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n",
+    );
+    let tools = vec![json!({ "type": "web_search" })];
+    let events = CodexCanonicalDecoder::new("gpt-4o-mini")
+        .with_request_tool_pricing("gpt-4o-mini", Some(&tools))
+        .push(body.as_bytes())
+        .expect("canonical fixed-block search response");
+
+    assert!(
+        canonical_facts(&events)
+            .into_iter()
+            .all(|event| !matches!(event, GatewayEvent::CalculatedCost(_)))
+    );
+}
+
+#[test]
+fn websocket_decoder_should_bill_requested_service_tier_despite_default_response() {
+    let created = websocket_event_to_sse_frame(
+        r#"{"type":"response.created","response":{"id":"resp_ws_fast_cost","model":"gpt-5.4","service_tier":"default"}}"#,
+    )
+    .expect("created frame");
+    let completed = websocket_event_to_sse_frame(
+        r#"{"type":"response.completed","response":{"id":"resp_ws_fast_cost","model":"gpt-5.4","status":"completed","usage":{"input_tokens":100,"output_tokens":10,"input_tokens_details":{"cached_tokens":25,"cache_write_tokens":0},"total_tokens":110}}}"#,
+    )
+    .expect("completed frame");
+    let mut decoder = CodexCanonicalDecoder::new("gpt-5.4")
+        .with_requested_service_tier(Some("priority"))
+        .with_raw_sse_passthrough();
+    let events = decoder
+        .push(format!("{created}{completed}").as_bytes())
+        .expect("canonical priority WebSocket response");
+
+    assert_eq!(decoder.response_service_tier(), Some("default"));
+    assert!(canonical_facts(&events).into_iter().any(|event| matches!(
+        event,
+        GatewayEvent::CalculatedCost(cost)
+            if cost.total().amount().scaled() == 6_875_000
+    )));
+}
+
+#[test]
+fn decoder_should_normalize_text_usage_and_completion() {
+    let body = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-test\"}}\n\n",
+        "event: response.content_part.added\n",
+        "data: {\"type\":\"response.content_part.added\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\"}}\n\n",
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"hello\"}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-test\",\"status\":\"completed\",\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}\n\n",
+    );
+    let events = CodexCanonicalDecoder::new("fallback")
+        .push(body.as_bytes())
+        .expect("canonical response");
+    let canonical = canonical_facts(&events);
+
+    assert!(matches!(canonical[0], GatewayEvent::Started(_)));
+    assert!(matches!(
+        canonical[1],
+        GatewayEvent::ContentAdded(item) if item.kind() == ContentKind::Text
+    ));
+    assert!(matches!(canonical[2], GatewayEvent::TextDelta(_)));
+    assert!(matches!(canonical[3], GatewayEvent::Usage(_)));
+    assert!(matches!(
+        canonical[4],
+        GatewayEvent::Completed(meta)
+            if meta.finish_reason() == Some(FinishReason::Stop)
+    ));
+}
+
+#[test]
+fn decoder_should_restore_done_only_reasoning_and_text_as_canonical_facts() {
+    let body = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_done_only\",\"model\":\"gpt-test\"}}\n\n",
+        "event: response.output_item.done\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"plan\"}]}}\n\n",
+        "event: response.output_item.done\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"answer\"}]}}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_done_only\",\"model\":\"gpt-test\",\"status\":\"completed\"}}\n\n",
+    );
+
+    let events = CodexCanonicalDecoder::new("fallback")
+        .push(body.as_bytes())
+        .expect("done-only output should be canonicalized");
+    let facts = canonical_facts(&events);
+    let wire_types = events
+        .iter()
+        .filter_map(ProviderEvent::wire_event)
+        .filter_map(|wire| wire.event_type())
+        .collect::<Vec<_>>();
+
+    assert!(facts.iter().any(|event| matches!(
+        event,
+        GatewayEvent::ReasoningDelta(delta) if delta.text == "plan"
+    )));
+    assert!(facts.iter().any(|event| matches!(
+        event,
+        GatewayEvent::TextDelta(delta) if delta.text == "answer"
+    )));
+    assert_eq!(
+        wire_types,
+        vec![
+            "response.created",
+            "response.output_item.done",
+            "response.output_item.done",
+            "response.completed",
+        ]
+    );
+}
+
+#[test]
+fn decoder_timing_signals_should_count_tool_arguments_as_first_token() {
+    let body = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_tool_timing\",\"model\":\"gpt-test\"}}\n\n",
+        "event: response.output_item.added\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_tool_timing\"}}\n\n",
+        "event: response.function_call_arguments.delta\n",
+        "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{\\\"path\\\":\\\"a\\\"}\"}\n\n",
+    );
+    let mut decoder = CodexCanonicalDecoder::new("fallback");
+
+    let _ = decoder.push(body.as_bytes()).expect("tool argument frame");
+    let signals = decoder.take_timing_signals();
+
+    assert!(signals.semantic_output);
+    assert!(!signals.reasoning_output);
+    assert!(!signals.text_output);
+}
+
+#[test]
+fn decoder_timing_signals_should_distinguish_reasoning_and_text_output() {
+    let body = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_output_timing\",\"model\":\"gpt-test\"}}\n\n",
+        "event: response.reasoning_summary_text.delta\n",
+        "data: {\"type\":\"response.reasoning_summary_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"plan\"}\n\n",
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"output_index\":1,\"content_index\":0,\"delta\":\"answer\"}\n\n",
+    );
+    let mut decoder = CodexCanonicalDecoder::new("fallback");
+
+    let _ = decoder.push(body.as_bytes()).expect("output frames");
+    let signals = decoder.take_timing_signals();
+
+    assert!(signals.semantic_output);
+    assert!(signals.reasoning_output);
+    assert!(signals.text_output);
+}
+
+#[test]
+fn decoder_should_preserve_image_tool_tokens_in_canonical_usage() {
+    let body = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_image_usage\",\"model\":\"gpt-test\"}}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_image_usage\",\"model\":\"gpt-test\",\"status\":\"completed\",\"usage\":{\"input_tokens\":12,\"output_tokens\":5,\"total_tokens\":17},\"tool_usage\":{\"image_gen\":{\"input_tokens\":31,\"output_tokens\":9}}}}\n\n",
+    );
+    let events = CodexCanonicalDecoder::new("fallback")
+        .push(body.as_bytes())
+        .expect("canonical image usage response");
+    let image_usage = canonical_facts(&events)
+        .into_iter()
+        .find_map(|event| match event {
+            GatewayEvent::Usage(usage) => {
+                Some((usage.image_input_tokens, usage.image_output_tokens))
+            }
+            _ => None,
+        });
+
+    assert_eq!(image_usage, Some((Some(31), Some(9))));
+}
+
+#[test]
+fn decoder_should_not_understate_cost_when_image_tool_price_is_ambiguous() {
+    let body = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_image_cost\",\"model\":\"gpt-5.4\"}}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_image_cost\",\"model\":\"gpt-5.4\",\"status\":\"completed\",\"usage\":{\"input_tokens\":12,\"output_tokens\":5,\"total_tokens\":17},\"tool_usage\":{\"image_gen\":{\"input_tokens\":31,\"output_tokens\":9}}}}\n\n",
+    );
+    let events = CodexCanonicalDecoder::new("fallback")
+        .push(body.as_bytes())
+        .expect("canonical image cost response");
+
+    assert!(
+        canonical_facts(&events)
+            .into_iter()
+            .all(|event| !matches!(event, GatewayEvent::CalculatedCost(_)))
+    );
+}
+
+#[test]
+fn decoder_should_drop_rate_limit_control_and_preserve_metadata_lifecycle_events() {
+    let body = concat!(
+        "event: codex.rate_limits\n",
+        "data: {\"type\":\"codex.rate_limits\",\"rate_limits\":{\"primary\":{\"used_percent\":42.0}}}\n\n",
+        "event: response.metadata\n",
+        "data: {\"type\":\"response.metadata\",\"x-codex-turn-state\":\"state\"}\n\n",
+        "event: response.in_progress\n",
+        "data: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"resp_metadata\",\"status\":\"in_progress\"}}\n\n",
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"hello\"}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_metadata\",\"model\":\"gpt-test\",\"status\":\"completed\"}}\n\n",
+    );
+
+    let events = CodexCanonicalDecoder::new("fallback")
+        .with_raw_sse_passthrough()
+        .push(body.as_bytes())
+        .expect("official Codex metadata lifecycle events");
+    let canonical = canonical_facts(&events);
+    let wire_types = events
+        .iter()
+        .filter_map(ProviderEvent::wire_event)
+        .filter_map(|wire| wire.event_type())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        wire_types,
+        vec![
+            "response.metadata",
+            "response.in_progress",
+            "response.output_text.delta",
+            "response.completed"
+        ]
+    );
+    assert!(matches!(
+        canonical.as_slice(),
+        [
+            GatewayEvent::Started(_),
+            GatewayEvent::ContentAdded(_),
+            GatewayEvent::TextDelta(_),
+            GatewayEvent::Completed(_)
+        ]
+    ));
+}
+
+#[test]
+fn decoder_should_accept_whole_function_call_without_argument_deltas() {
+    let body = concat!(
+        "event: response.created\n",
+        "data: {\"response\":{\"id\":\"resp_tool\",\"model\":\"gpt-test\"}}\n\n",
+        "event: response.output_item.added\n",
+        "data: {\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"item_1\",\"call_id\":\"call_1\",\"name\":\"lookup\"}}\n\n",
+        "event: response.output_item.done\n",
+        "data: {\"output_index\":1,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"lookup\",\"arguments\":\"{\\\"q\\\":1}\"}}\n\n",
+        "event: response.completed\n",
+        "data: {\"response\":{\"id\":\"resp_tool\",\"model\":\"gpt-test\",\"status\":\"completed\"}}\n\n",
+    );
+    let events = CodexCanonicalDecoder::new("fallback")
+        .push(body.as_bytes())
+        .expect("canonical function call");
+    let tool_deltas = events
+        .iter()
+        .flat_map(ProviderEvent::canonical_facts)
+        .filter_map(|event| match event {
+            GatewayEvent::ToolCallDelta(delta) => Some(delta),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(tool_deltas.len(), 2);
+    assert_eq!(tool_deltas[0].name.as_deref(), Some("lookup"));
+    assert_eq!(tool_deltas[1].arguments_delta, r#"{"q":1}"#);
+}
+
+#[test]
+fn decoder_should_preserve_unknown_events_without_exposing_wire_data_in_debug() {
+    let body = concat!(
+        "event: response.created\n",
+        "data: {\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-test\"}}\n\n",
+        "event: response.secret_future_event\n",
+        "id: evt_future\n",
+        "retry: 900\n",
+        "data: {\"secret\":\"must-not-leak\"}\n\n",
+    );
+    let events = CodexCanonicalDecoder::new("fallback")
+        .push(body.as_bytes())
+        .expect("unknown OpenAI event should remain wire-only");
+    let unknown = events[1]
+        .wire_event()
+        .expect("unknown event should retain wire data");
+
+    assert_eq!(unknown.event_type(), Some("response.secret_future_event"));
+    assert_eq!(unknown.sse_id(), Some("evt_future"));
+    assert_eq!(unknown.sse_retry(), Some(900));
+    assert_eq!(
+        unknown.data().get("secret"),
+        Some(&serde_json::json!("must-not-leak"))
+    );
+    assert!(!format!("{unknown:?}").contains("must-not-leak"));
+}
+
+#[test]
+fn decoder_should_keep_media_and_hosted_tool_events_as_openai_wire() {
+    for event_type in [
+        "response.image_generation_call.partial_image",
+        "response.audio.delta",
+        "response.web_search_call.searching",
+        "response.code_interpreter_call.in_progress",
+        "response.computer_tool_call.in_progress",
+    ] {
+        let body = format!(
+            "event: response.created\ndata: {{\"type\":\"response.created\",\"response\":{{\"id\":\"resp_open_world\",\"model\":\"gpt-test\"}}}}\n\nevent: {event_type}\ndata: {{\"type\":\"{event_type}\",\"opaque\":{{\"future\":true}}}}\n\n"
+        );
+        let events = CodexCanonicalDecoder::new("fallback")
+            .push(body.as_bytes())
+            .expect("open-world event should remain protocol wire");
+        let event = &events[1];
+
+        assert!(event.canonical_facts().is_empty(), "{event_type}");
+        assert_eq!(
+            event.wire_event().and_then(|wire| wire.event_type()),
+            Some(event_type)
+        );
+        assert_eq!(
+            event
+                .wire_event()
+                .and_then(|wire| wire.data().pointer("/opaque/future")),
+            Some(&serde_json::json!(true))
+        );
+    }
+}
+
+#[test]
+fn decoder_finish_should_parse_a_final_frame_without_blank_line() {
+    let mut decoder = CodexCanonicalDecoder::new("fallback");
+    let prefix = concat!(
+        "event: response.created\n",
+        "data: {\"response\":{\"id\":\"resp_finish\",\"model\":\"gpt-test\"}}\n\n",
+    );
+    let tail = concat!(
+        "event: response.completed\n",
+        "data: {\"response\":{\"id\":\"resp_finish\",\"model\":\"gpt-test\",\"status\":\"completed\"}}",
+    );
+    decoder.push(prefix.as_bytes()).expect("started event");
+    decoder.push(tail.as_bytes()).expect("buffer partial frame");
+
+    let events = decoder.finish().expect("finish partial frame");
+    assert!(matches!(
+        canonical_facts(&events).as_slice(),
+        [GatewayEvent::Completed(_)]
+    ));
+}
+
+#[test]
+fn decoder_should_accept_done_only_after_terminal_event() {
+    let body = concat!(
+        "event: response.created\n",
+        "data: {\"response\":{\"id\":\"resp_done\",\"model\":\"gpt-test\"}}\n\n",
+        "event: response.completed\n",
+        "data: {\"response\":{\"id\":\"resp_done\",\"model\":\"gpt-test\",\"status\":\"completed\"}}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    let events = CodexCanonicalDecoder::new("fallback")
+        .push(body.as_bytes())
+        .expect("terminal done marker");
+
+    assert!(matches!(
+        canonical_facts(&events).last(),
+        Some(GatewayEvent::Completed(_))
+    ));
+}
+
+#[test]
+fn decoder_should_classify_official_token_invalid_failure() {
+    assert_failed_event("token_invalid", "auth-secret-marker");
+}
+
+#[test]
+fn decoder_should_classify_official_model_not_supported_failure() {
+    assert_failed_event("model_not_supported", "model-secret-marker");
+}
+
+#[test]
+fn decoder_should_classify_official_quota_failure() {
+    assert_failed_event("quota_exceeded", "quota-secret-marker");
+}
+
+#[test]
+fn decoder_should_classify_official_server_overloaded_failure() {
+    assert_failed_event("server_is_overloaded", "server-secret-marker");
+}
+
+#[test]
+fn capacity_failure_preserves_original_wire_and_diagnostics() {
+    for path in ["error", "response.failed"] {
+        let data = if path == "error" {
+            r#"{"type":"error","error":{"code":"slow_down","message":"busy","extra":123456789012345678901234567890},"extension":true}"#
+        } else {
+            r#"{"type":"response.failed","response":{"id":"resp_capacity","error":{"code":"server_is_overloaded","message":"busy","extra":123456789012345678901234567890}},"extension":true}"#
+        };
+        let raw = format!("event: {path}\r\nid: upstream-id\r\nretry: 123\r\ndata: {data}\r\n\r\n");
+        let failure = CodexCanonicalDecoder::new("fallback")
+            .with_raw_sse_passthrough()
+            .push(raw.as_bytes())
+            .expect_err("capacity failure");
+        let wire = failure.events()[0].wire_event().expect("client wire");
+        let expected: serde_json::Value = serde_json::from_str(data).expect("original JSON");
+        assert_eq!(wire.data(), &expected);
+        assert_eq!(wire.sse_id(), Some("upstream-id"));
+        assert_eq!(wire.sse_retry(), Some(123));
+        assert_eq!(
+            wire.raw_sse_frame().map(AsRef::as_ref),
+            Some(raw.as_bytes())
+        );
+        let CodexCanonicalError::Upstream(upstream) = failure.error() else {
+            panic!("typed failure")
+        };
+        assert_eq!(upstream.raw_body(), data);
+        assert_ne!(upstream.upstream_code.as_deref(), Some("server_error"));
+    }
+}
+
+#[test]
+fn decoder_should_classify_official_cyber_policy_as_an_invalid_request() {
+    assert_failed_event("cyber_policy", "policy-secret-marker");
+}
+
+#[test]
+fn raw_sse_failure_should_keep_the_original_frame_before_reporting_the_typed_failure() {
+    let raw = concat!(
+        "event: response.failed\r\n",
+        "data: { \"type\": \"response.failed\", \"response\": { \"id\": \"resp_raw_failed\", \"status\": \"failed\", \"error\": { \"code\": \"rate_limit_exceeded\", \"message\": \"raw failure marker\" } } }\r\n\r\n",
+    );
+
+    let failure = CodexCanonicalDecoder::new("fallback")
+        .with_raw_sse_passthrough()
+        .push(raw.as_bytes())
+        .expect_err("response.failed remains a typed lifecycle failure");
+    let wire = failure.events()[0]
+        .wire_event()
+        .expect("upstream failure wire remains deliverable");
+
+    assert_eq!(wire.event_type(), Some("response.failed"));
+    assert_eq!(
+        wire.raw_sse_frame().map(|frame| frame.as_ref()),
+        Some(raw.as_bytes())
+    );
+    assert!(!format!("{failure:?}").contains("raw failure marker"));
+}
+
+#[test]
+fn bare_response_failed_should_project_started_identity_with_the_fallback_model() {
+    let raw = concat!(
+        "event: response.failed\n",
+        "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_bare_failed\",\"status\":\"failed\",\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"bare failure\"}}}\n\n",
+    );
+
+    let failure = CodexCanonicalDecoder::new("fallback-model")
+        .push(raw.as_bytes())
+        .expect_err("bare response.failed remains a typed lifecycle failure");
+
+    assert!(matches!(
+        canonical_facts(failure.events()).as_slice(),
+        [GatewayEvent::Started(metadata)]
+            if metadata.response_id() == "resp_bare_failed"
+                && metadata.model() == Some("fallback-model")
+    ));
+}
+
+#[test]
+fn response_failed_without_identity_should_keep_the_upstream_typed_failure() {
+    let raw = concat!(
+        "event: response.failed\n",
+        "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"missing identity\"}}}\n\n",
+    );
+
+    let failure = CodexCanonicalDecoder::new("fallback")
+        .push(raw.as_bytes())
+        .expect_err("missing identity must not replace the upstream lifecycle failure");
+
+    assert!(matches!(failure.error(), CodexCanonicalError::Upstream(_)));
+    assert!(canonical_facts(failure.events()).is_empty());
+}
+
+#[test]
+fn decoder_should_preserve_same_chunk_output_before_typed_failure() {
+    let marker = "same-chunk-secret-marker";
+    let body = format!(
+        concat!(
+            "event: response.created\n",
+            "data: {{\"type\":\"response.created\",\"response\":{{\"id\":\"resp_partial\",\"model\":\"gpt-test\"}}}}\n\n",
+            "event: response.content_part.added\n",
+            "data: {{\"type\":\"response.content_part.added\",\"output_index\":0,\"content_index\":0,\"part\":{{\"type\":\"output_text\"}}}}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {{\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"hello\"}}\n\n",
+            "event: response.failed\n",
+            "data: {{\"type\":\"response.failed\",\"response\":{{\"id\":\"resp_partial\",\"status\":\"failed\",\"error\":{{\"code\":\"rate_limit_exceeded\",\"message\":\"{}\"}}}}}}\n\n"
+        ),
+        marker
+    );
+
+    let failure = CodexCanonicalDecoder::new("fallback")
+        .push(body.as_bytes())
+        .expect_err("response.failed must retain the preceding batch");
+    let facts = canonical_facts(failure.events());
+    let wire_types = failure
+        .events()
+        .iter()
+        .filter_map(ProviderEvent::wire_event)
+        .filter_map(|wire| wire.event_type())
+        .collect::<Vec<_>>();
+
+    assert!(failure.semantic_output_seen());
+    assert!(matches!(facts[0], GatewayEvent::Started(_)));
+    assert!(matches!(facts[1], GatewayEvent::ContentAdded(_)));
+    assert!(matches!(facts[2], GatewayEvent::TextDelta(_)));
+    assert_eq!(
+        wire_types,
+        vec![
+            "response.created",
+            "response.content_part.added",
+            "response.output_text.delta",
+            "response.failed"
+        ]
+    );
+    assert!(!format!("{failure:?}").contains(marker));
+}
+
+#[test]
+fn decoder_should_map_max_output_tokens_incomplete_to_length() {
+    assert_incomplete_reason("max_output_tokens", FinishReason::Length);
+}
+
+#[test]
+fn decoder_should_map_content_filter_incomplete_to_content_filter() {
+    assert_incomplete_reason("content_filter", FinishReason::ContentFilter);
+}
+
+#[test]
+fn decoder_should_keep_unknown_incomplete_reason_explicit() {
+    assert_incomplete_reason("future_reason", FinishReason::Other);
+}
+
+#[test]
+fn decoder_should_preserve_changed_upstream_response_ids_as_wire() {
+    let body = concat!(
+        "event: response.created\n",
+        "data: {\"response\":{\"id\":\"resp_first\",\"model\":\"gpt-test\"}}\n\n",
+        "event: response.completed\n",
+        "data: {\"response\":{\"id\":\"resp_changed\",\"model\":\"gpt-test\"}}\n\n",
+    );
+
+    let events = CodexCanonicalDecoder::new("fallback")
+        .push(body.as_bytes())
+        .expect("response ID changes must not block wire delivery");
+
+    let wire = events
+        .iter()
+        .filter_map(ProviderEvent::wire_event)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        wire.iter()
+            .filter_map(|event| event.event_type())
+            .collect::<Vec<_>>(),
+        vec!["response.created", "response.completed"]
+    );
+    assert_eq!(
+        wire.iter()
+            .map(|event| event
+                .data()
+                .pointer("/response/id")
+                .and_then(|id| id.as_str()))
+            .collect::<Vec<_>>(),
+        vec![Some("resp_first"), Some("resp_changed")]
+    );
+}
+
+fn assert_failed_event(code: &str, marker: &str) {
+    let raw_error = format!(
+        "{{\"response\":{{\"id\":\"resp_failed\",\"status\":\"failed\",\"error\":{{\"code\":\"{code}\",\"message\":\"{marker}\"}}}}}}"
+    );
+    let body = format!("event: response.failed\ndata: {raw_error}\n\n");
+    let failure = CodexCanonicalDecoder::new("fallback")
+        .push(body.as_bytes())
+        .expect_err("failed event must become a typed error");
+
+    let CodexCanonicalError::Upstream(upstream) = failure.error() else {
+        panic!("response.failed must preserve its typed upstream failure");
+    };
+    assert_eq!(upstream.upstream_code.as_deref(), Some(code));
+    assert_eq!(upstream.raw_body(), raw_error);
+    assert!(!failure.semantic_output_seen());
+    assert!(!format!("{failure:?}").contains(marker));
+}
+
+fn assert_incomplete_reason(reason: &str, expected: FinishReason) {
+    let body = format!(
+        "event: response.created\ndata: {{\"response\":{{\"id\":\"resp_incomplete\",\"model\":\"gpt-test\"}}}}\n\nevent: response.incomplete\ndata: {{\"response\":{{\"id\":\"resp_incomplete\",\"model\":\"gpt-test\",\"status\":\"incomplete\",\"incomplete_details\":{{\"reason\":\"{reason}\"}}}}}}\n\n"
+    );
+    let events = CodexCanonicalDecoder::new("fallback")
+        .push(body.as_bytes())
+        .expect("incomplete response is terminal");
+    let finish_reason = canonical_facts(&events)
+        .into_iter()
+        .find_map(|event| match event {
+            GatewayEvent::Completed(meta) => meta.finish_reason(),
+            _ => None,
+        });
+
+    assert_eq!(finish_reason, Some(expected));
+}
+
+trait CanonicalOutcomeAssertions {
+    fn expect(self, message: &str) -> Vec<ProviderEvent>;
+    fn expect_err(self, message: &str) -> CodexCanonicalFailure;
+}
+
+impl CanonicalOutcomeAssertions for CodexCanonicalOutcome {
+    fn expect(self, message: &str) -> Vec<ProviderEvent> {
+        match self {
+            Self::Events(events) => events,
+            Self::Failed(failure) => panic!("{message}: {failure:?}"),
+        }
+    }
+
+    fn expect_err(self, message: &str) -> CodexCanonicalFailure {
+        match self {
+            Self::Events(events) => panic!("{message}: decoded {} events", events.len()),
+            Self::Failed(failure) => failure,
+        }
+    }
+}
+
+fn canonical_facts(events: &[ProviderEvent]) -> Vec<&GatewayEvent> {
+    events
+        .iter()
+        .flat_map(ProviderEvent::canonical_facts)
+        .collect()
+}
+
+fn pricing_response_cost(
+    requested: Option<&str>,
+    actual: Option<&str>,
+    output: serde_json::Value,
+    tools: &[serde_json::Value],
+) -> Option<u128> {
+    let mut response = json!({
+        "id": "resp_pricing", "model": "gpt-6-astra", "status": "completed",
+        "output": output, "usage": {"input_tokens": 10_000, "output_tokens": 0, "total_tokens": 10_000}
+    });
+    if let Some(tier) = actual {
+        response["service_tier"] = json!(tier);
+    }
+    let created = json!({"type": "response.created", "response": {"id": "resp_pricing", "model": "gpt-6-astra"}});
+    let completed = json!({"type": "response.completed", "response": response});
+    let body = format!(
+        "event: response.created\ndata: {created}\n\nevent: response.completed\ndata: {completed}\n\n"
+    );
+    let events = CodexCanonicalDecoder::new("gpt-6-astra")
+        .with_requested_service_tier(requested)
+        .with_request_tool_pricing("gpt-6-astra", Some(tools))
+        .with_raw_sse_passthrough()
+        .push(body.as_bytes())
+        .expect("计费不确定时仍须正常透传响应");
+    assert!(
+        canonical_facts(&events)
+            .iter()
+            .any(|event| matches!(event, GatewayEvent::Completed(_)))
+    );
+    canonical_facts(&events)
+        .into_iter()
+        .find_map(|event| match event {
+            GatewayEvent::CalculatedCost(cost) => Some(cost.total().amount().scaled()),
+            _ => None,
+        })
+}
+
+#[test]
+fn billing_should_follow_requested_tier_independently_of_response_tier() {
+    for (requested, actual, expected) in [
+        (Some("priority"), Some("default"), Some(2_000_000_000)),
+        (Some("fast"), Some("default"), Some(2_000_000_000)),
+        (Some("auto"), Some("fast"), None),
+        (Some("default"), Some("flex"), Some(1_000_000_000)),
+        (Some("flex"), Some("priority"), Some(500_000_000)),
+        (Some("fast"), None, Some(2_000_000_000)),
+        (Some("auto"), None, None),
+        (Some("default"), Some("future"), Some(1_000_000_000)),
+        (Some("future"), Some("default"), None),
+        (None, Some("priority"), Some(1_000_000_000)),
+        (None, None, Some(1_000_000_000)),
+    ] {
+        assert_eq!(
+            pricing_response_cost(requested, actual, json!([]), &[]),
+            expected,
+            "{requested:?} -> {actual:?}"
+        );
+    }
+}
+
+#[test]
+fn billing_should_add_file_and_web_search_fees_without_tier_markup() {
+    let output = json!([
+        {"type": "file_search_call", "id": "fs_1", "status": "completed"},
+        {"type": "file_search_call", "id": "fs_2", "status": "completed"},
+        {"type": "web_search_call", "id": "ws_1", "status": "completed", "action": {"type": "search"}}
+    ]);
+    for (tier, expected) in [("default", 1_150_000_000), ("fast", 2_150_000_000)] {
+        assert_eq!(
+            pricing_response_cost(
+                Some(tier),
+                Some("default"),
+                output.clone(),
+                &[json!({"type": "web_search"})]
+            ),
+            Some(expected)
+        );
+    }
+}
+
+#[test]
+fn billing_should_not_emit_partial_totals_for_unpriced_tool_outputs() {
+    for output in [
+        json!([{"type": "code_interpreter_call", "id": "ci_1", "status": "completed"}]),
+        json!([{"type": "shell_call", "id": "sh_1", "status": "completed"}]),
+        json!([{"type": "image_generation_call", "id": "ig_1", "status": "completed"}]),
+        json!([{"type": "future_paid_tool_call", "id": "tool_1"}]),
+        json!([{"type": "file_search_call", "id": "fs_1", "status": "failed"}]),
+        json!({"malformed": true}),
+    ] {
+        assert_eq!(
+            pricing_response_cost(None, None, output.clone(), &[]),
+            None,
+            "{output}"
+        );
+    }
+}

@@ -1,0 +1,558 @@
+use super::*;
+
+#[test]
+fn custom_ca_should_report_environment_cache_key_consistently() {
+    const CASE_ENV: &str = "CODEX_PROXY_TEST_CUSTOM_CA_CACHE_KEY_CASE";
+    const CASE_COMPLETED: &str = "custom-ca-cache-key-case-completed:";
+    const SSL_CERT_PATH: &str = "/tmp/codex-proxy-ssl-cert-file.pem";
+    const CODEX_CA_PATH: &str = "/tmp/codex-proxy-codex-ca-certificate.pem";
+
+    if let Ok(case) = std::env::var(CASE_ENV) {
+        let expected = match case.as_str() {
+            "unset" => None,
+            "ssl_cert_file" => Some(format!(
+                "{}={SSL_CERT_PATH}",
+                provider_openai::transport::tls::SSL_CERT_FILE_ENV
+            )),
+            "codex_ca_priority" => Some(format!(
+                "{}={CODEX_CA_PATH}",
+                provider_openai::transport::tls::CODEX_CA_CERT_ENV
+            )),
+            _ => panic!("unknown custom CA cache key test case: {case}"),
+        };
+
+        assert_eq!(
+            provider_openai::transport::tls::custom_ca_env_cache_key(),
+            expected
+        );
+        println!("\n{CASE_COMPLETED}{case}");
+        return;
+    }
+
+    let current_exe = std::env::current_exe().expect("current test binary path");
+    let cases = [
+        ("unset", None, None),
+        (
+            "ssl_cert_file",
+            None,
+            Some((
+                provider_openai::transport::tls::SSL_CERT_FILE_ENV,
+                SSL_CERT_PATH,
+            )),
+        ),
+        (
+            "codex_ca_priority",
+            Some((
+                provider_openai::transport::tls::CODEX_CA_CERT_ENV,
+                CODEX_CA_PATH,
+            )),
+            Some((
+                provider_openai::transport::tls::SSL_CERT_FILE_ENV,
+                SSL_CERT_PATH,
+            )),
+        ),
+    ];
+
+    for (case, codex_ca, ssl_cert_file) in cases {
+        let mut command = Command::new(&current_exe);
+        command
+            .arg("--exact")
+            .arg("transport::http_client::custom_ca_should_report_environment_cache_key_consistently")
+            .arg("--nocapture")
+            .env(CASE_ENV, case)
+            .env_remove(provider_openai::transport::tls::CODEX_CA_CERT_ENV)
+            .env_remove(provider_openai::transport::tls::SSL_CERT_FILE_ENV);
+        if let Some((key, value)) = codex_ca {
+            command.env(key, value);
+        }
+        if let Some((key, value)) = ssl_cert_file {
+            command.env(key, value);
+        }
+
+        let output = command.output().expect("run isolated custom CA case");
+        assert!(
+            output.status.success(),
+            "isolated custom CA case {case} failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // libtest 匹配零个测试也返回成功；完成标记证明该环境分支执行了生产断言。
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let completed = format!("{CASE_COMPLETED}{case}");
+        assert_eq!(
+            stdout.lines().filter(|line| *line == completed).count(),
+            1,
+            "isolated custom CA case {case} did not complete exactly once\nstdout:\n{stdout}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn codex_backend_client_should_preserve_oversized_error_response() {
+    let server = wiremock::MockServer::start().await;
+    let large_error_body = "x".repeat(1024 * 1024 + 17);
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/codex/responses"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(500)
+                .append_header("x-future-error", "first")
+                .append_header("x-future-error", "second")
+                .insert_header("x-request-id", "req-upstream-error")
+                .insert_header("set-cookie", "account-secret=value")
+                .insert_header("authorization", "Bearer response-secret")
+                .insert_header("connection", "x-hop-secret")
+                .insert_header("x-hop-secret", "hop-secret")
+                .set_body_raw(
+                    large_error_body.clone(),
+                    "application/problem+json; charset=utf-8",
+                ),
+        )
+        .mount(&server)
+        .await;
+    let client = CodexBackendClient::new(
+        reqwest::Client::builder().no_proxy().build().unwrap(),
+        server.uri(),
+        test_wire_profile(),
+    );
+    let mut request = codex_request("gpt-5.5", "", Vec::new());
+    request.force_http_sse = true;
+
+    let result = client
+        .create_response(
+            &request,
+            CodexRequestContext {
+                trace: None,
+                authorization: "Bearer access-token",
+                account_id: Some("chatgpt-account"),
+                request_id: "req_large_error",
+                turn_state: None,
+                turn_metadata: None,
+                beta_features: None,
+                include_timing_metrics: None,
+                version: None,
+                codex_window_id: None,
+                parent_thread_id: None,
+                cookie_header: None,
+                installation_id: None,
+                session_id: None,
+                thread_id: None,
+                client_request_id: None,
+                turn_id: None,
+                account_selection: Default::default(),
+            },
+        )
+        .await;
+
+    let Err(CodexClientError::Upstream {
+        status,
+        body,
+        client_response: Some(client_response),
+        ..
+    }) = result
+    else {
+        panic!("expected upstream error");
+    };
+    assert_eq!(status, reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body, large_error_body);
+    assert_eq!(client_response.status(), 500);
+    assert_eq!(
+        client_response.content_type(),
+        Some(b"application/problem+json; charset=utf-8".as_slice())
+    );
+    let future_values = client_response
+        .client_headers()
+        .iter()
+        .filter(|(name, _)| name == "x-future-error")
+        .map(|(_, value)| value.as_ref())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        future_values,
+        vec![b"first".as_slice(), b"second".as_slice()]
+    );
+    assert!(
+        client_response
+            .client_headers()
+            .iter()
+            .any(|(name, value)| {
+                name == "x-request-id" && value.as_ref() == b"req-upstream-error"
+            })
+    );
+    for excluded in [
+        "content-type",
+        "content-length",
+        "set-cookie",
+        "authorization",
+        "connection",
+        "x-hop-secret",
+    ] {
+        assert!(
+            client_response
+                .client_headers()
+                .iter()
+                .all(|(name, _)| name != excluded),
+            "unexpected forwarded header {excluded}"
+        );
+    }
+    assert_eq!(client_response.body().as_ref(), large_error_body.as_bytes());
+}
+
+#[tokio::test]
+async fn codex_backend_client_should_parse_retry_after_from_rate_limit_error_body() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/codex/responses"))
+        .respond_with(wiremock::ResponseTemplate::new(429).set_body_json(json!({
+            "error": {
+                "code": "rate_limit_exceeded",
+                "message": "Rate limit exceeded, try again in 12s"
+            }
+        })))
+        .mount(&server)
+        .await;
+    let client = CodexBackendClient::new(
+        reqwest::Client::builder().no_proxy().build().unwrap(),
+        server.uri(),
+        test_wire_profile(),
+    );
+    let mut request = codex_request("gpt-5.5", "", Vec::new());
+    request.force_http_sse = true;
+
+    let result = client
+        .create_response(
+            &request,
+            CodexRequestContext {
+                trace: None,
+                authorization: "Bearer access-token",
+                account_id: Some("chatgpt-account"),
+                request_id: "req_http_retry_after_body",
+                turn_state: None,
+                turn_metadata: None,
+                beta_features: None,
+                include_timing_metrics: None,
+                version: None,
+                codex_window_id: None,
+                parent_thread_id: None,
+                cookie_header: None,
+                installation_id: None,
+                session_id: None,
+                thread_id: None,
+                client_request_id: None,
+                turn_id: None,
+                account_selection: Default::default(),
+            },
+        )
+        .await;
+
+    let Err(CodexClientError::Upstream {
+        status,
+        retry_after_seconds,
+        ..
+    }) = result
+    else {
+        panic!("expected upstream error");
+    };
+    assert_eq!(status, reqwest::StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(retry_after_seconds, Some(12));
+}
+
+#[tokio::test]
+async fn codex_backend_http_sse_should_capture_structured_rate_limit_event_updates() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/codex/responses"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(concat!(
+                    "event: codex.rate_limits\n",
+                    "data: {\"type\":\"codex.rate_limits\",\"rate_limits\":{\"allowed\":true,\"limit_reached\":false,\"primary\":{\"used_percent\":100,\"window_minutes\":300,\"reset_at\":1893456300}}}\n\n",
+                    "event: response.completed\n",
+                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_http_rate_limits\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"
+                )),
+        )
+        .mount(&server)
+        .await;
+    let client = CodexBackendClient::new(
+        reqwest::Client::builder().no_proxy().build().unwrap(),
+        server.uri(),
+        test_wire_profile(),
+    );
+    let mut request = codex_request("gpt-5.5", "", Vec::new());
+    request.force_http_sse = true;
+
+    let trace = gateway_core::diagnostics::TraceContext::new("req_http_rate_limit_event");
+    let response = client
+        .create_response(
+            &request,
+            request_context("req_http_rate_limit_event", Some("acct")).with_trace(&trace),
+        )
+        .await
+        .expect("HTTP SSE response");
+    let structured = response
+        .rate_limit_headers
+        .iter()
+        .filter(|(name, _)| matches!(name.as_str(), "x-codex-allowed" | "x-codex-limit-reached"))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        structured,
+        vec![
+            ("x-codex-allowed".to_owned(), "true".to_owned()),
+            ("x-codex-limit-reached".to_owned(), "false".to_owned()),
+        ]
+    );
+    let snapshot = trace.snapshot().unwrap();
+    let events = snapshot["events"].as_array().unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| event["data"]["eventType"] == "codex.rate_limits")
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event["data"]["eventType"] == "response.completed")
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn codex_backend_http_sse_should_fail_after_five_minutes_without_stream_data() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let _request = read_http_request(&mut stream).await;
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        std::future::pending::<()>().await;
+    });
+    let client = CodexBackendClient::new(
+        reqwest::Client::builder().no_proxy().build().unwrap(),
+        base_url,
+        test_wire_profile(),
+    );
+    let mut request = codex_request("gpt-5.5", "", Vec::new());
+    request.force_http_sse = true;
+
+    let mut response = client
+        .create_response_stream(&request, request_context("req_http_idle", Some("acct")))
+        .await
+        .unwrap();
+    let next = tokio::spawn(async move { response.body.next().await });
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(5 * 60)).await;
+
+    let Some(Err(CodexClientError::StreamIdleTimeout { timeout })) = next.await.unwrap() else {
+        panic!("expected HTTP/SSE idle timeout");
+    };
+    assert_eq!(timeout, Duration::from_secs(5 * 60));
+    server.abort();
+}
+
+#[tokio::test]
+async fn codex_backend_client_should_capture_forwardable_response_metadata() {
+    let server = wiremock::MockServer::start().await;
+    let body = concat!(
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"
+    );
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/codex/responses"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .insert_header("x-request-id", "upstream-request")
+                .insert_header("openai-model", "gpt-5.5-2026-07-01")
+                .insert_header("x-models-etag", "models-v2")
+                .insert_header("x-reasoning-included", "true")
+                .insert_header("x-codex-turn-state", "turn-state-from-upstream")
+                .insert_header("openai-processing-ms", "42")
+                .append_header("x-future-multi", "first")
+                .append_header("x-future-multi", "second")
+                .insert_header(
+                    "x-future-bytes",
+                    reqwest::header::HeaderValue::from_bytes(b"\xffopaque")
+                        .expect("non-UTF-8 header value"),
+                )
+                .insert_header("set-cookie", "secret=value")
+                .insert_header("authorization", "Bearer response-secret")
+                .insert_header("chatgpt-account-id", "account-secret")
+                .insert_header("connection", "x-hop-secret")
+                .insert_header("x-hop-secret", "hop-secret")
+                .insert_header("x-codex-primary-used-percent", "15")
+                .insert_header("x-codex-code-review-primary-used-percent", "20")
+                .insert_header("x-codex-promo-message", "internal quota notice")
+                .insert_header("x-codex-safety-buffering-enabled", "true")
+                .insert_header("retry-after", "17")
+                .insert_header("x-ratelimit-remaining", "23")
+                .set_body_string(body),
+        )
+        .mount(&server)
+        .await;
+    let client = CodexBackendClient::new(
+        reqwest::Client::builder().no_proxy().build().unwrap(),
+        server.uri(),
+        test_wire_profile(),
+    );
+    let mut request = codex_request("gpt-5.5", "", Vec::new());
+    request.force_http_sse = true;
+
+    let response = client
+        .create_response(
+            &request,
+            CodexRequestContext {
+                trace: None,
+                authorization: "Bearer access-token",
+                account_id: Some("chatgpt-account"),
+                request_id: "req_response_metadata",
+                turn_state: None,
+                turn_metadata: None,
+                beta_features: None,
+                include_timing_metrics: None,
+                version: None,
+                codex_window_id: None,
+                parent_thread_id: None,
+                cookie_header: None,
+                installation_id: None,
+                session_id: None,
+                thread_id: None,
+                client_request_id: None,
+                turn_id: None,
+                account_selection: Default::default(),
+            },
+        )
+        .await
+        .expect("response should succeed");
+
+    assert_eq!(
+        response.response_metadata.effective_model.as_deref(),
+        Some("gpt-5.5-2026-07-01")
+    );
+    assert_eq!(
+        response.response_metadata.models_etag.as_deref(),
+        Some("models-v2")
+    );
+    assert!(response.response_metadata.reasoning_included);
+    let mut names = response
+        .response_metadata
+        .client_headers
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        vec![
+            "date",
+            "openai-model",
+            "openai-processing-ms",
+            "retry-after",
+            "x-codex-safety-buffering-enabled",
+            "x-codex-turn-state",
+            "x-future-bytes",
+            "x-future-multi",
+            "x-future-multi",
+            "x-models-etag",
+            "x-ratelimit-remaining",
+            "x-reasoning-included",
+            "x-request-id"
+        ]
+    );
+    assert_eq!(
+        response
+            .response_metadata
+            .client_headers
+            .iter()
+            .filter(|(name, _)| name == "x-future-multi")
+            .map(|(_, value)| value.as_ref())
+            .collect::<Vec<_>>(),
+        vec![b"first".as_slice(), b"second".as_slice()]
+    );
+    assert!(
+        response
+            .response_metadata
+            .client_headers
+            .iter()
+            .any(|(name, value)| { name == "x-future-bytes" && value.as_ref() == b"\xffopaque" })
+    );
+    assert!(
+        response
+            .response_metadata
+            .client_headers
+            .iter()
+            .any(|(name, value)| {
+                name == "x-codex-turn-state" && value.as_ref() == b"turn-state-from-upstream"
+            })
+    );
+    for blocked in [
+        "set-cookie",
+        "authorization",
+        "chatgpt-account-id",
+        "connection",
+        "x-hop-secret",
+        "content-type",
+        "content-length",
+    ] {
+        assert!(
+            !names.contains(&blocked),
+            "leaked response header {blocked}"
+        );
+    }
+    assert_eq!(response.set_cookie_headers, vec!["secret=value"]);
+    for expected in [
+        ("x-codex-primary-used-percent", "15"),
+        ("x-codex-code-review-primary-used-percent", "20"),
+        ("x-codex-promo-message", "internal quota notice"),
+        ("retry-after", "17"),
+        ("x-ratelimit-remaining", "23"),
+    ] {
+        assert!(
+            response
+                .rate_limit_headers
+                .iter()
+                .any(|(name, value)| name == expected.0 && value == expected.1),
+            "missing locally observed rate-limit header {}",
+            expected.0
+        );
+    }
+}
+
+#[tokio::test]
+async fn build_reqwest_client_should_reuse_cached_connection_pool() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut first_stream, _) = listener.accept().await.unwrap();
+        read_http_request(&mut first_stream).await;
+        write_empty_http_response(&mut first_stream).await;
+
+        tokio::select! {
+            request = read_http_request(&mut first_stream) => {
+                write_empty_http_response(&mut first_stream).await;
+                !request.is_empty()
+            }
+            accepted = listener.accept() => {
+                let (mut second_stream, _) = accepted.unwrap();
+                read_http_request(&mut second_stream).await;
+                write_empty_http_response(&mut second_stream).await;
+                false
+            }
+            () = tokio::time::sleep(Duration::from_millis(500)) => false,
+        }
+    });
+
+    let url = format!("http://{addr}/reuse");
+    // 前后分别取得生产缓存中的客户端，避免只验证单个 reqwest client 自身能复用连接。
+    // 本地服务使用 HTTP/1.1；该断言不代表已验证 HTTP/2 的 idle ping 或保活间隔。
+    let client = provider_openai::transport::build_reqwest_client().unwrap();
+    client.get(&url).send().await.unwrap().text().await.unwrap();
+    let client = provider_openai::transport::build_reqwest_client().unwrap();
+    client.get(&url).send().await.unwrap().text().await.unwrap();
+
+    assert!(server.await.unwrap());
+}

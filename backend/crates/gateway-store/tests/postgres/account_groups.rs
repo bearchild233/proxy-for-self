@@ -1,0 +1,502 @@
+use std::collections::BTreeMap;
+
+use gateway_admin::{
+    model::{
+        MutationActor, MutationContext, PageSize,
+        account_groups::{
+            AccountGroupColor, AccountGroupListQuery, DeleteAccountGroup, NewAccountGroup,
+        },
+        client_keys::NewClientKey,
+        client_keys::UpdateClientKey,
+    },
+    ports::store::{AccountGroupStore, AdminStoreErrorKind, ClientKeyStore},
+};
+use gateway_core::{
+    policy::{ClientApiKeyId, RateLimits},
+    routing::AccountGroupId,
+};
+use gateway_store::postgres::{PgAccountGroupRepository, PgAdminClientKeyStore};
+
+use super::TestDatabase;
+
+const MIXED_GROUP: &str = "grp_00000000000000000000000000000001";
+const EMPTY_GROUP: &str = "grp_00000000000000000000000000000002";
+
+#[tokio::test]
+async fn groups_aggregate_cross_provider_members_and_key_bindings_without_multiplication() {
+    let Some(database) = TestDatabase::create("account_group_aggregate").await else {
+        return;
+    };
+    seed_account(
+        &database.pool,
+        "acct_group_openai",
+        "openai",
+        "OpenAI Account",
+    )
+    .await;
+    seed_account(&database.pool, "acct_group_xai", "xai", "xAI Account").await;
+    sqlx::query(
+        "update provider_accounts set concurrency_limit = 4 where id = 'acct_group_openai'",
+    )
+    .execute(&database.pool)
+    .await
+    .expect("set account concurrency override");
+
+    let groups = PgAccountGroupRepository::new(database.pool.clone());
+    let keys = PgAdminClientKeyStore::new(database.pool.clone());
+    let mixed_group = group_id(MIXED_GROUP);
+    let empty_group = group_id(EMPTY_GROUP);
+    groups
+        .create_account_group(
+            NewAccountGroup {
+                disable_fast: false,
+                id: mixed_group.clone(),
+                name: "Mixed Production".to_owned(),
+                description: Some("cross-provider".to_owned()),
+                color: group_color("#2563EBFF"),
+            },
+            &context("create-mixed"),
+        )
+        .await
+        .expect("create mixed account group");
+    groups
+        .create_account_group(
+            NewAccountGroup {
+                disable_fast: false,
+                id: empty_group.clone(),
+                name: "Empty Pool".to_owned(),
+                description: None,
+                color: group_color("#06B6D4CC"),
+            },
+            &context("create-empty"),
+        )
+        .await
+        .expect("create empty account group");
+    assign_accounts(
+        &database.pool,
+        MIXED_GROUP,
+        &["acct_group_openai", "acct_group_xai"],
+    )
+    .await;
+
+    for (id, group_ids) in [
+        ("key_group_one", vec![mixed_group.clone()]),
+        ("key_group_two", vec![mixed_group.clone()]),
+        ("key_empty_pool", vec![empty_group.clone()]),
+        ("key_all_accounts", Vec::new()),
+    ] {
+        keys.create_client_key(new_key(id, group_ids), &context(id))
+            .await
+            .expect("create scoped client key");
+    }
+    seed_group_cost_snapshot(
+        &database.pool,
+        "req_historical_empty_group",
+        "acct_group_openai",
+        EMPTY_GROUP,
+        "1.5",
+    )
+    .await;
+
+    let page = groups
+        .list_account_groups(AccountGroupListQuery {
+            page: 1,
+            page_size: PageSize::new(20).expect("page size"),
+            search: None,
+            enabled: None,
+        })
+        .await
+        .expect("list account groups");
+    let members = groups
+        .load_account_group_members(std::slice::from_ref(&mixed_group))
+        .await
+        .expect("load current-page group members");
+    assert_eq!(members.len(), 2);
+    assert_eq!(
+        members
+            .iter()
+            .map(|member| member.total_slots)
+            .sum::<Option<u64>>(),
+        Some(7)
+    );
+    assert_eq!(page.total, 2);
+    let by_id = page
+        .items
+        .into_iter()
+        .map(|group| (group.id.to_string(), group))
+        .collect::<BTreeMap<_, _>>();
+    let mixed = by_id.get(MIXED_GROUP).expect("mixed group");
+    assert_eq!(mixed.member_count, 2);
+    assert_eq!(
+        mixed.provider_counts,
+        BTreeMap::from([("openai".to_owned(), 1), ("xai".to_owned(), 1)])
+    );
+    assert_eq!(mixed.client_key_count, 2);
+    // PostgreSQL 返回持久页与 member facts；实时状态/容量由 Admin query service 投影。
+    assert_eq!(mixed.account_summary.available, 0);
+    assert_eq!(mixed.account_summary.limited, 0);
+    assert_eq!(mixed.account_summary.total, 0);
+    assert_eq!(mixed.capacity.used_slots, None);
+    assert_eq!(mixed.capacity.total_slots, Some(0));
+    assert_eq!(mixed.usage.today_usd.as_str(), "0");
+    assert_eq!(mixed.usage.retained_total_usd.as_str(), "0");
+    let empty = by_id.get(EMPTY_GROUP).expect("empty group");
+    assert_eq!(empty.member_count, 0);
+    assert!(empty.provider_counts.is_empty());
+    assert_eq!(empty.client_key_count, 1);
+    assert_eq!(empty.usage.today_usd.as_str(), "1.5");
+    assert_eq!(empty.usage.retained_total_usd.as_str(), "1.5");
+
+    let all_key = keys
+        .reveal_client_key(&client_key_id("key_all_accounts"))
+        .await
+        .expect("reveal all-accounts key")
+        .expect("all-accounts key exists");
+    assert!(all_key.record.groups.is_empty());
+    assert_eq!(
+        all_key
+            .record
+            .provider_kinds
+            .iter()
+            .map(|kind| kind.as_str())
+            .collect::<Vec<_>>(),
+        ["openai", "xai"]
+    );
+    let empty_pool_key = keys
+        .reveal_client_key(&client_key_id("key_empty_pool"))
+        .await
+        .expect("reveal empty-pool key")
+        .expect("empty-pool key exists");
+    assert_eq!(empty_pool_key.record.groups.len(), 1);
+    assert!(empty_pool_key.record.provider_kinds.is_empty());
+
+    let (scope_revision, widened) = keys
+        .update_client_key(
+            UpdateClientKey {
+                openai_client_profile_override: None,
+                xai_client_profile_override: None,
+                daily_limit_usd: None,
+                weekly_limit_usd: None,
+                id: client_key_id("key_group_one"),
+                name: "key_group_one".to_owned(),
+                label: None,
+                group_ids: Vec::new(),
+                limits: RateLimits::unlimited(),
+            },
+            &context("widen-group-key"),
+        )
+        .await
+        .expect("widen restricted key to all accounts");
+    assert!(widened.groups.is_empty());
+    let scope_audit: Vec<String> = sqlx::query_scalar(
+        "select changed_fields from admin_audit_events
+         where admin_request_id = 'widen-group-key'",
+    )
+    .fetch_one(&database.pool)
+    .await
+    .expect("load scope widening audit");
+    assert!(scope_audit.contains(&"routing_scope:groups->all".to_owned()));
+    assert_eq!(current_revision(&database.pool).await, scope_revision.get());
+    let (restricted_revision, restricted) = keys
+        .update_client_key(
+            UpdateClientKey {
+                openai_client_profile_override: None,
+                xai_client_profile_override: None,
+                daily_limit_usd: None,
+                weekly_limit_usd: None,
+                id: client_key_id("key_group_one"),
+                name: "key_group_one".to_owned(),
+                label: None,
+                group_ids: vec![empty_group],
+                limits: RateLimits::unlimited(),
+            },
+            &context("restrict-all-key"),
+        )
+        .await
+        .expect("restrict all-accounts key to groups");
+    assert_eq!(restricted.groups.len(), 1);
+    let restricted_audit: Vec<String> = sqlx::query_scalar(
+        "select changed_fields from admin_audit_events
+         where admin_request_id = 'restrict-all-key'",
+    )
+    .fetch_one(&database.pool)
+    .await
+    .expect("load scope restriction audit");
+    assert!(restricted_audit.contains(&"routing_scope:all->groups".to_owned()));
+    assert_eq!(
+        current_revision(&database.pool).await,
+        restricted_revision.get()
+    );
+
+    let revision_before_delete = current_revision(&database.pool).await;
+    let audit_before_delete = audit_count(&database.pool).await;
+    let error = groups
+        .delete_account_group(
+            DeleteAccountGroup { id: mixed_group },
+            &context("delete-referenced"),
+        )
+        .await
+        .expect_err("referenced group must not be deleted");
+    assert_eq!(error.kind(), AdminStoreErrorKind::Conflict);
+    assert_eq!(
+        current_revision(&database.pool).await,
+        revision_before_delete
+    );
+    assert_eq!(audit_count(&database.pool).await, audit_before_delete);
+
+    database.close().await;
+}
+
+#[tokio::test]
+async fn group_costs_should_include_statusless_websocket_but_reject_statusless_http() {
+    let Some(database) = TestDatabase::create("account_group_statusless_websocket_cost").await
+    else {
+        return;
+    };
+    seed_account(
+        &database.pool,
+        "acct_group_statusless",
+        "openai",
+        "Statusless Account",
+    )
+    .await;
+    let groups = PgAccountGroupRepository::new(database.pool.clone());
+    groups
+        .create_account_group(
+            NewAccountGroup {
+                disable_fast: false,
+                id: group_id(EMPTY_GROUP),
+                name: "Statusless Costs".to_owned(),
+                description: None,
+                color: group_color("#06B6D4CC"),
+            },
+            &context("create-statusless-cost-group"),
+        )
+        .await
+        .expect("create statusless cost group");
+    for (request_id, cost_amount) in [
+        ("req_group_http_success", "1.5"),
+        ("req_group_statusless_websocket", "2"),
+        ("req_group_statusless_http", "4"),
+    ] {
+        seed_group_cost_snapshot(
+            &database.pool,
+            request_id,
+            "acct_group_statusless",
+            EMPTY_GROUP,
+            cost_amount,
+        )
+        .await;
+    }
+    sqlx::query(
+        "update model_requests
+         set client_transport = case id
+               when 'req_group_statusless_websocket' then 'websocket'
+               else 'http_sse'
+             end,
+             client_status_code = null
+         where id in ('req_group_statusless_websocket', 'req_group_statusless_http')",
+    )
+    .execute(&database.pool)
+    .await
+    .expect("make account group requests statusless");
+
+    let page = groups
+        .list_account_groups(AccountGroupListQuery {
+            page: 1,
+            page_size: PageSize::new(20).expect("page size"),
+            search: None,
+            enabled: None,
+        })
+        .await
+        .expect("list statusless cost group");
+
+    assert_eq!(
+        (
+            page.items[0].usage.today_usd.as_str(),
+            page.items[0].usage.retained_total_usd.as_str(),
+        ),
+        ("3.5", "3.5"),
+    );
+
+    database.close().await;
+}
+
+fn new_key(id: &str, group_ids: Vec<AccountGroupId>) -> NewClientKey {
+    let marker = char::from(id.as_bytes().last().copied().unwrap_or(b'k'));
+    NewClientKey {
+        openai_client_profile_override: None,
+        xai_client_profile_override: None,
+        budget: Default::default(),
+        id: client_key_id(id),
+        name: id.to_owned(),
+        label: None,
+        group_ids,
+        limits: RateLimits::unlimited(),
+        plaintext: format!("sk_{}", marker.to_string().repeat(43)),
+    }
+}
+
+fn group_id(value: &str) -> AccountGroupId {
+    AccountGroupId::new(value).expect("valid account group ID")
+}
+
+fn group_color(value: &str) -> AccountGroupColor {
+    AccountGroupColor::parse(value).expect("valid account group color")
+}
+
+fn client_key_id(value: &str) -> ClientApiKeyId {
+    ClientApiKeyId::new(value).expect("valid client key ID")
+}
+
+fn context(request_id: &str) -> MutationContext {
+    MutationContext {
+        actor: MutationActor::System,
+        request_id: request_id.to_owned(),
+    }
+}
+
+async fn seed_account(pool: &sqlx::PgPool, id: &str, provider: &str, name: &str) {
+    sqlx::query(
+        "insert into provider_accounts (
+           id, provider_kind, name, email, upstream_user_id, upstream_account_id,
+           plan_type, authentication_kind, provider_credentials_json, credential_revision,
+           has_refresh_token, access_token_expires_at, next_refresh_at, enabled,
+           credential_state, credential_observed_at, created_at, updated_at
+         ) values (
+           $1, $2, $3, null, $1 || '-user', null, null, 'oauth', '{}'::jsonb, 1,
+           false, null, null, true, 'ready', now(), now(), now()
+         )",
+    )
+    .bind(id)
+    .bind(provider)
+    .bind(name)
+    .execute(pool)
+    .await
+    .expect("seed provider account");
+}
+
+async fn assign_accounts(pool: &sqlx::PgPool, group_id: &str, account_ids: &[&str]) {
+    for account_id in account_ids {
+        sqlx::query(
+            "insert into account_group_accounts (
+               account_group_id, provider_account_id, created_at
+             )
+             values ($1, $2, now())",
+        )
+        .bind(group_id)
+        .bind(account_id)
+        .execute(pool)
+        .await
+        .expect("seed account group membership");
+    }
+}
+
+async fn seed_group_cost_snapshot(
+    pool: &sqlx::PgPool,
+    request_id: &str,
+    account_id: &str,
+    historical_group_id: &str,
+    cost_amount: &str,
+) {
+    sqlx::query(
+        "insert into model_requests (
+           id, client_api_key_ref, config_revision, protocol, operation, endpoint,
+           client_transport, requested_model_id, provider_kind, provider_account_id,
+           provider_account_ref, upstream_model_id, upstream_transport, attempt_count,
+           upstream_send_state, downstream_committed_at, outcome, client_status_code,
+           upstream_status_code, total_tokens, cost_source, cost_amount, cost_currency,
+           started_at, deadline_at, completed_at,
+           routing_scope, routing_group_refs, routing_group_names_snapshot
+         ) values (
+           $1, 'key-group-history', 1, 'openai', 'responses', '/v1/responses',
+           'http_sse', 'gpt-group', 'openai', $2, $2, 'gpt-group', 'http_sse', 1,
+           'sent', now(), 'succeeded', 200, 200, 10,
+           'provider_reported', $4::numeric, 'USD', now() - interval '1 minute',
+           now() + interval '5 minutes', now(),
+           'groups', array[$3]::text[], jsonb_build_array($3::text)
+         )",
+    )
+    .bind(request_id)
+    .bind(account_id)
+    .bind(historical_group_id)
+    .bind(cost_amount)
+    .execute(pool)
+    .await
+    .expect("seed historical group cost snapshot");
+}
+
+async fn current_revision(pool: &sqlx::PgPool) -> u64 {
+    let value =
+        sqlx::query_scalar::<_, i64>("select config_revision from runtime_settings where id = 1")
+            .fetch_one(pool)
+            .await
+            .expect("load config revision");
+    u64::try_from(value).expect("positive config revision")
+}
+
+async fn audit_count(pool: &sqlx::PgPool) -> u64 {
+    let value = sqlx::query_scalar::<_, i64>("select count(*) from admin_audit_events")
+        .fetch_one(pool)
+        .await
+        .expect("count audit rows");
+    u64::try_from(value).expect("non-negative audit count")
+}
+
+#[tokio::test]
+async fn disable_fast_group_updates_preserve_omitted_values_and_publish_snapshot_facts() {
+    use gateway_admin::model::account_groups::UpdateAccountGroup;
+    use gateway_store::postgres::{PgRuntimeSnapshotRepository, RuntimeSnapshotRepository};
+    let Some(database) = TestDatabase::create("disable_fast_group").await else {
+        return;
+    };
+    let repository = PgAccountGroupRepository::new(database.pool.clone());
+    let id = group_id(MIXED_GROUP);
+    repository
+        .create_account_group(
+            NewAccountGroup {
+                id: id.clone(),
+                name: "Fast policy".to_owned(),
+                description: None,
+                color: group_color("#2563EBFF"),
+                disable_fast: true,
+            },
+            &context("create-fast"),
+        )
+        .await
+        .unwrap();
+    for (value, expected) in [(None, true), (Some(false), false), (Some(true), true)] {
+        let mutation = repository
+            .update_account_group(
+                UpdateAccountGroup {
+                    id: id.clone(),
+                    name: "Renamed policy".to_owned(),
+                    description: None,
+                    color: group_color("#2563EBFF"),
+                    disable_fast: value,
+                },
+                &context("update-fast"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mutation.record.unwrap().disable_fast, expected);
+        let snapshot = PgRuntimeSnapshotRepository::new(database.pool.clone())
+            .load_runtime_snapshot()
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot.config_revision.get(),
+            mutation.config_revision.get()
+        );
+        assert_eq!(
+            snapshot
+                .account_groups
+                .iter()
+                .find(|group| group.id == id)
+                .unwrap()
+                .disable_fast,
+            expected
+        );
+    }
+    database.close().await;
+}

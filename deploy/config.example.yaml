@@ -1,0 +1,95 @@
+# proxy-for-self 应用配置模板。
+#
+# 使用：
+#   sudo install -m 0640 -o "$(id -u)" -g 10001 deploy/config.example.yaml deploy/config.yaml
+#
+# PostgreSQL 与 Redis 密码分别执行 `openssl rand -hex 24` 生成；管理员初始密码单独设置。
+
+schema_version: 1
+
+host:
+  listen:
+    # 本地 cargo run 使用；Docker 内由 CPR_SERVER_HOST/PORT 覆盖。
+    host: '127.0.0.1'
+    port: 8080
+  # OpenAI 会话身份、系统更新状态和备份暂存区的统一根目录。
+  # 相对路径以 deploy/config.yaml 所在目录为基准。
+  runtime_data_dir: '../.runtime/data'
+  logging:
+    level: 'info'
+    stdout: true
+    # 将原始 AT/RT 写入独立 OAuth 恢复文件，沿用 file 的目录、大小与保留期。
+    oauth_recovery: false
+    # 将完整请求与响应头、正文写入独立文件；包含凭据，仅排障时开启。
+    request_dump: false
+    request_dump_retention_days: 1
+    file:
+      enabled: true
+      # 相对路径以 deploy/config.yaml 所在目录为基准。
+      directory: '../.runtime/logs'
+      retention_days: 7
+      max_file_size_mb: 20
+  drain_timeout_seconds: 30
+  worker_shutdown_timeout_seconds: 30
+
+store:
+  # 首次启动前生成 32 字节十六进制密钥，权限仅允许服务账号读取。
+  # 下方为 Docker 绝对路径；本机/systemd 请改为自己的密钥绝对路径。
+  vault_key_file: /app/.runtime/data/vault-key.hex
+  database:
+    # Docker 内由 CPR_DATABASE_URL 覆盖；密码不要写进 URL。
+    url: 'postgres://codex_proxy@127.0.0.1:5432/codex_proxy'
+    password: &postgres_password ''
+  redis:
+    # Docker 内由 CPR_REDIS_URL 覆盖；密码不要写进 URL。
+    url: 'redis://127.0.0.1:6379/'
+    password: &redis_password ''
+  # 可选：PostgreSQL 连接池预算；下列值与当前推荐默认一致。
+  # pool:
+  #   max_connections: 20
+  #   acquire_timeout_seconds: 5
+
+admin:
+  session_ttl_minutes: 1440
+  default_username: 'admin@cpr.local'
+  # 仅首次创建管理员时使用；至少 12 个字符且不能包含 `$`。
+  default_password: ''
+
+client:
+  # 统一登录中密钥身份的固定会话有效期。
+  session_ttl_minutes: 1440
+
+api:
+  # Docker 内由 CPR_WEB_DIST_DIR 覆盖。
+  asset_directory: '../frontend/dist'
+  cors_allowed_origins: []
+  request_timeout_seconds: null
+  request_id_header: 'x-request-id'
+
+openai:
+  # 可选 Linux 私有 Worker，未启用时保持 null。
+  excel_worker_socket: null
+  # 数据驻留约束；省略或 null 不指定地域约束，与管理端客户端身份无关。
+  residency: us
+
+# Compose 凭据桥接区；密码仍只维护在 store 中。
+services:
+  postgres-credentials:
+    environment:
+      POSTGRES_PASSWORD: *postgres_password
+
+  redis-credentials:
+    command:
+      - redis-server
+      - --appendonly
+      - 'yes'
+      - --requirepass
+      - *redis_password
+    healthcheck:
+      test:
+        - CMD
+        - redis-cli
+        - --no-auth-warning
+        - -a
+        - *redis_password
+        - ping

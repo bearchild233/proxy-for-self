@@ -1,0 +1,44 @@
+[workspace]
+members = [
+    "apps/gateway",
+    "crates/gateway-admin",
+    "crates/gateway-api",
+    "crates/gateway-core",
+    "crates/gateway-host",
+    "crates/gateway-protocol",
+    "crates/gateway-store",
+    "crates/providers/openai",
+    "crates/providers/xai",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+rust-version = "1.97"
+
+[workspace.lints.rust]
+warnings = "deny"
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = 10 }
+redundant_clone = { level = "deny", priority = 9 }
+large_enum_variant = { level = "warn", priority = 8 }
+needless_collect = { level = "deny", priority = 7 }
+
+[profile.dev]
+debug = true
+
+[profile.release]
+debug = false
+strip = "symbols"
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+[patch.crates-io]
+# Upstream SOCKS IPv6 fix; remove once a release includes hyperium/hyper-util#302.
+hyper-util = { git = "https://github.com/hyperium/hyper-util", rev = "191b1acf0a6b18e807e4abf5a6d4a7c47979ecd6" }

@@ -1,0 +1,883 @@
+//! 模型请求生命周期、单行持久化 port 与 commit/send/cancellation 边界。
+
+pub mod admission;
+pub mod budget;
+pub mod continuation;
+pub mod coordinator;
+pub mod execution;
+mod observation;
+pub mod probe;
+pub mod provider;
+
+pub use coordinator::{AttemptCoordinator, ResponseExecutionSession};
+
+use std::collections::BTreeSet;
+use std::fmt;
+use std::net::IpAddr;
+use std::num::NonZeroU32;
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
+
+use async_trait::async_trait;
+use thiserror::Error;
+
+use crate::account::{AccountSelectionPolicy, ProviderAccountId};
+use crate::engine::continuation::{ContinuationBinding, NativeContinuationPin};
+use crate::error::{
+    GatewayError, ProviderConnectionObservation, ProviderError, ProviderErrorKind, StoreError,
+};
+use crate::event::ProviderEvent;
+use crate::identity::ProviderKind;
+use crate::lifecycle::CancellationToken;
+use crate::metering::{CostEstimate, Usage};
+use crate::operation::OperationKind;
+use crate::operation::ProviderSessionState;
+use crate::policy::ClientApiKeyId;
+use crate::routing::{ConfigRevision, PublicModelId, UpstreamModelId};
+use crate::upstream::UpstreamSendState;
+use crate::validation::{IdentifierError, validate_text};
+
+/// `model_requests.id`。
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ModelRequestId(String);
+
+impl ModelRequestId {
+    pub fn new(value: impl Into<String>) -> Result<Self, IdentifierError> {
+        let value = value.into();
+        validate_text(&value, 128, false, Some("req_"))?;
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ModelRequestId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// `model_requests.outcome`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExecutionOutcome {
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+    Incomplete,
+}
+
+impl ExecutionOutcome {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Incomplete => "incomplete",
+        }
+    }
+}
+
+/// Request-local attempt 的原因，不对应数据库表。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AttemptTrigger {
+    Initial,
+    AccountRetry,
+}
+
+/// Provider 可为当前 attempt 选择的请求局部传输档位。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum AttemptTransport {
+    /// 使用 Provider 的默认传输策略。
+    #[default]
+    Default,
+    /// 固定账号重试 Provider 的首选传输；序号由 Provider 的独立预算驱动。
+    Retry(NonZeroU32),
+    /// 使用 Provider 定义的备用传输。
+    Fallback,
+}
+
+impl AttemptTrigger {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Initial => "initial",
+            Self::AccountRetry => "account_retry",
+        }
+    }
+}
+
+/// 一次实际上游调用对 Provider 健康度产生的事实。
+///
+/// 该事实只描述调用结果，不在 Core 中定义 circuit 策略或持久化方式。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderAttemptOutcome {
+    /// 上游流自然完成且通过 canonical event 序列校验。
+    Succeeded { provider_kind: ProviderKind },
+    /// 上游打开或流式阶段返回了稳定 Provider 错误。
+    Failed {
+        provider_kind: ProviderKind,
+        error_kind: ProviderErrorKind,
+    },
+}
+
+impl ProviderAttemptOutcome {
+    /// 返回本次调用实际归属的 Provider。
+    #[must_use]
+    pub const fn provider_kind(&self) -> &ProviderKind {
+        match self {
+            Self::Succeeded { provider_kind } | Self::Failed { provider_kind, .. } => provider_kind,
+        }
+    }
+
+    /// 成功返回 `None`，失败返回稳定 Provider 错误分类。
+    #[must_use]
+    pub const fn error_kind(&self) -> Option<ProviderErrorKind> {
+        match self {
+            Self::Succeeded { .. } => None,
+            Self::Failed { error_kind, .. } => Some(*error_kind),
+        }
+    }
+}
+
+/// 单次 attempt 的账号选择与账号绑定状态事实。
+///
+/// `required_account` 用于管理端 connection test，或请求局部的同账号恢复 attempt；
+/// 一旦设置，Provider 在本 attempt 内不得换号或切换 target。
+#[derive(Debug, Clone, Default)]
+pub struct AccountAttemptContext {
+    excluded_accounts: BTreeSet<ProviderAccountId>,
+    required_account: Option<ProviderAccountId>,
+    state_owner: Option<ProviderAccountStateOwner>,
+    credential_recovery_attempted: bool,
+    diagnostic_required_account: bool,
+    account_scope: Option<Arc<crate::account::scope::FrozenAccountScope>>,
+}
+
+impl AccountAttemptContext {
+    #[must_use]
+    pub const fn new(
+        excluded_accounts: BTreeSet<ProviderAccountId>,
+        required_account: Option<ProviderAccountId>,
+        state_owner: Option<ProviderAccountStateOwner>,
+    ) -> Self {
+        Self {
+            excluded_accounts,
+            required_account,
+            state_owner,
+            credential_recovery_attempted: false,
+            diagnostic_required_account: false,
+            account_scope: None,
+        }
+    }
+
+    /// 为管理端对固定账号的上游诊断创建上下文。
+    ///
+    /// 诊断只绕过本地的被动可用性投影，不能换号，并继续受账号租约保护。
+    #[must_use]
+    pub const fn diagnostic(
+        excluded_accounts: BTreeSet<ProviderAccountId>,
+        required_account: ProviderAccountId,
+        state_owner: Option<ProviderAccountStateOwner>,
+    ) -> Self {
+        Self {
+            excluded_accounts,
+            required_account: Some(required_account),
+            state_owner,
+            credential_recovery_attempted: false,
+            diagnostic_required_account: true,
+            account_scope: None,
+        }
+    }
+
+    /// 附着普通请求认证时冻结的账号范围。
+    #[must_use]
+    pub fn with_account_scope(
+        mut self,
+        scope: Arc<crate::account::scope::FrozenAccountScope>,
+    ) -> Self {
+        self.account_scope = Some(scope);
+        self
+    }
+
+    /// 标记本请求已对即将选择的固定账号执行过一次凭据恢复。
+    #[must_use]
+    pub const fn with_credential_recovery_attempted(mut self, attempted: bool) -> Self {
+        self.credential_recovery_attempted = attempted;
+        self
+    }
+
+    #[must_use]
+    pub const fn excluded_accounts(&self) -> &BTreeSet<ProviderAccountId> {
+        &self.excluded_accounts
+    }
+
+    #[must_use]
+    pub const fn required_account(&self) -> Option<&ProviderAccountId> {
+        self.required_account.as_ref()
+    }
+
+    #[must_use]
+    pub const fn state_owner(&self) -> Option<&ProviderAccountStateOwner> {
+        self.state_owner.as_ref()
+    }
+
+    #[must_use]
+    pub const fn credential_recovery_attempted(&self) -> bool {
+        self.credential_recovery_attempted
+    }
+
+    /// 此尝试是否要由真实上游而非本地投影确认固定账号的可用性。
+    #[must_use]
+    pub const fn is_diagnostic_required_account(&self) -> bool {
+        self.diagnostic_required_account
+    }
+
+    #[must_use]
+    pub const fn account_scope(&self) -> Option<&Arc<crate::account::scope::FrozenAccountScope>> {
+        self.account_scope.as_ref()
+    }
+}
+
+/// 请求中 Provider 账号绑定状态的唯一归属。
+///
+/// `turn_state` 等 opaque 状态只能发送给创建它的 Provider 与账号；
+/// Core 在首次真实选号后冻结该事实，Provider 据此决定是否清理跨账号状态。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderAccountStateOwner {
+    provider: ProviderKind,
+    account: ProviderAccountId,
+}
+
+impl ProviderAccountStateOwner {
+    #[must_use]
+    pub const fn new(provider: ProviderKind, account: ProviderAccountId) -> Self {
+        Self { provider, account }
+    }
+
+    #[must_use]
+    pub fn from_continuation(pin: &NativeContinuationPin) -> Self {
+        Self::new(pin.provider().clone(), pin.account().clone())
+    }
+
+    #[must_use]
+    pub fn matches(&self, provider: &ProviderKind, account: &ProviderAccountId) -> bool {
+        self.provider == *provider && self.account == *account
+    }
+
+    #[must_use]
+    pub const fn provider(&self) -> &ProviderKind {
+        &self.provider
+    }
+
+    #[must_use]
+    pub const fn account(&self) -> &ProviderAccountId {
+        &self.account
+    }
+}
+
+/// 当前 attempt 对 previous-response 的唯一处理方式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContinuationAttempt {
+    /// 没有 previous-response。
+    None,
+    /// 使用 Store 解析出的原生 handle 与账号绑定。
+    Native,
+    /// 在原账号上执行 Provider 定义的恢复。
+    ///
+    /// 只有持有可携带 transcript 的 Provider 才能清除 native handle 后重放；
+    /// 只持有 opaque state 的 Provider 必须保留 continuation 依赖或返回客户端错误。
+    ReplayOwner,
+    /// 允许选择其他账号并执行 Provider 定义的恢复。
+    ///
+    /// 该枚举本身不证明客户端 input 完整，也不授权 Provider 清除 previous-response。
+    ReplayAny,
+}
+
+impl ContinuationAttempt {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Native => "native",
+            Self::ReplayOwner => "replay_owner",
+            Self::ReplayAny => "replay_any",
+        }
+    }
+}
+
+/// Provider 每次执行可见的 request-local context。
+#[derive(Debug, Clone)]
+pub struct RequestAttemptContext {
+    pricing: Arc<crate::metering::PricingOverrides>,
+    request_profile: Option<crate::account::OpaqueProviderData>,
+    disable_fast: bool,
+    request_location: Option<crate::account::RequestLocation>,
+    request_id: ModelRequestId,
+    client_api_key_ref: ClientApiKeyId,
+    timing_started_at: Instant,
+    trace: crate::diagnostics::TraceContext,
+    concurrency_wait_budget: crate::concurrency::ConcurrencyWaitBudget,
+}
+
+impl RequestAttemptContext {
+    #[must_use]
+    pub fn with_pricing(mut self, pricing: Arc<crate::metering::PricingOverrides>) -> Self {
+        self.pricing = pricing;
+        self
+    }
+
+    #[must_use]
+    pub fn with_request_profile(
+        mut self,
+        profile: Option<crate::account::OpaqueProviderData>,
+    ) -> Self {
+        self.request_profile = profile;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_disable_fast(mut self, disable_fast: bool) -> Self {
+        self.disable_fast = disable_fast;
+        self
+    }
+
+    #[must_use]
+    pub fn with_request_location(
+        mut self,
+        location: Option<crate::account::RequestLocation>,
+    ) -> Self {
+        self.request_location = location;
+        self
+    }
+
+    #[must_use]
+    pub fn new(request_id: ModelRequestId, client_api_key_ref: ClientApiKeyId) -> Self {
+        Self {
+            request_id,
+            client_api_key_ref,
+            request_profile: None,
+            pricing: Arc::default(),
+            disable_fast: false,
+            request_location: None,
+            timing_started_at: Instant::now(),
+            trace: crate::diagnostics::TraceContext::default(),
+            concurrency_wait_budget: crate::concurrency::ConcurrencyWaitBudget::default(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_trace(mut self, trace: crate::diagnostics::TraceContext) -> Self {
+        self.trace = trace;
+        self
+    }
+
+    /// 传递本次请求已经消耗的排队预算，不能在新 attempt 中重置。
+    #[must_use]
+    pub fn with_concurrency_wait_budget(
+        mut self,
+        budget: crate::concurrency::ConcurrencyWaitBudget,
+    ) -> Self {
+        self.concurrency_wait_budget = budget;
+        self
+    }
+
+    /// 覆盖本次请求的单调计时原点。
+    #[must_use]
+    pub fn with_timing_started_at(mut self, timing_started_at: Instant) -> Self {
+        self.timing_started_at = timing_started_at;
+        self
+    }
+
+    #[must_use]
+    pub const fn request_id(&self) -> &ModelRequestId {
+        &self.request_id
+    }
+
+    #[must_use]
+    pub const fn client_api_key_ref(&self) -> &ClientApiKeyId {
+        &self.client_api_key_ref
+    }
+
+    /// 返回贯穿本次请求的单调计时原点。
+    #[must_use]
+    pub const fn timing_started_at(&self) -> Instant {
+        self.timing_started_at
+    }
+}
+
+/// Provider 每次执行可见的 request-local context。
+#[derive(Debug, Clone)]
+pub struct AttemptContext {
+    request: RequestAttemptContext,
+    attempt_index: NonZeroU32,
+    deadline: SystemTime,
+    account_selection_policy: AccountSelectionPolicy,
+    account: AccountAttemptContext,
+    continuation: Option<ContinuationBinding>,
+    continuation_attempt: ContinuationAttempt,
+    transport: AttemptTransport,
+    cancellation: CancellationToken,
+}
+
+impl AttemptContext {
+    #[must_use]
+    pub fn pricing(&self) -> &crate::metering::PricingOverrides {
+        &self.request.pricing
+    }
+
+    /// 本次逻辑请求首次解析的 Provider 身份，换号及传输重试保持不变。
+    #[must_use]
+    pub const fn request_profile(&self) -> Option<&crate::account::OpaqueProviderData> {
+        self.request.request_profile.as_ref()
+    }
+
+    #[must_use]
+    pub const fn disable_fast(&self) -> bool {
+        self.request.disable_fast
+    }
+
+    #[must_use]
+    pub const fn request_location(&self) -> Option<&crate::account::RequestLocation> {
+        self.request.request_location.as_ref()
+    }
+
+    /// 当前 attempt 的诊断关联；克隆后可传给后台 transport 任务。
+    #[must_use]
+    pub fn trace(&self) -> crate::diagnostics::TraceContext {
+        self.request.trace.attempt(self.attempt_index.get())
+    }
+
+    #[must_use]
+    pub const fn new(
+        request: RequestAttemptContext,
+        attempt_index: NonZeroU32,
+        deadline: SystemTime,
+        account_selection_policy: AccountSelectionPolicy,
+        account: AccountAttemptContext,
+        continuation: Option<ContinuationBinding>,
+        cancellation: CancellationToken,
+    ) -> Self {
+        let continuation_attempt = if continuation.is_some() {
+            ContinuationAttempt::Native
+        } else {
+            ContinuationAttempt::None
+        };
+        Self {
+            request,
+            attempt_index,
+            deadline,
+            account_selection_policy,
+            account,
+            continuation,
+            continuation_attempt,
+            transport: AttemptTransport::Default,
+            cancellation,
+        }
+    }
+
+    /// 覆盖本次 attempt 的 continuation 恢复方式。
+    #[must_use]
+    pub const fn with_continuation_attempt(
+        mut self,
+        continuation_attempt: ContinuationAttempt,
+    ) -> Self {
+        self.continuation_attempt = continuation_attempt;
+        self
+    }
+
+    /// 覆盖本次 attempt 的 Provider 传输档位。
+    #[must_use]
+    pub const fn with_transport(mut self, transport: AttemptTransport) -> Self {
+        self.transport = transport;
+        self
+    }
+
+    #[must_use]
+    pub const fn request_id(&self) -> &ModelRequestId {
+        self.request.request_id()
+    }
+
+    /// 返回隔离 Provider 会话与缓存身份的下游租户引用。
+    #[must_use]
+    pub const fn client_api_key_ref(&self) -> &ClientApiKeyId {
+        self.request.client_api_key_ref()
+    }
+
+    /// 返回本次请求统一的单调计时原点。
+    #[must_use]
+    pub const fn timing_started_at(&self) -> Instant {
+        self.request.timing_started_at()
+    }
+
+    #[must_use]
+    pub const fn attempt_index(&self) -> NonZeroU32 {
+        self.attempt_index
+    }
+
+    #[must_use]
+    pub const fn deadline(&self) -> SystemTime {
+        self.deadline
+    }
+
+    /// 返回密钥准入、账号选择与重试共用的排队预算。
+    #[must_use]
+    pub const fn concurrency_wait_budget(&self) -> &crate::concurrency::ConcurrencyWaitBudget {
+        &self.request.concurrency_wait_budget
+    }
+
+    #[must_use]
+    pub const fn account_selection_policy(&self) -> AccountSelectionPolicy {
+        self.account_selection_policy
+    }
+
+    #[must_use]
+    pub const fn excluded_accounts(&self) -> &BTreeSet<ProviderAccountId> {
+        self.account.excluded_accounts()
+    }
+
+    /// 管理端诊断或请求局部恢复 attempt 强制使用的唯一账号。
+    #[must_use]
+    pub const fn required_account(&self) -> Option<&ProviderAccountId> {
+        self.account.required_account()
+    }
+
+    #[must_use]
+    pub const fn account_state_owner(&self) -> Option<&ProviderAccountStateOwner> {
+        self.account.state_owner()
+    }
+
+    /// 同一请求是否已经为当前固定账号执行过一次 OAuth 恢复。
+    #[must_use]
+    pub const fn credential_recovery_attempted(&self) -> bool {
+        self.account.credential_recovery_attempted()
+    }
+
+    /// 管理端固定账号诊断会跳过本地可用性投影，保留全部租约约束。
+    #[must_use]
+    pub const fn is_diagnostic_required_account(&self) -> bool {
+        self.account.is_diagnostic_required_account()
+    }
+
+    /// 普通请求认证时冻结的账号范围；管理端诊断为 `None`。
+    #[must_use]
+    pub const fn account_scope(&self) -> Option<&Arc<crate::account::scope::FrozenAccountScope>> {
+        self.account.account_scope()
+    }
+
+    #[must_use]
+    pub const fn continuation(&self) -> Option<&ContinuationBinding> {
+        self.continuation.as_ref()
+    }
+
+    #[must_use]
+    pub const fn continuation_attempt(&self) -> ContinuationAttempt {
+        self.continuation_attempt
+    }
+
+    /// 返回本次 attempt 的 Provider 传输档位。
+    #[must_use]
+    pub const fn transport(&self) -> AttemptTransport {
+        self.transport
+    }
+
+    #[must_use]
+    pub const fn cancellation(&self) -> &CancellationToken {
+        &self.cancellation
+    }
+}
+
+/// 创建唯一 `model_requests` 行所需的入口事实。
+#[derive(Debug, Clone)]
+pub struct NewModelRequest {
+    pub id: ModelRequestId,
+    pub client_api_key_id: Option<ClientApiKeyId>,
+    pub client_api_key_ref: ClientApiKeyId,
+    pub config_revision: ConfigRevision,
+    pub routing: crate::routing::AccountRoutingSnapshot,
+    pub protocol: String,
+    pub operation: OperationKind,
+    pub endpoint: String,
+    pub client_transport: String,
+    pub requested_model: Option<PublicModelId>,
+    pub client_ip: Option<IpAddr>,
+    pub user_agent: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub reasoning_preset: Option<String>,
+    pub request_kind: Option<String>,
+    pub subagent_kind: Option<String>,
+    pub compact: bool,
+    pub continuation: provider::ContinuationRequestObservation,
+    pub image_generation_requested: bool,
+    /// Client Key 准入判定的完整耗时；内部探测不经过该阶段。
+    pub admission_decision_ms: Option<u64>,
+    pub started_at: SystemTime,
+    pub deadline_at: SystemTime,
+}
+
+/// 每次真实上游发送前对同一 `model_requests` 行的更新。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttemptRecord {
+    pub request_id: ModelRequestId,
+    pub attempt_count: NonZeroU32,
+    pub trigger: AttemptTrigger,
+    pub provider_kind: ProviderKind,
+    pub provider_account_id: Option<ProviderAccountId>,
+    pub provider_account_ref: Option<ProviderAccountId>,
+    pub upstream_model_id: Option<UpstreamModelId>,
+    pub upstream_transport: String,
+    pub http_version: Option<String>,
+    /// 本 attempt 从进入 Provider 选择器到持有账号 lease 的等待。
+    pub account_selection_wait_ms: Option<u64>,
+    /// 选择成功后（含当前请求）的请求级账号池容量快照。
+    pub capacity_used_slots: Option<u64>,
+    pub capacity_total_slots: Option<u64>,
+}
+
+/// 需要解释换号的中间失败。
+#[derive(Debug)]
+pub struct IntermediateFailure {
+    pub request_id: ModelRequestId,
+    pub attempt_index: NonZeroU32,
+    pub trigger: AttemptTrigger,
+    pub provider_kind: ProviderKind,
+    pub account_id: Option<ProviderAccountId>,
+    pub upstream_model_id: Option<UpstreamModelId>,
+    pub upstream_status_code: Option<u16>,
+    pub upstream_request_id: Option<String>,
+    pub error: ProviderError,
+    pub latency: Duration,
+}
+
+/// 不属于任何 `model_requests` 行的管理端账号探测失败。
+#[derive(Debug)]
+pub struct ProbeFailure {
+    pub provider_kind: ProviderKind,
+    pub account_id: ProviderAccountId,
+    pub upstream_model_id: UpstreamModelId,
+    pub error: ProviderError,
+    pub latency: Duration,
+}
+
+/// `model_requests` 可用的毫秒级阶段耗时。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelRequestTimings {
+    pub transport_decision_wait_ms: Option<u64>,
+    pub connect_ms: Option<u64>,
+    pub headers_ms: Option<u64>,
+    pub first_event_ms: Option<u64>,
+    pub first_reasoning_ms: Option<u64>,
+    pub first_text_ms: Option<u64>,
+    pub first_token_ms: Option<u64>,
+    pub provider_processing_ms: Option<u64>,
+    pub latency_ms: Option<u64>,
+}
+
+/// 终态失败的 Provider 结构化连接与 continuation 观测。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelRequestFailureObservation {
+    pub continuation_unavailable_reason: Option<String>,
+    pub upstream_connection: Option<ProviderConnectionObservation>,
+}
+
+/// 单行模型请求的终态写回。
+#[derive(Debug)]
+pub struct ModelRequestFinalization {
+    pub request_id: ModelRequestId,
+    pub outcome: ExecutionOutcome,
+    pub send_state: UpstreamSendState,
+    pub attempt_count: u32,
+    pub downstream_committed_at: Option<SystemTime>,
+    pub client_status_code: Option<u16>,
+    pub client_response_id: Option<String>,
+    pub upstream_status_code: Option<u16>,
+    pub upstream_request_id: Option<String>,
+    pub upstream_response_id: Option<String>,
+    pub upstream_transport: Option<String>,
+    pub http_version: Option<String>,
+    pub websocket_pool: Option<String>,
+    pub service_tier: Option<String>,
+    pub upstream_response_model: Option<String>,
+    /// Provider 已筛选的专有观测 JSON；Core 不解释字段。
+    pub provider_metadata_json: Option<String>,
+    /// 请求全程的有界诊断快照，跨 Provider 与重试保留。
+    pub diagnostic_trace_json: Option<String>,
+    pub error: Option<GatewayError>,
+    pub provider_error_code: Option<String>,
+    /// Provider 返回的原始错误正文或 WebSocket close/error frame。
+    pub raw_upstream_error: Option<String>,
+    pub failure_observation: ModelRequestFailureObservation,
+    pub retry_after_ms: Option<u64>,
+    pub usage: Usage,
+    pub image_generation_succeeded: Option<bool>,
+    pub cost: CostEstimate,
+    pub timings: ModelRequestTimings,
+    pub completed_at: SystemTime,
+}
+
+/// 进程崩溃后按冻结 deadline 收敛的 running 请求数。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RecoveryReport {
+    pub requests: u64,
+}
+
+/// `model_requests` 与必要 `ops_events` 的唯一 Core port。
+#[async_trait]
+pub trait ExecutionStore: Send + Sync {
+    async fn create_model_request(&self, request: NewModelRequest) -> Result<(), StoreError>;
+    async fn record_attempt(&self, attempt: AttemptRecord) -> Result<(), StoreError>;
+    /// 请求插入与首次 attempt 合并持久化；两者写同一行，支持合并写的
+    /// store 可覆写为单次往返，缩短首 token 前的关键路径。
+    ///
+    /// 覆写实现应保证原子性：默认的两步实现里第二步失败会留下一条
+    /// `running` 请求行，由 deadline 回收器收敛。
+    async fn create_model_request_with_attempt(
+        &self,
+        request: NewModelRequest,
+        attempt: AttemptRecord,
+    ) -> Result<(), StoreError> {
+        self.create_model_request(request).await?;
+        self.record_attempt(attempt).await
+    }
+    async fn mark_send_state(
+        &self,
+        request_id: &ModelRequestId,
+        state: UpstreamSendState,
+    ) -> Result<(), StoreError>;
+    async fn mark_downstream_committed(
+        &self,
+        request_id: &ModelRequestId,
+        committed_at: SystemTime,
+        client_status_code: Option<u16>,
+    ) -> Result<(), StoreError>;
+    async fn record_client_status(
+        &self,
+        request_id: &ModelRequestId,
+        client_status_code: u16,
+    ) -> Result<(), StoreError>;
+    async fn record_intermediate_failure(
+        &self,
+        failure: IntermediateFailure,
+    ) -> Result<(), StoreError>;
+    /// 记录不挂在 `model_requests` 上的账号探测失败；默认丢弃。
+    async fn record_probe_failure(&self, _failure: ProbeFailure) -> Result<(), StoreError> {
+        Ok(())
+    }
+    async fn finalize_model_request(
+        &self,
+        finalization: ModelRequestFinalization,
+    ) -> Result<(), StoreError>;
+
+    async fn recover_expired(&self, now: SystemTime) -> Result<RecoveryReport, StoreError>;
+}
+
+/// 首事件能否交付客户端的持久化屏障。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitRequirement {
+    CommitBeforeDelivery,
+    AlreadyCommitted,
+}
+
+#[derive(Debug)]
+pub struct CoordinatedEvent {
+    events: Vec<ProviderEvent>,
+    commit_requirement: CommitRequirement,
+}
+
+impl CoordinatedEvent {
+    #[must_use]
+    pub fn single(event: ProviderEvent, commit_requirement: CommitRequirement) -> Self {
+        Self {
+            events: vec![event],
+            commit_requirement,
+        }
+    }
+
+    /// 将一批 provider 事件合并为单个提交单元；空批次是无效投递状态。
+    pub fn try_batch(
+        events: Vec<ProviderEvent>,
+        commit_requirement: CommitRequirement,
+    ) -> Result<Self, EngineError> {
+        if events.is_empty() {
+            return Err(EngineError::InvalidDeliveryState);
+        }
+        Ok(Self {
+            events,
+            commit_requirement,
+        })
+    }
+
+    #[must_use]
+    pub const fn commit_requirement(&self) -> CommitRequirement {
+        self.commit_requirement
+    }
+
+    #[must_use]
+    pub fn into_provider_events(self) -> Vec<ProviderEvent> {
+        self.events
+    }
+
+    /// 返回本批次中 Provider 交付的私有会话更新。
+    #[must_use]
+    pub fn session_update(&self) -> Option<&ProviderSessionState> {
+        self.events.iter().find_map(ProviderEvent::session_update)
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum EngineError {
+    #[error("execution store failed")]
+    Store(#[from] StoreError),
+    #[error("provider `{provider}` is not registered")]
+    ProviderNotRegistered { provider: String },
+    #[error("provider metadata did not match the selected Provider and account")]
+    ProviderMetadataMismatch,
+    #[error("native continuation pin did not match the selected account")]
+    ContinuationPinMismatch,
+    #[error("provider did not use the account required by this execution")]
+    RequiredAccountMismatch,
+    #[error("provider selected an account outside the frozen client scope")]
+    AccountOutsideClientScope,
+    #[error("provider execution failed")]
+    Provider(ProviderError),
+    #[error("request was cancelled")]
+    Cancelled,
+    #[error("request deadline elapsed")]
+    Deadline,
+    #[error("routing plan has no candidate")]
+    EmptyRoutingPlan,
+    #[error("no provider attempt is active")]
+    NoActiveAttempt,
+    #[error("downstream delivery must be committed before execution can continue")]
+    DownstreamCommitRequired,
+    #[error("downstream delivery cannot be committed in the current state")]
+    InvalidDeliveryState,
+}
+
+/// Engine 只组合 Store 与 Provider Registry；重试算法完全位于 coordinator。
+pub struct GatewayEngine<S: ?Sized> {
+    store: Arc<S>,
+    providers: provider::ProviderRegistry,
+}
+
+impl<S: ?Sized> GatewayEngine<S> {
+    #[must_use]
+    pub const fn new(store: Arc<S>, providers: provider::ProviderRegistry) -> Self {
+        Self { store, providers }
+    }
+
+    #[must_use]
+    pub const fn store(&self) -> &Arc<S> {
+        &self.store
+    }
+
+    #[must_use]
+    pub const fn providers(&self) -> &provider::ProviderRegistry {
+        &self.providers
+    }
+}

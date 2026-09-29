@@ -1,0 +1,1156 @@
+//! Codex Responses SSE 到核心 canonical event 的单一解码边界。
+
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
+
+use bytes::Bytes;
+use gateway_core::error::{ProviderError, ProviderErrorKind};
+use gateway_core::event::{
+    ContentItem, ContentKind, FinishReason, GatewayEvent, ProtocolWireEvent, ProviderEvent,
+    ReasoningDelta, ResponseMeta, TextDelta, ToolCallDelta,
+};
+use gateway_core::metering::Usage;
+use gateway_core::upstream::UpstreamSendState;
+use gateway_protocol::openai::events::{
+    ResponseModelObservation, TokenUsage, billable_usage_is_complete, extract_usage,
+    observed_model_name,
+};
+use gateway_protocol::openai::sse::{SseEvent, SseEventDecoder, SseFrame, sse_frame_is_done};
+use serde_json::Value;
+use thiserror::Error;
+
+use super::protocol::responses::{
+    ResponseEventSignals, ResponsesSseFailure, response_event_signals,
+};
+use super::usage::{
+    OpenAiBillingUsage, WebSearchPricing, normalize_service_tier, web_search_pricing,
+};
+
+const CONTENTS_PER_OUTPUT: u32 = 1_024;
+
+/// 单 attempt 的增量 Responses decoder。
+///
+/// 上游 wire 是客户端可见的事实来源；canonical facts 只用于观测、亲和和计费。
+/// 因而未知或形状变化的 JSON event 只能放弃 canonical 投影，不能截断 wire 流。
+pub struct CodexCanonicalDecoder {
+    pricing: Option<gateway_core::metering::ModelPriceOverride>,
+    decoder: SseEventDecoder,
+    upstream_model: String,
+    response_id: Option<String>,
+    started: bool,
+    completed: bool,
+    content: BTreeMap<u32, ContentKind>,
+    tool_arguments_seen: BTreeSet<u32>,
+    text_output_seen: BTreeSet<u32>,
+    reasoning_output_seen: BTreeSet<u32>,
+    usage_emitted: bool,
+    semantic_output_seen: bool,
+    requested_service_tier: Option<String>,
+    response_service_tier: Option<String>,
+    response_model: ResponseModelObservation,
+    reported_model: Option<String>,
+    web_search_pricing: Option<WebSearchPricing>,
+    timing_signals: ResponseEventSignals,
+    raw_sse_passthrough: bool,
+    exact_wire: bool,
+    pending_terminal: Option<ResponseMeta>,
+}
+
+/// 上游 Responses 事件的两类失败：协议损坏，或上游明确报告业务失败。
+#[derive(Error)]
+pub enum CodexCanonicalError {
+    /// SSE/JSON 违反了已知协议不变量。
+    #[error("invalid Codex Responses event")]
+    Protocol(#[source] ProviderError),
+    /// 上游在成功建立流后发送了明确的失败事件。
+    #[error("Codex upstream reported a failed response")]
+    Upstream(Box<ResponsesSseFailure>),
+}
+
+impl fmt::Debug for CodexCanonicalError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Protocol(error) => formatter.debug_tuple("Protocol").field(error).finish(),
+            Self::Upstream(_) => formatter.write_str("Upstream(<redacted>)"),
+        }
+    }
+}
+
+impl From<ProviderError> for CodexCanonicalError {
+    fn from(error: ProviderError) -> Self {
+        Self::Protocol(error)
+    }
+}
+
+/// 单次增量解码的有序结果。
+///
+/// 上游失败不是解析异常：它与失败前已经产生的事件一起返回，Provider 因而可以
+/// 先保留真实输出，再把类型化失败交给 Core 收敛。
+pub enum CodexCanonicalOutcome {
+    /// 本批次只包含正常事件。
+    Events(Vec<ProviderEvent>),
+    /// 本批次在若干正常事件后到达失败边界。
+    Failed(CodexCanonicalFailure),
+}
+
+/// `response.failed` 或协议错误发生时的单一 typed outcome。
+pub struct CodexCanonicalFailure {
+    events: Vec<ProviderEvent>,
+    error: CodexCanonicalError,
+    semantic_output_seen: bool,
+}
+
+impl fmt::Debug for CodexCanonicalFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CodexCanonicalFailure")
+            .field("events", &self.events)
+            .field("error", &self.error)
+            .field("semantic_output_seen", &self.semantic_output_seen)
+            .finish()
+    }
+}
+
+impl CodexCanonicalFailure {
+    /// 失败前按上游顺序产生的事件。
+    pub fn events(&self) -> &[ProviderEvent] {
+        &self.events
+    }
+
+    /// 类型化失败；其 Debug/Display 不包含上游正文。
+    pub const fn error(&self) -> &CodexCanonicalError {
+        &self.error
+    }
+
+    /// 失败前是否已经出现客户端可消费的真实输出。
+    pub const fn semantic_output_seen(&self) -> bool {
+        self.semantic_output_seen
+    }
+
+    pub(crate) fn into_parts(self) -> (Vec<ProviderEvent>, CodexCanonicalError, bool) {
+        (self.events, self.error, self.semantic_output_seen)
+    }
+}
+
+impl CodexCanonicalDecoder {
+    #[must_use]
+    pub fn with_pricing(
+        mut self,
+        pricing: Option<gateway_core::metering::ModelPriceOverride>,
+    ) -> Self {
+        self.pricing = pricing;
+        self
+    }
+
+    /// 使用路由后最终发往上游的请求模型计价，并在响应缺少模型时用于 canonical 兜底。
+    pub fn new(upstream_model: impl Into<String>) -> Self {
+        Self {
+            decoder: SseEventDecoder::default(),
+            upstream_model: upstream_model.into(),
+            response_id: None,
+            started: false,
+            completed: false,
+            content: BTreeMap::new(),
+            tool_arguments_seen: BTreeSet::new(),
+            text_output_seen: BTreeSet::new(),
+            reasoning_output_seen: BTreeSet::new(),
+            usage_emitted: false,
+            semantic_output_seen: false,
+            requested_service_tier: None,
+            response_service_tier: None,
+            response_model: ResponseModelObservation::default(),
+            reported_model: None,
+            web_search_pricing: None,
+            pricing: None,
+            timing_signals: ResponseEventSignals::default(),
+            raw_sse_passthrough: false,
+            exact_wire: false,
+            pending_terminal: None,
+        }
+    }
+
+    /// 让 HTTP SSE 上游帧以原始字节随 wire event 向下游传递。
+    ///
+    /// JSON 投影仍只供 canonical facts、计费与亲和旁路读取；不会用于重建 SSE。
+    #[must_use]
+    pub fn with_raw_sse_passthrough(mut self) -> Self {
+        self.raw_sse_passthrough = true;
+        self
+    }
+
+    /// 保真模式等待上游 EOF 后才结算，防止 Core 提前丢掉尾部 wire 帧。
+    #[must_use]
+    pub fn with_exact_wire(mut self, enabled: bool) -> Self {
+        self.exact_wire = enabled;
+        self.raw_sse_passthrough |= enabled;
+        self
+    }
+
+    /// 使用最终发送给上游的请求档位估算费用，不由响应回显覆盖。
+    #[must_use]
+    pub fn with_requested_service_tier(mut self, service_tier: Option<&str>) -> Self {
+        self.requested_service_tier = normalize_service_tier(service_tier);
+        self
+    }
+
+    /// 记录请求工具类型，用于区分标准与预览 Web Search 的按次价格。
+    #[must_use]
+    pub fn with_request_tool_pricing(mut self, model: &str, tools: Option<&[Value]>) -> Self {
+        self.web_search_pricing = web_search_pricing(model, tools);
+        self
+    }
+
+    pub fn push(&mut self, chunk: &[u8]) -> CodexCanonicalOutcome {
+        self.timing_signals = ResponseEventSignals::default();
+        if self.raw_sse_passthrough {
+            let frames = self.decoder.push_frames(chunk);
+            return self.decode_frames(frames);
+        }
+        let events = match self.decoder.push(chunk) {
+            Ok(events) => events,
+            Err(error) => {
+                return self.failure(
+                    Vec::new(),
+                    CodexCanonicalError::Protocol(protocol_error(error)),
+                );
+            }
+        };
+        self.decode(events)
+    }
+
+    pub fn finish(&mut self) -> CodexCanonicalOutcome {
+        self.timing_signals = ResponseEventSignals::default();
+        if self.raw_sse_passthrough {
+            let frames = self.decoder.finish_frames();
+            let mut outcome = self.decode_frames(frames);
+            if let CodexCanonicalOutcome::Events(events) = &mut outcome
+                && let Some(meta) = self.pending_terminal.take()
+            {
+                // EOF 结算仍是原始 wire 的旁路事实，不切换为 canonical-only Provider。
+                let wire = ProtocolWireEvent::raw_sse("openai", Bytes::new())
+                    .expect("static protocol name")
+                    .with_exact_wire(None);
+                events.push(ProviderEvent::canonical_with_wire(
+                    vec![GatewayEvent::Completed(meta)],
+                    wire,
+                ));
+            }
+            return outcome;
+        }
+        let events = match self.decoder.finish() {
+            Ok(events) => events,
+            Err(error) => {
+                return self.failure(
+                    Vec::new(),
+                    CodexCanonicalError::Protocol(protocol_error(error)),
+                );
+            }
+        };
+        self.decode(events)
+    }
+
+    /// 取走最近一次解码中由原始 Responses 事件观察到的计时语义。
+    ///
+    /// 这份事实独立于 canonical 投影：未知的未来事件仍可保留 wire 透明转发，
+    /// 同时让 Provider 正确记录首个可消费输出的时延。
+    #[must_use]
+    pub fn take_timing_signals(&mut self) -> ResponseEventSignals {
+        std::mem::take(&mut self.timing_signals)
+    }
+
+    /// 返回本 attempt 的上游响应回显档位，仅供诊断，不作为本地计费依据。
+    #[must_use]
+    pub fn response_service_tier(&self) -> Option<&str> {
+        self.response_service_tier.as_deref()
+    }
+
+    /// 真实 HTTP 响应头提供初始报告；流内请求级报告可覆盖它。
+    #[must_use]
+    pub fn with_reported_model(mut self, model: Option<&str>) -> Self {
+        self.reported_model = model.and_then(observed_model_name).map(str::to_owned);
+        self
+    }
+
+    /// 接收 transport 已解析的内部 metadata 报告，内部帧无需交付客户端。
+    pub(crate) fn observe_reported_model(&mut self, model: &str) {
+        if let Some(model) = observed_model_name(model) {
+            self.reported_model = Some(model.to_owned());
+        }
+    }
+
+    /// 官方服务端报告优先；缺少报告时仅使用正文明确声明，不使用请求兜底值。
+    #[must_use]
+    pub fn response_model(&self) -> Option<&str> {
+        self.reported_model
+            .as_deref()
+            .or_else(|| self.response_model.model())
+    }
+
+    fn decode(&mut self, events: Vec<SseEvent>) -> CodexCanonicalOutcome {
+        let mut output = Vec::new();
+        for event in events {
+            if let Err(error) = self.decode_one(event, None, &mut output) {
+                return self.failure(output, error);
+            }
+        }
+        CodexCanonicalOutcome::Events(output)
+    }
+
+    fn decode_frames(&mut self, frames: Vec<SseFrame>) -> CodexCanonicalOutcome {
+        let mut output = Vec::new();
+        for frame in frames {
+            let done = std::str::from_utf8(frame.raw()).is_ok_and(sse_frame_is_done);
+            let (raw, events) = frame.into_parts();
+            if done && !self.exact_wire {
+                continue;
+            }
+            let raw = Bytes::from(raw);
+            if events.is_empty() || done {
+                if let Ok(wire) = ProtocolWireEvent::raw_sse("openai", raw) {
+                    output.push(ProviderEvent::wire(if self.exact_wire {
+                        wire.with_exact_wire(None)
+                    } else {
+                        wire
+                    }));
+                }
+                continue;
+            }
+            for (index, event) in events.into_iter().enumerate() {
+                let raw_sse_frame = (index == 0).then(|| raw.clone());
+                if let Err(error) = self.decode_one(event, raw_sse_frame, &mut output) {
+                    return self.failure(output, error);
+                }
+            }
+        }
+        CodexCanonicalOutcome::Events(output)
+    }
+
+    fn decode_one(
+        &mut self,
+        event: SseEvent,
+        raw_sse_frame: Option<Bytes>,
+        output: &mut Vec<ProviderEvent>,
+    ) -> Result<(), CodexCanonicalError> {
+        if event.data.trim() == "[DONE]" {
+            return Ok(());
+        }
+        let value = match serde_json::from_str::<Value>(&event.data) {
+            Ok(value) => value,
+            Err(_) => {
+                if let Some(raw_sse_frame) = raw_sse_frame
+                    && let Ok(wire) = ProtocolWireEvent::raw_sse("openai", raw_sse_frame)
+                {
+                    output.push(ProviderEvent::wire(if self.exact_wire {
+                        wire.with_exact_wire(None)
+                    } else {
+                        wire
+                    }));
+                }
+                return Ok(());
+            }
+        };
+        let event_type = event
+            .event
+            .as_deref()
+            .or_else(|| value.get("type").and_then(Value::as_str));
+        if event_type == Some("codex.rate_limits") && !self.exact_wire {
+            // HTTP transport has already projected this control frame into local quota facts.
+            // It must not become client output or start first-output timing.
+            return Ok(());
+        }
+        self.observe_response_service_tier(&value);
+        self.response_model.observe(event_type, &value);
+        if let Some(model) = super::response_meta::reported_model_from_event(&value) {
+            self.reported_model = Some(model.to_owned());
+        }
+        let signals = response_event_signals(event_type, &value);
+        self.merge_timing_signals(signals);
+        if matches!(event_type, Some("response.failed" | "error")) {
+            let failure = ResponsesSseFailure::from_raw_event(
+                event_type.unwrap_or_default(),
+                &event.data,
+                &value,
+            );
+            let mut canonical = Vec::new();
+            if !self.started {
+                // 失败首帧可能是唯一携带 response_id 的上游事实。身份投影只做
+                // 最佳努力：缺少 response/id 时仍必须保留原 typed failure。
+                let _ = self.start(&value, &mut canonical);
+            }
+            if let Some(wire) = Self::wire_for_event(event, value, raw_sse_frame, self.exact_wire) {
+                output.push(if canonical.is_empty() {
+                    ProviderEvent::wire(wire)
+                } else {
+                    ProviderEvent::canonical_with_wire(canonical, wire)
+                });
+            } else {
+                output.extend(canonical.into_iter().map(ProviderEvent::canonical));
+            }
+            return Err(CodexCanonicalError::Upstream(Box::new(failure)));
+        }
+        let mut canonical = Vec::new();
+        if let Some(event_type) = event_type {
+            let _ = self.decode_event(event_type, &value, &mut canonical);
+        }
+        if self.exact_wire {
+            canonical.retain(|fact| {
+                if let GatewayEvent::Completed(meta) = fact {
+                    self.pending_terminal = Some(meta.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        let Some(wire) = Self::wire_for_event(event, value, raw_sse_frame, self.exact_wire) else {
+            return Ok(());
+        };
+        output.push(if canonical.is_empty() {
+            ProviderEvent::wire(wire)
+        } else {
+            ProviderEvent::canonical_with_wire(canonical, wire)
+        });
+        self.semantic_output_seen |= signals.semantic_output;
+        Ok(())
+    }
+
+    fn merge_timing_signals(&mut self, signals: ResponseEventSignals) {
+        self.timing_signals.protocol_progress |= signals.protocol_progress;
+        self.timing_signals.output_start |= signals.output_start;
+        self.timing_signals.semantic_output |= signals.semantic_output;
+        self.timing_signals.reasoning_output |= signals.reasoning_output;
+        self.timing_signals.text_output |= signals.text_output;
+    }
+
+    fn observe_response_service_tier(&mut self, value: &Value) {
+        let Some(service_tier) = normalize_service_tier(
+            response_object(value)
+                .and_then(|response| response.get("service_tier"))
+                .and_then(Value::as_str),
+        ) else {
+            return;
+        };
+        self.response_service_tier = Some(service_tier);
+    }
+
+    /// 构造下发的 wire event。
+    ///
+    /// raw 帧存在时原始字节原样透传；解析出的 event/id 只作旁路元数据，不能
+    /// 反过来决定客户端事件是否可交付。
+    fn wire_for_event(
+        event: SseEvent,
+        value: Value,
+        raw_sse_frame: Option<Bytes>,
+        exact_wire: bool,
+    ) -> Option<ProtocolWireEvent> {
+        let raw_message = exact_wire.then(|| Bytes::from(event.data));
+        let event_type = event.event;
+        let sse_id = event.id;
+        match raw_sse_frame {
+            Some(raw_sse_frame) => ProtocolWireEvent::json_with_raw_sse_metadata(
+                "openai",
+                event_type,
+                value,
+                raw_sse_frame,
+                sse_id,
+                event.retry,
+            ),
+            None => ProtocolWireEvent::json_with_sse_metadata(
+                "openai",
+                event_type,
+                value,
+                sse_id,
+                event.retry,
+            ),
+        }
+        .ok()
+        .map(|wire| {
+            if exact_wire {
+                wire.with_exact_wire(raw_message)
+            } else {
+                wire
+            }
+        })
+    }
+
+    fn failure(
+        &self,
+        events: Vec<ProviderEvent>,
+        error: CodexCanonicalError,
+    ) -> CodexCanonicalOutcome {
+        CodexCanonicalOutcome::Failed(CodexCanonicalFailure {
+            events,
+            error,
+            semantic_output_seen: self.semantic_output_seen,
+        })
+    }
+
+    fn decode_event(
+        &mut self,
+        event_type: &str,
+        value: &Value,
+        output: &mut Vec<GatewayEvent>,
+    ) -> Result<(), ProviderError> {
+        if self.completed {
+            return Ok(());
+        }
+
+        match event_type {
+            "response.created" | "response.in_progress" => self.start(value, output),
+            "response.output_item.added" => self.output_item_added(value, output),
+            "response.output_item.done" => self.output_item_done(value, output),
+            "response.content_part.added"
+            | "response.reasoning_summary_part.added"
+            | "response.reasoning_part.added" => self.content_part_added(value, output),
+            "response.output_text.delta" | "response.refusal.delta" => {
+                self.text_delta(value, output)
+            }
+            "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                self.reasoning_delta(value, output)
+            }
+            "response.function_call_arguments.delta" | "response.custom_tool_call_input.delta" => {
+                self.tool_delta(value, output)
+            }
+            "response.output_text.done" | "response.refusal.done" => self.text_done(value, output),
+            "response.reasoning_summary_text.done" | "response.reasoning_text.done" => {
+                self.reasoning_done(value, output)
+            }
+            "response.function_call_arguments.done" | "response.custom_tool_call_input.done" => {
+                self.tool_done(value, output)
+            }
+            "response.content_part.done" => self.content_part_done(value, output),
+            "response.reasoning_summary_part.done" | "response.reasoning_part.done" => {
+                self.reasoning_part_done(value, output)
+            }
+            "response.completed" | "response.incomplete" => {
+                self.complete(event_type, value, output)
+            }
+            "response.failed" | "error" => Err(protocol_error_marker()),
+            "response.rate_limits.updated" | "response.metadata" => Ok(()),
+            _ => Ok(()),
+        }
+    }
+
+    fn start(
+        &mut self,
+        value: &Value,
+        output: &mut Vec<GatewayEvent>,
+    ) -> Result<(), ProviderError> {
+        if self.started {
+            // `response.in_progress` 是 created 后的结构事件，不重复发 Started。
+            return Ok(());
+        }
+        let response = response_object(value).ok_or_else(protocol_error_marker)?;
+        let response_id = required_string(response, "id")?;
+        let model = response
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|model| !model.is_empty())
+            .unwrap_or(&self.upstream_model)
+            .to_owned();
+        self.response_id = Some(response_id.clone());
+        self.started = true;
+        output.push(GatewayEvent::Started(ResponseMeta::new(response_id, model)));
+        Ok(())
+    }
+
+    fn output_item_added(
+        &mut self,
+        value: &Value,
+        output: &mut Vec<GatewayEvent>,
+    ) -> Result<(), ProviderError> {
+        self.require_started()?;
+        let item = value.get("item").ok_or_else(protocol_error_marker)?;
+        let output_index = event_index(value, "output_index")?;
+        match item.get("type").and_then(Value::as_str) {
+            Some("function_call" | "custom_tool_call") => {
+                let index = content_index(output_index, 0)?;
+                self.add_content(index, ContentKind::ToolCall, output)?;
+                let call_id = item
+                    .get("call_id")
+                    .or_else(|| item.get("id"))
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(protocol_error_marker)?;
+                let name = item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned);
+                output.push(GatewayEvent::ToolCallDelta(ToolCallDelta {
+                    content_index: index,
+                    call_id: call_id.to_owned(),
+                    name,
+                    arguments_delta: String::new(),
+                }));
+                Ok(())
+            }
+            Some("reasoning") => {
+                let index = content_index(output_index, 0)?;
+                self.add_content(index, ContentKind::Reasoning, output)
+            }
+            Some("message") => Ok(()),
+            Some("image_generation_call" | "computer_call" | "web_search_call") => Ok(()),
+            _ => Ok(()),
+        }
+    }
+
+    fn output_item_done(
+        &mut self,
+        value: &Value,
+        output: &mut Vec<GatewayEvent>,
+    ) -> Result<(), ProviderError> {
+        self.require_started()?;
+        let item = value.get("item").ok_or_else(protocol_error_marker)?;
+        let output_index = event_index(value, "output_index")?;
+        self.complete_output_item(item, output_index, output)
+    }
+
+    fn complete_output_item(
+        &mut self,
+        item: &Value,
+        output_index: u32,
+        output: &mut Vec<GatewayEvent>,
+    ) -> Result<(), ProviderError> {
+        match item.get("type").and_then(Value::as_str) {
+            Some("function_call" | "custom_tool_call") => {
+                self.tool_item_done(item, output_index, output)
+            }
+            Some("message") => self.message_item_done(item, output_index, output),
+            Some("reasoning") => self.reasoning_item_done(item, output_index, output),
+            Some("output_text" | "text" | "refusal") => {
+                self.text_item_done(item, content_index(output_index, 0)?, output)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn tool_item_done(
+        &mut self,
+        item: &Value,
+        output_index: u32,
+        output: &mut Vec<GatewayEvent>,
+    ) -> Result<(), ProviderError> {
+        let index = content_index(output_index, 0)?;
+        if self.tool_arguments_seen.contains(&index) {
+            return Ok(());
+        }
+        let arguments = item
+            .get("arguments")
+            .or_else(|| item.get("input"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty());
+        let Some(arguments) = arguments else {
+            return Ok(());
+        };
+        let call_id = item
+            .get("call_id")
+            .or_else(|| item.get("id"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(protocol_error_marker)?;
+        if !self.content.contains_key(&index) {
+            self.add_content(index, ContentKind::ToolCall, output)?;
+        }
+        self.tool_arguments_seen.insert(index);
+        output.push(GatewayEvent::ToolCallDelta(ToolCallDelta {
+            content_index: index,
+            call_id: call_id.to_owned(),
+            name: item
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned),
+            arguments_delta: arguments.to_owned(),
+        }));
+        Ok(())
+    }
+
+    fn message_item_done(
+        &mut self,
+        item: &Value,
+        output_index: u32,
+        output: &mut Vec<GatewayEvent>,
+    ) -> Result<(), ProviderError> {
+        let Some(parts) = item.get("content").and_then(Value::as_array) else {
+            return self.text_item_done(item, content_index(output_index, 0)?, output);
+        };
+        for (part_index, part) in parts.iter().enumerate() {
+            let part_index = u32::try_from(part_index).map_err(|_| protocol_error_marker())?;
+            let index = content_index(output_index, part_index)?;
+            if let Some("output_text" | "text" | "refusal") =
+                part.get("type").and_then(Value::as_str)
+            {
+                self.text_item_done(part, index, output)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn reasoning_item_done(
+        &mut self,
+        item: &Value,
+        output_index: u32,
+        output: &mut Vec<GatewayEvent>,
+    ) -> Result<(), ProviderError> {
+        let parts = item
+            .get("summary")
+            .and_then(Value::as_array)
+            .or_else(|| item.get("content").and_then(Value::as_array));
+        let Some(parts) = parts else {
+            return self.reasoning_item_text_done(item, content_index(output_index, 0)?, output);
+        };
+        for (part_index, part) in parts.iter().enumerate() {
+            let part_index = u32::try_from(part_index).map_err(|_| protocol_error_marker())?;
+            let index = content_index(output_index, part_index)?;
+            self.reasoning_item_text_done(part, index, output)?;
+        }
+        Ok(())
+    }
+
+    fn content_part_done(
+        &mut self,
+        value: &Value,
+        output: &mut Vec<GatewayEvent>,
+    ) -> Result<(), ProviderError> {
+        self.require_started()?;
+        let part = value.get("part").ok_or_else(protocol_error_marker)?;
+        let index = event_content_index(value)?;
+        match part.get("type").and_then(Value::as_str) {
+            Some("output_text" | "text" | "refusal") => self.text_item_done(part, index, output),
+            _ => Ok(()),
+        }
+    }
+
+    fn reasoning_part_done(
+        &mut self,
+        value: &Value,
+        output: &mut Vec<GatewayEvent>,
+    ) -> Result<(), ProviderError> {
+        self.require_started()?;
+        let part = value
+            .get("part")
+            .or_else(|| value.get("summary_part"))
+            .ok_or_else(protocol_error_marker)?;
+        self.reasoning_item_text_done(part, event_content_index(value)?, output)
+    }
+
+    fn text_done(
+        &mut self,
+        value: &Value,
+        output: &mut Vec<GatewayEvent>,
+    ) -> Result<(), ProviderError> {
+        self.require_started()?;
+        self.text_item_done(value, event_content_index(value)?, output)
+    }
+
+    fn reasoning_done(
+        &mut self,
+        value: &Value,
+        output: &mut Vec<GatewayEvent>,
+    ) -> Result<(), ProviderError> {
+        self.require_started()?;
+        self.reasoning_item_text_done(value, event_content_index(value)?, output)
+    }
+
+    fn tool_done(
+        &mut self,
+        value: &Value,
+        output: &mut Vec<GatewayEvent>,
+    ) -> Result<(), ProviderError> {
+        self.require_started()?;
+        let output_index = event_index(value, "output_index")?;
+        let index = content_index(output_index, 0)?;
+        if self.tool_arguments_seen.contains(&index) {
+            return Ok(());
+        }
+        let arguments = value
+            .get("arguments")
+            .or_else(|| value.get("input"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty());
+        let Some(arguments) = arguments else {
+            return Ok(());
+        };
+        let call_id = value
+            .get("call_id")
+            .or_else(|| value.get("item_id"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(protocol_error_marker)?;
+        self.ensure_content(index, ContentKind::ToolCall, output)?;
+        self.tool_arguments_seen.insert(index);
+        output.push(GatewayEvent::ToolCallDelta(ToolCallDelta {
+            content_index: index,
+            call_id: call_id.to_owned(),
+            name: None,
+            arguments_delta: arguments.to_owned(),
+        }));
+        Ok(())
+    }
+
+    fn text_item_done(
+        &mut self,
+        value: &Value,
+        index: u32,
+        output: &mut Vec<GatewayEvent>,
+    ) -> Result<(), ProviderError> {
+        let text = value
+            .get("text")
+            .or_else(|| value.get("refusal"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty());
+        let Some(text) = text else {
+            return Ok(());
+        };
+        self.ensure_content(index, ContentKind::Text, output)?;
+        if self.text_output_seen.insert(index) {
+            output.push(GatewayEvent::TextDelta(TextDelta {
+                content_index: index,
+                text: text.to_owned(),
+            }));
+        }
+        Ok(())
+    }
+
+    fn reasoning_item_text_done(
+        &mut self,
+        value: &Value,
+        index: u32,
+        output: &mut Vec<GatewayEvent>,
+    ) -> Result<(), ProviderError> {
+        let text = value
+            .get("text")
+            .or_else(|| value.get("summary"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty());
+        let Some(text) = text else {
+            return Ok(());
+        };
+        self.ensure_content(index, ContentKind::Reasoning, output)?;
+        if self.reasoning_output_seen.insert(index) {
+            output.push(GatewayEvent::ReasoningDelta(ReasoningDelta {
+                content_index: index,
+                text: text.to_owned(),
+            }));
+        }
+        Ok(())
+    }
+
+    fn content_part_added(
+        &mut self,
+        value: &Value,
+        output: &mut Vec<GatewayEvent>,
+    ) -> Result<(), ProviderError> {
+        self.require_started()?;
+        let output_index = event_index(value, "output_index")?;
+        let part_index = optional_event_index(value, "content_index")?.unwrap_or_default();
+        let part = value
+            .get("part")
+            .or_else(|| value.get("summary_part"))
+            .ok_or_else(protocol_error_marker)?;
+        let kind = match part.get("type").and_then(Value::as_str) {
+            Some("output_text" | "refusal") => ContentKind::Text,
+            Some("summary_text" | "reasoning_text") => ContentKind::Reasoning,
+            _ => return Ok(()),
+        };
+        self.add_content(content_index(output_index, part_index)?, kind, output)
+    }
+
+    fn text_delta(
+        &mut self,
+        value: &Value,
+        output: &mut Vec<GatewayEvent>,
+    ) -> Result<(), ProviderError> {
+        self.require_started()?;
+        let index = event_content_index(value)?;
+        self.ensure_content(index, ContentKind::Text, output)?;
+        let text = required_text(value, "delta")?;
+        self.text_output_seen.insert(index);
+        output.push(GatewayEvent::TextDelta(TextDelta {
+            content_index: index,
+            text,
+        }));
+        Ok(())
+    }
+
+    fn reasoning_delta(
+        &mut self,
+        value: &Value,
+        output: &mut Vec<GatewayEvent>,
+    ) -> Result<(), ProviderError> {
+        self.require_started()?;
+        let index = event_content_index(value)?;
+        self.ensure_content(index, ContentKind::Reasoning, output)?;
+        let text = required_text(value, "delta")?;
+        self.reasoning_output_seen.insert(index);
+        output.push(GatewayEvent::ReasoningDelta(ReasoningDelta {
+            content_index: index,
+            text,
+        }));
+        Ok(())
+    }
+
+    fn tool_delta(
+        &mut self,
+        value: &Value,
+        output: &mut Vec<GatewayEvent>,
+    ) -> Result<(), ProviderError> {
+        self.require_started()?;
+        let output_index = event_index(value, "output_index")?;
+        let index = content_index(output_index, 0)?;
+        self.ensure_content(index, ContentKind::ToolCall, output)?;
+        let call_id = value
+            .get("call_id")
+            .or_else(|| value.get("item_id"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(protocol_error_marker)?;
+        let arguments_delta = required_text(value, "delta")?;
+        self.tool_arguments_seen.insert(index);
+        output.push(GatewayEvent::ToolCallDelta(ToolCallDelta {
+            content_index: index,
+            call_id: call_id.to_owned(),
+            name: None,
+            arguments_delta,
+        }));
+        Ok(())
+    }
+
+    fn complete(
+        &mut self,
+        event_type: &str,
+        value: &Value,
+        output: &mut Vec<GatewayEvent>,
+    ) -> Result<(), ProviderError> {
+        let Some(response) = response_object(value) else {
+            self.completed = true;
+            return Ok(());
+        };
+        let Ok(response_id) = required_string(response, "id") else {
+            self.completed = true;
+            return Ok(());
+        };
+        if !self.started || self.response_id.as_deref() != Some(response_id.as_str()) {
+            self.completed = true;
+            return Ok(());
+        }
+        if let Some(items) = response.get("output").and_then(Value::as_array) {
+            for (output_index, item) in items.iter().enumerate() {
+                let output_index =
+                    u32::try_from(output_index).map_err(|_| protocol_error_marker())?;
+                self.complete_output_item(item, output_index, output)?;
+            }
+        }
+        let usage = extract_usage(response);
+        if !self.usage_emitted
+            && let Some(usage) = usage
+        {
+            output.push(GatewayEvent::Usage(core_usage(usage)));
+            self.usage_emitted = true;
+        }
+        let model = response
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|model| !model.is_empty())
+            .unwrap_or(&self.upstream_model)
+            .to_owned();
+        // 按最终发送的模型与档位估算，响应回显仅作观测，不改变本地计价口径。
+        let service_tier = self.requested_service_tier.as_deref();
+        let tool_calls = billable_tool_calls(response);
+        if let Some(breakdown) = usage
+            .filter(|usage| billable_usage_is_complete(response, *usage))
+            .and_then(|usage| {
+                let (web_search_calls, file_search_calls) = tool_calls?;
+                super::usage::openai_billing_breakdown_with_override(
+                    &self.upstream_model,
+                    OpenAiBillingUsage::from(usage)
+                        .with_web_search_calls(web_search_calls, self.web_search_pricing)
+                        .with_file_search_calls(file_search_calls),
+                    service_tier,
+                    self.pricing.as_ref(),
+                )
+            })
+        {
+            output.push(GatewayEvent::CalculatedCost(breakdown.calculated_cost()));
+        }
+        let finish_reason = if event_type == "response.incomplete"
+            || response.get("status").and_then(Value::as_str) == Some("incomplete")
+        {
+            incomplete_finish_reason(response)
+        } else {
+            FinishReason::Stop
+        };
+        output.push(GatewayEvent::Completed(
+            ResponseMeta::new(response_id, model).with_finish_reason(finish_reason),
+        ));
+        self.completed = true;
+        Ok(())
+    }
+
+    fn add_content(
+        &mut self,
+        index: u32,
+        kind: ContentKind,
+        output: &mut Vec<GatewayEvent>,
+    ) -> Result<(), ProviderError> {
+        if self.content.insert(index, kind).is_some() {
+            return Err(protocol_error_marker());
+        }
+        output.push(GatewayEvent::ContentAdded(ContentItem::new(index, kind)));
+        Ok(())
+    }
+
+    fn ensure_content(
+        &mut self,
+        index: u32,
+        kind: ContentKind,
+        output: &mut Vec<GatewayEvent>,
+    ) -> Result<(), ProviderError> {
+        match self.content.get(&index) {
+            Some(current) if *current == kind => Ok(()),
+            Some(_) => Err(protocol_error_marker()),
+            None => self.add_content(index, kind, output),
+        }
+    }
+
+    fn require_started(&self) -> Result<(), ProviderError> {
+        if self.started {
+            Ok(())
+        } else {
+            Err(protocol_error_marker())
+        }
+    }
+}
+
+fn response_object(value: &Value) -> Option<&Value> {
+    value
+        .get("response")
+        .filter(|response| response.is_object())
+}
+
+fn required_text(value: &Value, field: &str) -> Result<String, ProviderError> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(protocol_error_marker)
+}
+
+fn required_string(value: &Value, field: &str) -> Result<String, ProviderError> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .ok_or_else(protocol_error_marker)
+}
+
+fn optional_event_index(value: &Value, field: &str) -> Result<Option<u32>, ProviderError> {
+    value
+        .get(field)
+        .map(|index| {
+            index
+                .as_u64()
+                .and_then(|index| u32::try_from(index).ok())
+                .ok_or_else(protocol_error_marker)
+        })
+        .transpose()
+}
+
+fn event_index(value: &Value, field: &str) -> Result<u32, ProviderError> {
+    optional_event_index(value, field)?.ok_or_else(protocol_error_marker)
+}
+
+fn event_content_index(value: &Value) -> Result<u32, ProviderError> {
+    content_index(
+        event_index(value, "output_index")?,
+        optional_event_index(value, "content_index")?
+            .or(optional_event_index(value, "summary_index")?)
+            .unwrap_or_default(),
+    )
+}
+
+fn content_index(output_index: u32, part_index: u32) -> Result<u32, ProviderError> {
+    if part_index >= CONTENTS_PER_OUTPUT {
+        return Err(protocol_error_marker());
+    }
+    output_index
+        .checked_mul(CONTENTS_PER_OUTPUT)
+        .and_then(|base| base.checked_add(part_index))
+        .ok_or_else(protocol_error_marker)
+}
+
+pub(crate) fn core_usage(usage: TokenUsage) -> Usage {
+    let mut normalized = Usage::new();
+    normalized.input_tokens = Some(usage.input_tokens);
+    normalized.output_tokens = Some(usage.output_tokens);
+    normalized.cached_tokens = Some(usage.cached_tokens);
+    normalized.cache_write_tokens = Some(usage.cache_write_tokens);
+    normalized.reasoning_tokens = Some(usage.reasoning_tokens);
+    normalized.image_input_tokens = Some(usage.image_input_tokens);
+    normalized.image_output_tokens = Some(usage.image_output_tokens);
+    normalized.total_tokens = Some(usage.total_tokens);
+    normalized
+}
+
+fn billable_tool_calls(response: &Value) -> Option<(u64, u64)> {
+    let mut web = 0_u64;
+    let mut file = 0_u64;
+    let items = match response.get("output") {
+        Some(value) => value.as_array()?.as_slice(),
+        None => &[],
+    };
+    for item in items {
+        match item.get("type").and_then(Value::as_str)? {
+            "web_search_call" => match item.pointer("/action/type").and_then(Value::as_str) {
+                Some("search") => web = web.checked_add(1)?,
+                Some("open_page" | "find_in_page") => {}
+                _ => return None,
+            },
+            "file_search_call"
+                if item.get("status").and_then(Value::as_str) == Some("completed") =>
+            {
+                file = file.checked_add(1)?;
+            }
+            // 这些输出没有独立的 OpenAI 工具调用费。
+            "message"
+            | "reasoning"
+            | "function_call"
+            | "custom_tool_call"
+            | "computer_call"
+            | "local_shell_call"
+            | "apply_patch_call"
+            | "mcp_call"
+            | "mcp_list_tools"
+            | "mcp_approval_request"
+            | "compaction" => {}
+            // 容器会话、生图及未知工具需要额外计费事实，不能把 token 小计
+            // 当作完整费用。
+            _ => return None,
+        }
+    }
+    Some((web, file))
+}
+
+fn incomplete_finish_reason(response: &Value) -> FinishReason {
+    match response
+        .pointer("/incomplete_details/reason")
+        .and_then(Value::as_str)
+    {
+        Some("max_output_tokens" | "max_tokens") => FinishReason::Length,
+        Some("content_filter") => FinishReason::ContentFilter,
+        _ => FinishReason::Other,
+    }
+}
+
+fn protocol_error(_error: impl std::fmt::Debug) -> ProviderError {
+    protocol_error_marker()
+}
+
+fn protocol_error_marker() -> ProviderError {
+    ProviderError::new(ProviderErrorKind::Protocol, UpstreamSendState::Sent)
+        .redact_sensitive_context("invalid upstream event")
+}

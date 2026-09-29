@@ -1,0 +1,462 @@
+//! Codex credential 的 Provider-owned 明文结构与安全运行时值对象。
+
+use std::fmt;
+
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use chrono::{DateTime, Utc};
+use secrecy::SecretString;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use url::Url;
+
+/// OAuth AT/RT/ID Token；`Debug` 永不输出明文。
+#[derive(Clone)]
+pub struct CodexOAuthSecret {
+    pub access_token: SecretString,
+    pub refresh_token: Option<SecretString>,
+    pub id_token: Option<SecretString>,
+}
+
+impl fmt::Debug for CodexOAuthSecret {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CodexOAuthSecret")
+            .field("access_token", &"<redacted>")
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("id_token", &self.id_token.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// OAuth credential 持久化时使用的账号投影。
+#[derive(Clone)]
+pub struct CodexAccountProfile {
+    pub email: Option<String>,
+    pub oauth_subject: String,
+    pub poid: Option<String>,
+    pub chatgpt_account_id: String,
+    pub chatgpt_user_id: String,
+    pub plan_type: Option<String>,
+    pub access_token_expires_at: Option<DateTime<Utc>>,
+}
+
+/// 从 ChatGPT OAuth JWT payload 尽力提取的账号资料。
+///
+/// 这只是与官方客户端一致的 base64 JSON 读取，不校验 JWT 签名或 claims。
+#[derive(Clone, Default)]
+pub(crate) struct CodexOAuthMetadata {
+    pub(crate) email: Option<String>,
+    pub(crate) chatgpt_plan_type: Option<String>,
+    pub(crate) chatgpt_user_id: Option<String>,
+    pub(crate) chatgpt_account_id: Option<String>,
+}
+
+impl fmt::Debug for CodexOAuthMetadata {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CodexOAuthMetadata")
+            .field("email", &self.email.as_ref().map(|_| "<redacted>"))
+            .field(
+                "chatgpt_user_id",
+                &self.chatgpt_user_id.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "chatgpt_account_id",
+                &self.chatgpt_account_id.as_ref().map(|_| "<redacted>"),
+            )
+            .field("chatgpt_plan_type", &self.chatgpt_plan_type)
+            .finish()
+    }
+}
+
+/// 按官方 `token_data.rs::parse_chatgpt_jwt_claims` 的字段优先级读取 JWT payload。
+///
+/// 官方对 ID token 和外部 ChatGPT access token 复用同一解析逻辑。JWT 外形、
+/// payload base64 或 JSON 无法解析时返回错误；这不是签名或 claims 验证。
+/// 各账号字段本身仍全部可缺失。
+pub(crate) fn parse_chatgpt_jwt_claims(jwt: &str) -> Result<CodexOAuthMetadata, ()> {
+    let claims = decode_jwt_payload::<IdClaims>(jwt)?;
+    let email = claims
+        .email
+        .or_else(|| claims.profile.and_then(|profile| profile.email));
+    let Some(auth) = claims.auth else {
+        return Ok(CodexOAuthMetadata {
+            email,
+            ..CodexOAuthMetadata::default()
+        });
+    };
+    Ok(CodexOAuthMetadata {
+        email,
+        chatgpt_plan_type: auth.chatgpt_plan_type.map(ChatgptPlanType::into_raw_value),
+        chatgpt_user_id: auth.chatgpt_user_id.or(auth.user_id),
+        chatgpt_account_id: auth.chatgpt_account_id,
+    })
+}
+
+/// 按官方 Codex 的方式，从 access token JWT payload 读取调度所需的过期时刻。
+///
+/// 此处只投影未验证的 `exp`，不把它当作身份或签名验证结果。无法解析或缺少
+/// `exp` 的直接导入仍可保留为没有已知过期时刻的 OAuth 凭据。
+pub(crate) fn parse_access_token_expiration(jwt: &str) -> Option<DateTime<Utc>> {
+    let claims = decode_jwt_payload::<StandardJwtClaims>(jwt).ok()?;
+    claims
+        .exp
+        .and_then(|seconds| DateTime::<Utc>::from_timestamp(seconds, 0))
+}
+
+#[derive(Deserialize)]
+struct IdClaims {
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(rename = "https://api.openai.com/profile", default)]
+    profile: Option<ProfileClaims>,
+    #[serde(rename = "https://api.openai.com/auth", default)]
+    auth: Option<AuthClaims>,
+}
+
+#[derive(Deserialize)]
+struct StandardJwtClaims {
+    #[serde(default)]
+    exp: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct ProfileClaims {
+    #[serde(default)]
+    email: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AuthClaims {
+    #[serde(default)]
+    chatgpt_plan_type: Option<ChatgptPlanType>,
+    #[serde(default)]
+    chatgpt_user_id: Option<String>,
+    #[serde(default)]
+    user_id: Option<String>,
+    #[serde(default)]
+    chatgpt_account_id: Option<String>,
+    #[serde(rename = "chatgpt_account_is_fedramp", default)]
+    _chatgpt_account_is_fedramp: bool,
+}
+
+/// 与官方 `codex_protocol::auth::PlanType` 同构的 claims 反序列化类型。
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ChatgptPlanType {
+    Known(KnownChatgptPlan),
+    Unknown(String),
+}
+
+impl ChatgptPlanType {
+    fn into_raw_value(self) -> String {
+        match self {
+            Self::Known(plan) => plan.raw_value().to_owned(),
+            Self::Unknown(raw) => raw,
+        }
+    }
+}
+
+/// 与官方 `codex_protocol::auth::KnownPlan` 的 wire 名称和 aliases 保持一致。
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum KnownChatgptPlan {
+    Free,
+    Go,
+    Plus,
+    Pro,
+    ProLite,
+    Team,
+    #[serde(rename = "self_serve_business_prolite")]
+    SelfServeBusinessProLite,
+    #[serde(rename = "self_serve_business_usage_based")]
+    SelfServeBusinessUsageBased,
+    Business,
+    Ent26,
+    #[serde(rename = "enterprise_cbp_automation")]
+    EnterpriseCbpAutomation,
+    #[serde(rename = "enterprise_cbp_usage_based")]
+    EnterpriseCbpUsageBased,
+    #[serde(alias = "hc")]
+    Enterprise,
+    #[serde(alias = "education")]
+    Edu,
+}
+
+impl KnownChatgptPlan {
+    const fn raw_value(self) -> &'static str {
+        match self {
+            Self::Free => "free",
+            Self::Go => "go",
+            Self::Plus => "plus",
+            Self::Pro => "pro",
+            Self::ProLite => "prolite",
+            Self::Team => "team",
+            Self::SelfServeBusinessProLite => "self_serve_business_prolite",
+            Self::SelfServeBusinessUsageBased => "self_serve_business_usage_based",
+            Self::Business => "business",
+            Self::Ent26 => "ent26",
+            Self::EnterpriseCbpAutomation => "enterprise_cbp_automation",
+            Self::EnterpriseCbpUsageBased => "enterprise_cbp_usage_based",
+            Self::Enterprise => "enterprise",
+            Self::Edu => "edu",
+        }
+    }
+}
+
+fn decode_jwt_payload<T: DeserializeOwned>(jwt: &str) -> Result<T, ()> {
+    let mut parts = jwt.split('.');
+    let (Some(header), Some(payload), Some(signature)) = (parts.next(), parts.next(), parts.next())
+    else {
+        return Err(());
+    };
+    if header.is_empty() || payload.is_empty() || signature.is_empty() {
+        return Err(());
+    }
+    let payload = URL_SAFE_NO_PAD.decode(payload).map_err(|_| ())?;
+    serde_json::from_slice(&payload).map_err(|_| ())
+}
+
+impl fmt::Debug for CodexAccountProfile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CodexAccountProfile")
+            .field("email", &self.email.as_ref().map(|_| "<redacted>"))
+            .field("oauth_subject", &"<redacted>")
+            .field("poid", &self.poid.as_ref().map(|_| "<redacted>"))
+            .field("chatgpt_account_id", &"<redacted>")
+            .field("chatgpt_user_id", &"<redacted>")
+            .field("plan_type", &self.plan_type)
+            .field("access_token_expires_at", &self.access_token_expires_at)
+            .finish()
+    }
+}
+
+/// 持久化在 Provider credential JSON 中的签名认证主体。
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CodexCredentialPrincipal {
+    pub oauth_subject: String,
+    pub poid: Option<String>,
+}
+
+impl fmt::Debug for CodexCredentialPrincipal {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CodexCredentialPrincipal")
+            .field("oauth_subject", &"<redacted>")
+            .field("poid", &self.poid.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// 存在 `provider_credentials_json` 内的 Cookie。
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CodexCookie {
+    pub name: String,
+    pub value: String,
+    pub domain: String,
+    pub path: String,
+    pub host_only: bool,
+    pub secure: bool,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+impl fmt::Debug for CodexCookie {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CodexCookie")
+            .field("name", &self.name)
+            .field("value", &"<redacted>")
+            .field("domain", &self.domain)
+            .field("path", &self.path)
+            .field("host_only", &self.host_only)
+            .field("secure", &self.secure)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+pub const CODEX_AUTHENTICATION_KIND_OAUTH: &str = "oauth";
+
+/// Codex OAuth 对 `provider_credentials_json` 的完整明文 schema。
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CodexOAuthCredentialData {
+    pub schema_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<CodexCredentialPrincipal>,
+    pub installation_id: String,
+    pub access_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_client_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_scope: Option<String>,
+    #[serde(default)]
+    pub cookies: Vec<CodexCookie>,
+}
+
+impl fmt::Debug for CodexOAuthCredentialData {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CodexOAuthCredentialData")
+            .field("schema_version", &self.schema_version)
+            .field("principal", &self.principal)
+            .field("installation_id", &"<pseudonymous>")
+            .field("access_token", &"<redacted>")
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("id_token", &self.id_token.as_ref().map(|_| "<redacted>"))
+            .field("oauth_client_id", &self.oauth_client_id)
+            .field("oauth_scope", &self.oauth_scope)
+            .field("cookies", &self.cookies)
+            .finish()
+    }
+}
+
+/// OpenAI Provider 的规范化凭据形态。
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CodexCredentialData {
+    OAuth(CodexOAuthCredentialData),
+    ApiKey(super::api_key::ApiKeyCredentialData),
+}
+
+impl CodexCredentialData {
+    #[must_use]
+    pub const fn authentication_kind(&self) -> &'static str {
+        match self {
+            Self::OAuth(_) => CODEX_AUTHENTICATION_KIND_OAUTH,
+            Self::ApiKey(_) => super::api_key::CODEX_AUTHENTICATION_KIND_API_KEY,
+        }
+    }
+
+    #[must_use]
+    pub fn installation_id(&self) -> &str {
+        match self {
+            Self::OAuth(data) => &data.installation_id,
+            Self::ApiKey(data) => &data.installation_id,
+        }
+    }
+
+    #[must_use]
+    pub fn cookies(&self) -> &[CodexCookie] {
+        match self {
+            Self::OAuth(data) => &data.cookies,
+            Self::ApiKey(_) => &[],
+        }
+    }
+
+    pub fn cookies_mut(&mut self) -> Option<&mut Vec<CodexCookie>> {
+        match self {
+            Self::OAuth(data) => Some(&mut data.cookies),
+            Self::ApiKey(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub fn oauth(&self) -> Option<&CodexOAuthCredentialData> {
+        match self {
+            Self::OAuth(data) => Some(data),
+            Self::ApiKey(_) => None,
+        }
+    }
+
+    pub fn oauth_mut(&mut self) -> Option<&mut CodexOAuthCredentialData> {
+        match self {
+            Self::OAuth(data) => Some(data),
+            Self::ApiKey(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub fn has_refresh_token(&self) -> bool {
+        self.oauth()
+            .is_some_and(|data| data.refresh_token.is_some())
+    }
+}
+
+impl fmt::Debug for CodexCredentialData {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OAuth(data) => data.fmt(formatter),
+            Self::ApiKey(data) => data.fmt(formatter),
+        }
+    }
+}
+
+/// 运行时使用的 Cookie；值受 `secrecy` 保护。
+pub struct RuntimeCodexCookie {
+    pub name: String,
+    pub value: SecretString,
+    pub domain: String,
+    pub path: String,
+    pub host_only: bool,
+    pub secure: bool,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+impl fmt::Debug for RuntimeCodexCookie {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RuntimeCodexCookie")
+            .field("name", &self.name)
+            .field("value", &"<redacted>")
+            .field("domain", &self.domain)
+            .field("path", &self.path)
+            .field("host_only", &self.host_only)
+            .field("secure", &self.secure)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+/// 一批 `Set-Cookie` CAS 写回的结果。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CodexCookieCaptureOutcome {
+    pub credential_revision: Option<u64>,
+    pub rejected: usize,
+}
+
+/// 单个已验证 Cookie 的 Provider JSON CAS 输入。
+pub struct UpsertCodexCookie {
+    pub account_id: String,
+    pub expected_credential_revision: u64,
+    pub response_origin: Url,
+    pub domain_attribute: Option<String>,
+    pub name: String,
+    pub value: SecretString,
+    pub path: String,
+    pub secure: bool,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub delete: bool,
+}
+
+impl fmt::Debug for UpsertCodexCookie {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UpsertCodexCookie")
+            .field("account_id", &self.account_id)
+            .field(
+                "expected_credential_revision",
+                &self.expected_credential_revision,
+            )
+            .field("response_origin", &self.response_origin)
+            .field("domain_attribute", &self.domain_attribute)
+            .field("name", &self.name)
+            .field("value", &"<redacted>")
+            .field("path", &self.path)
+            .field("secure", &self.secure)
+            .field("expires_at", &self.expires_at)
+            .field("delete", &self.delete)
+            .finish()
+    }
+}

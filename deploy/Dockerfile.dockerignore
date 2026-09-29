@@ -1,0 +1,35 @@
+# Build outputs and dependency caches.
+**/target/
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+dist/*
+!dist/docker/
+!dist/docker/**
+
+# Application runtime state.
+.runtime/
+data/
+logs/
+deploy/data/
+deploy/logs/
+*.log
+
+# Local configuration.
+local.yaml
+local.yml
+.env
+config.yaml
+deploy/config.yaml
+deploy/.env
+
+# Local workspaces and tooling state.
+.git/
+.codegraph/
+.worktrees/
+worktrees/
+.codex-ws-audit/
+.agents/
+.cargo/
+.reasonix/
+*.tmp

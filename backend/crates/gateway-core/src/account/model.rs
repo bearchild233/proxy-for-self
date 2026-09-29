@@ -1,0 +1,1416 @@
+//! Provider 账号、明文 credential 与持久状态值对象。
+
+use std::fmt;
+use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
+use std::time::{Duration, SystemTime};
+
+use serde_json::{Map, Value};
+
+use crate::identity::ProviderKind;
+use crate::validation::{IdentifierError, validate_text};
+
+use super::CredentialError;
+
+/// `provider_accounts.id` 的核心值对象。
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ProviderAccountId(String);
+
+impl ProviderAccountId {
+    /// 校验并创建账号 ID。
+    ///
+    /// # Errors
+    ///
+    /// ID 缺少 `acct_` 前缀或不满足通用文本约束时返回错误。
+    pub fn new(value: impl Into<String>) -> Result<Self, IdentifierError> {
+        let value = value.into();
+        validate_text(&value, 128, false, Some("acct_"))?;
+        Ok(Self(value))
+    }
+
+    /// 返回数据库 ID 文本。
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Per-account scheduling concurrency override.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AccountConcurrencyLimit(NonZeroU32);
+
+impl AccountConcurrencyLimit {
+    #[must_use]
+    pub const fn new(value: u32) -> Option<Self> {
+        match NonZeroU32::new(value) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
+
+    #[must_use]
+    pub const fn into_non_zero(self) -> NonZeroU32 {
+        self.0
+    }
+}
+
+/// 账号继承默认值或应用独立覆盖后的实际并发约束。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountConcurrency {
+    Unlimited,
+    Limited(NonZeroU32),
+}
+
+impl AccountConcurrency {
+    /// 配置值零表示不限制；账号独立覆盖仍只接受正数。
+    #[must_use]
+    pub const fn new(value: u32) -> Self {
+        match NonZeroU32::new(value) {
+            Some(limit) => Self::Limited(limit),
+            None => Self::Unlimited,
+        }
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        match self {
+            Self::Unlimited => 0,
+            Self::Limited(limit) => limit.get(),
+        }
+    }
+
+    #[must_use]
+    pub const fn limit(self) -> Option<NonZeroU32> {
+        match self {
+            Self::Unlimited => None,
+            Self::Limited(limit) => Some(limit),
+        }
+    }
+}
+
+impl From<NonZeroU32> for AccountConcurrency {
+    fn from(limit: NonZeroU32) -> Self {
+        Self::Limited(limit)
+    }
+}
+
+/// Relative scheduling priority for an account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AccountWeight(NonZeroU16);
+
+impl AccountWeight {
+    pub const DEFAULT: Self = Self(NonZeroU16::MIN);
+    pub const MAX: u16 = 100;
+
+    #[must_use]
+    pub const fn new(value: u16) -> Option<Self> {
+        match NonZeroU16::new(value) {
+            Some(value) if value.get() <= Self::MAX => Some(Self(value)),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u16 {
+        self.0.get()
+    }
+}
+
+impl Default for AccountWeight {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+impl fmt::Display for ProviderAccountId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// credential 轮换时可选替换的上游账号身份。
+#[derive(Clone, PartialEq, Eq)]
+pub struct ProviderAccountIdentity {
+    upstream_user_id: String,
+    upstream_account_id: Option<String>,
+}
+
+impl fmt::Debug for ProviderAccountIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderAccountIdentity")
+            .field("upstream_user_id", &"<redacted>")
+            .field(
+                "upstream_account_id",
+                &self.upstream_account_id.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+impl ProviderAccountIdentity {
+    #[must_use]
+    pub const fn new(upstream_user_id: String, upstream_account_id: Option<String>) -> Self {
+        Self {
+            upstream_user_id,
+            upstream_account_id,
+        }
+    }
+
+    #[must_use]
+    pub fn upstream_user_id(&self) -> &str {
+        &self.upstream_user_id
+    }
+
+    #[must_use]
+    pub fn upstream_account_id(&self) -> Option<&str> {
+        self.upstream_account_id.as_deref()
+    }
+}
+
+/// `provider_accounts.credential_revision` 的正数 CAS revision。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CredentialRevision(NonZeroU64);
+
+impl CredentialRevision {
+    /// 创建正数 revision。
+    ///
+    /// # Errors
+    ///
+    /// `value` 为零时返回错误。
+    pub fn new(value: u64) -> Result<Self, CredentialError> {
+        NonZeroU64::new(value)
+            .map(Self)
+            .ok_or(CredentialError::InvalidRevision)
+    }
+
+    /// 返回 revision 数值。
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+
+    /// 返回下一个 revision；溢出时返回错误。
+    ///
+    /// # Errors
+    ///
+    /// 当前 revision 已是 `u64::MAX` 时返回错误。
+    pub fn next(self) -> Result<Self, CredentialError> {
+        self.get()
+            .checked_add(1)
+            .and_then(NonZeroU64::new)
+            .map(Self)
+            .ok_or(CredentialError::RevisionOverflow)
+    }
+}
+
+/// Provider-owned 的明文 credential JSON。
+///
+/// Core 只保证顶层是 object，绝不读取其中的 AT、RT、Cookie 或 Provider key。
+#[derive(Clone, PartialEq)]
+pub struct PlaintextCredential(Map<String, Value>);
+
+impl PlaintextCredential {
+    /// 接受由具体 Provider 完整校验后的 JSON object。
+    #[must_use]
+    pub const fn new(value: Map<String, Value>) -> Self {
+        Self(value)
+    }
+
+    /// 将明文 object 借给对应 Provider adapter。
+    #[must_use]
+    pub const fn expose_to_provider(&self) -> &Map<String, Value> {
+        &self.0
+    }
+
+    /// 将明文 object 交给 Store adapter 持久化。
+    #[must_use]
+    pub fn into_inner(self) -> Map<String, Value> {
+        self.0
+    }
+}
+
+impl fmt::Debug for PlaintextCredential {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PlaintextCredential")
+            .field("keys", &self.0.keys().collect::<Vec<_>>())
+            .field("values", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Provider-owned 的任意 JSON object；公共层只搬运、不读取内部 key。
+#[derive(Clone, PartialEq, Eq)]
+pub struct OpaqueProviderData(Map<String, Value>);
+
+impl OpaqueProviderData {
+    #[must_use]
+    pub const fn new(value: Map<String, Value>) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn expose_to_provider(&self) -> &Map<String, Value> {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn into_inner(self) -> Map<String, Value> {
+        self.0
+    }
+}
+
+impl fmt::Debug for OpaqueProviderData {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OpaqueProviderData")
+            .field("keys", &self.0.keys().collect::<Vec<_>>())
+            .field("values", &"<provider-owned>")
+            .finish()
+    }
+}
+
+/// 已持久化的凭据/账号身份状态。
+///
+/// 这里只保存凭据与账号身份事实。额度耗尽属于 [`QuotaState`]，临时 429 属于
+/// 运行时冷却；二者都不得写入此枚举。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CredentialState {
+    Unknown,
+    Ready,
+    Expired,
+    Banned,
+    Invalid,
+}
+
+impl CredentialState {
+    /// 返回数据库稳定值。
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Ready => "ready",
+            Self::Expired => "expired",
+            Self::Banned => "banned",
+            Self::Invalid => "invalid",
+        }
+    }
+
+    /// 返回该凭据状态对应的稳定错误原因。
+    #[must_use]
+    pub const fn error_reason(self) -> Option<AccountErrorReason> {
+        match self {
+            Self::Unknown => Some(AccountErrorReason::AccountUnverified),
+            Self::Expired => Some(AccountErrorReason::CredentialExpired),
+            Self::Banned => Some(AccountErrorReason::AccountBanned),
+            Self::Invalid => Some(AccountErrorReason::CredentialInvalid),
+            Self::Ready => None,
+        }
+    }
+
+    /// 解析数据库稳定值。
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "unknown" => Some(Self::Unknown),
+            "ready" => Some(Self::Ready),
+            "expired" => Some(Self::Expired),
+            "banned" => Some(Self::Banned),
+            "invalid" => Some(Self::Invalid),
+            _ => None,
+        }
+    }
+}
+
+/// 额度访问结论；百分比和余额等展示值不进入此枚举。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum QuotaAccessState {
+    Unknown,
+    Allowed,
+    Exhausted,
+}
+
+impl QuotaAccessState {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Allowed => "allowed",
+            Self::Exhausted => "exhausted",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "unknown" => Some(Self::Unknown),
+            "allowed" => Some(Self::Allowed),
+            "exhausted" => Some(Self::Exhausted),
+            _ => None,
+        }
+    }
+}
+
+/// 权威额度耗尽证据。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum QuotaEvidence {
+    ProviderDenied,
+    AccountLimitReached,
+    UsageLimitReached,
+    PaymentRequired,
+}
+
+impl QuotaEvidence {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ProviderDenied => "provider_denied",
+            Self::AccountLimitReached => "account_limit_reached",
+            Self::UsageLimitReached => "usage_limit_reached",
+            Self::PaymentRequired => "payment_required",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "provider_denied" => Some(Self::ProviderDenied),
+            "account_limit_reached" => Some(Self::AccountLimitReached),
+            "usage_limit_reached" => Some(Self::UsageLimitReached),
+            "payment_required" => Some(Self::PaymentRequired),
+            _ => None,
+        }
+    }
+}
+
+/// 可审计的额度访问事实。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuotaState {
+    access: QuotaAccessState,
+    evidence: Option<QuotaEvidence>,
+    observed_at: Option<SystemTime>,
+    reset_at: Option<SystemTime>,
+}
+
+impl Default for QuotaState {
+    fn default() -> Self {
+        Self::unknown()
+    }
+}
+
+impl QuotaState {
+    #[must_use]
+    pub const fn unknown() -> Self {
+        Self {
+            access: QuotaAccessState::Unknown,
+            evidence: None,
+            observed_at: None,
+            reset_at: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn observed_unknown(observed_at: SystemTime) -> Self {
+        Self {
+            access: QuotaAccessState::Unknown,
+            evidence: None,
+            observed_at: Some(observed_at),
+            reset_at: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn allowed(observed_at: SystemTime) -> Self {
+        Self {
+            access: QuotaAccessState::Allowed,
+            evidence: None,
+            observed_at: Some(observed_at),
+            reset_at: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn exhausted(
+        evidence: QuotaEvidence,
+        observed_at: SystemTime,
+        reset_at: Option<SystemTime>,
+    ) -> Self {
+        Self {
+            access: QuotaAccessState::Exhausted,
+            evidence: Some(evidence),
+            observed_at: Some(observed_at),
+            reset_at,
+        }
+    }
+
+    /// 从持久化列恢复额度状态；非法组合返回 `None`。
+    #[must_use]
+    pub const fn from_persisted(
+        access: QuotaAccessState,
+        evidence: Option<QuotaEvidence>,
+        observed_at: Option<SystemTime>,
+        reset_at: Option<SystemTime>,
+    ) -> Option<Self> {
+        match access {
+            QuotaAccessState::Unknown if evidence.is_none() && reset_at.is_none() => Some(Self {
+                access,
+                evidence,
+                observed_at,
+                reset_at,
+            }),
+            QuotaAccessState::Allowed
+                if evidence.is_none() && observed_at.is_some() && reset_at.is_none() =>
+            {
+                Some(Self {
+                    access,
+                    evidence,
+                    observed_at,
+                    reset_at,
+                })
+            }
+            QuotaAccessState::Exhausted if evidence.is_some() && observed_at.is_some() => {
+                Some(Self {
+                    access,
+                    evidence,
+                    observed_at,
+                    reset_at,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn access(self) -> QuotaAccessState {
+        self.access
+    }
+
+    #[must_use]
+    pub const fn evidence(self) -> Option<QuotaEvidence> {
+        self.evidence
+    }
+
+    #[must_use]
+    pub const fn observed_at(self) -> Option<SystemTime> {
+        self.observed_at
+    }
+
+    #[must_use]
+    pub const fn reset_at(self) -> Option<SystemTime> {
+        self.reset_at
+    }
+
+    /// 返回当前已确认的额度耗尽结论。
+    ///
+    /// `reset_at` 只表示何时应重新向 Provider 求证；时间到期本身不是额度恢复证据。
+    #[must_use]
+    pub fn is_exhausted(self) -> bool {
+        self.access == QuotaAccessState::Exhausted
+    }
+
+    /// 判断已耗尽额度是否到达 Provider 的下一次复核时间。
+    ///
+    /// 有明确 `reset_at` 时严格等待该时刻；没有时由 Provider 传入自己的保守复核周期。
+    #[must_use]
+    pub fn exhaustion_refresh_due(self, now: SystemTime, fallback_interval: Duration) -> bool {
+        if !self.is_exhausted() {
+            return false;
+        }
+        let due_at = self.reset_at.or_else(|| {
+            self.observed_at
+                .and_then(|observed_at| observed_at.checked_add(fallback_interval))
+        });
+        due_at.is_none_or(|due_at| due_at <= now)
+    }
+
+    /// 合并一次额度访问观察；`Unknown` 不能擦除已经确认的访问结论。
+    #[must_use]
+    pub fn merge_observation(self, observation: Self) -> Self {
+        if observation.access == QuotaAccessState::Unknown
+            && self.access != QuotaAccessState::Unknown
+        {
+            self
+        } else {
+            observation
+        }
+    }
+}
+
+/// 对外唯一的五态账号状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AccountStatus {
+    Normal,
+    QuotaExhausted,
+    RateLimited,
+    Disabled,
+    Error,
+}
+
+impl AccountStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::QuotaExhausted => "quota_exhausted",
+            Self::RateLimited => "rate_limited",
+            Self::Disabled => "disabled",
+            Self::Error => "error",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "normal" => Some(Self::Normal),
+            "quota_exhausted" => Some(Self::QuotaExhausted),
+            "rate_limited" => Some(Self::RateLimited),
+            "disabled" => Some(Self::Disabled),
+            "error" => Some(Self::Error),
+            _ => None,
+        }
+    }
+
+    /// 管理页稳定业务排序：正常、限流、耗尽、错误、停用。
+    #[must_use]
+    pub const fn sort_rank(self) -> u8 {
+        match self {
+            Self::Normal => 0,
+            Self::RateLimited => 1,
+            Self::QuotaExhausted => 2,
+            Self::Error => 3,
+            Self::Disabled => 4,
+        }
+    }
+}
+
+/// `error` 状态下的稳定原因码。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AccountErrorReason {
+    AccountUnverified,
+    AccessTokenExpired,
+    CredentialExpired,
+    CredentialInvalid,
+    AccountBanned,
+}
+
+impl AccountErrorReason {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AccountUnverified => "account_unverified",
+            Self::AccessTokenExpired => "access_token_expired",
+            Self::CredentialExpired => "credential_expired",
+            Self::CredentialInvalid => "credential_invalid",
+            Self::AccountBanned => "account_banned",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "account_unverified" => Some(Self::AccountUnverified),
+            "access_token_expired" => Some(Self::AccessTokenExpired),
+            "credential_expired" => Some(Self::CredentialExpired),
+            "credential_invalid" => Some(Self::CredentialInvalid),
+            "account_banned" => Some(Self::AccountBanned),
+            _ => None,
+        }
+    }
+}
+
+/// 账号冷却的原因与恢复方式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AccountCooldownKind {
+    /// 上游 429 临时限流；默认类别，兼容升级前未标记的存量 key。
+    #[default]
+    RateLimit,
+    /// 容量类错误高频触发后由熔断策略写入的自动冻结。
+    CapacityFreeze,
+    /// 到期后仍阻止调度，必须由恢复探测成功或管理员恢复解除。
+    CapacityFreezeProbe,
+}
+
+impl AccountCooldownKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RateLimit => "rate_limit",
+            Self::CapacityFreeze => "capacity_freeze",
+            Self::CapacityFreezeProbe => "capacity_freeze_probe",
+        }
+    }
+
+    #[must_use]
+    pub const fn is_capacity_freeze(self) -> bool {
+        matches!(self, Self::CapacityFreeze | Self::CapacityFreezeProbe)
+    }
+
+    #[must_use]
+    pub const fn requires_probe(self) -> bool {
+        matches!(self, Self::CapacityFreezeProbe)
+    }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "rate_limit" => Some(Self::RateLimit),
+            "capacity_freeze" => Some(Self::CapacityFreeze),
+            "capacity_freeze_probe" => Some(Self::CapacityFreezeProbe),
+            _ => None,
+        }
+    }
+}
+
+/// 账号级冷却投影；探测冻结的 until 是下次探测时间，不是自动放行时间。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccountCooldown {
+    pub until: SystemTime,
+    pub kind: AccountCooldownKind,
+}
+
+impl AccountCooldown {
+    #[must_use]
+    pub fn is_active(self, now: SystemTime) -> bool {
+        self.kind.requires_probe() || self.until > now
+    }
+}
+
+impl From<SystemTime> for AccountCooldown {
+    fn from(until: SystemTime) -> Self {
+        Self {
+            until,
+            kind: AccountCooldownKind::RateLimit,
+        }
+    }
+}
+
+/// 唯一状态解析器的完整输入事实。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountStatusFacts {
+    pub enabled: bool,
+    pub credential_state: CredentialState,
+    pub access_token_expires_at: Option<SystemTime>,
+    pub quota: QuotaState,
+    pub cooldown: Option<AccountCooldown>,
+    pub last_error_reason: Option<AccountErrorReason>,
+    pub last_error_message: Option<String>,
+}
+
+/// 唯一状态解析器的输出。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountStatusProjection {
+    pub status: AccountStatus,
+    pub error_reason: Option<AccountErrorReason>,
+    pub error_message: Option<String>,
+    /// 仅 `rate_limited` 状态携带仍有效的运行时冷却事实。
+    pub cooldown: Option<AccountCooldown>,
+}
+
+/// 从独立事实派生唯一、互斥的对外状态。
+#[must_use]
+pub fn resolve_account_status(
+    facts: &AccountStatusFacts,
+    now: SystemTime,
+) -> AccountStatusProjection {
+    if !facts.enabled {
+        return status_projection(AccountStatus::Disabled);
+    }
+    let credential_error = facts.credential_state.error_reason().or_else(|| {
+        facts
+            .access_token_expires_at
+            .is_some_and(|expires_at| expires_at <= now)
+            .then_some(AccountErrorReason::AccessTokenExpired)
+    });
+    if let Some(default_reason) = credential_error {
+        return AccountStatusProjection {
+            status: AccountStatus::Error,
+            error_reason: Some(facts.last_error_reason.unwrap_or(default_reason)),
+            error_message: facts.last_error_message.clone(),
+            cooldown: None,
+        };
+    }
+    if facts.quota.is_exhausted() {
+        return status_projection(AccountStatus::QuotaExhausted);
+    }
+    if facts
+        .cooldown
+        .is_some_and(|cooldown| cooldown.is_active(now))
+    {
+        return AccountStatusProjection {
+            status: AccountStatus::RateLimited,
+            error_reason: None,
+            error_message: None,
+            cooldown: facts.cooldown,
+        };
+    }
+    status_projection(AccountStatus::Normal)
+}
+
+const fn status_projection(status: AccountStatus) -> AccountStatusProjection {
+    AccountStatusProjection {
+        status,
+        error_reason: None,
+        error_message: None,
+        cooldown: None,
+    }
+}
+
+/// 账号持久事实；代理认证信息只通过显式 secret accessor 读取。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderAccount {
+    id: ProviderAccountId,
+    provider: ProviderKind,
+    name: String,
+    email: Option<String>,
+    upstream_user_id: Option<String>,
+    upstream_account_id: Option<String>,
+    plan_type: Option<String>,
+    authentication_kind: String,
+    revision: CredentialRevision,
+    enabled: bool,
+    concurrency_limit: Option<AccountConcurrencyLimit>,
+    weight: AccountWeight,
+    model_access: super::AccountModelAccess,
+    credential_state: CredentialState,
+    quota: QuotaState,
+    last_error_reason: Option<AccountErrorReason>,
+    last_error_message: Option<String>,
+    access_token_expires_at: Option<SystemTime>,
+    next_refresh_at: Option<SystemTime>,
+    has_refresh_token: bool,
+    outbound_proxy: Option<super::OutboundProxy>,
+    request_location: Option<super::RequestLocation>,
+}
+
+impl ProviderAccount {
+    /// 创建账号快照。
+    #[must_use]
+    pub const fn new(
+        id: ProviderAccountId,
+        provider: ProviderKind,
+        name: String,
+        upstream_user_id: Option<String>,
+        authentication_kind: String,
+        revision: CredentialRevision,
+        access_token_expires_at: Option<SystemTime>,
+    ) -> Self {
+        Self {
+            id,
+            provider,
+            name,
+            email: None,
+            upstream_user_id,
+            upstream_account_id: None,
+            plan_type: None,
+            authentication_kind,
+            revision,
+            enabled: true,
+            concurrency_limit: None,
+            weight: AccountWeight::DEFAULT,
+            model_access: super::AccountModelAccess::all(),
+            credential_state: CredentialState::Unknown,
+            quota: QuotaState::unknown(),
+            last_error_reason: None,
+            last_error_message: None,
+            access_token_expires_at,
+            next_refresh_at: None,
+            has_refresh_token: false,
+            outbound_proxy: None,
+            request_location: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_profile(
+        mut self,
+        email: Option<String>,
+        upstream_account_id: Option<String>,
+        plan_type: Option<String>,
+    ) -> Self {
+        self.email = email;
+        self.upstream_account_id = upstream_account_id;
+        self.plan_type = plan_type;
+        self
+    }
+
+    #[must_use]
+    pub fn with_model_access(mut self, model_access: super::AccountModelAccess) -> Self {
+        self.model_access = model_access;
+        self
+    }
+
+    #[must_use]
+    pub const fn model_access(&self) -> &super::AccountModelAccess {
+        &self.model_access
+    }
+
+    #[must_use]
+    pub fn with_outbound_proxy(mut self, proxy: Option<super::OutboundProxy>) -> Self {
+        // 出口变化后不能沿用旧出口的位置；存储投影应在绑定出口后设置位置。
+        self.request_location = None;
+        self.outbound_proxy = proxy;
+        self
+    }
+
+    #[must_use]
+    pub const fn outbound_proxy(&self) -> Option<&super::OutboundProxy> {
+        self.outbound_proxy.as_ref()
+    }
+
+    #[must_use]
+    pub fn with_request_location(mut self, location: Option<super::RequestLocation>) -> Self {
+        self.request_location = self.outbound_proxy.as_ref().and(location);
+        self
+    }
+
+    #[must_use]
+    pub const fn request_location(&self) -> Option<&super::RequestLocation> {
+        self.request_location.as_ref()
+    }
+
+    #[must_use]
+    pub fn with_account_facts(
+        mut self,
+        enabled: bool,
+        credential_state: CredentialState,
+        quota: QuotaState,
+        last_error_reason: Option<AccountErrorReason>,
+        last_error_message: Option<String>,
+    ) -> Self {
+        self.enabled = enabled;
+        // 凭据是否可用由 Provider 判断；API Key 等认证不要求上游用户身份。
+        self.credential_state = credential_state;
+        self.quota = quota;
+        self.last_error_reason = last_error_reason;
+        self.last_error_message = last_error_message;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_scheduling(
+        mut self,
+        concurrency_limit: Option<AccountConcurrencyLimit>,
+        weight: AccountWeight,
+    ) -> Self {
+        self.concurrency_limit = concurrency_limit;
+        self.weight = weight;
+        self
+    }
+
+    /// 设置 RT 存在性与失败后的最早重试时刻。
+    ///
+    /// 正常 OAuth 预刷新由 worker 使用 AT 原始过期时间与当前运行时策略动态判断，
+    /// 不应把提前量物化到 `next_refresh_at`。
+    #[must_use]
+    pub const fn with_refresh_schedule(
+        mut self,
+        has_refresh_token: bool,
+        next_refresh_at: Option<SystemTime>,
+    ) -> Self {
+        self.has_refresh_token = has_refresh_token;
+        self.next_refresh_at = next_refresh_at;
+        self
+    }
+
+    #[must_use]
+    pub const fn id(&self) -> &ProviderAccountId {
+        &self.id
+    }
+
+    #[must_use]
+    pub const fn provider(&self) -> &ProviderKind {
+        &self.provider
+    }
+
+    #[must_use]
+    pub const fn revision(&self) -> CredentialRevision {
+        self.revision
+    }
+
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[must_use]
+    pub fn email(&self) -> Option<&str> {
+        self.email.as_deref()
+    }
+
+    #[must_use]
+    pub fn upstream_user_id(&self) -> Option<&str> {
+        self.upstream_user_id.as_deref()
+    }
+
+    #[must_use]
+    pub fn upstream_account_id(&self) -> Option<&str> {
+        self.upstream_account_id.as_deref()
+    }
+
+    #[must_use]
+    pub fn plan_type(&self) -> Option<&str> {
+        self.plan_type.as_deref()
+    }
+
+    #[must_use]
+    pub fn authentication_kind(&self) -> &str {
+        &self.authentication_kind
+    }
+
+    #[must_use]
+    pub const fn credential_state(&self) -> CredentialState {
+        self.credential_state
+    }
+
+    #[must_use]
+    pub const fn quota(&self) -> QuotaState {
+        self.quota
+    }
+
+    #[must_use]
+    pub const fn last_error_reason(&self) -> Option<AccountErrorReason> {
+        self.last_error_reason
+    }
+
+    #[must_use]
+    pub fn last_error_message(&self) -> Option<&str> {
+        self.last_error_message.as_deref()
+    }
+
+    #[must_use]
+    pub const fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    #[must_use]
+    pub const fn concurrency_limit(&self) -> Option<AccountConcurrencyLimit> {
+        self.concurrency_limit
+    }
+
+    #[must_use]
+    pub const fn weight(&self) -> AccountWeight {
+        self.weight
+    }
+
+    #[must_use]
+    pub const fn effective_concurrency(&self, default: AccountConcurrency) -> AccountConcurrency {
+        match self.concurrency_limit {
+            Some(limit) => AccountConcurrency::Limited(limit.into_non_zero()),
+            None => default,
+        }
+    }
+
+    #[must_use]
+    pub const fn access_token_expires_at(&self) -> Option<SystemTime> {
+        self.access_token_expires_at
+    }
+
+    /// 返回瞬态 OAuth 刷新失败后的最早重试时刻；正常账号为 `None`。
+    #[must_use]
+    pub const fn next_refresh_at(&self) -> Option<SystemTime> {
+        self.next_refresh_at
+    }
+
+    #[must_use]
+    pub const fn has_refresh_token(&self) -> bool {
+        self.has_refresh_token
+    }
+
+    /// 组合持久事实与请求级冷却，交给唯一解析器派生状态。
+    #[must_use]
+    pub fn status_projection(
+        &self,
+        now: SystemTime,
+        cooldown: Option<AccountCooldown>,
+    ) -> AccountStatusProjection {
+        resolve_account_status(
+            &AccountStatusFacts {
+                enabled: self.enabled,
+                credential_state: self.credential_state,
+                access_token_expires_at: self.access_token_expires_at,
+                quota: self.quota,
+                cooldown,
+                last_error_reason: self.last_error_reason,
+                last_error_message: self.last_error_message.clone(),
+            },
+            now,
+        )
+    }
+}
+
+/// Store 读出的账号与 Provider-owned 明文 credential。
+#[derive(Clone, PartialEq)]
+pub struct LoadedCredential {
+    pub account: ProviderAccount,
+    pub credential: PlaintextCredential,
+}
+
+/// Provider 已计算好时间边界的有界 OAuth refresh 候选查询。
+///
+/// Store 只负责按持久事实筛选和稳定排序，不拥有提前量或恢复窗口语义。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderRefreshQuery {
+    provider: ProviderKind,
+    refresh_due_before: SystemTime,
+    force_due_before: SystemTime,
+    observed_at: SystemTime,
+    excluded_account_ids: Vec<ProviderAccountId>,
+    limit: NonZeroU32,
+}
+
+impl ProviderRefreshQuery {
+    #[must_use]
+    pub fn new(
+        provider: ProviderKind,
+        refresh_due_before: SystemTime,
+        force_due_before: SystemTime,
+        observed_at: SystemTime,
+        excluded_account_ids: Vec<ProviderAccountId>,
+        limit: NonZeroU32,
+    ) -> Self {
+        Self {
+            provider,
+            refresh_due_before,
+            force_due_before,
+            observed_at,
+            excluded_account_ids,
+            limit,
+        }
+    }
+
+    #[must_use]
+    pub const fn provider(&self) -> &ProviderKind {
+        &self.provider
+    }
+
+    #[must_use]
+    pub const fn refresh_due_before(&self) -> SystemTime {
+        self.refresh_due_before
+    }
+
+    #[must_use]
+    pub const fn force_due_before(&self) -> SystemTime {
+        self.force_due_before
+    }
+
+    #[must_use]
+    pub const fn observed_at(&self) -> SystemTime {
+        self.observed_at
+    }
+
+    #[must_use]
+    pub fn excluded_account_ids(&self) -> &[ProviderAccountId] {
+        &self.excluded_account_ids
+    }
+
+    #[must_use]
+    pub const fn limit(&self) -> NonZeroU32 {
+        self.limit
+    }
+
+    /// 判断内存 Store 中的账号是否满足与 PostgreSQL 相同的候选谓词。
+    #[must_use]
+    pub fn contains(&self, account: &ProviderAccount) -> bool {
+        account.provider() == &self.provider
+            && account.enabled()
+            && account.has_refresh_token()
+            && matches!(
+                account.credential_state(),
+                CredentialState::Unknown | CredentialState::Ready
+            )
+            && !self.excluded_account_ids.contains(account.id())
+            && account.access_token_expires_at().is_some_and(|expires_at| {
+                expires_at <= self.force_due_before
+                    || (expires_at <= self.refresh_due_before
+                        && account
+                            .next_refresh_at()
+                            .is_none_or(|retry_at| retry_at <= self.observed_at))
+            })
+    }
+}
+
+/// Admin/Provider import 创建账号时的一次性明文输入。
+#[derive(Clone, PartialEq)]
+pub struct NewProviderAccount {
+    pub account: ProviderAccount,
+    /// 导入时显式提供的政策；省略时保留已有账号设置。
+    pub model_access: Option<super::AccountModelAccess>,
+    pub credential: PlaintextCredential,
+}
+
+impl fmt::Debug for NewProviderAccount {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NewProviderAccount")
+            .field("account", &self.account)
+            .field("credential", &self.credential)
+            .finish()
+    }
+}
+
+/// 不改 credential revision 的管理字段更新。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderAccountUpdate {
+    pub account_id: ProviderAccountId,
+    pub name: String,
+    pub email: Option<String>,
+    pub plan_type: Option<String>,
+}
+
+impl fmt::Debug for LoadedCredential {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LoadedCredential")
+            .field("account", &self.account)
+            .field("credential", &self.credential)
+            .finish()
+    }
+}
+
+/// 与 credential revision CAS 同事务提交的账号错误事实。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialStateWrite {
+    pub credential_state: CredentialState,
+    pub observed_at: SystemTime,
+    pub error_reason: Option<AccountErrorReason>,
+    pub message: Option<String>,
+}
+
+/// [`CredentialCasUpdate`] 跨 store 边界的命名字段。
+pub struct CredentialCasUpdateParts {
+    pub account_id: ProviderAccountId,
+    pub expected_revision: CredentialRevision,
+    pub profile: ProviderAccountUpdate,
+    pub preserve_profile: bool,
+    pub credential: PlaintextCredential,
+    pub has_refresh_token: bool,
+    pub access_token_expires_at: Option<SystemTime>,
+    pub next_refresh_at: Option<SystemTime>,
+    pub account_state: Option<Box<CredentialStateWrite>>,
+}
+
+/// 刷新后的完整 CAS 写回。
+#[derive(Clone, PartialEq)]
+pub struct CredentialCasUpdate {
+    account_id: ProviderAccountId,
+    expected_revision: CredentialRevision,
+    profile: ProviderAccountUpdate,
+    preserve_profile: bool,
+    credential: PlaintextCredential,
+    has_refresh_token: bool,
+    access_token_expires_at: Option<SystemTime>,
+    next_refresh_at: Option<SystemTime>,
+    account_state: Option<Box<CredentialStateWrite>>,
+}
+
+impl fmt::Debug for CredentialCasUpdate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CredentialCasUpdate")
+            .field("account_id", &self.account_id)
+            .field("expected_revision", &self.expected_revision)
+            .field("profile", &self.profile)
+            .field("preserve_profile", &self.preserve_profile)
+            .field("credential", &self.credential)
+            .field("has_refresh_token", &self.has_refresh_token)
+            .field("access_token_expires_at", &self.access_token_expires_at)
+            .field("next_refresh_at", &self.next_refresh_at)
+            .field("account_state", &self.account_state)
+            .finish()
+    }
+}
+
+impl CredentialCasUpdate {
+    /// 创建同一账号 revision fence 下的完整 credential + 普通投影写回。
+    ///
+    /// # Errors
+    ///
+    /// profile 与 credential 指向不同账号，或无 RT 却声明下次刷新时间时失败。
+    pub fn new(
+        account_id: ProviderAccountId,
+        expected_revision: CredentialRevision,
+        profile: ProviderAccountUpdate,
+        credential: PlaintextCredential,
+        has_refresh_token: bool,
+        access_token_expires_at: Option<SystemTime>,
+        next_refresh_at: Option<SystemTime>,
+    ) -> Result<Self, CredentialError> {
+        if profile.account_id != account_id {
+            return Err(CredentialError::ProfileAccountMismatch);
+        }
+        if !has_refresh_token && next_refresh_at.is_some() {
+            return Err(CredentialError::InvalidRefreshSchedule);
+        }
+        Ok(Self {
+            account_id,
+            expected_revision,
+            profile,
+            preserve_profile: false,
+            credential,
+            has_refresh_token,
+            access_token_expires_at,
+            next_refresh_at,
+            account_state: None,
+        })
+    }
+
+    /// 仅轮换凭据，保留提交时的账号资料，避免覆盖并发额度观测更新的套餐。
+    #[must_use]
+    pub const fn preserving_profile(mut self) -> Self {
+        self.preserve_profile = true;
+        self
+    }
+
+    /// 将刷新调度与账号错误事实放入同一个 revision CAS。
+    #[must_use]
+    pub fn with_account_state(
+        mut self,
+        credential_state: CredentialState,
+        observed_at: SystemTime,
+        error_reason: Option<AccountErrorReason>,
+        message: Option<String>,
+    ) -> Self {
+        let message = message.filter(|value| !value.trim().is_empty());
+        let error_reason = if credential_state == CredentialState::Ready {
+            message.as_ref().and(error_reason)
+        } else {
+            error_reason.or_else(|| credential_state.error_reason())
+        };
+        self.account_state = Some(Box::new(CredentialStateWrite {
+            credential_state,
+            observed_at,
+            error_reason,
+            message,
+        }));
+        self
+    }
+
+    #[must_use]
+    pub const fn account_id(&self) -> &ProviderAccountId {
+        &self.account_id
+    }
+
+    #[must_use]
+    pub const fn expected_revision(&self) -> CredentialRevision {
+        self.expected_revision
+    }
+
+    #[must_use]
+    pub const fn profile(&self) -> &ProviderAccountUpdate {
+        &self.profile
+    }
+
+    #[must_use]
+    pub const fn credential(&self) -> &PlaintextCredential {
+        &self.credential
+    }
+
+    #[must_use]
+    pub const fn has_refresh_token(&self) -> bool {
+        self.has_refresh_token
+    }
+
+    #[must_use]
+    pub const fn access_token_expires_at(&self) -> Option<SystemTime> {
+        self.access_token_expires_at
+    }
+
+    #[must_use]
+    pub const fn next_refresh_at(&self) -> Option<SystemTime> {
+        self.next_refresh_at
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> CredentialCasUpdateParts {
+        CredentialCasUpdateParts {
+            account_id: self.account_id,
+            expected_revision: self.expected_revision,
+            profile: self.profile,
+            preserve_profile: self.preserve_profile,
+            credential: self.credential,
+            has_refresh_token: self.has_refresh_token,
+            access_token_expires_at: self.access_token_expires_at,
+            next_refresh_at: self.next_refresh_at,
+            account_state: self.account_state,
+        }
+    }
+}
+
+/// CAS 写回结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialCasOutcome {
+    Updated(CredentialRevision),
+    Conflict,
+}
+
+/// Provider quota 的一次完整观察结果。
+#[derive(Clone, PartialEq)]
+pub struct QuotaObservation {
+    pub account_id: ProviderAccountId,
+    pub expected_revision: CredentialRevision,
+    pub quota: OpaqueProviderData,
+    /// Provider 确认的账号套餐，与额度原子写入；`None` 保留已有套餐。
+    pub plan_type: Option<String>,
+    /// Provider 原始 quota document 的观察时间；不代表访问结论发生变化。
+    pub observed_at: SystemTime,
+    /// Provider 已从私有 JSON 归一化出的额度访问事实。
+    pub state: QuotaState,
+}
+
+impl fmt::Debug for QuotaObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("QuotaObservation")
+            .field("account_id", &self.account_id)
+            .field("expected_revision", &self.expected_revision)
+            .field("quota", &self.quota)
+            .field("plan_type", &self.plan_type)
+            .field("observed_at", &self.observed_at)
+            .field("state", &self.state)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuotaWriteOutcome {
+    Updated,
+    Conflict,
+}
+
+/// 只推进 Provider quota 文档的最后成功查询时间。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuotaObservationTouch {
+    pub account_id: ProviderAccountId,
+    pub expected_revision: CredentialRevision,
+    pub observed_at: SystemTime,
+}
+
+/// 不改 Provider 原始 quota JSON 的额度访问事实写入。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuotaAccessChange {
+    pub account_id: ProviderAccountId,
+    pub expected_revision: CredentialRevision,
+    pub state: QuotaState,
+}
+
+/// 账号状态的 revision-fenced 写入。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountStateChange {
+    pub account_id: ProviderAccountId,
+    pub expected_revision: CredentialRevision,
+    pub credential_state: CredentialState,
+    pub observed_at: SystemTime,
+    /// 受控错误原因；无失败事实的 Ready 写入必须清空。
+    ///
+    /// Ready 凭据可以在 AT 过期后继续 RT 恢复，此时允许保留最近一次
+    /// 刷新失败原因，供错误状态投影展示。
+    pub error_reason: Option<AccountErrorReason>,
+    /// 供管理端展示的错误消息；结构化上游失败应保留原始 message，不能写入整个正文。
+    /// 刷新成功或其他无失败事实的 Ready 写入必须清空。
+    pub message: Option<String>,
+}

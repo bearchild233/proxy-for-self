@@ -1,0 +1,11 @@
+[Unit]
+Description=proxy-for-self private Excel socket
+After=systemd-tmpfiles-setup.service
+[Socket]
+ListenStream=/run/proxy-for-self-excel/worker.sock
+SocketUser=proxy-for-self
+SocketGroup=proxy-for-self
+SocketMode=0600
+RemoveOnStop=true
+[Install]
+WantedBy=sockets.target

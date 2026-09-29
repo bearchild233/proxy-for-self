@@ -1,0 +1,17 @@
+[Unit]
+Description=proxy-for-self gateway
+After=network-online.target
+Wants=network-online.target
+[Service]
+User=proxy-for-self
+Group=proxy-for-self
+WorkingDirectory=/opt/proxy-for-self/current
+ExecStart=/opt/proxy-for-self/current/bin/codex-proxy-rs
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=650
+KillSignal=SIGTERM
+UMask=0077
+NoNewPrivileges=true
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,279 @@
+//! Client API Key 的 Command、Result 与安全秘密类型。
+
+use std::{fmt, num::NonZeroU16};
+
+use chrono::{DateTime, Utc};
+
+use gateway_core::{
+    engine::budget::{ClientBudgetLimits, ClientBudgetStatus},
+    policy::{ClientApiKeyId, PlaintextClientApiKey, RateLimits},
+    routing::{AccountGroupId, ProviderKind},
+};
+
+use super::{AdminModelError, Revision, account_groups::AccountGroupRef};
+
+/// Key 的固定账号和独立插件选择，不包含账号凭据。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientKeyBinding {
+    pub routing: Option<gateway_core::account::scope::KeyRoutingOptions>,
+    pub id: ClientApiKeyId,
+    pub account_id: Option<gateway_core::account::ProviderAccountId>,
+    pub excel_bridge_enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientKeyBindings {
+    pub config_revision: Revision,
+    pub items: Vec<ClientKeyBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetClientKeyBinding {
+    pub routing: Option<gateway_core::account::scope::KeyRoutingOptions>,
+    pub id: ClientApiKeyId,
+    pub account_id: Option<gateway_core::account::ProviderAccountId>,
+    pub excel_bridge_enabled: bool,
+    pub expected_revision: Revision,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientKeyBindingMutation {
+    pub config_revision: Revision,
+    pub binding: ClientKeyBinding,
+}
+
+/// Client Key 列表保持旧 HTTP 合同允许的完整非零 `u16` 页大小。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ClientKeyPageSize(NonZeroU16);
+
+impl ClientKeyPageSize {
+    /// 创建 1 至 65535 的 Client Key 页大小。
+    ///
+    /// # Errors
+    ///
+    /// `value` 为零时返回 [`AdminModelError::InvalidClientKeyPageSize`]。
+    pub fn new(value: u16) -> Result<Self, AdminModelError> {
+        NonZeroU16::new(value)
+            .map(Self)
+            .ok_or(AdminModelError::InvalidClientKeyPageSize)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u16 {
+        self.0.get()
+    }
+}
+
+/// Client Key 列表排序字段。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientKeySortField {
+    Name,
+    Enabled,
+    CreatedAt,
+    LastUsedAt,
+}
+
+/// Client Key 列表排序方向。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortDirection {
+    Asc,
+    Desc,
+}
+
+/// Client Key 列表排序规则。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientKeySort {
+    pub field: ClientKeySortField,
+    pub direction: SortDirection,
+}
+
+/// 与排序字段绑定的游标值。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClientKeyCursorValue {
+    Name(String),
+    Enabled(bool),
+    CreatedAt(DateTime<Utc>),
+    LastUsedAt(Option<DateTime<Utc>>),
+}
+
+/// Client Key 的稳定键集游标。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientKeyCursor {
+    pub sort: ClientKeySort,
+    pub value: ClientKeyCursorValue,
+    pub id: ClientApiKeyId,
+}
+
+/// Client Key 列表查询。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientKeyListQuery {
+    pub cursor: Option<ClientKeyCursor>,
+    pub page_size: ClientKeyPageSize,
+    pub search: Option<String>,
+    pub sort: ClientKeySort,
+}
+
+/// 不含完整明文 Key 的管理投影。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientKeyRecord {
+    pub openai_client_profile_override: Option<gateway_core::account::OpaqueProviderData>,
+    pub xai_client_profile_override: Option<gateway_core::account::OpaqueProviderData>,
+    pub id: ClientApiKeyId,
+    pub name: String,
+    pub label: Option<String>,
+    pub groups: Vec<AccountGroupRef>,
+    pub provider_kinds: Vec<ProviderKind>,
+    pub prefix: String,
+    pub enabled: bool,
+    pub limits: RateLimits,
+    pub budget: ClientBudgetStatus,
+    pub last_used_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Client Key 列表页。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientKeyPage {
+    pub config_revision: Revision,
+    pub items: Vec<ClientKeyRecord>,
+    pub total: u64,
+    pub next_cursor: Option<ClientKeyCursor>,
+}
+
+/// 仅在创建或显式读取密钥配置时返回的明文 Key；Debug 隐去明文。
+#[derive(Clone, PartialEq, Eq)]
+pub struct ClientKeySecret {
+    pub record: ClientKeyRecord,
+    plaintext: String,
+}
+
+impl ClientKeySecret {
+    #[must_use]
+    pub fn new(record: ClientKeyRecord, plaintext: impl Into<String>) -> Self {
+        Self {
+            record,
+            plaintext: plaintext.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn expose_for_response(&self) -> &str {
+        &self.plaintext
+    }
+}
+
+impl fmt::Debug for ClientKeySecret {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ClientKeySecret")
+            .field("record", &self.record)
+            .field("plaintext", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// API 提交的 Client Key 创建命令。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateClientKey {
+    pub openai_client_profile_override: Option<gateway_core::account::OpaqueProviderData>,
+    pub xai_client_profile_override: Option<gateway_core::account::OpaqueProviderData>,
+    pub custom_key: Option<PlaintextClientApiKey>,
+    pub name: String,
+    pub label: Option<String>,
+    pub group_ids: Vec<AccountGroupId>,
+    pub limits: RateLimits,
+    pub budget: ClientBudgetLimits,
+}
+
+/// 管理用例生成 ID 与明文后的持久化命令。
+#[derive(Clone, PartialEq, Eq)]
+pub struct NewClientKey {
+    pub openai_client_profile_override: Option<gateway_core::account::OpaqueProviderData>,
+    pub xai_client_profile_override: Option<gateway_core::account::OpaqueProviderData>,
+    pub id: ClientApiKeyId,
+    pub name: String,
+    pub label: Option<String>,
+    pub group_ids: Vec<AccountGroupId>,
+    pub limits: RateLimits,
+    pub budget: ClientBudgetLimits,
+    pub plaintext: String,
+}
+
+impl fmt::Debug for NewClientKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NewClientKey")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("group_ids", &self.group_ids)
+            .field("plaintext", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+
+/// 修改 Client Key 的公开策略字段。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateClientKey {
+    pub openai_client_profile_override: Option<Option<gateway_core::account::OpaqueProviderData>>,
+    pub xai_client_profile_override: Option<Option<gateway_core::account::OpaqueProviderData>>,
+    pub id: ClientApiKeyId,
+    pub name: String,
+    pub label: Option<String>,
+    pub group_ids: Vec<AccountGroupId>,
+    pub limits: RateLimits,
+    pub daily_limit_usd: Option<gateway_core::metering::Decimal>,
+    pub weekly_limit_usd: Option<gateway_core::metering::Decimal>,
+}
+
+/// 修改 Client Key 启用状态。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetClientKeyEnabled {
+    pub id: ClientApiKeyId,
+    pub enabled: bool,
+}
+
+/// 管理员选择的金额重置范围。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientKeyBudgetPeriod {
+    Daily,
+    Weekly,
+    All,
+}
+
+/// 清零所选窗口已用金额，保留限额、到期时间与历史费用。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResetClientKeyBudget {
+    pub id: ClientApiKeyId,
+    pub period: ClientKeyBudgetPeriod,
+}
+
+/// 删除 Client Key。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteClientKey {
+    pub id: ClientApiKeyId,
+}
+
+/// Client Key 创建结果；完整明文仅存在于该一次性结果中。
+pub struct CreatedClientKey {
+    pub config_revision: Revision,
+    pub secret: ClientKeySecret,
+}
+
+impl fmt::Debug for CreatedClientKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CreatedClientKey")
+            .field("config_revision", &self.config_revision)
+            .field("secret", &self.secret)
+            .finish()
+    }
+}
+
+/// Client Key 普通写操作结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientKeyMutation {
+    pub config_revision: Revision,
+    pub record: Option<ClientKeyRecord>,
+    pub id: ClientApiKeyId,
+}

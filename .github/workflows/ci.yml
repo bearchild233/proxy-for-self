@@ -1,0 +1,24 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  quality:
+    uses: ./.github/workflows/_quality.yml
+    with:
+      ref: ${{ github.sha }}
+  excel-worker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - run: python3 -m venv .venv
+      - run: .venv/bin/pip install -r plugins/excel-bridge/requirements.lock
+      - run: .venv/bin/pip install -e 'plugins/excel-bridge[test]'
+      - run: .venv/bin/python -m pytest plugins/excel-bridge -q

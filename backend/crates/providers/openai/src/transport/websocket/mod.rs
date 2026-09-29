@@ -1,0 +1,45 @@
+//! Codex Responses WebSocket 传输。
+
+mod audit;
+mod breaker;
+mod coordinator;
+mod error;
+mod exchange;
+mod handshake;
+mod model;
+mod pool;
+mod pump;
+
+pub use self::{
+    audit::{
+        WS_AUDIT_DIR_ENV, websocket_audit_dir, write_websocket_audit_artifact_for_dir,
+        write_websocket_audit_artifact_from_env,
+    },
+    breaker::{
+        WebSocketOriginBreaker, WebSocketOriginBreakerConfig, WebSocketOriginBreakerDecision,
+        WebSocketOriginBreakerPermit,
+    },
+    error::{CodexWebSocketCloseError, CodexWebSocketExchangeError, CodexWebSocketUpstreamError},
+    exchange::{
+        CodexWebSocketRateLimitUpdates, CodexWebSocketResponseMetadataUpdates,
+        CodexWebSocketSseStream, CodexWebSocketStreamingExchange,
+    },
+    handshake::responses_websocket_endpoint,
+    model::{
+        CodexWebSocketConnection, CodexWebSocketRequest, PreviousResponseUnavailableReason,
+        WebSocketContinuationRequirement,
+    },
+    pool::{
+        CodexWebSocketPool, CodexWebSocketPoolConfig, CodexWebSocketPoolKey,
+        WebSocketPoolBypassReason, WebSocketPoolDecision,
+    },
+    pump::WebSocketConnectionObservation,
+};
+pub(crate) use self::{
+    coordinator::{
+        PreparedWebSocket, WEBSOCKET_FAST_PATH_BUDGET, WebSocketFastPath,
+        execute_prepared_response_create_request_stream, post_send_ambiguous,
+        prepare_response_create_request_with_pool,
+    },
+    pool::DEFAULT_STREAM_IDLE_TIMEOUT,
+};

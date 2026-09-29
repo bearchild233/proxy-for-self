@@ -1,0 +1,1153 @@
+//! Client API Key 管理 wire contract。
+
+use crate::auth::SessionState;
+
+use std::fmt;
+
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use chrono::{DateTime, Utc};
+use gateway_admin::model::client_keys::{
+    ClientKeyBudgetPeriod, ClientKeyCursor, ClientKeyCursorValue as DomainCursorValue,
+    ClientKeyListQuery, ClientKeyMutation, ClientKeyPage, ClientKeyPageSize, ClientKeyRecord,
+    ClientKeySecret, ClientKeySort as DomainSort, ClientKeySortField as DomainSortField,
+    CreateClientKey, CreatedClientKey, DeleteClientKey, ResetClientKeyBudget, SetClientKeyEnabled,
+    SortDirection, UpdateClientKey,
+};
+use gateway_core::{
+    engine::budget::ClientBudgetLimits,
+    metering::Decimal,
+    policy::{ClientApiKeyId, PlaintextClientApiKey, RateLimits},
+    routing::AccountGroupId,
+};
+use serde::{Deserialize, Serialize};
+
+use axum::{
+    Router,
+    extract::State,
+    http::{HeaderValue, StatusCode, header::CACHE_CONTROL},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+};
+
+use super::{
+    AdminAuth, AdminEnvelope, AdminError, AdminJson, AdminQuery, AdminResponse,
+    WireValidationError, wire::map_admin_service_error,
+};
+
+const MAX_CURSOR_BYTES: usize = 512;
+const MAX_SEARCH_BYTES: usize = 256;
+const DEFAULT_PAGE_SIZE: u16 = 50;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LoadKeyBindingsRequest {
+    ids: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SetKeyBindingRequest {
+    routing: Option<gateway_core::account::scope::KeyRoutingOptions>,
+    id: String,
+    account_id: Option<String>,
+    excel_bridge_enabled: bool,
+    expected_revision: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CreateBoundKeyRequest {
+    routing: Option<gateway_core::account::scope::KeyRoutingOptions>,
+    key: CreateClientKeyRequest,
+    account_id: Option<String>,
+    excel_bridge_enabled: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct KeyBindingView {
+    routing: Option<gateway_core::account::scope::KeyRoutingOptions>,
+    id: String,
+    account_id: Option<String>,
+    excel_bridge_enabled: bool,
+}
+
+impl From<gateway_admin::model::client_keys::ClientKeyBinding> for KeyBindingView {
+    fn from(value: gateway_admin::model::client_keys::ClientKeyBinding) -> Self {
+        Self {
+            routing: value.routing,
+            id: value.id.as_str().to_owned(),
+            account_id: value.account_id.map(|id| id.as_str().to_owned()),
+            excel_bridge_enabled: value.excel_bridge_enabled,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct KeyBindingsData {
+    config_revision: u64,
+    items: Vec<KeyBindingView>,
+}
+
+fn parse_budget(
+    value: Option<String>,
+    field: &'static str,
+) -> Result<Option<Decimal>, WireValidationError> {
+    value
+        .map(|value| value.parse().map_err(|_| WireValidationError::new(field)))
+        .transpose()
+}
+
+/// Client Key 列表查询。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ListClientKeysQuery {
+    cursor: Option<String>,
+    limit: Option<u16>,
+    search: Option<String>,
+    sort_by: Option<String>,
+    sort_direction: Option<String>,
+}
+
+impl ListClientKeysQuery {
+    /// 校验 wire 边界并直接构造管理用例查询。
+    pub fn into_command(self) -> Result<ClientKeyListQuery, WireValidationError> {
+        if self
+            .cursor
+            .as_deref()
+            .is_some_and(|cursor| cursor.is_empty() || cursor.len() > MAX_CURSOR_BYTES)
+        {
+            return Err(WireValidationError::new("cursor"));
+        }
+        if self.limit == Some(0) {
+            return Err(WireValidationError::new("limit"));
+        }
+        let search = self.search.map(|search| search.trim().to_owned());
+        if search.as_deref().is_some_and(|search| {
+            search.len() > MAX_SEARCH_BYTES || search.chars().any(char::is_control)
+        }) {
+            return Err(WireValidationError::new("search"));
+        }
+        let sort = ClientKeySort::parse(
+            self.sort_by.as_deref().unwrap_or("createdAt"),
+            self.sort_direction.as_deref().unwrap_or("desc"),
+        )?;
+        let cursor = self
+            .cursor
+            .as_deref()
+            .map(decode_client_key_cursor)
+            .transpose()?
+            .map(domain_cursor)
+            .transpose()?;
+        let page_size = ClientKeyPageSize::new(self.limit.unwrap_or(DEFAULT_PAGE_SIZE))
+            .map_err(|_| WireValidationError::new("limit"))?;
+        Ok(ClientKeyListQuery {
+            cursor,
+            page_size,
+            search: search.filter(|search| !search.is_empty()),
+            sort: domain_sort(sort),
+        })
+    }
+}
+
+/// Client Key 数据库排序字段。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ClientKeySortField {
+    Name,
+    Enabled,
+    CreatedAt,
+    LastUsedAt,
+}
+
+/// Client Key 数据库排序方向。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClientKeySortDirection {
+    Asc,
+    Desc,
+}
+
+/// 已校验且会写入自描述游标的排序组合。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClientKeySort {
+    pub field: ClientKeySortField,
+    pub direction: ClientKeySortDirection,
+}
+
+impl ClientKeySort {
+    fn parse(field: &str, direction: &str) -> Result<Self, WireValidationError> {
+        let field = match field {
+            "name" => ClientKeySortField::Name,
+            "enabled" => ClientKeySortField::Enabled,
+            "createdAt" => ClientKeySortField::CreatedAt,
+            "lastUsedAt" => ClientKeySortField::LastUsedAt,
+            _ => return Err(WireValidationError::new("sortBy")),
+        };
+        let direction = match direction {
+            "asc" => ClientKeySortDirection::Asc,
+            "desc" => ClientKeySortDirection::Desc,
+            _ => return Err(WireValidationError::new("sortDirection")),
+        };
+        Ok(Self { field, direction })
+    }
+}
+
+/// 创建 Client Key 请求。
+#[derive(Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CreateClientKeyRequest {
+    openai_client_profile_override: Option<serde_json::Map<String, serde_json::Value>>,
+    xai_client_profile_override: Option<serde_json::Map<String, serde_json::Value>>,
+    custom_key: Option<String>,
+    name: String,
+    label: Option<String>,
+    group_ids: Vec<String>,
+    max_concurrency: u64,
+    requests_per_minute: u64,
+    daily_limit_usd: Option<String>,
+    weekly_limit_usd: Option<String>,
+}
+
+impl fmt::Debug for CreateClientKeyRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CreateClientKeyRequest")
+            .field("name", &self.name)
+            .field("custom_key", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+
+impl CreateClientKeyRequest {
+    /// 校验 wire 边界并直接构造管理用例命令。
+    pub fn into_command(self) -> Result<CreateClientKey, WireValidationError> {
+        validate_required_text(&self.name, "name")?;
+        validate_optional_text(self.label.as_deref(), "label")?;
+        let group_ids = validate_group_ids(self.group_ids)?;
+        validate_limit(self.max_concurrency, "maxConcurrency")?;
+        validate_limit(self.requests_per_minute, "requestsPerMinute")?;
+        Ok(CreateClientKey {
+            openai_client_profile_override: self
+                .openai_client_profile_override
+                .map(gateway_core::account::OpaqueProviderData::new),
+            xai_client_profile_override: self
+                .xai_client_profile_override
+                .map(gateway_core::account::OpaqueProviderData::new),
+            custom_key: self
+                .custom_key
+                .filter(|key| !key.is_empty())
+                .map(PlaintextClientApiKey::new)
+                .transpose()
+                .map_err(|_| WireValidationError::new("customKey"))?,
+            name: self.name,
+            label: self.label,
+            group_ids,
+            budget: ClientBudgetLimits {
+                daily_usd: parse_budget(self.daily_limit_usd, "dailyLimitUsd")?.unwrap_or_default(),
+                weekly_usd: parse_budget(self.weekly_limit_usd, "weeklyLimitUsd")?
+                    .unwrap_or_default(),
+            },
+            limits: RateLimits {
+                max_concurrency: self.max_concurrency,
+                requests_per_minute: self.requests_per_minute,
+            },
+        })
+    }
+}
+
+/// 更新 Client Key 请求。
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UpdateClientKeyRequest {
+    #[serde(default, deserialize_with = "deserialize_profile_override")]
+    openai_client_profile_override: Option<Option<serde_json::Map<String, serde_json::Value>>>,
+    #[serde(default, deserialize_with = "deserialize_profile_override")]
+    xai_client_profile_override: Option<Option<serde_json::Map<String, serde_json::Value>>>,
+    id: String,
+    name: String,
+    label: Option<String>,
+    group_ids: Vec<String>,
+    max_concurrency: u64,
+    requests_per_minute: u64,
+    daily_limit_usd: Option<String>,
+    weekly_limit_usd: Option<String>,
+}
+
+impl UpdateClientKeyRequest {
+    /// 校验 wire 边界并直接构造管理用例命令。
+    pub fn into_command(self) -> Result<UpdateClientKey, WireValidationError> {
+        validate_required_text(&self.id, "id")?;
+        validate_required_text(&self.name, "name")?;
+        validate_optional_text(self.label.as_deref(), "label")?;
+        let group_ids = validate_group_ids(self.group_ids)?;
+        validate_limit(self.max_concurrency, "maxConcurrency")?;
+        validate_limit(self.requests_per_minute, "requestsPerMinute")?;
+        Ok(UpdateClientKey {
+            openai_client_profile_override: self
+                .openai_client_profile_override
+                .map(|value| value.map(gateway_core::account::OpaqueProviderData::new)),
+            xai_client_profile_override: self
+                .xai_client_profile_override
+                .map(|value| value.map(gateway_core::account::OpaqueProviderData::new)),
+            id: client_key_id(self.id, "clientKeyMutationNotFound")?,
+            name: self.name,
+            label: self.label,
+            group_ids,
+            daily_limit_usd: parse_budget(self.daily_limit_usd, "dailyLimitUsd")?,
+            weekly_limit_usd: parse_budget(self.weekly_limit_usd, "weeklyLimitUsd")?,
+            limits: RateLimits {
+                max_concurrency: self.max_concurrency,
+                requests_per_minute: self.requests_per_minute,
+            },
+        })
+    }
+}
+
+/// 重置指定周期已用金额的请求。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResetClientKeyBudgetRequest {
+    id: String,
+    period: BudgetResetPeriod,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum BudgetResetPeriod {
+    Daily,
+    Weekly,
+    All,
+}
+
+impl ResetClientKeyBudgetRequest {
+    pub fn into_command(self) -> Result<ResetClientKeyBudget, WireValidationError> {
+        validate_required_text(&self.id, "id")?;
+        Ok(ResetClientKeyBudget {
+            id: client_key_id(self.id, "clientKeyMutationNotFound")?,
+            period: match self.period {
+                BudgetResetPeriod::Daily => ClientKeyBudgetPeriod::Daily,
+                BudgetResetPeriod::Weekly => ClientKeyBudgetPeriod::Weekly,
+                BudgetResetPeriod::All => ClientKeyBudgetPeriod::All,
+            },
+        })
+    }
+}
+
+/// 只携带 ID 的 Client Key mutation 请求。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClientKeyMutationRequest {
+    id: String,
+}
+
+/// 读取一次完整 Key 的 ID query。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientKeyIdQuery {
+    id: String,
+}
+
+impl ClientKeyIdQuery {
+    pub fn into_id(self) -> Result<String, WireValidationError> {
+        validate_required_text(&self.id, "id")?;
+        Ok(self.id)
+    }
+
+    fn into_domain_id(self) -> Result<ClientApiKeyId, WireValidationError> {
+        client_key_id(self.into_id()?, "clientKeyRevealNotFound")
+    }
+}
+
+impl ClientKeyMutationRequest {
+    /// 校验请求并取出 ID。
+    pub fn into_id(self) -> Result<String, WireValidationError> {
+        validate_required_text(&self.id, "id")?;
+        Ok(self.id)
+    }
+
+    fn into_domain_id(self) -> Result<ClientApiKeyId, WireValidationError> {
+        client_key_id(self.into_id()?, "clientKeyMutationNotFound")
+    }
+}
+
+/// 不含完整 Key 的管理端安全视图。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientKeyView {
+    openai_client_profile_override: Option<serde_json::Map<String, serde_json::Value>>,
+    xai_client_profile_override: Option<serde_json::Map<String, serde_json::Value>>,
+    id: String,
+    name: String,
+    label: Option<String>,
+    routing_scope: &'static str,
+    groups: Vec<ClientKeyGroupView>,
+    provider_kinds: Vec<String>,
+    prefix: String,
+    enabled: bool,
+    max_concurrency: u64,
+    requests_per_minute: u64,
+    daily_limit_usd: String,
+    weekly_limit_usd: String,
+    daily_used_usd: String,
+    weekly_used_usd: String,
+    daily_resets_at: Option<DateTime<Utc>>,
+    weekly_resets_at: Option<DateTime<Utc>>,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+    last_used_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientKeyGroupView {
+    id: String,
+    name: String,
+    color: String,
+    enabled: bool,
+}
+
+impl From<ClientKeyRecord> for ClientKeyView {
+    fn from(record: ClientKeyRecord) -> Self {
+        let routing_scope = if record.groups.is_empty() {
+            "all"
+        } else {
+            "groups"
+        };
+        Self {
+            openai_client_profile_override: record
+                .openai_client_profile_override
+                .map(gateway_core::account::OpaqueProviderData::into_inner),
+            xai_client_profile_override: record
+                .xai_client_profile_override
+                .map(gateway_core::account::OpaqueProviderData::into_inner),
+            id: record.id.to_string(),
+            name: record.name,
+            label: record.label,
+            routing_scope,
+            groups: record
+                .groups
+                .into_iter()
+                .map(|group| ClientKeyGroupView {
+                    id: group.id.to_string(),
+                    name: group.name,
+                    color: group.color.as_str().to_owned(),
+                    enabled: group.enabled,
+                })
+                .collect(),
+            provider_kinds: record
+                .provider_kinds
+                .into_iter()
+                .map(|provider| provider.to_string())
+                .collect(),
+            prefix: record.prefix,
+            enabled: record.enabled,
+            max_concurrency: record.limits.max_concurrency,
+            requests_per_minute: record.limits.requests_per_minute,
+            daily_limit_usd: record.budget.limits.daily_usd.canonical(),
+            weekly_limit_usd: record.budget.limits.weekly_usd.canonical(),
+            daily_used_usd: record.budget.daily_used_usd.canonical(),
+            weekly_used_usd: record.budget.weekly_used_usd.canonical(),
+            daily_resets_at: record.budget.daily_resets_at.map(DateTime::from),
+            weekly_resets_at: record.budget.weekly_resets_at.map(DateTime::from),
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+            last_used_at: record.last_used_at,
+        }
+    }
+}
+
+/// Client Key 列表响应数据。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientKeyListData {
+    items: Vec<ClientKeyView>,
+    next_cursor: Option<String>,
+    total: u64,
+}
+
+impl ClientKeyListData {
+    /// 构造 Client Key 列表响应。
+    #[must_use]
+    pub fn new(items: Vec<ClientKeyView>, next_cursor: Option<String>, total: u64) -> Self {
+        Self {
+            items,
+            next_cursor,
+            total,
+        }
+    }
+}
+
+impl TryFrom<ClientKeyPage> for ClientKeyListData {
+    type Error = WireValidationError;
+
+    fn try_from(page: ClientKeyPage) -> Result<Self, Self::Error> {
+        let next_cursor = page
+            .next_cursor
+            .map(wire_cursor)
+            .transpose()?
+            .as_ref()
+            .map(encode_client_key_cursor)
+            .transpose()?;
+        Ok(Self::new(
+            page.items.into_iter().map(Into::into).collect(),
+            next_cursor,
+            page.total,
+        ))
+    }
+}
+
+/// Client Key 创建响应；完整值只允许出现在本次序列化结果中。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreatedClientKeyData {
+    id: String,
+    prefix: String,
+    plaintext_key: String,
+}
+
+impl CreatedClientKeyData {
+    /// 构造一次性创建响应。
+    #[must_use]
+    pub fn new(id: String, prefix: String, plaintext_key: String) -> Self {
+        Self {
+            id,
+            prefix,
+            plaintext_key,
+        }
+    }
+}
+
+impl From<CreatedClientKey> for CreatedClientKeyData {
+    fn from(created: CreatedClientKey) -> Self {
+        Self::new(
+            created.secret.record.id.to_string(),
+            created.secret.record.prefix.clone(),
+            created.secret.expose_for_response().to_owned(),
+        )
+    }
+}
+
+impl fmt::Debug for CreatedClientKeyData {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CreatedClientKeyData")
+            .field("id", &self.id)
+            .field("prefix", &self.prefix)
+            .field("plaintext_key", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// 仅由显式 reveal 返回一次的完整明文 Key。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RevealedClientKeyData {
+    id: String,
+    plaintext_key: String,
+}
+
+impl RevealedClientKeyData {
+    #[must_use]
+    pub fn new(id: String, plaintext_key: String) -> Self {
+        Self { id, plaintext_key }
+    }
+}
+
+impl From<ClientKeySecret> for RevealedClientKeyData {
+    fn from(secret: ClientKeySecret) -> Self {
+        Self::new(
+            secret.record.id.to_string(),
+            secret.expose_for_response().to_owned(),
+        )
+    }
+}
+
+impl fmt::Debug for RevealedClientKeyData {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RevealedClientKeyData")
+            .field("id", &self.id)
+            .field("plaintext_key", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Client Key mutation 响应数据。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MutatedClientKeyData {
+    id: String,
+}
+
+impl MutatedClientKeyData {
+    /// 构造 mutation 响应。
+    #[must_use]
+    pub fn new(id: String) -> Self {
+        Self { id }
+    }
+}
+
+impl From<ClientKeyMutation> for MutatedClientKeyData {
+    fn from(mutation: ClientKeyMutation) -> Self {
+        Self::new(mutation.id.to_string())
+    }
+}
+
+/// 解码后的 Client Key 游标字段。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientKeyCursorData {
+    pub sort: ClientKeySort,
+    pub value: ClientKeyCursorValue,
+    pub id: String,
+}
+
+/// 游标中与排序字段严格对应的最后一行值。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "camelCase")]
+pub enum ClientKeyCursorValue {
+    Name(String),
+    Enabled(bool),
+    CreatedAt(DateTime<Utc>),
+    LastUsedAt(Option<DateTime<Utc>>),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CursorWire {
+    sort: ClientKeySort,
+    value: ClientKeyCursorValue,
+    id: String,
+}
+
+/// 把 owner 游标编码为不透明 wire 值。
+pub fn encode_client_key_cursor(
+    cursor: &ClientKeyCursorData,
+) -> Result<String, WireValidationError> {
+    validate_client_key_cursor(cursor)?;
+    let bytes = serde_json::to_vec(&CursorWire {
+        sort: cursor.sort,
+        value: cursor.value.clone(),
+        id: cursor.id.clone(),
+    })
+    .map_err(|_| WireValidationError::new("cursor"))?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
+/// 解码并严格校验 Client Key 游标。
+pub fn decode_client_key_cursor(encoded: &str) -> Result<ClientKeyCursorData, WireValidationError> {
+    if encoded.is_empty() || encoded.len() > MAX_CURSOR_BYTES {
+        return Err(WireValidationError::new("cursor"));
+    }
+    let bytes = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| WireValidationError::new("cursor"))?;
+    let cursor: CursorWire =
+        serde_json::from_slice(&bytes).map_err(|_| WireValidationError::new("cursor"))?;
+    let cursor = ClientKeyCursorData {
+        sort: cursor.sort,
+        value: cursor.value,
+        id: cursor.id,
+    };
+    validate_client_key_cursor(&cursor)?;
+    Ok(cursor)
+}
+
+fn validate_client_key_cursor(cursor: &ClientKeyCursorData) -> Result<(), WireValidationError> {
+    validate_required_text(&cursor.id, "cursor")?;
+    let matching = matches!(
+        (cursor.sort.field, &cursor.value),
+        (ClientKeySortField::Name, ClientKeyCursorValue::Name(value)) if !value.trim().is_empty()
+    ) || matches!(
+        (cursor.sort.field, &cursor.value),
+        (
+            ClientKeySortField::Enabled,
+            ClientKeyCursorValue::Enabled(_)
+        ) | (
+            ClientKeySortField::CreatedAt,
+            ClientKeyCursorValue::CreatedAt(_)
+        ) | (
+            ClientKeySortField::LastUsedAt,
+            ClientKeyCursorValue::LastUsedAt(_)
+        )
+    );
+    if matching {
+        Ok(())
+    } else {
+        Err(WireValidationError::new("cursor"))
+    }
+}
+
+const fn domain_sort(sort: ClientKeySort) -> DomainSort {
+    DomainSort {
+        field: match sort.field {
+            ClientKeySortField::Name => DomainSortField::Name,
+            ClientKeySortField::Enabled => DomainSortField::Enabled,
+            ClientKeySortField::CreatedAt => DomainSortField::CreatedAt,
+            ClientKeySortField::LastUsedAt => DomainSortField::LastUsedAt,
+        },
+        direction: match sort.direction {
+            ClientKeySortDirection::Asc => SortDirection::Asc,
+            ClientKeySortDirection::Desc => SortDirection::Desc,
+        },
+    }
+}
+
+const fn wire_sort(sort: DomainSort) -> ClientKeySort {
+    ClientKeySort {
+        field: match sort.field {
+            DomainSortField::Name => ClientKeySortField::Name,
+            DomainSortField::Enabled => ClientKeySortField::Enabled,
+            DomainSortField::CreatedAt => ClientKeySortField::CreatedAt,
+            DomainSortField::LastUsedAt => ClientKeySortField::LastUsedAt,
+        },
+        direction: match sort.direction {
+            SortDirection::Asc => ClientKeySortDirection::Asc,
+            SortDirection::Desc => ClientKeySortDirection::Desc,
+        },
+    }
+}
+
+fn domain_cursor(cursor: ClientKeyCursorData) -> Result<ClientKeyCursor, WireValidationError> {
+    let value = match cursor.value {
+        ClientKeyCursorValue::Name(value) => DomainCursorValue::Name(value),
+        ClientKeyCursorValue::Enabled(value) => DomainCursorValue::Enabled(value),
+        ClientKeyCursorValue::CreatedAt(value) => DomainCursorValue::CreatedAt(value),
+        ClientKeyCursorValue::LastUsedAt(value) => DomainCursorValue::LastUsedAt(value),
+    };
+    Ok(ClientKeyCursor {
+        sort: domain_sort(cursor.sort),
+        value,
+        id: client_key_id(cursor.id, "cursor")?,
+    })
+}
+
+fn wire_cursor(cursor: ClientKeyCursor) -> Result<ClientKeyCursorData, WireValidationError> {
+    let value = match cursor.value {
+        DomainCursorValue::Name(value) => ClientKeyCursorValue::Name(value),
+        DomainCursorValue::Enabled(value) => ClientKeyCursorValue::Enabled(value),
+        DomainCursorValue::CreatedAt(value) => ClientKeyCursorValue::CreatedAt(value),
+        DomainCursorValue::LastUsedAt(value) => ClientKeyCursorValue::LastUsedAt(value),
+    };
+    let cursor = ClientKeyCursorData {
+        sort: wire_sort(cursor.sort),
+        value,
+        id: cursor.id.to_string(),
+    };
+    validate_client_key_cursor(&cursor)?;
+    Ok(cursor)
+}
+
+fn client_key_id(
+    value: String,
+    field: &'static str,
+) -> Result<ClientApiKeyId, WireValidationError> {
+    ClientApiKeyId::new(value).map_err(|_| WireValidationError::new(field))
+}
+
+fn validate_limit(value: u64, field: &'static str) -> Result<(), WireValidationError> {
+    if i64::try_from(value).is_err() {
+        return Err(WireValidationError::new(field));
+    }
+    Ok(())
+}
+
+fn validate_required_text(value: &str, field: &'static str) -> Result<(), WireValidationError> {
+    if value.trim().is_empty() {
+        return Err(WireValidationError::new(field));
+    }
+    Ok(())
+}
+
+fn validate_group_ids(values: Vec<String>) -> Result<Vec<AccountGroupId>, WireValidationError> {
+    if values.len() > 1000
+        || values
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != values.len()
+    {
+        return Err(WireValidationError::new("groupIds"));
+    }
+    values
+        .into_iter()
+        .map(|value| AccountGroupId::new(value).map_err(|_| WireValidationError::new("groupIds")))
+        .collect()
+}
+
+fn validate_optional_text(
+    value: Option<&str>,
+    field: &'static str,
+) -> Result<(), WireValidationError> {
+    if value.is_some_and(|value| value.trim().is_empty()) {
+        return Err(WireValidationError::new(field));
+    }
+    Ok(())
+}
+
+/// 构造固定 GET/POST 且 ID 仅位于 query/body 的 Client API Key 路由。
+pub fn router<S>() -> Router<S>
+where
+    S: SessionState + Clone + Send + Sync + 'static,
+{
+    Router::new()
+        .route(
+            "/api/admin/client-keys/create-bound",
+            post(create_bound_key::<S>),
+        )
+        .route(
+            "/api/admin/client-keys/bindings",
+            post(load_key_bindings::<S>),
+        )
+        .route(
+            "/api/admin/client-keys/set-binding",
+            post(set_key_binding::<S>),
+        )
+        .route("/api/admin/client-keys", get(list_client_keys::<S>))
+        .route(
+            "/api/admin/client-keys/create",
+            post(create_client_key::<S>),
+        )
+        .route("/api/admin/client-keys/reveal", get(reveal_client_key::<S>))
+        .route(
+            "/api/admin/client-keys/reset-budget",
+            post(reset_client_key_budget::<S>),
+        )
+        .route(
+            "/api/admin/client-keys/update",
+            post(update_client_key::<S>),
+        )
+        .route(
+            "/api/admin/client-keys/disable",
+            post(disable_client_key::<S>),
+        )
+        .route(
+            "/api/admin/client-keys/enable",
+            post(enable_client_key::<S>),
+        )
+        .route(
+            "/api/admin/client-keys/delete",
+            post(delete_client_key::<S>),
+        )
+}
+
+fn validate_key_routing(
+    account: Option<&str>,
+    routing: Option<&gateway_core::account::scope::KeyRoutingOptions>,
+) -> Result<(), AdminError> {
+    let valid = match routing {
+        None => account.is_some(),
+        Some(routing) => {
+            routing.is_valid()
+                && match routing.mode.as_str() {
+                    "account" => account == routing.account_ids.first().map(String::as_str),
+                    _ => account.is_none(),
+                }
+        }
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(map_wire_error(WireValidationError::new("routing")))
+    }
+}
+
+async fn create_bound_key<S>(
+    auth: AdminAuth,
+    State(state): State<S>,
+    AdminJson(payload): AdminJson<CreateBoundKeyRequest>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    validate_key_routing(payload.account_id.as_deref(), payload.routing.as_ref())?;
+    let account_id = payload
+        .account_id
+        .map(gateway_core::account::ProviderAccountId::new)
+        .transpose()
+        .map_err(|_| map_wire_error(WireValidationError::new("accountId")))?;
+    let command = payload.key.into_command().map_err(map_wire_error)?;
+    let result = state
+        .admin_services()
+        .client_keys()
+        .create_bound(
+            &auth.context().mutation_context(),
+            command,
+            account_id,
+            payload.routing,
+            payload.excel_bridge_enabled,
+        )
+        .await
+        .map_err(map_service_error)?;
+    Ok(AdminResponse::new(
+        StatusCode::CREATED,
+        AdminEnvelope::ok(CreatedClientKeyData::from(result)),
+    ))
+}
+
+async fn load_key_bindings<S>(
+    _auth: AdminAuth,
+    State(state): State<S>,
+    AdminJson(payload): AdminJson<LoadKeyBindingsRequest>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    if payload.ids.is_empty() || payload.ids.len() > 200 {
+        return Err(map_wire_error(WireValidationError::new("ids")));
+    }
+    let ids = payload
+        .ids
+        .into_iter()
+        .map(|id| client_key_id(id, "ids"))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(map_wire_error)?;
+    let result = state
+        .admin_services()
+        .client_keys()
+        .bindings(ids)
+        .await
+        .map_err(map_service_error)?;
+    Ok(AdminResponse::new(
+        StatusCode::OK,
+        AdminEnvelope::ok(KeyBindingsData {
+            config_revision: result.config_revision.get(),
+            items: result.items.into_iter().map(Into::into).collect(),
+        }),
+    ))
+}
+
+async fn set_key_binding<S>(
+    auth: AdminAuth,
+    State(state): State<S>,
+    AdminJson(payload): AdminJson<SetKeyBindingRequest>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    validate_key_routing(payload.account_id.as_deref(), payload.routing.as_ref())?;
+    let command = gateway_admin::model::client_keys::SetClientKeyBinding {
+        routing: payload.routing,
+        id: client_key_id(payload.id, "id").map_err(map_wire_error)?,
+        account_id: payload
+            .account_id
+            .map(gateway_core::account::ProviderAccountId::new)
+            .transpose()
+            .map_err(|_| map_wire_error(WireValidationError::new("accountId")))?,
+        excel_bridge_enabled: payload.excel_bridge_enabled,
+        expected_revision: gateway_admin::model::Revision::new(payload.expected_revision)
+            .map_err(|_| map_wire_error(WireValidationError::new("expectedRevision")))?,
+    };
+    let result = state
+        .admin_services()
+        .client_keys()
+        .set_binding(&auth.context().mutation_context(), command)
+        .await
+        .map_err(map_service_error)?;
+    Ok(AdminResponse::new(
+        StatusCode::OK,
+        AdminEnvelope::ok(KeyBindingsData {
+            config_revision: result.config_revision.get(),
+            items: vec![result.binding.into()],
+        }),
+    ))
+}
+
+async fn list_client_keys<S>(
+    _auth: AdminAuth,
+    State(state): State<S>,
+    AdminQuery(query): AdminQuery<ListClientKeysQuery>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let result = state
+        .admin_services()
+        .client_keys()
+        .list(query.into_command().map_err(map_wire_error)?)
+        .await
+        .map_err(map_service_error)?;
+    let data = ClientKeyListData::try_from(result).map_err(|_| AdminError::internal())?;
+    Ok(AdminResponse::new(StatusCode::OK, AdminEnvelope::ok(data)))
+}
+
+async fn create_client_key<S>(
+    auth: AdminAuth,
+    State(state): State<S>,
+    AdminJson(payload): AdminJson<CreateClientKeyRequest>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let command = payload.into_command().map_err(map_wire_error)?;
+    let result = state
+        .admin_services()
+        .client_keys()
+        .create(&auth.context().mutation_context(), command)
+        .await
+        .map_err(map_service_error)?;
+    Ok(AdminResponse::new(
+        StatusCode::CREATED,
+        AdminEnvelope::ok(CreatedClientKeyData::from(result)),
+    ))
+}
+
+async fn reveal_client_key<S>(
+    _auth: AdminAuth,
+    State(state): State<S>,
+    AdminQuery(query): AdminQuery<ClientKeyIdQuery>,
+) -> Result<Response, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let id = query.into_domain_id().map_err(map_wire_error)?;
+    let result = state
+        .admin_services()
+        .client_keys()
+        .reveal(&id)
+        .await
+        .map_err(map_service_error)?;
+    let mut response = AdminResponse::new(
+        StatusCode::OK,
+        AdminEnvelope::ok(RevealedClientKeyData::from(result)),
+    )
+    .into_response();
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
+}
+
+async fn update_client_key<S>(
+    auth: AdminAuth,
+    State(state): State<S>,
+    AdminJson(payload): AdminJson<UpdateClientKeyRequest>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let command = payload.into_command().map_err(map_wire_error)?;
+    mutation_response(
+        state
+            .admin_services()
+            .client_keys()
+            .update(&auth.context().mutation_context(), command)
+            .await,
+    )
+}
+
+async fn reset_client_key_budget<S>(
+    auth: AdminAuth,
+    State(state): State<S>,
+    AdminJson(payload): AdminJson<ResetClientKeyBudgetRequest>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let id = state
+        .admin_services()
+        .client_keys()
+        .reset_budget(
+            &auth.context().mutation_context(),
+            payload.into_command().map_err(map_wire_error)?,
+        )
+        .await
+        .map_err(map_service_error)?;
+    Ok(AdminResponse::new(
+        StatusCode::OK,
+        AdminEnvelope::ok(MutatedClientKeyData::new(id.as_str().to_owned())),
+    ))
+}
+
+async fn disable_client_key<S>(
+    auth: AdminAuth,
+    State(state): State<S>,
+    AdminJson(payload): AdminJson<ClientKeyMutationRequest>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let id = payload.into_domain_id().map_err(map_wire_error)?;
+    mutation_response(
+        state
+            .admin_services()
+            .client_keys()
+            .set_enabled(
+                &auth.context().mutation_context(),
+                SetClientKeyEnabled { id, enabled: false },
+            )
+            .await,
+    )
+}
+
+async fn enable_client_key<S>(
+    auth: AdminAuth,
+    State(state): State<S>,
+    AdminJson(payload): AdminJson<ClientKeyMutationRequest>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let id = payload.into_domain_id().map_err(map_wire_error)?;
+    mutation_response(
+        state
+            .admin_services()
+            .client_keys()
+            .set_enabled(
+                &auth.context().mutation_context(),
+                SetClientKeyEnabled { id, enabled: true },
+            )
+            .await,
+    )
+}
+
+async fn delete_client_key<S>(
+    auth: AdminAuth,
+    State(state): State<S>,
+    AdminJson(payload): AdminJson<ClientKeyMutationRequest>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let id = payload.into_domain_id().map_err(map_wire_error)?;
+    mutation_response(
+        state
+            .admin_services()
+            .client_keys()
+            .delete(&auth.context().mutation_context(), DeleteClientKey { id })
+            .await,
+    )
+}
+
+fn mutation_response(
+    result: Result<ClientKeyMutation, gateway_admin::model::AdminError>,
+) -> Result<AdminResponse<AdminEnvelope<MutatedClientKeyData>>, AdminError> {
+    let data = result.map_err(map_service_error)?;
+    Ok(AdminResponse::new(
+        StatusCode::OK,
+        AdminEnvelope::ok(MutatedClientKeyData::from(data)),
+    ))
+}
+
+fn map_wire_error(error: WireValidationError) -> AdminError {
+    match error.field() {
+        "cursor" => AdminError::bad_request("Client API Key 游标不合法"),
+        "clientKeyRevealNotFound" | "clientKeyMutationNotFound" => {
+            AdminError::not_found("Client API Key 不存在")
+        }
+        _ => AdminError::bad_request("Client API Key 请求不合法"),
+    }
+}
+
+fn map_service_error(error: gateway_admin::model::AdminError) -> AdminError {
+    map_admin_service_error(error)
+}
+
+// 省略表示不修改，null 表示恢复跟随通用设置。
+fn deserialize_profile_override<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Option<serde_json::Map<String, serde_json::Value>>>, D::Error> {
+    Option::<serde_json::Map<String, serde_json::Value>>::deserialize(deserializer).map(Some)
+}

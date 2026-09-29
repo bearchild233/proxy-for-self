@@ -1,0 +1,70 @@
+//! Codex standalone search 非流式 HTTP adapter。
+
+use std::net::SocketAddr;
+
+use axum::{
+    body::Bytes,
+    extract::{Extension, State, connect_info::ConnectInfo},
+    http::HeaderMap,
+    response::Response,
+};
+use gateway_core::error::{GatewayError, GatewayErrorKind};
+use gateway_core::operation::{Operation, RawJsonPayload, StandaloneSearchRequest};
+
+use crate::ApiState;
+use crate::openai::{
+    auth::{authenticate_client, client_access_error_response},
+    endpoint::collect_raw_json_response,
+    error::gateway_error_response,
+    responses::{OpenAiRequestHeaders, request_client_context},
+};
+
+const OPENAI_PROTOCOL: &str = "openai";
+
+/// `POST /v1/alpha/search`。
+pub(crate) async fn standalone_search(
+    State(state): State<ApiState>,
+    connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let service = state.openai();
+    let client = match authenticate_client(service, &headers) {
+        Ok(client) => client,
+        Err(error) => return client_access_error_response(error),
+    };
+    if client.policy().account_scope().excel_bridge_enabled() {
+        return crate::openai::router::unsupported_endpoint_response(true);
+    }
+    let (client_ip, user_agent) = request_client_context(
+        &headers,
+        connect_info.map(|Extension(ConnectInfo(address))| address),
+    );
+    let operation = match search_operation(body, &headers) {
+        Ok(operation) => operation,
+        Err(error) => return gateway_error_response(&error),
+    };
+    let started = match service
+        .start_provider_endpoint(client, operation, client_ip, user_agent, "/v1/alpha/search")
+        .await
+    {
+        Ok(started) => started,
+        Err(error) => return gateway_error_response(&error),
+    };
+    collect_raw_json_response(started).await
+}
+
+fn search_operation(body: Bytes, headers: &HeaderMap) -> Result<Operation, GatewayError> {
+    let context = OpenAiRequestHeaders::from_headers(headers).session_context();
+    let payload = RawJsonPayload::new(OPENAI_PROTOCOL, body)
+        .map_err(|_| {
+            GatewayError::new(
+                GatewayErrorKind::Internal,
+                "OpenAI protocol identifier is invalid",
+            )
+        })?
+        .with_context(context);
+    Ok(Operation::Search(StandaloneSearchRequest::from_raw_json(
+        payload,
+    )))
+}

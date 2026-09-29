@@ -1,0 +1,328 @@
+//! OAuth 授权临时状态的 Redis 原子持久化。
+
+use std::time::Duration;
+
+use gateway_core::provider_ports::{
+    NewOAuthPendingFlow, OAuthPendingBinding, OAuthPendingClaimOutcome, OAuthPendingConsumeOutcome,
+    OAuthPendingFlowPort, OAuthPendingPutOutcome, OAuthPendingReleaseOutcome, ProviderStoreError,
+    ProviderStoreErrorKind,
+};
+use gateway_core::routing::ProviderKind;
+use redis::{Script, aio::ConnectionManager};
+use sha2::{Digest as _, Sha256};
+
+use super::{MAX_REDIS_EXACT_INTEGER, namespace};
+use crate::{StoreError, StoreResult};
+
+const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
+
+const CREATE_SCRIPT: &str = r#"
+if redis.call('EXISTS', KEYS[1]) == 1 then
+  return 0
+end
+local clock = redis.call('TIME')
+local now_ms = (tonumber(clock[1]) * 1000) + math.floor(tonumber(clock[2]) / 1000)
+local expires_at_ms = now_ms + tonumber(ARGV[3])
+local expires_at_epoch_seconds = math.floor(expires_at_ms / 1000)
+redis.call('HSET', KEYS[1],
+  'owner_fingerprint', ARGV[1],
+  'expires_at_epoch_seconds', expires_at_epoch_seconds,
+  'provider_payload', ARGV[2])
+redis.call('PEXPIREAT', KEYS[1], expires_at_ms)
+return 1
+"#;
+
+const CLAIM_SCRIPT: &str = r#"
+local function equal_bytes(left, right)
+  local different = math.abs(string.len(left) - string.len(right))
+  local length = math.max(string.len(left), string.len(right))
+  for index = 1, length do
+    local left_byte = string.byte(left, index) or 0
+    local right_byte = string.byte(right, index) or 0
+    if left_byte ~= right_byte then
+      different = different + 1
+    end
+  end
+  return different == 0
+end
+local owner = redis.call('HGET', KEYS[1], 'owner_fingerprint')
+if owner == false then
+  return {0, ''}
+end
+if not equal_bytes(owner, ARGV[1]) then
+  return {-1, ''}
+end
+local clock = redis.call('TIME')
+local now_ms = (tonumber(clock[1]) * 1000) + math.floor(tonumber(clock[2]) / 1000)
+local existing_claim = redis.call('HGET', KEYS[1], 'claim_fingerprint')
+if existing_claim ~= false then
+  local claim_expires_at = redis.call('HGET', KEYS[1], 'claim_expires_at_epoch_millis')
+  if claim_expires_at ~= false and tonumber(claim_expires_at) > now_ms then
+    return {-2, ''}
+  end
+  redis.call('HDEL', KEYS[1], 'claim_fingerprint', 'claim_expires_at_epoch_millis')
+end
+local payload = redis.call('HGET', KEYS[1], 'provider_payload')
+if payload == false then
+  return redis.error_reply('OAuth pending flow payload is missing')
+end
+redis.call('HSET', KEYS[1],
+  'claim_fingerprint', ARGV[2],
+  'claim_expires_at_epoch_millis', now_ms + tonumber(ARGV[3]))
+return {1, payload}
+"#;
+
+const RELEASE_CLAIM_SCRIPT: &str = r#"
+local function equal_bytes(left, right)
+  local different = math.abs(string.len(left) - string.len(right))
+  local length = math.max(string.len(left), string.len(right))
+  for index = 1, length do
+    local left_byte = string.byte(left, index) or 0
+    local right_byte = string.byte(right, index) or 0
+    if left_byte ~= right_byte then
+      different = different + 1
+    end
+  end
+  return different == 0
+end
+local owner = redis.call('HGET', KEYS[1], 'owner_fingerprint')
+if owner == false then
+  return 0
+end
+if not equal_bytes(owner, ARGV[1]) then
+  return -1
+end
+local claim = redis.call('HGET', KEYS[1], 'claim_fingerprint')
+if claim == false or not equal_bytes(claim, ARGV[2]) then
+  return -2
+end
+redis.call('HDEL', KEYS[1], 'claim_fingerprint', 'claim_expires_at_epoch_millis')
+return 1
+"#;
+
+const CONSUME_CLAIM_SCRIPT: &str = r#"
+local function equal_bytes(left, right)
+  local different = math.abs(string.len(left) - string.len(right))
+  local length = math.max(string.len(left), string.len(right))
+  for index = 1, length do
+    local left_byte = string.byte(left, index) or 0
+    local right_byte = string.byte(right, index) or 0
+    if left_byte ~= right_byte then
+      different = different + 1
+    end
+  end
+  return different == 0
+end
+local owner = redis.call('HGET', KEYS[1], 'owner_fingerprint')
+if owner == false then
+  return 0
+end
+if not equal_bytes(owner, ARGV[1]) then
+  return -1
+end
+local claim = redis.call('HGET', KEYS[1], 'claim_fingerprint')
+if claim == false or not equal_bytes(claim, ARGV[2]) then
+  return -2
+end
+redis.call('DEL', KEYS[1])
+return 1
+"#;
+
+/// OAuth pending flow 的 Redis 原子持久化能力。
+#[derive(Clone)]
+pub struct RedisOAuthPendingFlowRepository {
+    connection: ConnectionManager,
+    namespace: String,
+}
+
+impl RedisOAuthPendingFlowRepository {
+    pub fn new(connection: ConnectionManager, key_namespace: &str) -> StoreResult<Self> {
+        Ok(Self {
+            connection,
+            namespace: format!("{}:oauth-pending:v1", namespace(key_namespace)?),
+        })
+    }
+
+    fn key(&self, provider_kind: &ProviderKind, flow: &OAuthPendingBinding) -> String {
+        let fingerprint = provider_scoped_fingerprint(provider_kind, flow);
+        format!(
+            "{}:{}:{fingerprint}",
+            self.namespace,
+            provider_kind.as_str()
+        )
+    }
+}
+
+impl OAuthPendingFlowPort for RedisOAuthPendingFlowRepository {
+    fn put_if_absent(
+        &self,
+        flow: NewOAuthPendingFlow,
+    ) -> futures::future::BoxFuture<'_, Result<OAuthPendingPutOutcome, ProviderStoreError>> {
+        Box::pin(async move {
+            let key = self.key(flow.provider_kind(), flow.flow());
+            let owner = provider_scoped_fingerprint(flow.provider_kind(), flow.owner());
+            let payload = serde_json::to_vec(&serde_json::Value::Object(
+                flow.payload().expose_to_provider().clone(),
+            ))
+            .map_err(|_| provider_invalid("encode OAuth pending payload"))?;
+            if payload.len() > MAX_PAYLOAD_BYTES {
+                return Err(provider_invalid("validate OAuth pending payload"));
+            }
+            let ttl_millis =
+                ttl_millis(flow.ttl()).map_err(|_| provider_invalid("encode OAuth pending TTL"))?;
+            let mut connection = self.connection.clone();
+            let stored = Script::new(CREATE_SCRIPT)
+                .key(key)
+                .arg(owner)
+                .arg(payload)
+                .arg(ttl_millis)
+                .invoke_async::<i64>(&mut connection)
+                .await
+                .map_err(|_| provider_unavailable("create OAuth pending flow"))?;
+            Ok(if stored == 1 {
+                OAuthPendingPutOutcome::Stored
+            } else {
+                OAuthPendingPutOutcome::AlreadyExists
+            })
+        })
+    }
+
+    fn claim_if_owner<'a>(
+        &'a self,
+        provider_kind: &'a ProviderKind,
+        flow: &'a OAuthPendingBinding,
+        owner: &'a OAuthPendingBinding,
+        claim: &'a OAuthPendingBinding,
+        claim_ttl: Duration,
+    ) -> futures::future::BoxFuture<'a, Result<OAuthPendingClaimOutcome, ProviderStoreError>> {
+        Box::pin(async move {
+            let key = self.key(provider_kind, flow);
+            let owner = provider_scoped_fingerprint(provider_kind, owner);
+            let claim = provider_scoped_fingerprint(provider_kind, claim);
+            let claim_ttl = ttl_millis(claim_ttl)
+                .map_err(|_| provider_invalid("encode OAuth pending claim TTL"))?;
+            let mut connection = self.connection.clone();
+            let (status, payload): (i64, Vec<u8>) = Script::new(CLAIM_SCRIPT)
+                .key(key)
+                .arg(owner)
+                .arg(claim)
+                .arg(claim_ttl)
+                .invoke_async(&mut connection)
+                .await
+                .map_err(|_| provider_unavailable("claim OAuth pending flow"))?;
+            match status {
+                0 => Ok(OAuthPendingClaimOutcome::NotFound),
+                -1 => Ok(OAuthPendingClaimOutcome::OwnerMismatch),
+                -2 => Ok(OAuthPendingClaimOutcome::InProgress),
+                1 => {
+                    let value: serde_json::Value = serde_json::from_slice(&payload)
+                        .map_err(|_| provider_invalid("decode OAuth pending payload"))?;
+                    let serde_json::Value::Object(fields) = value else {
+                        return Err(provider_invalid("decode OAuth pending payload"));
+                    };
+                    Ok(OAuthPendingClaimOutcome::Claimed(
+                        gateway_core::account::OpaqueProviderData::new(fields),
+                    ))
+                }
+                _ => Err(provider_invalid("decode OAuth pending claim outcome")),
+            }
+        })
+    }
+
+    fn release_claim<'a>(
+        &'a self,
+        provider_kind: &'a ProviderKind,
+        flow: &'a OAuthPendingBinding,
+        owner: &'a OAuthPendingBinding,
+        claim: &'a OAuthPendingBinding,
+    ) -> futures::future::BoxFuture<'a, Result<OAuthPendingReleaseOutcome, ProviderStoreError>>
+    {
+        Box::pin(async move {
+            let key = self.key(provider_kind, flow);
+            let owner = provider_scoped_fingerprint(provider_kind, owner);
+            let claim = provider_scoped_fingerprint(provider_kind, claim);
+            let mut connection = self.connection.clone();
+            let status = Script::new(RELEASE_CLAIM_SCRIPT)
+                .key(key)
+                .arg(owner)
+                .arg(claim)
+                .invoke_async::<i64>(&mut connection)
+                .await
+                .map_err(|_| provider_unavailable("release OAuth pending claim"))?;
+            Ok(match status {
+                0 => OAuthPendingReleaseOutcome::NotFound,
+                -1 => OAuthPendingReleaseOutcome::OwnerMismatch,
+                -2 => OAuthPendingReleaseOutcome::ClaimMismatch,
+                1 => OAuthPendingReleaseOutcome::Released,
+                _ => {
+                    return Err(provider_invalid(
+                        "decode OAuth pending claim release outcome",
+                    ));
+                }
+            })
+        })
+    }
+
+    fn consume_claim<'a>(
+        &'a self,
+        provider_kind: &'a ProviderKind,
+        flow: &'a OAuthPendingBinding,
+        owner: &'a OAuthPendingBinding,
+        claim: &'a OAuthPendingBinding,
+    ) -> futures::future::BoxFuture<'a, Result<OAuthPendingConsumeOutcome, ProviderStoreError>>
+    {
+        Box::pin(async move {
+            let key = self.key(provider_kind, flow);
+            let owner = provider_scoped_fingerprint(provider_kind, owner);
+            let claim = provider_scoped_fingerprint(provider_kind, claim);
+            let mut connection = self.connection.clone();
+            let status = Script::new(CONSUME_CLAIM_SCRIPT)
+                .key(key)
+                .arg(owner)
+                .arg(claim)
+                .invoke_async::<i64>(&mut connection)
+                .await
+                .map_err(|_| provider_unavailable("consume OAuth pending claim"))?;
+            Ok(match status {
+                0 => OAuthPendingConsumeOutcome::NotFound,
+                -1 => OAuthPendingConsumeOutcome::OwnerMismatch,
+                -2 => OAuthPendingConsumeOutcome::ClaimMismatch,
+                1 => OAuthPendingConsumeOutcome::Consumed,
+                _ => {
+                    return Err(provider_invalid(
+                        "decode OAuth pending claim consume outcome",
+                    ));
+                }
+            })
+        })
+    }
+}
+
+fn provider_scoped_fingerprint(
+    provider_kind: &ProviderKind,
+    binding: &OAuthPendingBinding,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(provider_kind.as_str().as_bytes());
+    digest.update([0]);
+    digest.update(binding.expose_to_store().as_bytes());
+    hex::encode(digest.finalize())
+}
+
+fn ttl_millis(ttl: Duration) -> StoreResult<u64> {
+    u64::try_from(ttl.as_millis())
+        .ok()
+        .filter(|value| *value > 0 && *value <= MAX_REDIS_EXACT_INTEGER)
+        .ok_or_else(|| StoreError::InvalidData {
+            entity: "OAuth pending flow",
+            message: "TTL is outside the supported range".to_owned(),
+        })
+}
+
+fn provider_unavailable(operation: &'static str) -> ProviderStoreError {
+    ProviderStoreError::new(ProviderStoreErrorKind::Unavailable, operation)
+}
+
+fn provider_invalid(operation: &'static str) -> ProviderStoreError {
+    ProviderStoreError::new(ProviderStoreErrorKind::InvalidData, operation)
+}

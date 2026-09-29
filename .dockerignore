@@ -1,0 +1,11 @@
+.git
+**/node_modules
+**/target
+**/__pycache__
+.venv
+.runtime
+.build
+dist
+frontend/dist
+deploy/config.yaml
+.env*

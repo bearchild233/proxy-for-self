@@ -1,0 +1,418 @@
+use std::future::ready;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use chrono::{Duration, Utc};
+use provider_xai::{
+    FailClosedTokenVerifier, FailureClass, GrokCredentialAdmin, GrokOAuthClient, GrokOAuthConfig,
+    GrokOAuthImportCandidate, GrokOAuthImportDocument, GrokOAuthImportError,
+    GrokOAuthImportMetadata, GrokOAuthImportTokens, OAuthHttpRequest, OAuthHttpResponse,
+    OAuthHttpTransport, SecretValue, TokenCandidate, TokenVerificationContext, TokenVerifier,
+    TransportFuture, VerificationEvidence, VerificationFuture, VerifiedGrokAccount,
+};
+
+use crate::support::account_id;
+
+const DISCOVERY: &[u8] = include_bytes!("fixtures/discovery.json");
+const INVALID_GRANT: &[u8] = include_bytes!("fixtures/invalid_grant.json");
+const REQUIRED_SCOPE: &str = "openid offline_access grok-cli:access api:access";
+
+struct DiscoveryTransport;
+
+impl OAuthHttpTransport for DiscoveryTransport {
+    fn execute(&self, _request: OAuthHttpRequest) -> TransportFuture<'_> {
+        Box::pin(ready(Ok(OAuthHttpResponse::new(200, DISCOVERY.to_vec()))))
+    }
+}
+
+struct AcceptingUserInfoVerifier;
+
+impl TokenVerifier for AcceptingUserInfoVerifier {
+    fn verify<'a>(
+        &'a self,
+        _context: TokenVerificationContext<'a>,
+        _candidate: TokenCandidate<'a>,
+    ) -> VerificationFuture<'a> {
+        Box::pin(ready(Ok(VerificationEvidence::user_info(
+            "fixture-subject".to_owned(),
+        ))))
+    }
+}
+
+#[derive(Default)]
+struct RejectingRefreshTransport {
+    calls: AtomicUsize,
+}
+
+impl OAuthHttpTransport for RejectingRefreshTransport {
+    fn execute(&self, _request: OAuthHttpRequest) -> TransportFuture<'_> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(ready(Ok(if call == 0 {
+            OAuthHttpResponse::new(200, DISCOVERY.to_vec())
+        } else {
+            OAuthHttpResponse::new(400, INVALID_GRANT.to_vec())
+        })))
+    }
+}
+
+#[tokio::test]
+async fn expired_access_token_requires_official_refresh_before_identity_verification() {
+    let now = Utc::now();
+    let transport = Arc::new(RejectingRefreshTransport::default());
+    let client = GrokOAuthClient::new(
+        GrokOAuthConfig::official().expect("official config"),
+        crate::support::xai_wire_profile(),
+        transport.clone(),
+        Arc::new(FailClosedTokenVerifier),
+    );
+    let discovery = client.discover().await.expect("official discovery fixture");
+    let error = client
+        .verify_imported_credential(
+            &discovery,
+            candidate(
+                provider_xai::GROK_CLI_BASE_URL,
+                REQUIRED_SCOPE,
+                now - Duration::hours(2),
+                now - Duration::seconds(1),
+            ),
+        )
+        .await
+        .expect_err("rejected RT must fail before identity verification");
+
+    assert!(matches!(error, GrokOAuthImportError::OAuth(_)));
+    assert_eq!(error.class(), FailureClass::CredentialPermanent);
+    assert_eq!(transport.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn non_official_base_url_should_fail_closed() {
+    let now = Utc::now();
+    let error = verify(candidate(
+        "https://api.x.ai/v1",
+        REQUIRED_SCOPE,
+        now,
+        now + Duration::hours(1),
+    ))
+    .await;
+
+    assert!(matches!(
+        error,
+        GrokOAuthImportError::InvalidField("base_url")
+    ));
+}
+
+#[tokio::test]
+async fn missing_required_scope_should_fail_closed() {
+    let now = Utc::now();
+    let error = verify(candidate(
+        provider_xai::GROK_CLI_BASE_URL,
+        "openid offline_access grok-cli:access",
+        now,
+        now + Duration::hours(1),
+    ))
+    .await;
+
+    assert!(matches!(error, GrokOAuthImportError::InvalidField("scope")));
+}
+
+#[tokio::test]
+async fn verified_import_inside_refresh_margin_should_not_persist_a_refresh_schedule() {
+    let now = Utc::now();
+    let client = GrokOAuthClient::new(
+        GrokOAuthConfig::official().expect("official config"),
+        crate::support::xai_wire_profile(),
+        Arc::new(DiscoveryTransport),
+        Arc::new(AcceptingUserInfoVerifier),
+    );
+    let discovery = client.discover().await.expect("official discovery fixture");
+    let tokens = client
+        .verify_imported_credential(
+            &discovery,
+            candidate(
+                provider_xai::GROK_CLI_BASE_URL,
+                REQUIRED_SCOPE,
+                now,
+                now + Duration::minutes(30),
+            ),
+        )
+        .await
+        .expect("still-valid imported credential");
+    let prepared = GrokCredentialAdmin
+        .prepare_verified_account(&VerifiedGrokAccount {
+            account_id: account_id("refresh-window-import"),
+            name: "refresh-window-import".to_owned(),
+            email: None,
+            upstream_account_id: None,
+            plan_type: None,
+            tokens,
+            enabled: true,
+        })
+        .expect("valid credential inside refresh window must be imported");
+
+    assert!(prepared.account.next_refresh_at().is_none());
+}
+
+#[test]
+fn candidate_debug_should_redact_all_identity_and_secret_material() {
+    let now = Utc::now();
+    let candidate = GrokOAuthImportCandidate::new(
+        GrokOAuthImportTokens::new(
+            SecretValue::new("debug-access-secret".to_owned()),
+            SecretValue::new("debug-refresh-secret".to_owned()),
+            SecretValue::new("debug-id-secret".to_owned()),
+        ),
+        GrokOAuthImportMetadata::new(
+            "Bearer".to_owned(),
+            "debug-client-secret".to_owned(),
+            "debug-scope-secret".to_owned(),
+            provider_xai::GROK_CLI_BASE_URL.to_owned(),
+            now,
+            now + Duration::hours(1),
+        ),
+    );
+
+    let debug = format!("{candidate:?}");
+    assert!(debug.contains("[REDACTED]"));
+    for forbidden in [
+        "debug-access-secret",
+        "debug-refresh-secret",
+        "debug-id-secret",
+        "debug-client-secret",
+        "debug-scope-secret",
+    ] {
+        assert!(!debug.contains(forbidden));
+    }
+}
+
+#[test]
+fn strict_oauth_account_document_should_parse_without_exposing_credentials() {
+    let document = oauth_account_document();
+    let parsed = GrokOAuthImportDocument::parse_json(&document).expect("strict document");
+    let debug = format!("{parsed:?}");
+    assert!(debug.contains("account_count"));
+    assert!(!debug.contains("fixture-access-token"));
+    assert!(!debug.contains("fixture-refresh-token"));
+
+    let mut entries = parsed.into_entries();
+    assert_eq!(entries.len(), 1);
+    let entry = entries.pop().expect("one account");
+    assert_eq!(entry.name(), "grok-primary");
+    assert_eq!(entry.email(), Some("owner@example.test"));
+    let entry_debug = format!("{entry:?}");
+    assert!(!entry_debug.contains("owner@example.test"));
+    assert!(!entry_debug.contains("fixture-access-token"));
+    let _candidate = entry.into_candidate();
+}
+
+#[test]
+fn import_default_proxy_preserves_explicit_account_exits() {
+    let default_proxy =
+        gateway_core::account::OutboundProxy::parse("http://default.example:8080").unwrap();
+    for (field, value, expected) in [
+        (
+            None,
+            serde_json::Value::Null,
+            Some("http://default.example:8080/"),
+        ),
+        (
+            Some("outboundProxyUrl"),
+            serde_json::json!("socks5h://override.example:1080"),
+            Some("socks5h://override.example:1080"),
+        ),
+        (Some("outbound_proxy_url"), serde_json::json!(""), None),
+        (Some("outboundProxyUrl"), serde_json::Value::Null, None),
+        (Some("proxy_key"), serde_json::Value::Null, None),
+    ] {
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&oauth_account_document()).unwrap();
+        if let Some(field) = field {
+            document["accounts"][0][field] = value;
+        }
+        let parsed = GrokOAuthImportDocument::parse_json_with_proxy(
+            &serde_json::to_vec(&document).unwrap(),
+            Some(&default_proxy),
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.into_entries()[0]
+                .outbound_proxy()
+                .map(|proxy| proxy.endpoint())
+                .as_deref(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn oauth_account_document_should_reject_api_key_credential_field() {
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&oauth_account_document()).expect("fixture JSON");
+    document["accounts"][0]["credentials"]["api_key"] =
+        serde_json::Value::String("must-not-be-accepted".to_owned());
+
+    let error = GrokOAuthImportDocument::parse_json(
+        &serde_json::to_vec(&document).expect("serialize fixture"),
+    )
+    .expect_err("API key is outside the OAuth contract");
+    assert!(matches!(
+        error,
+        GrokOAuthImportError::InvalidField("account")
+    ));
+}
+
+#[test]
+fn oauth_account_document_should_ignore_source_wrapper_and_non_auth_metadata() {
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&oauth_account_document()).expect("fixture JSON");
+    document["type"] = serde_json::Value::String("external-oauth-data".to_owned());
+    document["version"] = serde_json::Value::from(99);
+    document["proxies"] = serde_json::json!([{"url": "http://127.0.0.1:8080"}]);
+    document["source_extension"] = serde_json::json!({"opaque": true});
+    document["accounts"][0]["platform"] = serde_json::Value::String("source-platform".to_owned());
+    document["accounts"][0]["type"] = serde_json::Value::String("source-auth".to_owned());
+    document["accounts"][0]["concurrency"] = serde_json::Value::from(0);
+    document["accounts"][0]["priority"] = serde_json::Value::from(0);
+    document["accounts"][0]["credentials"]["provider_extension"] =
+        serde_json::json!({"window": "dynamic"});
+    document["accounts"][0]["extra"] = serde_json::json!({
+        "email": "different@example.test",
+        "provider_snapshot": {"remaining": 1}
+    });
+
+    let parsed = GrokOAuthImportDocument::parse_json(
+        &serde_json::to_vec(&document).expect("serialize fixture"),
+    )
+    .expect("source wrapper must not constrain xAI OAuth import");
+
+    assert_eq!(parsed.into_entries().len(), 1);
+}
+
+#[test]
+fn minimal_oauth_credential_should_not_require_a_source_format() {
+    let document = serde_json::json!({
+        "access_token": "fixture-access-token",
+        "refresh_token": "fixture-refresh-token",
+        "expires_at": Utc::now() + Duration::hours(1)
+    });
+
+    let mut entries = GrokOAuthImportDocument::parse_json(
+        &serde_json::to_vec(&document).expect("serialize fixture"),
+    )
+    .expect("minimal credential")
+    .into_entries();
+
+    let entry = entries.pop().expect("one entry");
+    assert_eq!(entry.name(), "xAI OAuth account 1");
+    assert_eq!(entry.email(), None);
+}
+
+#[test]
+fn duplicate_refresh_token_entries_should_collapse_to_the_first() {
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&oauth_account_document()).expect("fixture JSON");
+    let duplicate = document["accounts"][0].clone();
+    document["accounts"]
+        .as_array_mut()
+        .expect("accounts array")
+        .push(duplicate);
+
+    // 同一 refresh token 重复出现时解析层去重，避免逐条 RT exchange
+    // 让先完成的轮换被后续重复条目作废。
+    let parsed = GrokOAuthImportDocument::parse_json(
+        &serde_json::to_vec(&document).expect("serialize fixture"),
+    )
+    .expect("duplicate refresh tokens collapse at parse");
+    assert_eq!(parsed.into_entries().len(), 1);
+
+    // 不同 refresh token 的同名条目不受影响，重复检测仍归上游身份验证。
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&oauth_account_document()).expect("fixture JSON");
+    let mut distinct = document["accounts"][0].clone();
+    distinct["credentials"]["refresh_token"] =
+        serde_json::Value::String("fixture-refresh-token-second".to_owned());
+    document["accounts"]
+        .as_array_mut()
+        .expect("accounts array")
+        .push(distinct);
+
+    let parsed = GrokOAuthImportDocument::parse_json(
+        &serde_json::to_vec(&document).expect("serialize fixture"),
+    )
+    .expect("distinct refresh tokens keep their entries");
+
+    assert_eq!(parsed.into_entries().len(), 2);
+}
+
+async fn verify(candidate: GrokOAuthImportCandidate) -> GrokOAuthImportError {
+    let client = GrokOAuthClient::new(
+        GrokOAuthConfig::official().expect("official config"),
+        crate::support::xai_wire_profile(),
+        Arc::new(DiscoveryTransport),
+        Arc::new(FailClosedTokenVerifier),
+    );
+    let discovery = client.discover().await.expect("official discovery fixture");
+    client
+        .verify_imported_credential(&discovery, candidate)
+        .await
+        .expect_err("invalid metadata must fail before fail-closed verifier")
+}
+
+fn candidate(
+    base_url: &str,
+    scope: &str,
+    exported_at: chrono::DateTime<Utc>,
+    expires_at: chrono::DateTime<Utc>,
+) -> GrokOAuthImportCandidate {
+    GrokOAuthImportCandidate::new(
+        GrokOAuthImportTokens::new(
+            SecretValue::new("fixture-access-token".to_owned()),
+            SecretValue::new("fixture-refresh-token".to_owned()),
+            SecretValue::new("header.payload.signature".to_owned()),
+        ),
+        GrokOAuthImportMetadata::new(
+            "Bearer".to_owned(),
+            provider_xai::OFFICIAL_CLIENT_ID.to_owned(),
+            scope.to_owned(),
+            base_url.to_owned(),
+            exported_at,
+            expires_at,
+        ),
+    )
+}
+
+fn oauth_account_document() -> Vec<u8> {
+    let exported_at = Utc::now();
+    serde_json::to_vec(&serde_json::json!({
+        "exported_at": exported_at,
+        "accounts": [{
+            "name": "grok-primary",
+            "platform": "grok",
+            "type": "oauth",
+            "credentials": {
+                "_token_version": 1,
+                "access_token": "fixture-access-token",
+                "refresh_token": "fixture-refresh-token",
+                "id_token": "fixture-id-token",
+                "token_type": "Bearer",
+                "expires_at": exported_at + Duration::hours(1),
+                "email": "owner@example.test",
+                "base_url": provider_xai::GROK_CLI_BASE_URL,
+                "client_id": provider_xai::OFFICIAL_CLIENT_ID,
+                "scope": REQUIRED_SCOPE,
+                "sub": "fixture-subject",
+                "team_id": "fixture-team"
+            },
+            "concurrency": 1,
+            "priority": 1,
+            "rate_multiplier": 1,
+            "auto_pause_on_expired": true,
+            "extra": {
+                "email": "owner@example.test",
+                "grok_billing_snapshot": {},
+                "grok_usage_snapshot": {}
+            }
+        }],
+        "proxies": []
+    }))
+    .expect("serialize fixture")
+}

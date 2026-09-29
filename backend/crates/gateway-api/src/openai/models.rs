@@ -1,0 +1,241 @@
+//! OpenAI 模型目录 HTTP adapter。
+
+use axum::{
+    Json,
+    extract::{Path, Query, State},
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
+};
+use gateway_core::routing::{PublicModelDescriptor, PublicModelId, PublicModelProfile};
+use serde::Deserialize;
+use serde_json::{Value, json};
+
+use crate::ApiState;
+
+use super::{
+    auth::{authenticate_client, client_access_error_response},
+    error::{model_not_found_response, openai_error_response},
+};
+
+const MODEL_CREATED_TIMESTAMP: i64 = 1_700_000_000;
+const CODEX_BASE_INSTRUCTIONS: &str = "You are Codex, a coding agent. Follow the user's instructions and use the available tools to complete software engineering tasks. Inspect relevant files before editing, preserve unrelated changes, and verify the result.";
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ModelsQuery {
+    client_version: Option<String>,
+}
+
+/// `GET /v1/models`。Codex 携带 `client_version` 时返回其专用目录合同。
+pub(crate) async fn models(
+    State(state): State<ApiState>,
+    Query(query): Query<ModelsQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let service = state.openai();
+    let client = match authenticate_client(service, &headers) {
+        Ok(client) => client,
+        Err(error) => return client_access_error_response(error),
+    };
+
+    if let Some(version) = query
+        .client_version
+        .as_deref()
+        .filter(|version| !version.trim().is_empty())
+    {
+        if version.len() > 64
+            || !version
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b".-+".contains(&byte))
+        {
+            return openai_error_response(
+                StatusCode::BAD_REQUEST,
+                "Invalid client_version",
+                "invalid_request_error",
+                "invalid_client_version",
+            )
+            .into_response();
+        }
+        let catalog = match service.client_model_catalog(&client, version).await {
+            Ok(catalog) => catalog,
+            Err(_) => return catalog_unavailable_response(),
+        };
+        let models = catalog
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| match entry {
+                PublicModelDescriptor::Adapted(profile) => Ok(codex_model_json(profile, index)),
+                PublicModelDescriptor::Native { model, payload } => {
+                    if payload.protocol() != "codex" {
+                        return Err(());
+                    }
+                    let mut value: Value =
+                        serde_json::from_slice(payload.body()).map_err(|_| ())?;
+                    let object = value.as_object_mut().ok_or(())?;
+                    // 别名只改变请求标识，能力、提示词、顺序等仍由上游目录决定。
+                    object.insert("slug".to_owned(), Value::String(model.as_str().to_owned()));
+                    Ok(value)
+                }
+            })
+            .collect::<Result<Vec<_>, ()>>();
+        let Ok(models) = models else {
+            return catalog_unavailable_response();
+        };
+        return (
+            StatusCode::OK,
+            // 目录经过账号选择/别名/多 Provider 聚合，不能借用上游 ETag 表示改写后的正文。
+            [("cache-control", "private, no-store")],
+            Json(json!({
+                "models": models,
+            })),
+        )
+            .into_response();
+    }
+
+    let data = service
+        .public_models(&client)
+        .into_iter()
+        .map(|model| openai_model_json(&model))
+        .collect::<Vec<_>>();
+    (
+        StatusCode::OK,
+        Json(json!({
+            "object": "list",
+            "data": data,
+        })),
+    )
+        .into_response()
+}
+
+fn catalog_unavailable_response() -> Response {
+    openai_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Model catalog is temporarily unavailable",
+        "server_error",
+        "model_catalog_unavailable",
+    )
+    .into_response()
+}
+
+/// `GET /v1/models/{model_id}`。
+pub(crate) async fn model_detail(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(model_id): Path<String>,
+) -> Response {
+    let service = state.openai();
+    let client = match authenticate_client(service, &headers) {
+        Ok(client) => client,
+        Err(error) => return client_access_error_response(error),
+    };
+    let Ok(public_model) = PublicModelId::new(model_id) else {
+        return model_not_found_response().into_response();
+    };
+    if !service.contains_public_model(&client, &public_model) {
+        return model_not_found_response().into_response();
+    }
+
+    (
+        StatusCode::OK,
+        Json(openai_model_json(public_model.as_str())),
+    )
+        .into_response()
+}
+
+fn openai_model_json(id: &str) -> Value {
+    json!({
+        "id": id,
+        "object": "model",
+        "created": MODEL_CREATED_TIMESTAMP,
+        "owned_by": "gateway",
+    })
+}
+
+fn codex_model_json(profile: &PublicModelProfile, index: usize) -> Value {
+    let id = profile.model().as_str();
+    let presentation = profile.presentation();
+    let reasoning_levels = presentation
+        .supported_reasoning_efforts()
+        .iter()
+        .map(|effort| {
+            json!({
+                "effort": effort,
+                "description": reasoning_effort_description(effort),
+            })
+        })
+        .collect::<Vec<_>>();
+    let reasoning_supported = presentation
+        .supported_reasoning_efforts()
+        .iter()
+        .any(|effort| effort != "none");
+    let context_window = presentation.context_window_tokens();
+    let max_context_window = presentation.max_context_window_tokens();
+    let input_modalities = if presentation.image_input() {
+        vec!["text", "image"]
+    } else {
+        vec!["text"]
+    };
+    let additional_speed_tiers = presentation
+        .service_tiers()
+        .iter()
+        .filter_map(|tier| tier.speed_tier())
+        .collect::<Vec<_>>();
+    let service_tiers = presentation
+        .service_tiers()
+        .iter()
+        .map(|tier| {
+            json!({
+                "id": tier.id(),
+                "name": tier.name(),
+                "description": tier.description(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    json!({
+        "slug": id,
+        "display_name": presentation.display_name().unwrap_or(id),
+        "description": presentation.description(),
+        "default_reasoning_level": presentation.default_reasoning_effort(),
+        "supported_reasoning_levels": reasoning_levels,
+        "shell_type": "shell_command",
+        "visibility": if presentation.hidden() { "hide" } else { "list" },
+        "supported_in_api": true,
+        "priority": index.saturating_add(1),
+        "additional_speed_tiers": additional_speed_tiers,
+        "service_tiers": service_tiers,
+        "availability_nux": Value::Null,
+        "upgrade": Value::Null,
+        "base_instructions": CODEX_BASE_INSTRUCTIONS,
+        "model_messages": Value::Null,
+        "include_skills_usage_instructions": false,
+        "supports_reasoning_summary_parameter": reasoning_supported,
+        "default_reasoning_summary": "auto",
+        "support_verbosity": presentation.verbosity(),
+        "default_verbosity": Value::Null,
+        "apply_patch_tool_type": presentation.agent_tools().then_some("freeform"),
+        "web_search_tool_type": "text",
+        "truncation_policy": { "mode": "tokens", "limit": 10_000 },
+        "supports_parallel_tool_calls": presentation.parallel_tool_calls(),
+        "supports_image_detail_original": presentation.image_detail_original(),
+        "context_window": context_window,
+        "max_context_window": max_context_window,
+        "effective_context_window_percent": 95,
+        "experimental_supported_tools": [],
+        "input_modalities": input_modalities,
+        "supports_search_tool": presentation.search_tool(),
+        "use_responses_lite": false,
+    })
+}
+
+fn reasoning_effort_description(effort: &str) -> &'static str {
+    match effort {
+        "none" => "No reasoning",
+        "minimal" => "Minimal reasoning",
+        "low" => "Fast responses with lighter reasoning",
+        "medium" => "Balances speed and reasoning depth for everyday tasks",
+        "high" => "Greater reasoning depth for complex problems",
+        "xhigh" => "Extra high reasoning depth for complex problems",
+        "max" => "Maximum reasoning depth for the hardest problems",
+        _ => "Provider-supported reasoning level",
+    }
+}

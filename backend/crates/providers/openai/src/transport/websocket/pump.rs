@@ -1,0 +1,780 @@
+//! 常驻后台的 WebSocket 泵（对齐官方 Codex CLI 的连接管理）。
+//!
+//! 每条上游 WebSocket 连接都由一个后台 pump 任务独占：
+//!   - 持续读取 socket：一旦观察到 `Close` / EOF / 传输错误，立即把连接标记为 `closed`。
+//!   - 自动回应上游 `Ping`，并按 `ping_interval` 主动 `Ping`；收到任意入站帧即解除本次心跳 deadline。
+//!   - 可选 `liveness_timeout`：长时间无任何入站活动时判定连接失活并退出。
+//!
+//! 因此空闲连接的“死没死”在后台被实时感知；复用方只需零成本读取 [`PumpedWebSocket::is_closed`]，
+//! 无需在请求路径上做同步探活 ping（消除“复用到静默死连接才卡住超时”的长尾）。
+//!
+//! 收发都通过 channel 与 pump 任务交互：
+//!   - 发送：`send` 走 command channel，等待 pump 回执。
+//!   - 接收：`next` 从 message channel 取出 pump 转发的入站帧（`Ping`/`Pong` 已被 pump 吞掉）。
+//!   - 入站缓冲满时暂停读取 socket 和主动探活，仅继续处理发送/关闭命令；消费恢复后按原顺序继续转发。
+
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::Duration;
+
+use futures::{Sink, SinkExt, Stream, StreamExt};
+use tokio::{
+    sync::{mpsc, oneshot},
+    task::JoinHandle,
+    time::{Instant, MissedTickBehavior},
+};
+use tokio_tungstenite::tungstenite::Message;
+use uuid::Uuid;
+
+use super::CodexWebSocketCloseError;
+
+/// 底层 tungstenite WebSocket 流。
+pub(crate) trait WebSocketIo:
+    Stream<Item = Result<Message, tungstenite::Error>>
+    + Sink<Message, Error = tungstenite::Error>
+    + Send
+    + Unpin
+{
+}
+
+impl<T> WebSocketIo for T where
+    T: Stream<Item = Result<Message, tungstenite::Error>>
+        + Sink<Message, Error = tungstenite::Error>
+        + Send
+        + Unpin
+{
+}
+
+pub(crate) type RawWsStream = Box<dyn WebSocketIo>;
+
+const PUMP_COMMAND_BUFFER: usize = 32;
+
+/// pump 日志的账号级关联上下文；空闲连接被上游重置等场景用于回溯归属。
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PumpLogContext {
+    pub(crate) account_id: Option<String>,
+    pub(crate) conversation_id_hash: Option<String>,
+}
+
+impl PumpLogContext {
+    pub(crate) fn new(account_id: Option<String>, conversation_id_hash: Option<String>) -> Self {
+        Self {
+            account_id,
+            conversation_id_hash,
+        }
+    }
+}
+
+/// pump 保活策略。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PumpKeepalive {
+    /// 主动 `Ping` 间隔；`None` 表示 pump 不主动 ping（仅被动读取 + 回应上游 ping）。
+    pub(crate) ping_interval: Option<Duration>,
+    /// 主动 `Ping` 发出后等待任意入站帧的 deadline；`None` 表示不校验响应。
+    pub(crate) ping_timeout: Option<Duration>,
+    /// 无入站活动多久后判定失活；`None` 表示只靠显式 close/传输错误发现死亡。
+    pub(crate) liveness_timeout: Option<Duration>,
+}
+
+impl PumpKeepalive {
+    /// 不做主动保活（用于即用即弃的非池化连接）。
+    pub(crate) fn disabled() -> Self {
+        Self {
+            ping_interval: None,
+            ping_timeout: None,
+            liveness_timeout: None,
+        }
+    }
+}
+
+enum PumpCommand {
+    Send {
+        message: Message,
+        ack: oneshot::Sender<Result<(), tungstenite::Error>>,
+    },
+}
+
+const PUMP_MESSAGE_BUFFER: usize = 64;
+
+#[derive(Debug, Clone)]
+pub(crate) enum PumpExitReason {
+    CommandChannelClosed,
+    LocalClose,
+    OutboundTransportError {
+        message: String,
+        metric_reason: &'static str,
+    },
+    UpstreamCloseFrame {
+        close: Option<CodexWebSocketCloseError>,
+    },
+    UpstreamEof,
+    InboundTransportError {
+        message: String,
+        metric_reason: &'static str,
+    },
+    PongTimeout {
+        timeout: Duration,
+    },
+    LivenessTimeout {
+        timeout: Duration,
+    },
+    KeepaliveTransportError {
+        message: String,
+        metric_reason: &'static str,
+    },
+    MessageReceiverClosed,
+}
+
+impl PumpExitReason {
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::CommandChannelClosed => "command_channel_closed",
+            Self::LocalClose => "local_close",
+            Self::OutboundTransportError { .. } => "outbound_transport_error",
+            Self::UpstreamCloseFrame { .. } => "upstream_close_frame",
+            Self::UpstreamEof => "upstream_eof",
+            Self::InboundTransportError { .. } => "inbound_transport_error",
+            Self::PongTimeout { .. } => "pong_timeout",
+            Self::LivenessTimeout { .. } => "liveness_timeout",
+            Self::KeepaliveTransportError { .. } => "keepalive_transport_error",
+            Self::MessageReceiverClosed => "message_receiver_closed",
+        }
+    }
+
+    pub(crate) fn detail(&self) -> Option<String> {
+        match self {
+            Self::OutboundTransportError { message, .. }
+            | Self::InboundTransportError { message, .. }
+            | Self::KeepaliveTransportError { message, .. } => Some(message.clone()),
+            Self::UpstreamCloseFrame { close } => close.as_ref().map(ToString::to_string),
+            Self::PongTimeout { timeout } | Self::LivenessTimeout { timeout } => {
+                Some(format!("{timeout:?}"))
+            }
+            Self::CommandChannelClosed
+            | Self::LocalClose
+            | Self::UpstreamEof
+            | Self::MessageReceiverClosed => None,
+        }
+    }
+
+    pub(crate) fn metric_reason(&self) -> &'static str {
+        match self {
+            Self::CommandChannelClosed => "command_channel_closed",
+            Self::LocalClose => "local_close",
+            Self::OutboundTransportError { metric_reason, .. }
+            | Self::InboundTransportError { metric_reason, .. }
+            | Self::KeepaliveTransportError { metric_reason, .. } => metric_reason,
+            Self::UpstreamCloseFrame { close } => {
+                if close.as_ref().and_then(CodexWebSocketCloseError::code) == Some(1000) {
+                    "normal_close"
+                } else {
+                    "upstream_close"
+                }
+            }
+            Self::UpstreamEof => "eof",
+            Self::PongTimeout { .. } => "pong_timeout",
+            Self::LivenessTimeout { .. } => "liveness_timeout",
+            Self::MessageReceiverClosed => "message_receiver_closed",
+        }
+    }
+
+    pub(crate) fn upstream_close(&self) -> Option<&CodexWebSocketCloseError> {
+        match self {
+            Self::UpstreamCloseFrame { close: Some(close) } => Some(close),
+            _ => None,
+        }
+    }
+
+    fn is_unexpected(&self) -> bool {
+        matches!(
+            self,
+            Self::OutboundTransportError { .. }
+                | Self::UpstreamEof
+                | Self::InboundTransportError { .. }
+                | Self::PongTimeout { .. }
+                | Self::LivenessTimeout { .. }
+                | Self::KeepaliveTransportError { .. }
+        )
+    }
+
+    fn should_send_close(&self) -> bool {
+        matches!(
+            self,
+            Self::CommandChannelClosed
+                | Self::UpstreamCloseFrame { .. }
+                | Self::PongTimeout { .. }
+                | Self::LivenessTimeout { .. }
+                | Self::MessageReceiverClosed
+        )
+    }
+}
+
+struct PendingInbound {
+    item: Result<Message, tungstenite::Error>,
+    exit_reason: Option<PumpExitReason>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingPing {
+    payload: [u8; 8],
+    deadline: Instant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebSocketConnectionObservation {
+    connection_id: Uuid,
+    exit_reason: String,
+    age_ms: u64,
+    idle_ms: u64,
+}
+
+impl WebSocketConnectionObservation {
+    pub(crate) fn with_exit_reason(mut self, exit_reason: &'static str) -> Self {
+        self.exit_reason = exit_reason.to_owned();
+        self
+    }
+
+    pub const fn connection_id(&self) -> Uuid {
+        self.connection_id
+    }
+
+    pub fn exit_reason(&self) -> &str {
+        &self.exit_reason
+    }
+
+    pub const fn age_ms(&self) -> u64 {
+        self.age_ms
+    }
+
+    pub const fn idle_ms(&self) -> u64 {
+        self.idle_ms
+    }
+}
+
+struct PumpLifecycleState {
+    opened_at: Instant,
+    last_activity: Instant,
+    closed_at: Option<Instant>,
+    exit_reason: Option<PumpExitReason>,
+}
+
+impl PumpLifecycleState {
+    fn observation(
+        &self,
+        connection_id: Uuid,
+        observed_at: Instant,
+    ) -> WebSocketConnectionObservation {
+        let effective_end = self.closed_at.unwrap_or(observed_at);
+        WebSocketConnectionObservation {
+            connection_id,
+            exit_reason: self
+                .exit_reason
+                .as_ref()
+                .map_or("running", PumpExitReason::metric_reason)
+                .to_owned(),
+            age_ms: duration_millis(effective_end.duration_since(self.opened_at)),
+            idle_ms: duration_millis(effective_end.duration_since(self.last_activity)),
+        }
+    }
+}
+
+/// 由后台 pump 任务托管的 WebSocket 连接句柄。
+pub(crate) struct PumpedWebSocket {
+    connection_id: Uuid,
+    tx_command: mpsc::Sender<PumpCommand>,
+    rx_message: mpsc::Receiver<Result<Message, tungstenite::Error>>,
+    closed: Arc<AtomicBool>,
+    lifecycle: Arc<Mutex<PumpLifecycleState>>,
+    pump: Option<JoinHandle<()>>,
+}
+
+impl std::fmt::Debug for PumpedWebSocket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PumpedWebSocket")
+            .field("connection_id", &self.connection_id)
+            .field("closed", &self.closed.load(Ordering::Acquire))
+            .finish()
+    }
+}
+
+impl PumpedWebSocket {
+    /// 用底层流启动一个 pump 任务并返回句柄。
+    pub(crate) fn new(
+        inner: RawWsStream,
+        keepalive: PumpKeepalive,
+        context: PumpLogContext,
+    ) -> Self {
+        let (tx_command, rx_command) = mpsc::channel::<PumpCommand>(PUMP_COMMAND_BUFFER);
+        let (tx_message, rx_message) = mpsc::channel(PUMP_MESSAGE_BUFFER);
+        let connection_id = Uuid::new_v4();
+        let opened_at = Instant::now();
+        let closed = Arc::new(AtomicBool::new(false));
+        let closed_for_task = Arc::clone(&closed);
+        let lifecycle = Arc::new(Mutex::new(PumpLifecycleState {
+            opened_at,
+            last_activity: opened_at,
+            closed_at: None,
+            exit_reason: None,
+        }));
+        let lifecycle_for_task = Arc::clone(&lifecycle);
+        let pump = tokio::spawn(async move {
+            pump_loop(
+                connection_id,
+                inner,
+                rx_command,
+                tx_message,
+                keepalive,
+                context,
+                closed_for_task,
+                lifecycle_for_task,
+            )
+            .await;
+        });
+        Self {
+            connection_id,
+            tx_command,
+            rx_message,
+            closed,
+            lifecycle,
+            pump: Some(pump),
+        }
+    }
+
+    /// 通过 pump 发送一帧，返回底层 `send` 的结果。
+    pub(crate) async fn send(&self, message: Message) -> Result<(), tungstenite::Error> {
+        let (ack, rx_ack) = oneshot::channel();
+        if self
+            .tx_command
+            .send(PumpCommand::Send { message, ack })
+            .await
+            .is_err()
+        {
+            return Err(tungstenite::Error::ConnectionClosed);
+        }
+        rx_ack
+            .await
+            .unwrap_or(Err(tungstenite::Error::ConnectionClosed))
+    }
+
+    /// 取出下一帧入站消息（`Ping`/`Pong` 已被 pump 处理，不会到达这里）。
+    ///
+    /// 返回 `None` 表示连接已结束（pump 已退出且缓冲已排空）。
+    pub(crate) async fn next(&mut self) -> Option<Result<Message, tungstenite::Error>> {
+        self.rx_message.recv().await
+    }
+
+    /// 连接是否已被后台 pump 判定关闭/失活。零成本，用于复用前探活。
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire) || self.tx_command.is_closed()
+    }
+
+    pub(crate) fn connection_id(&self) -> Uuid {
+        self.connection_id
+    }
+
+    pub(crate) fn exit_reason(&self) -> Option<PumpExitReason> {
+        self.lifecycle
+            .lock()
+            .expect("WebSocket pump lifecycle lock poisoned")
+            .exit_reason
+            .clone()
+    }
+
+    pub(crate) fn observation(&self) -> WebSocketConnectionObservation {
+        self.lifecycle
+            .lock()
+            .expect("WebSocket pump lifecycle lock poisoned")
+            .observation(self.connection_id, Instant::now())
+    }
+
+    /// 主动关闭连接（best-effort 发送 Close 帧）。
+    pub(crate) async fn close(&self) {
+        if !self.is_closed() {
+            let _ = self.send(Message::Close(None)).await;
+        }
+    }
+}
+
+impl Drop for PumpedWebSocket {
+    fn drop(&mut self) {
+        if let Some(pump) = self.pump.take() {
+            pump.abort();
+        }
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "pump owns one flat set of channel/state handles and log context"
+)]
+async fn pump_loop(
+    connection_id: Uuid,
+    mut inner: RawWsStream,
+    mut rx_command: mpsc::Receiver<PumpCommand>,
+    tx_message: mpsc::Sender<Result<Message, tungstenite::Error>>,
+    keepalive: PumpKeepalive,
+    context: PumpLogContext,
+    closed: Arc<AtomicBool>,
+    lifecycle: Arc<Mutex<PumpLifecycleState>>,
+) {
+    let mut last_activity = lifecycle
+        .lock()
+        .expect("WebSocket pump lifecycle lock poisoned")
+        .last_activity;
+    let ping_interval = keepalive.ping_interval.filter(|d| !d.is_zero());
+    let ping_timeout = keepalive.ping_timeout.filter(|d| !d.is_zero());
+    let liveness_timeout = keepalive.liveness_timeout.filter(|d| !d.is_zero());
+    let mut ping_ticker = ping_interval.map(|d| {
+        // 首个 tick 推迟一整个间隔：tokio::time::interval 默认会让首个 tick 立即就绪，
+        // 否则连接一建立就会立刻发一帧 Ping，与首个请求 Text 抢跑、打乱帧序。
+        let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + d, d);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        ticker
+    });
+
+    let mut pending_inbound: Option<PendingInbound> = None;
+    let mut pending_ping: Option<PendingPing> = None;
+    let mut ping_sequence = 0_u64;
+    let mut backpressure_events = 0_u64;
+
+    let reason = 'pump: loop {
+        if pending_inbound.is_some() {
+            tokio::select! {
+                permit = tx_message.reserve() => {
+                    let Ok(permit) = permit else {
+                        break 'pump PumpExitReason::MessageReceiverClosed;
+                    };
+                    let pending = pending_inbound
+                        .take()
+                        .expect("pending inbound frame must exist");
+                    permit.send(pending.item);
+                    if let Some(reason) = pending.exit_reason {
+                        break 'pump reason;
+                    }
+                    // 背压期间无法读取 socket，不能把这段本地下游阻塞误算成上游静默。
+                    last_activity = Instant::now();
+                    record_activity(&lifecycle, last_activity);
+                }
+                command = rx_command.recv() => {
+                    let Some(command) = command else {
+                        break 'pump PumpExitReason::CommandChannelClosed;
+                    };
+                    if let Some(reason) = handle_command(&mut inner, command).await {
+                        break 'pump reason;
+                    }
+                }
+            }
+            continue;
+        }
+
+        let pong_deadline = pending_ping.map(|ping| ping.deadline);
+        let liveness_deadline = liveness_timeout.map(|timeout| last_activity + timeout);
+        tokio::select! {
+            command = rx_command.recv() => {
+                let Some(command) = command else {
+                    break 'pump PumpExitReason::CommandChannelClosed;
+                };
+                if let Some(reason) = handle_command(&mut inner, command).await {
+                    break 'pump reason;
+                }
+            }
+            message = inner.next() => {
+                match message {
+                    None => break 'pump PumpExitReason::UpstreamEof,
+                    Some(Ok(message)) => {
+                        last_activity = Instant::now();
+                        record_activity(&lifecycle, last_activity);
+                        observe_inbound(connection_id, &mut pending_ping, &message);
+                        match message {
+                            Message::Ping(payload) => {
+                                if let Err(error) = inner.send(Message::Pong(payload)).await {
+                                    break 'pump PumpExitReason::KeepaliveTransportError {
+                                        message: error.to_string(),
+                                        metric_reason: transport_metric_reason(&error),
+                                    };
+                                }
+                            }
+                            Message::Pong(_) => {}
+                            message => {
+                                let terminal_reason = match &message {
+                                    Message::Close(frame) => Some(PumpExitReason::UpstreamCloseFrame {
+                                        close: frame.as_ref().map(|frame| {
+                                            CodexWebSocketCloseError::new(
+                                                Some(u16::from(frame.code)),
+                                                Some(frame.reason.to_string()),
+                                            )
+                                        }),
+                                    }),
+                                    _ => None,
+                                };
+                                if let Some(reason) = enqueue_inbound(
+                                    &tx_message,
+                                    &mut pending_inbound,
+                                    connection_id,
+                                    &mut backpressure_events,
+                                    PendingInbound {
+                                        item: Ok(message),
+                                        exit_reason: terminal_reason,
+                                    },
+                                ) {
+                                    break 'pump reason;
+                                }
+                            }
+                        }
+                    }
+                    Some(Err(err)) => {
+                        let terminal_reason = PumpExitReason::InboundTransportError {
+                            message: err.to_string(),
+                            metric_reason: transport_metric_reason(&err),
+                        };
+                        if let Some(reason) = enqueue_inbound(
+                            &tx_message,
+                            &mut pending_inbound,
+                            connection_id,
+                            &mut backpressure_events,
+                            PendingInbound {
+                                item: Err(err),
+                                exit_reason: Some(terminal_reason),
+                            },
+                        ) {
+                            break 'pump reason;
+                        }
+                    }
+                }
+            }
+            _ = tick(&mut ping_ticker) => {
+                if pending_ping.is_none() {
+                    match send_keepalive_ping(
+                        &mut inner,
+                        &mut ping_sequence,
+                        ping_timeout,
+                    ).await {
+                        Ok(pending) => pending_ping = pending,
+                        Err(reason) => break 'pump reason,
+                    }
+                }
+            }
+            _ = wait_until(pong_deadline) => {
+                break 'pump PumpExitReason::PongTimeout {
+                    timeout: ping_timeout.expect("pending ping must have a timeout"),
+                };
+            }
+            _ = wait_until(liveness_deadline) => {
+                break 'pump PumpExitReason::LivenessTimeout {
+                    timeout: liveness_timeout.expect("liveness deadline must have a timeout"),
+                };
+            }
+        }
+    };
+
+    closed.store(true, Ordering::Release);
+    let observation = {
+        let closed_at = Instant::now();
+        let mut lifecycle = lifecycle
+            .lock()
+            .expect("WebSocket pump lifecycle lock poisoned");
+        lifecycle.closed_at = Some(closed_at);
+        lifecycle.exit_reason = Some(reason.clone());
+        lifecycle.observation(connection_id, closed_at)
+    };
+    log_pump_exit(
+        connection_id,
+        &context,
+        &reason,
+        &observation,
+        backpressure_events,
+    );
+
+    if reason.should_send_close() {
+        let _ = inner.send(Message::Close(None)).await;
+    }
+}
+
+fn enqueue_inbound(
+    tx_message: &mpsc::Sender<Result<Message, tungstenite::Error>>,
+    pending_inbound: &mut Option<PendingInbound>,
+    connection_id: Uuid,
+    backpressure_events: &mut u64,
+    inbound: PendingInbound,
+) -> Option<PumpExitReason> {
+    let PendingInbound { item, exit_reason } = inbound;
+    match tx_message.try_send(item) {
+        Ok(()) => exit_reason,
+        Err(mpsc::error::TrySendError::Full(item)) => {
+            *backpressure_events += 1;
+            if *backpressure_events == 1 {
+                tracing::info!(
+                    websocket_connection_id = %connection_id,
+                    buffer_capacity = PUMP_MESSAGE_BUFFER,
+                    "Responses WebSocket pump applying inbound backpressure"
+                );
+            }
+            *pending_inbound = Some(PendingInbound { item, exit_reason });
+            None
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => Some(PumpExitReason::MessageReceiverClosed),
+    }
+}
+
+async fn handle_command(inner: &mut RawWsStream, command: PumpCommand) -> Option<PumpExitReason> {
+    let PumpCommand::Send { message, ack } = command;
+    let is_close = matches!(message, Message::Close(_));
+    let result = inner.send(message).await;
+    let transport_error = result
+        .as_ref()
+        .err()
+        .map(|error| (error.to_string(), transport_metric_reason(error)));
+    let _ = ack.send(result);
+    match transport_error {
+        Some((message, metric_reason)) => Some(PumpExitReason::OutboundTransportError {
+            message,
+            metric_reason,
+        }),
+        None if is_close => Some(PumpExitReason::LocalClose),
+        None => None,
+    }
+}
+
+fn observe_inbound(connection_id: Uuid, pending_ping: &mut Option<PendingPing>, message: &Message) {
+    let Some(pending) = pending_ping else {
+        return;
+    };
+    if let Message::Pong(payload) = message
+        && payload.as_ref() != pending.payload
+    {
+        tracing::debug!(
+            websocket_connection_id = %connection_id,
+            "Responses WebSocket pump received a non-matching Pong"
+        );
+    }
+    // 匹配 Pong 是探针的直接回执；其他入站帧同样证明上游链路仍可达。
+    *pending_ping = None;
+}
+
+fn record_activity(lifecycle: &Mutex<PumpLifecycleState>, observed_at: Instant) {
+    lifecycle
+        .lock()
+        .expect("WebSocket pump lifecycle lock poisoned")
+        .last_activity = observed_at;
+}
+
+pub(crate) fn transport_metric_reason(error: &tungstenite::Error) -> &'static str {
+    match error {
+        tungstenite::Error::Io(error) => match error.kind() {
+            std::io::ErrorKind::ConnectionReset => "tcp_reset",
+            std::io::ErrorKind::ConnectionAborted => "connection_aborted",
+            std::io::ErrorKind::BrokenPipe => "broken_pipe",
+            std::io::ErrorKind::UnexpectedEof => "unexpected_eof",
+            std::io::ErrorKind::TimedOut => "transport_timeout",
+            _ => "transport_error",
+        },
+        // 未收到关闭握手只能证明连接异常结束，不能据此认定收到 TCP RST。
+        tungstenite::Error::Protocol(
+            tungstenite::error::ProtocolError::ResetWithoutClosingHandshake,
+        ) => "reset_without_closing_handshake",
+        _ => "transport_error",
+    }
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+async fn send_keepalive_ping(
+    inner: &mut RawWsStream,
+    sequence: &mut u64,
+    ping_timeout: Option<Duration>,
+) -> Result<Option<PendingPing>, PumpExitReason> {
+    let payload = sequence.to_be_bytes();
+    *sequence = sequence.wrapping_add(1);
+    inner
+        .send(Message::Ping(payload.to_vec().into()))
+        .await
+        .map_err(|error| PumpExitReason::KeepaliveTransportError {
+            message: error.to_string(),
+            metric_reason: transport_metric_reason(&error),
+        })?;
+    Ok(ping_timeout.map(|timeout| PendingPing {
+        payload,
+        deadline: Instant::now() + timeout,
+    }))
+}
+
+fn log_pump_exit(
+    connection_id: Uuid,
+    context: &PumpLogContext,
+    reason: &PumpExitReason,
+    observation: &WebSocketConnectionObservation,
+    backpressure_events: u64,
+) {
+    let detail = reason.detail().unwrap_or_default();
+    let account_id = context.account_id.as_deref().unwrap_or("unknown");
+    let conversation_id_hash = context.conversation_id_hash.as_deref().unwrap_or("unknown");
+    if reason.is_unexpected() {
+        tracing::warn!(
+            websocket_connection_id = %connection_id,
+            account_id = %account_id,
+            conversation_id_hash = %conversation_id_hash,
+            pump_exit_reason = reason.as_str(),
+            connection_exit_reason = observation.exit_reason(),
+            connection_age_ms = observation.age_ms(),
+            connection_idle_ms = observation.idle_ms(),
+            pump_exit_detail = detail,
+            backpressure_events,
+            "Responses WebSocket pump stopped unexpectedly"
+        );
+    } else if matches!(reason, PumpExitReason::UpstreamCloseFrame { .. }) {
+        let upstream_close = reason.upstream_close();
+        let upstream_error_raw = upstream_close
+            .and_then(CodexWebSocketCloseError::reason)
+            .unwrap_or_default();
+        tracing::info!(
+            websocket_connection_id = %connection_id,
+            account_id = %account_id,
+            conversation_id_hash = %conversation_id_hash,
+            pump_exit_reason = reason.as_str(),
+            connection_exit_reason = observation.exit_reason(),
+            connection_age_ms = observation.age_ms(),
+            connection_idle_ms = observation.idle_ms(),
+            pump_exit_detail = detail,
+            upstream_close_code = ?upstream_close.and_then(CodexWebSocketCloseError::code),
+            upstream_error_raw,
+            upstream_error_raw_present = upstream_close.is_some_and(|close| close.reason().is_some()),
+            backpressure_events,
+            "Responses WebSocket pump received close frame"
+        );
+    } else {
+        tracing::debug!(
+            websocket_connection_id = %connection_id,
+            account_id = %account_id,
+            conversation_id_hash = %conversation_id_hash,
+            pump_exit_reason = reason.as_str(),
+            connection_exit_reason = observation.exit_reason(),
+            connection_age_ms = observation.age_ms(),
+            connection_idle_ms = observation.idle_ms(),
+            pump_exit_detail = detail,
+            backpressure_events,
+            "Responses WebSocket pump stopped"
+        );
+    }
+}
+
+/// 等待 ping ticker；`None` 时永远挂起，让 `select!` 分支实际禁用。
+async fn tick(ticker: &mut Option<tokio::time::Interval>) {
+    match ticker {
+        Some(ticker) => {
+            ticker.tick().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
+/// 等待可选 deadline；`None` 时永远挂起，让 `select!` 分支实际禁用。
+async fn wait_until(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending::<()>().await,
+    }
+}
