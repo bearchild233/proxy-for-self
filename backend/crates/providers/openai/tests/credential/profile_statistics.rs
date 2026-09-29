@@ -235,7 +235,7 @@ async fn profile_avatar_reuses_cached_source_with_the_accounts_rotated_token() {
 }
 
 #[tokio::test]
-async fn subscription_is_read_only_and_makes_one_bound_account_request_per_query() {
+async fn subscription_is_read_only_and_shares_recent_bound_account_result() {
     let server = MockServer::start().await;
     let (store, service) = service("acct_subscription", &server).await;
     let account = store.account("acct_subscription").expect("account");
@@ -247,7 +247,7 @@ async fn subscription_is_read_only_and_makes_one_bound_account_request_per_query
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "active_until": "2026-10-01T00:00:00Z", "will_renew": true
         })))
-        .expect(2)
+        .expect(1)
         .mount(&server)
         .await;
     for _ in 0..2 {
@@ -257,7 +257,7 @@ async fn subscription_is_read_only_and_makes_one_bound_account_request_per_query
     let after = store.account("acct_subscription").expect("account");
     assert_eq!(after.revision(), account.revision());
     assert_eq!(after.quota(), account.quota());
-    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 
 #[tokio::test]

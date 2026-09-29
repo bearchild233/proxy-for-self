@@ -92,7 +92,7 @@ function upstreamSendStateText(value: string | null | undefined) {
       aria-label="错误筛选与操作"
     >
       <div class="min-w-0 flex-1">
-        <CatalogFilter v-model="searchQuery" kind="errors" label="全部账号 / Key" class="min-w-0 w-full xl:max-w-xl" />
+        <CatalogFilter v-model="searchQuery" kind="errors" label="错误记录筛选" class="min-w-0 w-full xl:max-w-xl" />
       </div>
 
       <div class="flex shrink-0 self-end items-center justify-end gap-2 lg:ml-auto">
@@ -132,7 +132,7 @@ function upstreamSendStateText(value: string | null | undefined) {
       >
         <template #clientApiKeyName="{ displayValue }">
           <span
-            class="block max-w-full truncate font-mono text-cp-sm font-bold text-cp-text"
+            class="block max-w-full truncate py-0.5 font-mono text-cp-sm leading-normal font-bold text-cp-text"
             :title="String(displayValue)"
           >
             {{ displayValue }}

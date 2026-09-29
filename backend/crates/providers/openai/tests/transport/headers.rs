@@ -449,6 +449,83 @@ async fn backend_http_should_ignore_unrepresentable_protocol_headers_without_blo
 }
 
 #[tokio::test]
+async fn backend_http_should_use_cache_key_only_for_missing_codex_session_headers() {
+    for (cache_key, session, thread, expected_session, expected_thread) in [
+        (
+            "client-cache",
+            None,
+            None,
+            Some("client-cache"),
+            Some("client-cache"),
+        ),
+        (
+            "client-cache",
+            Some("real-session"),
+            Some("real-thread"),
+            Some("real-session"),
+            Some("real-thread"),
+        ),
+        (
+            "client-cache",
+            None,
+            Some("real-thread"),
+            Some("client-cache"),
+            Some("real-thread"),
+        ),
+        ("bad\ncache", None, None, None, None),
+        ("", None, None, None, None),
+        (
+            "client-cache",
+            Some("real-session"),
+            None,
+            Some("real-session"),
+            None,
+        ),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind cache header server");
+        let address = listener.local_addr().expect("cache header address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept cache request");
+            let raw = read_http_request_with_body(&mut stream).await;
+            write_completed_sse_response(&mut stream).await;
+            raw
+        });
+        let mut request =
+            codex_request_with_prompt_cache_key("gpt-test", "stable", Vec::new(), cache_key);
+        request.force_http_sse = true;
+        let client = CodexBackendClient::new(
+            reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .expect("HTTP client"),
+            format!("http://{address}"),
+            test_wire_profile(),
+        );
+        let mut context = request_context("req_cache_headers", Some("acct-cache"));
+        context.session_id = session;
+        context.thread_id = thread;
+        client
+            .create_response(&request, context)
+            .await
+            .expect("cache response");
+        let raw = server.await.expect("cache server task");
+        let separator = raw
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("HTTP separator");
+        let head = std::str::from_utf8(&raw[..separator]).expect("HTTP headers");
+        assert_eq!(read_header_value(head, "session-id"), expected_session);
+        assert_eq!(read_header_value(head, "thread-id"), expected_thread);
+        let decoded = zstd::stream::decode_all(std::io::Cursor::new(&raw[separator + 4..]))
+            .expect("decode body");
+        let body: Value = serde_json::from_slice(&decoded).expect("request JSON");
+        assert_eq!(body["prompt_cache_key"], cache_key);
+    }
+}
+
+#[tokio::test]
 async fn backend_http_should_zstd_compress_codex_responses_request_body() {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await

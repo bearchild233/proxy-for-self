@@ -725,6 +725,9 @@ async fn openai_admin_provider_projects_cached_quota_models_and_canonical_export
         encoded.body().get("model").and_then(Value::as_str),
         Some("gpt-5.4")
     );
+    assert_eq!(encoded.body()["reasoning"]["effort"], "low");
+    assert_eq!(encoded.body()["tool_choice"], "none");
+    assert_eq!(encoded.body()["tools"], serde_json::json!([]));
     assert_eq!(
         encoded.body().get("stream").and_then(Value::as_bool),
         Some(true)

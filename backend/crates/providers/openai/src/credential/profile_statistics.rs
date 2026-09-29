@@ -23,7 +23,7 @@ use super::CodexCredentialRepository;
 
 const PROFILE_AVATAR_SOURCE_TTL: Duration = Duration::from_secs(10 * 60);
 
-#[derive(Error)]
+#[derive(Clone, Error)]
 pub enum CodexProfileStatisticsError {
     #[error("Codex profile-statistics credential data is invalid")]
     InvalidCredentialData,
@@ -111,6 +111,10 @@ pub struct CodexCredentialProfileService {
     http: Client,
     base_url: String,
     avatar_sources: Mutex<HashMap<ProviderAccountId, CachedProfileAvatarSource>>,
+    subscription_queue:
+        super::refresh_queue::RefreshQueue<Option<CodexSubscription>, CodexProfileStatisticsError>,
+    statistics_queue:
+        super::refresh_queue::RefreshQueue<CodexProfileStatistics, CodexProfileStatisticsError>,
 }
 
 impl CodexCredentialProfileService {
@@ -127,10 +131,12 @@ impl CodexCredentialProfileService {
             http,
             base_url,
             avatar_sources: Mutex::new(HashMap::new()),
+            subscription_queue: Default::default(),
+            statistics_queue: Default::default(),
         }
     }
 
-    /// 订阅只按需读取；不缓存、不刷新凭据，也不更新额度状态。
+    /// 订阅只按需读取；多设备共享短期结果，不刷新凭据或更新额度状态。
     pub async fn subscription(
         &self,
         account_id: &ProviderAccountId,
@@ -141,23 +147,35 @@ impl CodexCredentialProfileService {
             return Ok(None);
         };
         let request_id = format!("subscription_{}", Uuid::now_v7().simple());
-        let subscription = CodexBackendClient::new(
-            self.http.clone(),
-            self.base_url.clone(),
-            self.profile.clone(),
-        )
-        .for_account(&account)
-        .map_err(map_client_error)?
-        .fetch_subscription(
-            CodexRequestContext::auxiliary(
-                authorization.expose_secret(),
-                Some(&upstream_account_id),
-                &request_id,
-                None,
-            ),
-            &upstream_account_id,
-        )
-        .await;
+        let subscription = self
+            .subscription_queue
+            .run(
+                format!("{}:{:?}", account_id, account.revision()),
+                false,
+                Duration::from_secs(15),
+                CodexProfileStatisticsError::TransportUnavailable,
+                async {
+                    let subscription = CodexBackendClient::new(
+                        self.http.clone(),
+                        self.base_url.clone(),
+                        self.profile.clone(),
+                    )
+                    .for_account(&account)
+                    .map_err(map_client_error)?
+                    .fetch_subscription(
+                        CodexRequestContext::auxiliary(
+                            authorization.expose_secret(),
+                            Some(&upstream_account_id),
+                            &request_id,
+                            None,
+                        ),
+                        &upstream_account_id,
+                    )
+                    .await;
+                    Ok(subscription)
+                },
+            )
+            .await?;
         // 请求期间重新授权、换绑或删除账号时，丢弃旧身份的结果。
         let current = self
             .repository
@@ -184,21 +202,32 @@ impl CodexCredentialProfileService {
         let (authorization, upstream_account_id, account) =
             self.account_authentication(account_id).await?;
         let request_id = format!("profile_statistics_{}", Uuid::now_v7().simple());
-        let statistics = CodexBackendClient::new(
-            self.http.clone(),
-            self.base_url.clone(),
-            self.profile.clone(),
-        )
-        .for_account(&account)
-        .map_err(map_client_error)?
-        .fetch_profile_statistics(CodexRequestContext::auxiliary(
-            authorization.expose_secret(),
-            upstream_account_id.as_deref(),
-            &request_id,
-            None,
-        ))
-        .await
-        .map_err(map_client_error)?;
+        let statistics = self
+            .statistics_queue
+            .run(
+                format!("{}:{:?}", account_id, account.revision()),
+                false,
+                Duration::from_secs(15),
+                CodexProfileStatisticsError::TransportUnavailable,
+                async {
+                    CodexBackendClient::new(
+                        self.http.clone(),
+                        self.base_url.clone(),
+                        self.profile.clone(),
+                    )
+                    .for_account(&account)
+                    .map_err(map_client_error)?
+                    .fetch_profile_statistics(CodexRequestContext::auxiliary(
+                        authorization.expose_secret(),
+                        upstream_account_id.as_deref(),
+                        &request_id,
+                        None,
+                    ))
+                    .await
+                    .map_err(map_client_error)
+                },
+            )
+            .await?;
         self.remember_avatar_source(account_id, statistics.image_url.as_deref());
         Ok(statistics)
     }

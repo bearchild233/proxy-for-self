@@ -28,12 +28,16 @@ const props = withDefaults(
     disabled?: boolean
     placeholder?: string
     emptyText?: string
+    searchable?: boolean
+    wrapOptions?: boolean
   }>(),
   {
     size: 'md',
     disabled: false,
     placeholder: '请选择',
     emptyText: '暂无选项',
+    searchable: false,
+    wrapOptions: false,
   },
 )
 
@@ -47,6 +51,12 @@ const popoverRef = ref<HTMLElement | null>(null)
 const listboxRef = ref<HTMLElement | null>(null)
 const scrollbarRef = ref<InstanceType<typeof BaseScrollbar> | null>(null)
 const open = ref(false)
+const search = ref('')
+const searchRef = ref<HTMLInputElement | null>(null)
+const visibleOptions = computed(() => {
+  const query = search.value.trim().toLocaleLowerCase()
+  return query ? props.options.filter(option => `${option.label} ${option.description ?? ''}`.toLocaleLowerCase().includes(query)) : props.options
+})
 const activeIndex = ref(-1)
 const popoverStyle = ref<CSSProperties>({})
 const popoverMaxHeight = ref('244px')
@@ -98,7 +108,7 @@ const sizeConfig: Record<
 const selectedOption = computed(() => props.options.find(option => option.value === model.value))
 
 const triggerClasses = computed(() => [
-  'relative inline-flex w-full min-w-0 items-center gap-2 overflow-visible border-0 text-left font-emphasis leading-none shadow-cp-input outline-none transition-[background-color,box-shadow,color] duration-[160ms]',
+  'relative inline-flex w-full min-w-0 items-center gap-2 overflow-visible border-0 text-left font-emphasis leading-normal shadow-cp-input outline-none transition-[background-color,box-shadow,color] duration-[160ms]',
   sizeConfig[props.size].trigger,
   props.disabled
     ? 'cursor-not-allowed bg-cp-bg-container-disabled text-cp-text-disabled shadow-none'
@@ -118,16 +128,16 @@ function optionId(index: number) {
 }
 
 function enabledIndexes() {
-  return props.options.flatMap((option, index) => (option.disabled ? [] : [index]))
+  return visibleOptions.value.flatMap((option, index) => (option.disabled ? [] : [index]))
 }
 
 function selectedIndex() {
-  return props.options.findIndex(option => option.value === model.value)
+  return visibleOptions.value.findIndex(option => option.value === model.value)
 }
 
 function setActiveToSelected() {
   const selected = selectedIndex()
-  if (selected >= 0 && !props.options[selected]?.disabled) {
+  if (selected >= 0 && !visibleOptions.value[selected]?.disabled) {
     activeIndex.value = selected
     return
   }
@@ -141,7 +151,8 @@ function updatePopoverPosition() {
 
   const rect = triggerRef.value.getBoundingClientRect()
   const gap = 6
-  const menuHeight = Math.min(listboxRef.value.scrollHeight, 244)
+  const searchHeight = props.searchable ? 44 : 0
+  const menuHeight = Math.min(listboxRef.value.scrollHeight, 244) + searchHeight
   const belowSpace = window.innerHeight - rect.bottom - gap - 8
   const aboveSpace = rect.top - gap - 8
   const placeAbove = belowSpace < menuHeight && aboveSpace > belowSpace
@@ -152,7 +163,7 @@ function updatePopoverPosition() {
     : Math.min(rect.bottom + gap, window.innerHeight - maxHeight - 8)
   const left = clamp(rect.left, 8, window.innerWidth - rect.width - 8)
 
-  popoverMaxHeight.value = `${maxHeight}px`
+  popoverMaxHeight.value = `${Math.max(0, maxHeight - searchHeight)}px`
   popoverStyle.value = {
     left: `${left}px`,
     top: `${top}px`,
@@ -181,12 +192,14 @@ async function openMenu() {
   if (props.disabled || open.value)
     return
 
+  search.value = ''
   open.value = true
   setActiveToSelected()
   await nextTick()
   updatePopoverPosition()
   await nextTick()
   scrollActiveIntoView()
+  searchRef.value?.focus({ preventScroll: true })
 }
 
 function closeMenu() {
@@ -215,7 +228,7 @@ function moveActive(delta: number) {
 }
 
 function handleOptionFocus(index: number) {
-  const option = props.options[index]
+  const option = visibleOptions.value[index]
   if (!option || option.disabled)
     return
 
@@ -230,10 +243,12 @@ function chooseOption(option: SelectOption, index: number) {
   model.value = option.value
   activeIndex.value = index
   closeMenu()
+  if (props.searchable)
+    triggerRef.value?.focus({ preventScroll: true })
 }
 
 function chooseActive() {
-  const option = props.options[activeIndex.value]
+  const option = visibleOptions.value[activeIndex.value]
   if (!option)
     return
 
@@ -279,10 +294,26 @@ function handleTriggerKeydown(event: KeyboardEvent) {
   }
 }
 
+function handleSearchKeydown(event: KeyboardEvent) {
+  if (event.isComposing || event.keyCode === 229)
+    return
+  if (event.key === 'Tab') {
+    triggerRef.value?.focus({ preventScroll: true })
+    closeMenu()
+    return
+  }
+  if (['ArrowDown', 'ArrowUp', 'Enter', 'Escape'].includes(event.key)) {
+    event.stopPropagation()
+    handleTriggerKeydown(event)
+    if (event.key === 'Escape')
+      triggerRef.value?.focus({ preventScroll: true })
+  }
+}
+
 function optionClasses(option: SelectOption, index: number) {
   return [
-    'flex w-full shrink-0 touch-manipulation items-center gap-2 rounded-cp-sm border-0 px-3 text-left font-emphasis leading-none outline-none transition-colors motion-reduce:transition-none',
-    sizeConfig[props.size].option,
+    'flex w-full shrink-0 touch-manipulation items-center gap-2 rounded-cp-sm border-0 px-3 text-left font-emphasis leading-normal outline-none transition-colors motion-reduce:transition-none',
+    props.wrapOptions ? 'min-h-8.5 px-3 py-2 text-cp' : sizeConfig[props.size].option,
     option.disabled
       ? 'cursor-not-allowed bg-transparent text-cp-text-disabled'
       : option.value === model.value
@@ -294,7 +325,7 @@ function optionClasses(option: SelectOption, index: number) {
 }
 
 watch(
-  () => [props.options, props.size, model.value],
+  () => [visibleOptions.value, props.size, model.value],
   async () => {
     if (!open.value)
       return
@@ -330,11 +361,11 @@ useEventListener(window, 'scroll', updatePopoverPositionThrottled, { capture: tr
       @click="toggleMenu"
       @keydown="handleTriggerKeydown"
     >
-      <span class="min-w-0 truncate" :class="selectedOption?.description ? 'max-w-1/2 shrink-0' : 'flex-1'">
+      <span :title="selectedOption?.label" class="min-w-0 truncate" :class="selectedOption?.description && !wrapOptions ? 'max-w-1/2 shrink-0' : 'flex-1'">
         {{ selectedOption?.label ?? placeholder }}
       </span>
       <span
-        v-if="selectedOption?.description"
+        v-if="selectedOption?.description && !wrapOptions"
         :title="selectedOption.description"
         class="min-w-0 flex-1 truncate font-normal"
         :class="disabled ? 'text-cp-text-disabled' : 'text-cp-text-tertiary'"
@@ -365,6 +396,20 @@ useEventListener(window, 'scroll', updatePopoverPositionThrottled, { capture: tr
           class="fixed z-50 rounded-cp-lg border-0 bg-cp-bg-elevated shadow-cp"
           :style="popoverStyle"
         >
+          <div v-if="searchable" class="h-11 px-2 py-1.5">
+            <input
+              ref="searchRef"
+              v-model="search"
+              type="search"
+              aria-label="搜索当前类别的选项"
+              :aria-controls="`${selectId}-listbox`"
+              :aria-activedescendant="activeIndex >= 0 ? optionId(activeIndex) : undefined"
+              placeholder="输入部分名称查找…"
+              autocomplete="off"
+              class="h-8 w-full rounded-cp-sm border-0 bg-cp-fill-tertiary px-2.5 text-cp text-cp-text outline-none focus-visible:ring-1 focus-visible:ring-cp-primary"
+              @keydown="handleSearchKeydown"
+            >
+          </div>
           <BaseScrollbar ref="scrollbarRef" :max-height="popoverMaxHeight" class="rounded-cp-lg">
             <div
               :id="`${selectId}-listbox`"
@@ -374,15 +419,15 @@ useEventListener(window, 'scroll', updatePopoverPositionThrottled, { capture: tr
               :aria-labelledby="controlId"
             >
               <div
-                v-if="options.length === 0"
-                class="flex h-8.5 shrink-0 items-center rounded-cp-sm px-3 text-cp leading-none font-emphasis text-cp-text-quaternary"
+                v-if="visibleOptions.length === 0"
+                class="flex h-8.5 shrink-0 items-center rounded-cp-sm px-3 text-cp leading-normal font-emphasis text-cp-text-quaternary"
               >
-                {{ emptyText }}
+                {{ search ? '没有匹配的选项' : emptyText }}
               </div>
 
               <template v-else>
                 <button
-                  v-for="(option, index) in options"
+                  v-for="(option, index) in visibleOptions"
                   :id="optionId(index)"
                   :key="option.value"
                   type="button"
@@ -395,9 +440,13 @@ useEventListener(window, 'scroll', updatePopoverPositionThrottled, { capture: tr
                   @mousedown.prevent
                   @click="chooseOption(option, index)"
                 >
-                  <span class="min-w-0 truncate" :class="option.description ? 'max-w-1/2 shrink-0' : 'flex-1'">{{ option.label }}</span>
+                  <span v-if="wrapOptions" class="min-w-0 flex-1 whitespace-normal text-left leading-snug wrap-anywhere">
+                    <span class="block">{{ option.label }}</span>
+                    <span v-if="option.description" class="mt-1 block text-cp-xs font-normal text-cp-text-tertiary">{{ option.description }}</span>
+                  </span>
+                  <span v-else :title="option.label" class="min-w-0 truncate" :class="option.description ? 'max-w-1/2 shrink-0' : 'flex-1'">{{ option.label }}</span>
                   <span
-                    v-if="option.description"
+                    v-if="option.description && !wrapOptions"
                     :title="option.description"
                     class="min-w-0 flex-1 truncate font-normal"
                     :class="option.disabled ? 'text-cp-text-disabled' : 'text-cp-text-tertiary'"

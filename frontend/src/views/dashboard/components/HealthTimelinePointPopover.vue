@@ -116,7 +116,7 @@ const metricItems = outcomeMeta
           class="grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-2 rounded-cp bg-cp-fill-tertiary px-2.5 py-2.5"
         >
           <span class="size-1.5 rounded-full" :class="item.dotClass" />
-          <span class="truncate text-[10px] leading-none font-emphasis text-cp-text-secondary">
+          <span class="truncate text-[10px] leading-normal font-emphasis text-cp-text-secondary">
             {{ item.label }}
           </span>
           <strong class="font-mono text-cp-sm leading-none font-heavy tabular-nums" :class="item.valueClass">

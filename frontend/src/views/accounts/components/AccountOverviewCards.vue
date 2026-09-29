@@ -67,7 +67,7 @@ function overviewIconClass(tone: string) {
           <strong class="my-2 block font-mono text-[26px] leading-none font-extrabold text-cp-text">
             {{ item.value }}
           </strong>
-          <p class="m-0 truncate text-cp-sm leading-none font-emphasis text-cp-text-quaternary">
+          <p class="m-0 truncate text-cp-sm leading-normal font-emphasis text-cp-text-quaternary">
             {{ item.caption }}
           </p>
         </div>

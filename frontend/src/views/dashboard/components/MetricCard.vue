@@ -111,7 +111,7 @@ const sparklineOption = computed<EChartsOption | null>(() => {
           {{ metric.details[0]?.label }}
         </span>
         <b
-          class="min-w-0 truncate font-mono text-xs leading-none font-bold tabular-nums"
+          class="min-w-0 truncate font-mono text-xs leading-normal font-bold tabular-nums"
           :class="metric.details[0]?.tone ? metricToneValueClasses[metric.details[0].tone] : undefined"
         >
           {{ metric.details[0]?.value }}
@@ -122,7 +122,7 @@ const sparklineOption = computed<EChartsOption | null>(() => {
           {{ metric.details[1]?.label }}
         </span>
         <b
-          class="min-w-0 truncate font-mono text-xs leading-none font-bold tabular-nums"
+          class="min-w-0 truncate font-mono text-xs leading-normal font-bold tabular-nums"
           :class="metric.details[1]?.tone ? metricToneValueClasses[metric.details[1].tone] : undefined"
         >
           {{ metric.details[1]?.value }}

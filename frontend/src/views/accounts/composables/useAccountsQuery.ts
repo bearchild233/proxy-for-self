@@ -1,10 +1,14 @@
+import type { AccountAttention } from '../utils/accountAttention'
+import type { AccountListResponse, AccountPersonalInfoResponse } from '@/api'
+import type { RequestOptions } from '@/api/request'
 import type { BaseTableSort } from '@/components/base/BaseTable/columns'
 import { useDocumentVisibility, useIntervalFn, watchDebounced } from '@vueuse/core'
 
 import { computed, onMounted, onScopeDispose, shallowRef, watch } from 'vue'
-import { getAccounts, refreshAccountQuota } from '@/api'
+import { getAccountPersonalInfo, getAccounts, refreshAccountQuota } from '@/api'
 import { toast } from '@/components/base/BaseToast'
 import { usePagedQuery } from '@/composables/usePagedQuery'
+import { accountNeedsAttention } from '../utils/accountAttention'
 import { refreshAccountPage } from '../utils/refreshAccountPage'
 
 type AccountRow = Awaited<ReturnType<typeof getAccounts>>['items'][number]
@@ -19,6 +23,9 @@ export function useAccountsQuery() {
   const providerQuery = shallowRef('')
   const statusQuery = shallowRef('')
   const groupQuery = shallowRef('')
+  const attentionQuery = shallowRef<AccountAttention>('')
+  const attentionNote = shallowRef('')
+  const subscriptions = new Map<string, { identity: string, checkedAt: number, value: AccountPersonalInfoResponse['subscription'] }>()
   const sort = shallowRef<BaseTableSort>()
   const accountSummary = shallowRef({
     total: 0,
@@ -31,26 +38,78 @@ export function useAccountsQuery() {
 
   const query = usePagedQuery({
     initialPageSize: 20,
-    load: ({ page, pageSize }, options) =>
-      getAccounts({
-        page,
-        pageSize,
-        search: searchQuery.value,
-        provider: providerQuery.value || undefined,
-        status: statusQuery.value || undefined,
-        groupId: groupQuery.value || undefined,
-        sortBy: sort.value?.key,
-        sortDirection: sort.value?.direction,
-      }, options),
+    load: loadPage,
     onSuccess: (result) => {
       accountSummary.value = result.summary
     },
   })
 
+  async function loadPage({ page, pageSize }: { page: number, pageSize: number }, options: RequestOptions): Promise<AccountListResponse> {
+    const attention = attentionQuery.value
+    const params = {
+      page,
+      pageSize,
+      search: searchQuery.value,
+      provider: providerQuery.value || undefined,
+      status: statusQuery.value || undefined,
+      groupId: groupQuery.value || undefined,
+      sortBy: sort.value?.key,
+      sortDirection: sort.value?.direction,
+    }
+    if (!attention) {
+      attentionNote.value = ''
+      return getAccounts(params, options)
+    }
+    // 先读取全部匹配目录再筛选、分页，避免只筛当前页造成漏报。
+    const first = await getAccounts({ ...params, page: 1, pageSize: 200 }, options)
+    const all = [...first.items]
+    for (let next = 2; next <= first.page.totalPages; next++) {
+      options.signal?.throwIfAborted()
+      const result = await getAccounts({ ...params, page: next, pageSize: 200 }, options)
+      all.push(...result.items)
+    }
+    if (attention === 'expiring' || attention === 'subscription_unknown') {
+      const pending = all.filter(account => account.enabled && account.provider === 'openai' && account.authenticationKind === 'oauth')
+      let completed = 0
+      const total = pending.length
+      async function worker() {
+        while (pending.length) {
+          options.signal?.throwIfAborted()
+          const account = pending.shift()!
+          const identity = JSON.stringify([account.accountId, account.userId, account.planType, account.authenticationKind])
+          const cached = subscriptions.get(account.id)
+          if (!cached || cached.identity !== identity || Date.now() - cached.checkedAt > 300_000) {
+            let value: AccountPersonalInfoResponse['subscription'] = null
+            try {
+              value = (await getAccountPersonalInfo({ accountId: account.id }, { ...options, silent: true })).subscription
+            }
+            catch {
+              options.signal?.throwIfAborted()
+            }
+            subscriptions.set(account.id, { identity, checkedAt: Date.now(), value })
+          }
+          completed++
+          attentionNote.value = `订阅信息已检查 ${completed}/${total}`
+        }
+      }
+      await Promise.all([worker(), worker()])
+      const unknown = all.filter(account => accountNeedsAttention(account, 'subscription_unknown', subscriptions.get(account.id)?.value)).length
+      attentionNote.value = `已检查全部匹配账号；${unknown} 个订阅信息未知，可切换“订阅未知”查看。订阅结果缓存 5 分钟，手动刷新可重新读取。`
+    }
+    else {
+      attentionNote.value = attention === 'low_quota' ? '任一已知额度窗口剩余 ≤10%，或已确认额度耗尽；未知额度不视为充足。' : '凭据无效、过期或身份未确认；不自动重新授权。'
+    }
+    options.signal?.throwIfAborted()
+    const items = all.filter(account => accountNeedsAttention(account, attention, subscriptions.get(account.id)?.value))
+    return { ...first, items: items.slice((page - 1) * pageSize, page * pageSize), page: { page, pageSize, total: items.length, totalPages: Math.max(1, Math.ceil(items.length / pageSize)) } }
+  }
+
   async function refreshAccounts(silent = false) {
     if (query.loading.value || refreshing.value)
       return
     refreshing.value = true
+    if (!silent)
+      subscriptions.clear()
     const controller = new AbortController()
     syncController = controller
     refreshMessage.value = ''
@@ -105,7 +164,7 @@ export function useAccountsQuery() {
     total: query.total.value,
   }))
 
-  watch([query.page, query.pageSize, searchQuery, providerQuery, statusQuery, groupQuery, sort], () => {
+  watch([query.page, query.pageSize, searchQuery, providerQuery, statusQuery, groupQuery, attentionQuery, sort], () => {
     // 翻页或切换筛选后，不把上一页的同步结果显示成当前页已更新。
     syncController?.abort()
     lastRefreshedAt.value = ''
@@ -149,7 +208,7 @@ export function useAccountsQuery() {
     { debounce: 250 },
   )
 
-  watch([providerQuery, statusQuery, groupQuery], () => {
+  watch([providerQuery, statusQuery, groupQuery, attentionQuery], () => {
     query.page.value = 1
     void query.execute()
   })
@@ -176,6 +235,8 @@ export function useAccountsQuery() {
     providerQuery,
     statusQuery,
     groupQuery,
+    attentionQuery,
+    attentionNote,
     sort,
     accountSummary,
     accountPagination,

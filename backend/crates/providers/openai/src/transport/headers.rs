@@ -178,9 +178,20 @@ impl CodexBackendClient {
                 .or(context.thread_id)
                 .or(context.session_id),
         );
+        // ChatGPT 的缓存亲和依赖会话头；OpenAI-compatible 客户端可能只传 body 缓存键。
+        // 仅补齐 OAuth Codex 缺失的头，不覆盖客户端身份，也不改写缓存键或请求正文。
+        let cache_session = if matches!(self.protocol, OpenAiUpstreamProtocol::Codex)
+            && context.session_id.is_none()
+        {
+            request.prompt_cache_key().filter(|key| {
+                !key.is_empty() && key.len() <= 1024 && HeaderValue::from_str(key).is_ok()
+            })
+        } else {
+            None
+        };
         for (name, value) in [
-            ("session-id", context.session_id),
-            ("thread-id", context.thread_id),
+            ("session-id", context.session_id.or(cache_session)),
+            ("thread-id", context.thread_id.or(cache_session)),
             ("x-codex-window-id", context.codex_window_id),
             ("x-codex-turn-state", context.turn_state),
             ("x-codex-turn-metadata", context.turn_metadata),

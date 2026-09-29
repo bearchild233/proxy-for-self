@@ -66,10 +66,10 @@ const items = computed(() => [
         <span class="block text-cp-sm leading-none font-bold text-cp-text-quaternary">
           {{ item.label }}
         </span>
-        <strong class="block truncate text-[22px] leading-none font-extrabold text-cp-text">
+        <strong class="block truncate text-[22px] leading-normal font-extrabold text-cp-text">
           {{ item.value }}
         </strong>
-        <span class="block truncate text-cp-sm leading-none font-emphasis text-cp-text-secondary">
+        <span class="block truncate text-cp-sm leading-normal font-emphasis text-cp-text-secondary">
           {{ item.detail }}
         </span>
       </div>

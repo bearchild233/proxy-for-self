@@ -148,7 +148,7 @@ function diagnosticNameDisplay(name: string) {
         <template #nameDisplay="{ row }">
           <div class="inline-grid max-w-full min-w-0 gap-1" :title="row.nameDisplay.full">
             <code
-              class="block max-w-full truncate font-mono text-cp-sm leading-none font-heavy text-cp-text"
+              class="block max-w-full truncate font-mono text-cp-sm leading-normal font-heavy text-cp-text"
             >
               {{ row.nameDisplay.primary }}
             </code>

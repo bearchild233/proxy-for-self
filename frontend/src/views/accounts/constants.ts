@@ -38,6 +38,7 @@ export const accountColumns = defineTableColumns<AccountRow>([
   },
   { key: 'status', label: '状态', kind: 'status', align: 'left', sortable: true },
   { key: 'planType', label: '套餐', kind: 'status', sortable: true },
+  { key: 'subscription', label: '订阅剩余', kind: 'custom', size: 'xl' },
   { key: 'usage', label: '用量', kind: 'custom', size: '2xl', sortable: true },
   { key: 'groups', label: '账号分组', kind: 'status' },
   {

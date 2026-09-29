@@ -231,7 +231,7 @@ watch(
             class="min-w-0 rounded-cp bg-cp-bg-container px-3 py-2.5"
           >
             <div class="flex min-w-0 items-center justify-between gap-2">
-              <p class="m-0 truncate text-cp-xs leading-none font-heavy text-cp-text-quaternary">
+              <p class="m-0 truncate text-cp-xs leading-normal font-heavy text-cp-text-quaternary">
                 {{ item.label }}
               </p>
               <a
@@ -246,7 +246,7 @@ watch(
               </a>
             </div>
             <p
-              class="mt-2 mb-0 truncate font-mono text-cp leading-none font-bold text-cp-text"
+              class="mt-2 mb-0 truncate font-mono text-cp leading-normal font-bold text-cp-text"
               :title="item.title || item.value"
             >
               {{ item.value }}
@@ -396,7 +396,7 @@ watch(
             {{ item.label }}
           </span>
           <span
-            class="truncate font-mono text-cp leading-none font-heavy text-cp-text"
+            class="truncate font-mono text-cp leading-normal font-heavy text-cp-text"
           >
             {{ item.value }}
           </span>

@@ -1,14 +1,15 @@
 <script setup lang="ts">
 import { Apple, Copy, Download, Monitor, Upload } from '@lucide/vue'
 import { computed, shallowRef, watch } from 'vue'
+import { getClientModels } from '@/api/modules/client-models'
 import BaseButton from '@/components/base/BaseButton.vue'
 import BaseFormItem from '@/components/base/BaseForm/FormItem.vue'
 
 import BaseIconButton from '@/components/base/BaseIconButton.vue'
-import BaseInput from '@/components/base/BaseInput.vue'
 import BaseModal from '@/components/base/BaseModal/index.vue'
 import BaseScrollbar from '@/components/base/BaseScrollbar.vue'
 import BaseSegmented from '@/components/base/BaseSegmented.vue'
+import BaseSelect from '@/components/base/BaseSelect.vue'
 import BaseSwitch from '@/components/base/BaseSwitch.vue'
 import KeyCapabilityNotice from '@/components/KeyCapabilityNotice.vue'
 import { useDownload } from '@/composables/useDownload'
@@ -55,6 +56,47 @@ const platformOptions = [
 ]
 
 const keyValue = computed(() => props.apiKey?.key ?? '')
+const modelOptions = shallowRef<{ label: string, value: string }[]>([])
+const modelsLoading = shallowRef(false)
+const modelLoadError = shallowRef(false)
+const modelReload = shallowRef(0)
+watch([open, keyValue, excelEnabled, () => props.apiBaseUrl, modelReload], async ([isOpen], _, onCleanup) => {
+  modelOptions.value = []
+  modelLoadError.value = false
+  modelsLoading.value = false
+  if (!isOpen || !keyValue.value)
+    return
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), 15000)
+  let active = true
+  onCleanup(() => {
+    active = false
+    clearTimeout(timeout)
+    controller.abort()
+  })
+  modelsLoading.value = true
+  try {
+    const models = await getClientModels(props.apiBaseUrl, keyValue.value, controller.signal)
+    if (!active)
+      return
+    modelOptions.value = models.map(model => ({ label: model, value: model }))
+    const preferred = excelEnabled.value ? CODEX_EXCEL_DEFAULT_MODEL : CODEX_DEFAULT_MODEL
+    selectedModel.value = models.includes(preferred) ? preferred : models[0] || preferred
+    modelLoadError.value = models.length === 0
+  }
+  catch {
+    if (active)
+      modelLoadError.value = true
+  }
+  finally {
+    clearTimeout(timeout)
+    if (active)
+      modelsLoading.value = false
+  }
+}, { immediate: true })
+const exportModelOptions = computed(() => modelOptions.value.length
+  ? modelOptions.value
+  : [{ label: `${selectedModel.value}（默认配置）`, value: selectedModel.value }])
 const configPath = computed(() =>
   activePlatform.value === 'windows'
     ? '%userprofile%\\.codex\\config.toml'
@@ -124,11 +166,22 @@ function importToCcs() {
       <KeyCapabilityNotice v-if="bound" :excel-enabled="excelEnabled" />
       <div v-if="bound" class="grid gap-2">
         <BaseFormItem label="导出模型">
-          <BaseInput v-model="selectedModel" aria-label="导出模型" />
+          <BaseSelect
+            v-model="selectedModel"
+            class="w-full"
+            aria-label="导出模型"
+            :options="exportModelOptions"
+            :disabled="modelsLoading"
+            searchable
+            wrap-options
+          />
         </BaseFormItem>
         <p class="m-0 text-cp-xs text-cp-text-secondary">
-          模型值仅为配置模板，请按此 Key 的 /v1/models 选择可用模型
+          {{ modelsLoading ? '正在加载此密钥的可用模型…' : modelLoadError ? '暂未获取到可用模型，当前保留默认配置，可重试加载。' : '选择此密钥可用的模型，支持输入关键词筛选。' }}
         </p>
+        <BaseButton v-if="modelLoadError" variant="secondary" size="sm" @click="modelReload++">
+          重新加载模型
+        </BaseButton>
         <p class="m-0 text-cp-xs text-cp-text-secondary">
           Hermes 使用命名 provider 与 codex_responses，普通 custom 可能仍走 Chat Completions
         </p>

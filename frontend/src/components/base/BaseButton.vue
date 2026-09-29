@@ -53,7 +53,7 @@ const spinnerSizes: Record<ButtonSize, number> = {
 }
 
 const classes = computed(() => [
-  'inline-flex shrink-0 touch-manipulation items-center justify-center rounded-cp-sm border-0 font-bold leading-none outline-none transition-[background-color,box-shadow,color,opacity,transform] duration-150 motion-safe:active:translate-y-px motion-safe:active:scale-[0.985] motion-reduce:transition-none',
+  'inline-flex shrink-0 touch-manipulation items-center justify-center rounded-cp-sm border-0 font-bold leading-normal outline-none transition-[background-color,box-shadow,color,opacity,transform] duration-150 motion-safe:active:translate-y-px motion-safe:active:scale-[0.985] motion-reduce:transition-none',
   'focus-visible:ring-2 focus-visible:ring-cp-control-outline focus-visible:ring-offset-2 focus-visible:ring-offset-cp-bg-container',
   'disabled:cursor-not-allowed disabled:transform-none disabled:bg-cp-bg-container-disabled disabled:text-cp-text-disabled disabled:shadow-none',
   sizeClasses[props.size],

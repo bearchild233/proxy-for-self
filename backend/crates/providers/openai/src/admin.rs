@@ -1520,6 +1520,10 @@ fn build_connection_test_operation(
     body.insert("store".to_owned(), Value::Bool(false));
     body.insert("tools".to_owned(), Value::Array(Vec::new()));
     body.insert("tool_choice".to_owned(), Value::String("none".to_owned()));
+    body.insert(
+        "reasoning".to_owned(),
+        serde_json::json!({ "effort": "low" }),
+    );
     let payload = ProtocolPayload::json_object("openai", body)
         .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Invalid))?;
     Ok(Operation::Generate(GenerateRequest::from_protocol_payload(

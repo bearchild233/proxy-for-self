@@ -205,7 +205,7 @@ function providerLabel(provider: string) {
               <span class="inline-flex size-7 shrink-0 items-center justify-center rounded-lg bg-cp-fill-tertiary">
                 <Box class="size-3.75 text-cp-text-secondary" />
               </span>
-              <span class="truncate text-cp-xs leading-none font-heavy">{{ profile.product }}</span>
+              <span class="truncate text-cp-xs leading-normal font-heavy">{{ profile.product }}</span>
             </div>
             <span
               class="inline-flex h-7 shrink-0 items-center gap-1.5 rounded-lg px-2.5 text-cp-sm leading-none font-bold"
@@ -250,7 +250,7 @@ function providerLabel(provider: string) {
                 认证协议
               </dt>
               <dd
-                class="mt-2 mb-0 truncate font-mono text-cp-lg leading-none font-bold tabular-nums text-cp-text"
+                class="mt-2 mb-0 truncate font-mono text-cp-lg leading-normal font-bold tabular-nums text-cp-text"
                 :title="authProtocol"
               >
                 {{ authProtocol }}
@@ -263,7 +263,7 @@ function providerLabel(provider: string) {
                 {{ profile.provider === 'openai' ? '模拟运行环境' : '运行环境' }}
               </dt>
               <dd
-                class="mt-2 mb-0 truncate font-mono text-cp-lg leading-none font-bold tabular-nums text-cp-text"
+                class="mt-2 mb-0 truncate font-mono text-cp-lg leading-normal font-bold tabular-nums text-cp-text"
                 :title="runtimeEnvironment.title"
               >
                 {{ runtimeEnvironment.primary }}
@@ -279,7 +279,7 @@ function providerLabel(provider: string) {
                 客户端标识
               </dt>
               <dd
-                class="mt-2 mb-0 truncate font-mono text-[16px] leading-none font-heavy tabular-nums text-cp-text"
+                class="mt-2 mb-0 truncate font-mono text-[16px] leading-normal font-heavy tabular-nums text-cp-text"
                 :title="clientIdentity"
               >
                 {{ clientIdentity }}

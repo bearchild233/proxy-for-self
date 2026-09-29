@@ -97,6 +97,9 @@ function connectionLogClass(tone: string) {
             :placeholder="loadingModels ? '加载模型中...' : '选择上游模型'"
             empty-text="上游没有返回模型"
           />
+          <p v-if="account.provider === 'openai'" class="m-0 text-cp-xs leading-normal text-cp-text-secondary">
+            推理强度：Low（低）
+          </p>
         </div>
       </section>
 

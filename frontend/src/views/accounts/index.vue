@@ -28,6 +28,7 @@ import AccountPlanBadge from './components/AccountPlanBadge.vue'
 import AccountQuotaPanel from './components/AccountQuotaPanel/index.vue'
 import AccountQuotaSummaryCell from './components/AccountQuotaSummaryCell/index.vue'
 import AccountStatusBadge from './components/AccountStatusBadge/index.vue'
+import AccountSubscriptionCell from './components/AccountSubscriptionCell.vue'
 import AccountTableActions from './components/AccountTableActions.vue'
 import AccountUsagePanel from './components/AccountUsagePanel.vue'
 import { useAccountBatchEditor } from './composables/useAccountBatchEditor'
@@ -37,6 +38,7 @@ import { useAccountImportTasks } from './composables/useAccountImportTasks'
 import { useAccountMutations } from './composables/useAccountMutations'
 import { useAccountsQuery } from './composables/useAccountsQuery'
 import { useAccountsTable } from './composables/useAccountsTable'
+import { useAccountSubscriptions } from './composables/useAccountSubscriptions'
 import { accountColumns, derivedAccountStatus } from './constants'
 
 const selectedIds = ref<Set<string>>(new Set())
@@ -54,6 +56,8 @@ const {
   providerQuery,
   statusQuery,
   groupQuery,
+  attentionQuery,
+  attentionNote,
   sort,
   accountSummary,
   accountPagination,
@@ -62,6 +66,11 @@ const {
   handlePageSizeChange,
   handleSortChange,
 } = useAccountsQuery()
+
+const { subscriptionStates, subscriptionsRefreshing, refreshSubscriptions } = useAccountSubscriptions(accounts)
+async function refreshPage() {
+  await Promise.all([refreshAccounts(), refreshSubscriptions()])
+}
 
 const {
   groups,
@@ -206,7 +215,7 @@ const { savingOrder, saveOrder } = useSharedOrder('accounts', loadAccounts)
     >
       <template #actions>
         <span class="text-cp-xs text-cp-text-secondary">当前页每 30 秒同步 · {{ lastRefreshedAt || '尚未同步上游' }}</span>
-        <BaseButton variant="secondary" :loading="refreshing" :disabled="loading || refreshing" @click="refreshAccounts()">
+        <BaseButton variant="secondary" :loading="refreshing || subscriptionsRefreshing" :disabled="loading || refreshing || subscriptionsRefreshing" @click="refreshPage">
           <RefreshCw class="size-4" />
           同步状态与额度
         </BaseButton>
@@ -223,6 +232,7 @@ const { savingOrder, saveOrder } = useSharedOrder('accounts', loadAccounts)
     >
       <template #header>
         <AccountFilters
+          v-model:attention="attentionQuery"
           v-model:search="searchQuery"
           v-model:status="statusQuery"
           v-model:provider="providerQuery"
@@ -249,6 +259,9 @@ const { savingOrder, saveOrder } = useSharedOrder('accounts', loadAccounts)
             />
           </template>
         </AccountFilters>
+        <p v-if="attentionQuery && attentionNote" role="status" class="mt-2 mb-0 text-cp-xs leading-normal text-cp-text-secondary">
+          {{ attentionNote }}
+        </p>
       </template>
 
       <template #body>
@@ -327,6 +340,10 @@ const { savingOrder, saveOrder } = useSharedOrder('accounts', loadAccounts)
 
             <template #usage="{ row }">
               <AccountQuotaSummaryCell :account="row" />
+            </template>
+
+            <template #subscription="{ row }">
+              <AccountSubscriptionCell :account="row" :state="subscriptionStates[row.id]" />
             </template>
 
             <template #groups="{ row }">

@@ -42,7 +42,7 @@ withDefaults(
   >
     <template #clientApiKeyName="{ displayValue }">
       <span
-        class="block max-w-full truncate font-mono text-cp-sm leading-none font-bold text-cp-text"
+        class="block max-w-full truncate py-0.5 font-mono text-cp-sm leading-normal font-bold text-cp-text"
         :title="String(displayValue)"
       >
         {{ displayValue }}
@@ -58,7 +58,7 @@ withDefaults(
 
     <template #accountEmail="{ row }">
       <span
-        class="block max-w-full truncate font-mono text-cp-sm leading-none font-bold text-cp-text"
+        class="block max-w-full truncate py-0.5 font-mono text-cp-sm leading-normal font-bold text-cp-text"
         :title="usageAccountText(row)"
       >
         {{ usageAccountText(row) }}

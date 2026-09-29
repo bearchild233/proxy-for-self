@@ -1,7 +1,7 @@
 import excelModelCatalog from './excelModelCatalog.json' with { type: 'json' }
 import { buildCapabilityReadme } from './keyCapabilities.ts'
 
-export const CODEX_DEFAULT_MODEL = 'gpt-5.6-terra'
+export const CODEX_DEFAULT_MODEL = 'gpt-6-astra'
 export const CODEX_EXCEL_DEFAULT_MODEL = 'gpt-5.6-sol-excel'
 export const CODEX_WEBSOCKET_ENABLED_BY_DEFAULT = false
 
@@ -20,14 +20,14 @@ export function buildCodexConfigFiles(input: CodexConfigInput) {
   const model = input.model?.trim() || (excelEnabled ? CODEX_EXCEL_DEFAULT_MODEL : CODEX_DEFAULT_MODEL)
   // 保留 auth.json 载荷，兼容仍依赖该字段的 CCSwitch 导入器。
   const auth = { OPENAI_API_KEY: input.apiKey }
-  const configToml = `model_provider = "OpenAI"
+  const configToml = `model_provider = "cc-switch-official"
 model = ${JSON.stringify(model)}
 review_model = ${JSON.stringify(model)}
-${excelEnabled ? 'model_catalog_json = "./excel-models.json"\nmodel_reasoning_effort = "medium"' : '# Native reasoning uses the official model catalog default'}
+${excelEnabled ? 'model_catalog_json = "./excel-models.json"\nmodel_reasoning_effort = "medium"' : 'model_reasoning_effort = "high"'}
 service_tier = "default"
 
-[model_providers.OpenAI]
-name = "OpenAI"
+[model_providers.cc-switch-official]
+name = "cc-switch-official"
 base_url = ${JSON.stringify(baseUrl)}
 wire_api = "responses"
 supports_websockets = ${websocketEnabled}
@@ -35,7 +35,7 @@ requires_openai_auth = false
 # 代理密钥仅用于网关鉴权，真实账号登录状态由服务端管理。
 experimental_bearer_token = ${JSON.stringify(input.apiKey)}
 
-[model_providers.OpenAI.http_headers]
+[model_providers.cc-switch-official.http_headers]
 # 声明服务端托管认证，让官方客户端启用原生生图；该标记不是密钥。
 X-OpenAI-Actor-Authorization = "${excelEnabled ? 'excel-codex-bridge' : 'proxy-managed'}"
 

@@ -15,7 +15,7 @@ const modelDisplay = computed(() => usageModelDisplay(props.record))
 <template>
   <div class="inline-grid max-w-full gap-1">
     <code
-      class="block max-w-full truncate font-mono text-cp-sm leading-none font-heavy text-cp-text"
+      class="block max-w-full truncate font-mono text-cp-sm leading-normal font-heavy text-cp-text"
       :title="`请求模型：${modelDisplay.primary}`"
     >
       {{ modelDisplay.primary }}
@@ -32,7 +32,7 @@ const modelDisplay = computed(() => usageModelDisplay(props.record))
         stroke-width="2.4"
         aria-hidden="true"
       />
-      <code class="block truncate font-mono text-cp-xs leading-none font-bold">
+      <code class="block truncate font-mono text-cp-xs leading-normal font-bold">
         {{ route.model }}
       </code>
     </div>

@@ -10,6 +10,7 @@ mod profile_statistics;
 mod quota;
 mod recovery_log;
 mod refresh;
+mod refresh_queue;
 mod repository;
 mod security;
 mod selector;

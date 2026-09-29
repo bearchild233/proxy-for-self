@@ -137,12 +137,13 @@ watch(open, async (active, _previous, onCleanup) => {
       </BaseFormItem>
 
       <BaseFormItem label="账号范围" required>
-        <BaseSelect v-model="form.scopeMode" :options="scopeOptions" :disabled="saving" aria-label="账号范围" />
+        <BaseSelect v-model="form.scopeMode" :options="scopeOptions" :disabled="saving" aria-label="账号范围" class="w-full" />
       </BaseFormItem>
       <BaseFormItem v-if="form.scopeMode === 'account'" label="固定账号" required>
         <BaseSelect
           v-model="form.accountId" :options="accountOptions"
           placeholder="请选择账号" :disabled="saving || accountLoading"
+          class="w-full" searchable wrap-options
         />
         <p v-if="accountError" class="text-cp-xs text-cp-error-text">
           {{ accountError }}
@@ -152,7 +153,7 @@ watch(open, async (active, _previous, onCleanup) => {
       <BaseFormItem v-if="form.scopeMode === 'accounts'" label="选择账号" required>
         <div class="grid gap-3">
           <div class="grid gap-2 sm:grid-cols-2">
-            <BaseSelect id="key-account-group-filter" v-model="filterGroup" :options="filterOptions" :disabled="saving" aria-label="按组筛选账号" />
+            <BaseSelect id="key-account-group-filter" v-model="filterGroup" :options="filterOptions" :disabled="saving" aria-label="按组筛选账号" class="min-w-0 w-full" searchable wrap-options />
             <BaseInput id="key-account-search" v-model="accountSearch" :disabled="saving" aria-label="搜索账号" placeholder="搜索名称或邮箱" />
           </div>
           <div class="flex justify-between text-cp-xs text-cp-text-secondary">
@@ -165,7 +166,7 @@ watch(open, async (active, _previous, onCleanup) => {
             <div v-for="account in filteredAccounts" :key="account.id" class="flex items-center gap-3">
               <BaseCheckbox :model-value="form.accountIds.includes(account.id)" :label="account.name" :disabled="saving" @update:model-value="toggleAccount(account.id, $event)" />
               <div class="min-w-0 flex-1">
-                <div class="truncate text-cp text-cp-text">
+                <div class="whitespace-normal wrap-anywhere text-cp text-cp-text">
                   {{ account.name }} · {{ account.planTypeDisplay }}
                 </div>
                 <div class="truncate text-cp-xs text-cp-text-secondary">
@@ -185,7 +186,7 @@ watch(open, async (active, _previous, onCleanup) => {
         </p>
       </BaseFormItem>
       <BaseFormItem label="轮转方式">
-        <BaseSelect v-model="form.rotationStrategy" :options="strategyOptions" :disabled="saving" aria-label="轮转方式" />
+        <BaseSelect v-model="form.rotationStrategy" :options="strategyOptions" :disabled="saving" aria-label="轮转方式" class="w-full" />
         <p class="mt-2 text-cp-xs text-cp-text-secondary">
           新会话按策略选号，已有会话优先保持账号，Native 额度耗尽时仅在历史完整且尚未交付结果的条件下恢复
         </p>

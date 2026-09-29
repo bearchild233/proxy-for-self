@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import type { AccountAttention } from '../utils/accountAttention'
 import type { AccountGroup } from '@/api'
 import { Download, ListTodo, Pencil, Trash2, Upload } from '@lucide/vue'
 import { computed } from 'vue'
@@ -31,6 +32,14 @@ const search = defineModel<string>('search', { required: true })
 const status = defineModel<string>('status', { required: true })
 const provider = defineModel<string>('provider', { required: true })
 const group = defineModel<string>('group', { required: true })
+const attention = defineModel<AccountAttention>('attention', { required: true })
+const quickFilters: { label: string, value: AccountAttention }[] = [
+  { label: '全部', value: '' },
+  { label: '3 天内到期', value: 'expiring' },
+  { label: '额度不足', value: 'low_quota' },
+  { label: '需要授权', value: 'reauthorize' },
+  { label: '订阅未知', value: 'subscription_unknown' },
+]
 const groupOptions = computed(() => [
   { label: '全部分组', value: '' },
   { label: '未分组账号', value: 'ungrouped' },
@@ -47,6 +56,11 @@ const groupOptions = computed(() => [
     role="group"
     aria-label="账号筛选与操作"
   >
+    <div class="flex w-full flex-wrap items-center gap-2" role="group" aria-label="账号快捷筛选">
+      <BaseButton v-for="item in quickFilters" :key="item.value" size="sm" :variant="attention === item.value ? 'primary' : 'secondary'" :aria-pressed="attention === item.value" @click="attention = item.value">
+        {{ item.label }}
+      </BaseButton>
+    </div>
     <div
       class="grid w-full min-w-0 grid-cols-2 items-center gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_7.75rem] xl:flex xl:w-auto xl:flex-none xl:flex-wrap xl:gap-3"
     >

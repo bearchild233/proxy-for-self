@@ -58,7 +58,7 @@ const linkItems = [
           Z
         </span>
         <div class="min-w-0">
-          <p class="m-0 truncate text-cp-xl leading-none font-heavy text-cp-text">
+          <p class="m-0 truncate text-cp-xl leading-normal font-heavy text-cp-text">
             {{ author }}
           </p>
           <p class="mt-1.5 mb-0 text-cp-sm leading-none font-emphasis text-cp-text-secondary">
@@ -84,7 +84,7 @@ const linkItems = [
                 {{ item.label }}
               </p>
               <p
-                class="mt-2 mb-0 truncate font-mono text-cp-sm leading-none font-bold text-cp-text"
+                class="mt-2 mb-0 truncate font-mono text-cp-sm leading-normal font-bold text-cp-text"
                 :title="item.value"
               >
                 {{ item.value }}

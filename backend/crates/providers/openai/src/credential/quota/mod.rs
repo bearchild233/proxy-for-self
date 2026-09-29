@@ -193,6 +193,7 @@ pub struct CodexCredentialQuotaService {
     freeze_policy_cache: Mutex<Option<(ProviderFreezePolicy, Instant)>>,
     scheduling: CodexQuotaSchedulingProjection,
     reset_consume_locks: Mutex<HashMap<ProviderAccountId, Arc<Mutex<()>>>>,
+    refresh_queue: super::refresh_queue::RefreshQueue<FetchedCodexQuota, CodexQuotaFetchError>,
 }
 
 /// 冻结策略缓存活跃期；过期后下一次容量错误重新读取运行时设置。
@@ -236,6 +237,7 @@ struct CodexQuotaHydrationTarget {
     expected_version: Option<u64>,
 }
 
+#[derive(Clone)]
 struct FetchedCodexQuota {
     account: ProviderAccount,
     value: Value,
@@ -251,12 +253,14 @@ enum CodexQuotaFetchAttemptError {
     Upstream(CodexClientError),
 }
 
+#[derive(Clone)]
 enum CodexQuotaFetchError {
     InvalidCredential,
     Upstream {
         account: Box<ProviderAccount>,
-        error: CodexClientError,
+        error: Arc<CodexClientError>,
     },
+    Unavailable,
 }
 
 enum ResetCreditAttemptError {
@@ -530,6 +534,7 @@ impl CodexCredentialQuotaService {
             freeze_policy_cache: Mutex::new(None),
             scheduling: CodexQuotaSchedulingProjection::default(),
             reset_consume_locks: Mutex::new(HashMap::new()),
+            refresh_queue: Default::default(),
         }
     }
 
@@ -844,7 +849,7 @@ impl CodexCredentialQuotaService {
         );
         for account in accounts {
             let observed_at = SystemTime::now();
-            match self.fetch_usage(&client, &account).await {
+            match self.fetch_usage(&client, &account, true).await {
                 Ok(FetchedCodexQuota { account, value }) => {
                     // 单账号解析或落库失败只影响该账号；其余账号继续同步。
                     if let Err(error) = self
@@ -858,6 +863,9 @@ impl CodexCredentialQuotaService {
                             "OpenAI quota synchronization skipped one account"
                         );
                     }
+                }
+                Err(CodexQuotaFetchError::Unavailable) => {
+                    summary.transient += 1;
                 }
                 Err(CodexQuotaFetchError::InvalidCredential) => {
                     summary.stale += 1;
@@ -1207,28 +1215,34 @@ impl CodexCredentialQuotaService {
             self.base_url.clone(),
             self.profile.clone(),
         );
-        let FetchedCodexQuota { account, value } = match self.fetch_usage(&client, &account).await {
-            Ok(fetched) => fetched,
-            Err(CodexQuotaFetchError::InvalidCredential) => {
-                return Err(CodexCredentialQuotaError::InvalidCredentialData);
-            }
-            Err(CodexQuotaFetchError::Upstream { account, error }) => {
-                match classify_quota_endpoint_failure(&error) {
-                    Some(QuotaEndpointFailure::Exhausted(evidence)) => {
-                        self.record_confirmed_exhaustion(&account, evidence, None, observed_at)
-                            .await?;
-                    }
-                    Some(QuotaEndpointFailure::Credential { state, reason }) => {
-                        self.persist_credential_failure(&account, state, reason, observed_at)
-                            .await;
-                    }
-                    None => {}
+        let FetchedCodexQuota { account, value } =
+            match self.fetch_usage(&client, &account, false).await {
+                Ok(fetched) => fetched,
+                Err(CodexQuotaFetchError::Unavailable) => {
+                    return Err(CodexCredentialQuotaError::Upstream {
+                        detail: "quota refresh queue busy or timed out".to_owned(),
+                    });
                 }
-                return Err(CodexCredentialQuotaError::Upstream {
-                    detail: error.to_string(),
-                });
-            }
-        };
+                Err(CodexQuotaFetchError::InvalidCredential) => {
+                    return Err(CodexCredentialQuotaError::InvalidCredentialData);
+                }
+                Err(CodexQuotaFetchError::Upstream { account, error }) => {
+                    match classify_quota_endpoint_failure(&error) {
+                        Some(QuotaEndpointFailure::Exhausted(evidence)) => {
+                            self.record_confirmed_exhaustion(&account, evidence, None, observed_at)
+                                .await?;
+                        }
+                        Some(QuotaEndpointFailure::Credential { state, reason }) => {
+                            self.persist_credential_failure(&account, state, reason, observed_at)
+                                .await;
+                        }
+                        None => {}
+                    }
+                    return Err(CodexCredentialQuotaError::Upstream {
+                        detail: error.to_string(),
+                    });
+                }
+            };
         let mut object = normalize_quota_window_placeholders(
             value
                 .as_object()
@@ -1328,6 +1342,23 @@ impl CodexCredentialQuotaService {
         &self,
         client: &CodexBackendClient,
         account: &ProviderAccount,
+        background: bool,
+    ) -> Result<FetchedCodexQuota, CodexQuotaFetchError> {
+        self.refresh_queue
+            .run(
+                format!("{}:{:?}", account.id(), account.revision()),
+                background,
+                Duration::ZERO,
+                CodexQuotaFetchError::Unavailable,
+                self.fetch_usage_unqueued(client, account),
+            )
+            .await
+    }
+
+    async fn fetch_usage_unqueued(
+        &self,
+        client: &CodexBackendClient,
+        account: &ProviderAccount,
     ) -> Result<FetchedCodexQuota, CodexQuotaFetchError> {
         let credential = self
             .repository
@@ -1350,7 +1381,7 @@ impl CodexCredentialQuotaService {
             Err(CodexQuotaFetchAttemptError::Upstream(error)) => {
                 Err(CodexQuotaFetchError::Upstream {
                     account: Box::new(prepared.account),
-                    error,
+                    error: Arc::new(error),
                 })
             }
         }
