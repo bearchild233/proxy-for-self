@@ -229,7 +229,7 @@ async fn validate_group_filter(
 
 fn admin_account_order(sort: Option<AdminAccountSort>) -> String {
     let Some(sort) = sort else {
-        return "a.id asc".to_owned();
+        return "admin_display_rank('accounts', a.id), a.id asc".to_owned();
     };
     let expression = match sort.field {
         AdminAccountSortField::Email => "a.email",

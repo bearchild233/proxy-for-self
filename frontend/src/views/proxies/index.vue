@@ -16,6 +16,7 @@ import BaseTable from '@/components/base/BaseTable/index.vue'
 import { toast } from '@/components/base/BaseToast'
 import { useAsyncAction } from '@/composables/useAsyncAction'
 import { usePagedQuery } from '@/composables/usePagedQuery'
+import { useSharedOrder } from '@/composables/useSharedOrder'
 import { formatDateTime } from '@/utils/date'
 import { normalizeRequestLocation, requestLocationError } from '@/utils/request-location'
 import ProxyAccountsModal from './components/ProxyAccountsModal.vue'
@@ -181,6 +182,7 @@ watch(showForm, (open) => {
 })
 watchDebounced(search, () => setPage(1), { debounce: 300 })
 onMounted(() => void query.execute())
+const { savingOrder, saveOrder } = useSharedOrder('proxies', () => query.execute())
 </script>
 
 <template>
@@ -210,7 +212,7 @@ onMounted(() => void query.execute())
       </template>
       <template #body>
         <div class="flex h-full min-h-0 flex-col">
-          <BaseTable class="min-h-0 flex-1" :columns="columns" :rows="proxies" :loading="loading" :empty-text="search.trim() ? '没有找到匹配的代理，请尝试其他名称' : '暂无代理，请点击新增代理添加'">
+          <BaseTable reorderable :reorder-disabled="savingOrder" class="min-h-0 flex-1" :columns="columns" :rows="proxies" :loading="loading" :empty-text="search.trim() ? '没有找到匹配的代理，请尝试其他名称' : '暂无代理，请点击新增代理添加'" @reorder="saveOrder">
             <template #name="{ row }">
               <span class="block truncate text-cp text-cp-text" :title="row.name">{{ row.name }}</span>
             </template>

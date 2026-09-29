@@ -67,6 +67,7 @@ impl ClientKeyPageSize {
 /// Client Key 列表排序字段。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientKeySortField {
+    Manual,
     Name,
     Enabled,
     CreatedAt,
@@ -90,6 +91,7 @@ pub struct ClientKeySort {
 /// 与排序字段绑定的游标值。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientKeyCursorValue {
+    Manual,
     Name(String),
     Enabled(bool),
     CreatedAt(DateTime<Utc>),

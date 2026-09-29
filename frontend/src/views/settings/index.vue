@@ -50,6 +50,9 @@ function switchSection(value: string): void {
 }
 
 const {
+  savingLocation,
+  locationStatus,
+  saveLocation,
   loading,
   saving,
   hasChanges,
@@ -78,7 +81,7 @@ const {
   loadSettings,
 } = useSettingsForm()
 
-const disabled = computed(() => saving.value || loading.value || !!error.value)
+const disabled = computed(() => saving.value || savingLocation.value || loading.value || !!error.value)
 
 watch(section, (value) => {
   visited.add(value)
@@ -110,10 +113,10 @@ watch(section, (value) => {
       />
       <div v-if="isBasicSection || hasChanges" class="ml-auto flex items-center justify-end gap-2">
         <span v-if="hasChanges" class="mr-1 size-1.5 shrink-0 rounded-full bg-cp-warning" aria-hidden="true" />
-        <BaseIconButton v-if="hasChanges" label="撤销全部基础设置更改" variant="filled" :disabled="saving || loading" @click="resetSettings">
+        <BaseIconButton v-if="hasChanges" label="撤销全部基础设置更改" variant="filled" :disabled="saving || savingLocation || loading" @click="resetSettings">
           <Undo2 class="size-4" />
         </BaseIconButton>
-        <BaseButton variant="primary" :loading="saving" :disabled="loading || !hasChanges || !!error" @click="saveSettings">
+        <BaseButton variant="primary" :loading="saving" :disabled="loading || savingLocation || !hasChanges || !!error" @click="saveSettings">
           <template #icon>
             <Save class="size-4" />
           </template>
@@ -175,7 +178,13 @@ watch(section, (value) => {
             :active="section === 'upstream'"
             :disabled="disabled"
           />
-          <RequestLocationCard v-model="form.requestLocation" v-model:enabled="form.requestLocationEnabled" :disabled="disabled" />
+          <RequestLocationCard v-model="form.requestLocation" v-model:enabled="form.requestLocationEnabled" :disabled="saving || loading || !!error" />
+          <p class="mt-2 text-cp-sm text-cp-text-secondary" role="status">
+            {{ locationStatus }}
+            <button v-if="locationStatus.includes('失败')" type="button" class="ml-2 text-cp-primary-text" @click="saveLocation">
+              重试保存
+            </button>
+          </p>
           <ModelAliasesCard
             :mappings="mappings"
             :loading="loading"

@@ -15,6 +15,7 @@ import { useTableColumns } from '@/components/base/BaseTable/useTableColumns'
 import LastUsedAtCell from '@/components/LastUsedAtCell.vue'
 import ProviderIconGroup from '@/components/ProviderIconGroup.vue'
 import { useAccountGroupCatalog } from '@/composables/useAccountGroupCatalog'
+import { useSharedOrder } from '@/composables/useSharedOrder'
 import AccountBatchEditModal from './components/AccountBatchEditModal.vue'
 import AccountConnectionTestModal from './components/AccountConnectionTestModal.vue'
 import AccountCreateModal from './components/AccountCreateModal/index.vue'
@@ -193,6 +194,7 @@ const {
   reloadAccounts: loadAccounts,
   reloadGroups: loadGroups,
 })
+const { savingOrder, saveOrder } = useSharedOrder('accounts', loadAccounts)
 </script>
 
 <template>
@@ -252,6 +254,8 @@ const {
       <template #body>
         <div class="flex min-h-0 flex-col xl:h-full">
           <BaseTable
+            reorderable
+            :reorder-disabled="savingOrder || refreshing"
             class="h-100! min-h-100 flex-none [--cp-table-row-height:72px] xl:h-auto! xl:min-h-0 xl:flex-1"
             :columns="visibleColumns"
             :rows="accounts"
@@ -260,6 +264,7 @@ const {
             :expanded-row-keys="expandedRowKeys"
             :sort="sort"
             empty-text="暂无账号数据"
+            @reorder="saveOrder"
             @sort-change="handleSortChange"
           >
             <template #expander="{ row }">

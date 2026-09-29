@@ -369,6 +369,14 @@ where
         .route("/api/admin/settings/pricing/sync", post(sync_pricing::<S>))
         .route("/api/admin/settings", get(settings::<S>))
         .route(
+            "/api/admin/settings/display-order",
+            post(reorder_display::<S>),
+        )
+        .route(
+            "/api/admin/settings/request-location",
+            post(update_location::<S>),
+        )
+        .route(
             "/api/admin/settings/client-profiles/{provider}",
             get(client_profile_options::<S>),
         )
@@ -784,5 +792,65 @@ where
     Ok(AdminResponse::new(
         StatusCode::OK,
         AdminEnvelope::ok(result.into_inner()),
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReorderDisplayRequest {
+    scope: String,
+    original_ids: Vec<String>,
+    ordered_ids: Vec<String>,
+}
+async fn reorder_display<S>(
+    _auth: AdminAuth,
+    State(state): State<S>,
+    AdminJson(request): AdminJson<ReorderDisplayRequest>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    state
+        .admin_services()
+        .settings()
+        .reorder_display(gateway_admin::model::settings::ReorderDisplay {
+            scope: request.scope,
+            original_ids: request.original_ids,
+            ordered_ids: request.ordered_ids,
+        })
+        .await
+        .map_err(map_service_error)?;
+    Ok(AdminResponse::new(
+        StatusCode::OK,
+        AdminEnvelope::ok(serde_json::json!({"saved": true})),
+    ))
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LocationRequest {
+    enabled: bool,
+    location: gateway_core::account::RequestLocation,
+}
+async fn update_location<S>(
+    auth: AdminAuth,
+    State(state): State<S>,
+    AdminJson(request): AdminJson<LocationRequest>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    state
+        .admin_services()
+        .settings()
+        .update_location(
+            &auth.context().mutation_context(),
+            request.enabled,
+            request.location,
+        )
+        .await
+        .map_err(map_service_error)?;
+    Ok(AdminResponse::new(
+        StatusCode::OK,
+        AdminEnvelope::ok(serde_json::json!({"saved": true})),
     ))
 }

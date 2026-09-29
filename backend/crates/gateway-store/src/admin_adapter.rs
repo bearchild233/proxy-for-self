@@ -15,6 +15,36 @@ pub(crate) struct AdminSettingsStoreAdapter {
 
 #[async_trait::async_trait]
 impl SettingsStore for AdminSettingsStoreAdapter {
+    async fn reorder_display(
+        &self,
+        command: gateway_admin::model::settings::ReorderDisplay,
+    ) -> AdminStoreResult<()> {
+        self.control_plane
+            .reorder_display(command)
+            .await
+            .map_err(|e| admin_store_error("display order", e))
+    }
+    async fn update_location(
+        &self,
+        context: &MutationContext,
+        enabled: bool,
+        location: gateway_core::account::RequestLocation,
+    ) -> AdminStoreResult<gateway_admin::model::Revision> {
+        let audit = mutation_audit(
+            context,
+            "settings.location",
+            "runtime_settings",
+            "global",
+            vec!["request_location".to_owned()],
+        );
+        let revision = self
+            .control_plane
+            .update_location(enabled, location, audit)
+            .await
+            .map_err(|e| admin_store_error("request location", e))?;
+        admin_revision(revision)
+    }
+
     async fn load_pricing(&self) -> AdminStoreResult<gateway_admin::model::pricing::StoredPricing> {
         self.control_plane
             .load_pricing()

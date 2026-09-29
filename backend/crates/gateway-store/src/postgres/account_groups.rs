@@ -117,7 +117,7 @@ impl AccountGroupStore for PgAccountGroupRepository {
         let offset = u64::from(query.page.saturating_sub(1)) * u64::from(query.page_size.get());
         let mut statement = group_select();
         push_group_filter(&mut statement, &query);
-        statement.push(" order by g.created_at desc, g.id desc limit ");
+        statement.push(" order by admin_display_rank('groups', g.id), g.id limit ");
         statement.push_bind(i64::from(query.page_size.get()));
         statement.push(" offset ");
         statement.push_bind(i64::try_from(offset).map_err(|_| invalid_admin("page is too large"))?);

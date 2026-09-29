@@ -41,6 +41,8 @@ export interface BaseTableSort {
 }
 
 export interface BaseTableProps<Row extends TableRow> {
+  reorderable?: boolean
+  reorderDisabled?: boolean
   columns: BaseTableColumn<Row>[]
   rows: Row[]
   rowKey?: string | ((row: Row, index: number) => string | number)

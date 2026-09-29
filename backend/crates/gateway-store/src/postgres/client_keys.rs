@@ -147,6 +147,7 @@ pub struct ClientApiKeyGroupRecord {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ClientApiKeySortField {
+    Manual,
     Name,
     Enabled,
     #[default]
@@ -169,6 +170,7 @@ pub struct ClientApiKeySort {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientApiKeyCursorValue {
+    Manual,
     Name(String),
     Enabled(bool),
     CreatedAt(DateTime<Utc>),
@@ -199,6 +201,7 @@ impl ClientApiKeyCursor {
 
     fn from_record(sort: ClientApiKeySort, record: &ClientApiKeyRecord) -> Self {
         let value = match sort.field {
+            ClientApiKeySortField::Manual => ClientApiKeyCursorValue::Manual,
             ClientApiKeySortField::Name => ClientApiKeyCursorValue::Name(record.name.clone()),
             ClientApiKeySortField::Enabled => ClientApiKeyCursorValue::Enabled(record.enabled),
             ClientApiKeySortField::CreatedAt => {
@@ -220,6 +223,9 @@ impl ClientApiKeyCursor {
         let matches_sort = matches!(
             (self.sort.field, &self.value),
             (
+                ClientApiKeySortField::Manual,
+                ClientApiKeyCursorValue::Manual
+            ) | (
                 ClientApiKeySortField::Name,
                 ClientApiKeyCursorValue::Name(_)
             ) | (
@@ -1014,6 +1020,7 @@ fn store_client_key_query(
 fn store_client_key_sort(sort: AdminClientKeySort) -> ClientApiKeySort {
     ClientApiKeySort {
         field: match sort.field {
+            AdminClientKeySortField::Manual => ClientApiKeySortField::Manual,
             AdminClientKeySortField::Name => ClientApiKeySortField::Name,
             AdminClientKeySortField::Enabled => ClientApiKeySortField::Enabled,
             AdminClientKeySortField::CreatedAt => ClientApiKeySortField::CreatedAt,
@@ -1031,6 +1038,7 @@ fn store_client_key_cursor(
     sort: ClientApiKeySort,
 ) -> AdminStoreResult<ClientApiKeyCursor> {
     let value = match cursor.value {
+        AdminClientKeyCursorValue::Manual => ClientApiKeyCursorValue::Manual,
         AdminClientKeyCursorValue::Name(value) => ClientApiKeyCursorValue::Name(value),
         AdminClientKeyCursorValue::Enabled(value) => ClientApiKeyCursorValue::Enabled(value),
         AdminClientKeyCursorValue::CreatedAt(value) => ClientApiKeyCursorValue::CreatedAt(value),
@@ -1043,6 +1051,7 @@ fn store_client_key_cursor(
 fn admin_client_key_cursor(cursor: ClientApiKeyCursor) -> AdminStoreResult<AdminClientKeyCursor> {
     let sort = AdminClientKeySort {
         field: match cursor.sort.field {
+            ClientApiKeySortField::Manual => AdminClientKeySortField::Manual,
             ClientApiKeySortField::Name => AdminClientKeySortField::Name,
             ClientApiKeySortField::Enabled => AdminClientKeySortField::Enabled,
             ClientApiKeySortField::CreatedAt => AdminClientKeySortField::CreatedAt,
@@ -1054,6 +1063,7 @@ fn admin_client_key_cursor(cursor: ClientApiKeyCursor) -> AdminStoreResult<Admin
         },
     };
     let value = match cursor.value {
+        ClientApiKeyCursorValue::Manual => AdminClientKeyCursorValue::Manual,
         ClientApiKeyCursorValue::Name(value) => AdminClientKeyCursorValue::Name(value),
         ClientApiKeyCursorValue::Enabled(value) => AdminClientKeyCursorValue::Enabled(value),
         ClientApiKeyCursorValue::CreatedAt(value) => AdminClientKeyCursorValue::CreatedAt(value),
@@ -1528,6 +1538,16 @@ fn push_client_key_cursor(statement: &mut QueryBuilder<Postgres>, cursor: &Clien
         ClientApiKeySortDirection::Desc => " < ",
     };
     match &cursor.value {
+        ClientApiKeyCursorValue::Manual => {
+            statement.push(" and (admin_display_rank('keys', id), id)");
+            statement.push(comparison);
+            statement.push("(admin_display_rank('keys', ");
+            statement.push_bind(cursor.id.clone());
+            statement.push("), ");
+            statement.push_bind(cursor.id.clone());
+            statement.push(")");
+        }
+
         ClientApiKeyCursorValue::Name(name) => {
             statement.push(" and (lower(name), id)");
             statement.push(comparison);
@@ -1578,6 +1598,7 @@ fn push_client_key_order(statement: &mut QueryBuilder<Postgres>, sort: ClientApi
         ClientApiKeySortDirection::Desc => " desc",
     };
     match sort.field {
+        ClientApiKeySortField::Manual => statement.push(" order by admin_display_rank('keys', id)"),
         ClientApiKeySortField::Name => statement.push(" order by lower(name)"),
         ClientApiKeySortField::Enabled => statement.push(" order by enabled"),
         ClientApiKeySortField::CreatedAt => statement.push(" order by created_at"),

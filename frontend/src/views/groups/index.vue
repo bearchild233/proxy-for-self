@@ -6,6 +6,7 @@ import BasePageHeader from '@/components/base/BasePageHeader.vue'
 import BaseTablePagination from '@/components/base/BaseTable/BaseTablePagination.vue'
 import BaseTable from '@/components/base/BaseTable/index.vue'
 import { usePageSelection } from '@/composables/usePageSelection'
+import { useSharedOrder } from '@/composables/useSharedOrder'
 import AccountGroupActions from './components/AccountGroupActions.vue'
 import AccountGroupFilters from './components/AccountGroupFilters.vue'
 import AccountGroupFormModal from './components/AccountGroupFormModal.vue'
@@ -14,6 +15,7 @@ import { useAccountGroups } from './composables/useAccountGroups'
 import { accountGroupColumns } from './constants'
 
 const {
+  loadGroups,
   groups,
   loading,
   pagination,
@@ -48,6 +50,7 @@ const {
 
 const { allSelected, indeterminate, selectedRowKeys, toggleSelection, toggleAll }
   = usePageSelection(groups, selectedIds)
+const { savingOrder, saveOrder } = useSharedOrder('groups', loadGroups)
 </script>
 
 <template>
@@ -75,12 +78,15 @@ const { allSelected, indeterminate, selectedRowKeys, toggleSelection, toggleAll 
       <template #body>
         <div class="flex h-full min-h-0 flex-col">
           <BaseTable
+            reorderable
+            :reorder-disabled="savingOrder"
             class="min-h-0 flex-1"
             :columns="accountGroupColumns"
             :rows="groups"
             :loading="loading"
             :selected-row-keys="selectedRowKeys"
             empty-text="暂无分组，请点击创建分组创建"
+            @reorder="saveOrder"
           >
             <template #header-selection>
               <BaseCheckbox

@@ -1,8 +1,9 @@
 <script setup lang="ts" generic="Row extends object = Record<string, unknown>">
 import type { BaseTableProps, BaseTableSort, ResolvedTableColumn } from './columns'
 
-import { Triangle } from '@lucide/vue'
+import { GripVertical, Triangle } from '@lucide/vue'
 import { useResizeObserver } from '@vueuse/core'
+import { useSortable } from '@vueuse/integrations/useSortable'
 import { computed, nextTick, onMounted, shallowRef, useSlots, useTemplateRef, watch } from 'vue'
 import BaseEmpty from '../BaseEmpty.vue'
 import BaseScrollbar from '../BaseScrollbar.vue'
@@ -34,9 +35,10 @@ const props = withDefaults(defineProps<BaseTableProps<Row>>(), {
 
 const emit = defineEmits<{
   sortChange: [sort: BaseTableSort | undefined]
+  reorder: [change: { originalIds: string[], orderedIds: string[] }]
 }>()
 const slots = useSlots()
-const computedColumns = computed(() => resolveColumns(props.columns))
+const computedColumns = computed(() => resolveColumns(props.reorderable ? [{ key: '__reorder', label: '排序', kind: 'expander' }, ...props.columns] : props.columns))
 const resolvedTableStyle = computed(() => tableStyle(computedColumns.value))
 
 const retainedRows = shallowRef<Row[]>([])
@@ -48,11 +50,47 @@ watch(
   },
   { immediate: true },
 )
-const displayRows = computed(() => (props.loading && props.rows.length === 0 ? retainedRows.value : props.rows))
+const dragRows = shallowRef<Row[]>()
+const displayRows = computed(() => dragRows.value ?? (props.loading && props.rows.length === 0 ? retainedRows.value : props.rows))
 const hasRows = computed(() => displayRows.value.length > 0)
 
 const scrollbarRef = useTemplateRef<InstanceType<typeof BaseScrollbar>>('scrollbar')
 const tableRef = useTemplateRef<HTMLTableElement>('table')
+const canReorder = computed(() => props.reorderable && !props.loading && !props.reorderDisabled && !props.sort)
+function moveRow(from: number, to: number, rows = displayRows.value) {
+  if (from === to || to < 0 || to >= rows.length)
+    return
+  const originalIds = rows.map((row, index) => String(getRowKey(row, index)))
+  const orderedIds = [...originalIds]
+  orderedIds.splice(to, 0, orderedIds.splice(from, 1)[0]!)
+  emit('reorder', { originalIds, orderedIds })
+}
+function moveWithKeyboard(event: KeyboardEvent, index: number) {
+  if (canReorder.value && event.altKey && ['ArrowUp', 'ArrowDown'].includes(event.key)) {
+    event.preventDefault()
+    moveRow(index, index + (event.key === 'ArrowUp' ? -1 : 1))
+  }
+}
+const sortable = useSortable(tableRef, shallowRef<Row[]>([]), {
+  watchElement: true,
+  animation: 150,
+  handle: '[data-row-handle]',
+  draggable: 'tbody[data-row-group]',
+  ghostClass: 'opacity-40',
+  disabled: !canReorder.value,
+  onStart: () => { dragRows.value = [...displayRows.value] },
+  onUpdate: () => {},
+  onEnd: (event) => {
+    // Sortable 只提供手势，先还原 DOM，再交给 Vue 和服务器更新（展开行与主行一起移动）。
+    const rows = dragRows.value ?? displayRows.value
+    event.item.remove()
+    event.from.insertBefore(event.item, event.from.children[event.oldIndex ?? 0] ?? null)
+    dragRows.value = undefined
+    if (event.oldDraggableIndex !== undefined && event.newDraggableIndex !== undefined)
+      moveRow(event.oldDraggableIndex, event.newDraggableIndex, rows)
+  },
+})
+watch(canReorder, value => sortable.option('disabled', !value))
 useTableColumnMotion(tableRef, () => computedColumns.value.map(column => column.key))
 const horizontalScrolled = shallowRef(false)
 const horizontalCanScrollRight = shallowRef(false)
@@ -194,6 +232,17 @@ function sortButtonLabel(column: ResolvedTableColumn<Row>) {
 
 <template>
   <div class="@container/table isolate flex h-full min-h-0 w-full max-w-full flex-col overflow-hidden">
+    <div v-if="reorderable" class="flex shrink-0 items-center gap-2 px-4 py-2 text-cp-xs text-cp-text-secondary" aria-live="polite">
+      <template v-if="sort">
+        当前按列排序
+        <button type="button" class="text-cp-primary-text" @click="emit('sortChange', undefined)">
+          恢复拖动顺序
+        </button>
+      </template>
+      <template v-else>
+        拖动左侧手柄调整当前页顺序，自动保存并全站共享；也可聚焦手柄后按 Alt + ↑ / ↓
+      </template>
+    </div>
     <div v-loading="loading && (hasRows || !showHeaderWhenEmpty)" class="relative flex min-h-0 max-w-full flex-1 overflow-hidden">
       <BaseScrollbar
         v-if="hasRows || showHeaderWhenEmpty"
@@ -266,52 +315,54 @@ function sortButtonLabel(column: ResolvedTableColumn<Row>) {
               </th>
             </tr>
           </thead>
-          <tbody>
-            <template v-for="(row, index) in displayRows" :key="getRowKey(row, index)">
-              <tr :class="rowClass(row, index)" :aria-selected="isRowSelected(row, index) || undefined">
-                <td
-                  v-for="(column, columnIndex) in computedColumns"
-                  :key="column.key"
-                  class="min-w-0 transition-[background-color] duration-150 ease-out motion-reduce:transition-none"
-                  :class="[
-                    column.paddingClass ?? cellPaddingClass,
-                    bodyTextClass,
-                    bodyCellFrameClass,
-                    column.contentClass,
-                    alignClass(column),
-                    index === 0 ? firstRowTopGapClass : undefined,
-                    columnIndex === 0 ? 'rounded-l-cp' : undefined,
-                    columnIndex === computedColumns.length - 1 ? 'rounded-r-cp pr-6' : undefined,
-                    stickyClass(column),
-                    rowBackgroundClass(row, index),
-                  ]"
-                  :style="stickyStyle(column)"
-                >
-                  <div class="grid content-center" :class="bodyCellContentClass" :data-column-motion="column.sticky ? undefined : column.key">
-                    <div :class="cellContentClass(column)" :title="bodyCellTitle(column, row)">
-                      <slot
-                        :name="column.key"
-                        :row="row"
-                        :value="cellValue(row, column.key)"
-                        :display-value="cellDisplayValue(column, row)"
-                        :index="index"
-                      >
-                        {{ cellDisplayValue(column, row) }}
-                      </slot>
-                    </div>
+          <tbody v-for="(row, index) in displayRows" :key="getRowKey(row, index)" data-row-group>
+            <tr :class="rowClass(row, index)" :aria-selected="isRowSelected(row, index) || undefined">
+              <td
+                v-for="(column, columnIndex) in computedColumns"
+                :key="column.key"
+                class="min-w-0 transition-[background-color] duration-150 ease-out motion-reduce:transition-none"
+                :class="[
+                  column.paddingClass ?? cellPaddingClass,
+                  bodyTextClass,
+                  bodyCellFrameClass,
+                  column.contentClass,
+                  alignClass(column),
+                  index === 0 ? firstRowTopGapClass : undefined,
+                  columnIndex === 0 ? 'rounded-l-cp' : undefined,
+                  columnIndex === computedColumns.length - 1 ? 'rounded-r-cp pr-6' : undefined,
+                  stickyClass(column),
+                  rowBackgroundClass(row, index),
+                ]"
+                :style="stickyStyle(column)"
+              >
+                <div class="grid content-center" :class="bodyCellContentClass" :data-column-motion="column.sticky ? undefined : column.key">
+                  <div :class="cellContentClass(column)" :title="bodyCellTitle(column, row)">
+                    <button v-if="column.key === '__reorder'" type="button" data-row-handle :disabled="!canReorder" class="touch-none rounded p-1 text-cp-text-tertiary enabled:cursor-grab enabled:hover:text-cp-primary-text disabled:opacity-30" :aria-label="`调整第 ${index + 1} 行顺序`" title="拖动排序 · Alt + ↑ / ↓" @keydown="moveWithKeyboard($event, index)">
+                      <GripVertical class="size-4" />
+                    </button>
+                    <slot
+                      v-else
+                      :name="column.key"
+                      :row="row"
+                      :value="cellValue(row, column.key)"
+                      :display-value="cellDisplayValue(column, row)"
+                      :index="index"
+                    >
+                      {{ cellDisplayValue(column, row) }}
+                    </slot>
                   </div>
-                </td>
-              </tr>
-              <tr v-if="isRowExpanded(row, index)">
-                <td
-                  :colspan="computedColumns.length"
-                  class="rounded-cp border-y-transparent bg-cp-fill-quaternary bg-clip-padding p-0"
-                  :class="bodyCellFrameClass"
-                >
-                  <slot name="expanded" :row="row" :index="index" />
-                </td>
-              </tr>
-            </template>
+                </div>
+              </td>
+            </tr>
+            <tr v-if="isRowExpanded(row, index)">
+              <td
+                :colspan="computedColumns.length"
+                class="rounded-cp border-y-transparent bg-cp-fill-quaternary bg-clip-padding p-0"
+                :class="bodyCellFrameClass"
+              >
+                <slot name="expanded" :row="row" :index="index" />
+              </td>
+            </tr>
           </tbody>
         </table>
       </BaseScrollbar>

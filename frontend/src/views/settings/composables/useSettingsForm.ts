@@ -1,9 +1,10 @@
 import type { rotationOptions } from '../constants'
 import type { RequestLocation } from '@/api'
 import type { ClientProfileSelection, XaiClientProfileSelection } from '@/api/modules/client-profiles'
-import { computed, reactive, ref, shallowRef } from 'vue'
+import { computed, reactive, ref, shallowRef, watch } from 'vue'
 
 import { getSettings, updateSettings } from '@/api'
+import { updateRequestLocation } from '@/api/modules/settings'
 import { ApiError } from '@/api/request'
 import { toast } from '@/components/base/BaseToast'
 import { useAsyncAction } from '@/composables/useAsyncAction'
@@ -15,6 +16,8 @@ type RotationStrategy = (typeof rotationOptions)[number]['value']
 const MIB = 1024 * 1024
 
 export function useSettingsForm() {
+  const savingLocation = shallowRef(false)
+  const locationStatus = shallowRef('位置更改会自动保存到服务器')
   const loading = shallowRef(true)
   const saveAction = useAsyncAction()
   const saving = saveAction.loading
@@ -62,8 +65,36 @@ export function useSettingsForm() {
   const loaded = computed(() => saved.value !== undefined)
   const hasChanges = computed(() => loaded.value && JSON.stringify(snapshot()) !== JSON.stringify(saved.value))
 
+  async function saveLocation() {
+    if (!saved.value || savingLocation.value || loading.value)
+      return
+    savingLocation.value = true
+    try {
+      // 串行保存并合并连续选择，只更新位置字段，不覆盖其他管理员的并发设置。
+      while (saved.value && (JSON.stringify(form.requestLocation) !== JSON.stringify(saved.value.form.requestLocation) || form.requestLocationEnabled !== saved.value.form.requestLocationEnabled)) {
+        const enabled = form.requestLocationEnabled
+        const location = normalizeRequestLocation(form.requestLocation)
+        const invalid = requestLocationError(location)
+        if (invalid) {
+          locationStatus.value = invalid
+          return
+        }
+        locationStatus.value = '正在保存位置…'
+        await updateRequestLocation(enabled, location)
+        savedRequestLocation.value = { ...location }
+        saved.value = { ...saved.value, form: { ...saved.value.form, requestLocationEnabled: enabled, requestLocation: { ...location } } }
+        locationStatus.value = '位置已保存到服务器，其他设备共享'
+      }
+    }
+    catch { locationStatus.value = '位置保存失败，点击重试' }
+    finally { savingLocation.value = false }
+  }
+  watch(() => [form.requestLocationEnabled, JSON.stringify(form.requestLocation)], () => {
+    void saveLocation()
+  })
+
   function resetSettings() {
-    if (!saved.value || saving.value)
+    if (!saved.value || saving.value || savingLocation.value)
       return
     Object.assign(form, saved.value.form, { requestLocation: { ...saved.value.form.requestLocation } })
     mappings.value = saved.value.mappings.map(row => ({ ...row }))
@@ -185,7 +216,7 @@ export function useSettingsForm() {
   }
 
   async function saveSettings() {
-    if (saving.value || loading.value || !savedRequestLocation.value || !form.openaiClientProfile || !form.xaiClientProfile)
+    if (saving.value || savingLocation.value || loading.value || !savedRequestLocation.value || !form.openaiClientProfile || !form.xaiClientProfile)
       return
     const { refreshMarginSeconds, refreshConcurrency, maxConcurrentPerAccount, requestIntervalMs, rotationStrategy, maxWaitingPerKey, maxWaitingPerAccount, concurrencyWaitTimeoutSeconds, responsesMaxDecompressedBodyMiB, accountAutoFreezeThreshold, accountAutoFreezeWindowSeconds, accountAutoFreezeDurationSeconds } = form
     if (refreshMarginSeconds === null || refreshConcurrency === null || maxConcurrentPerAccount === null || requestIntervalMs === null || !rotationStrategy || maxWaitingPerKey === null || maxWaitingPerAccount === null || concurrencyWaitTimeoutSeconds === null) {
@@ -210,10 +241,7 @@ export function useSettingsForm() {
       toast.warning('请修正客户端最低版本格式')
       return
     }
-    // 关闭时保留已保存的自定义值，未完成的草稿不阻止停止覆盖。
-    const requestLocation = form.requestLocationEnabled
-      ? normalizeRequestLocation(form.requestLocation)
-      : savedRequestLocation.value
+    const requestLocation = normalizeRequestLocation(form.requestLocation)
     const locationError = requestLocationError(requestLocation)
     if (locationError) {
       toast.warning(locationError)
@@ -276,6 +304,9 @@ export function useSettingsForm() {
   }
 
   return {
+    savingLocation,
+    locationStatus,
+    saveLocation,
     loading,
     saving,
     hasChanges,

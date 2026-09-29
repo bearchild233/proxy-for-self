@@ -280,6 +280,7 @@ export function useAccountGroups() {
 
   return {
     groups,
+    loadGroups: () => query.execute(),
     loading: query.loading,
     pagination,
     searchQuery,

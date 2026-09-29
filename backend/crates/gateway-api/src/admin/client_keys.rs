@@ -155,6 +155,7 @@ impl ListClientKeysQuery {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ClientKeySortField {
+    Manual,
     Name,
     Enabled,
     CreatedAt,
@@ -180,6 +181,7 @@ pub struct ClientKeySort {
 impl ClientKeySort {
     fn parse(field: &str, direction: &str) -> Result<Self, WireValidationError> {
         let field = match field {
+            "manual" => ClientKeySortField::Manual,
             "name" => ClientKeySortField::Name,
             "enabled" => ClientKeySortField::Enabled,
             "createdAt" => ClientKeySortField::CreatedAt,
@@ -608,6 +610,7 @@ pub struct ClientKeyCursorData {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "camelCase")]
 pub enum ClientKeyCursorValue {
+    Manual,
     Name(String),
     Enabled(bool),
     CreatedAt(DateTime<Utc>),
@@ -662,16 +665,19 @@ fn validate_client_key_cursor(cursor: &ClientKeyCursorData) -> Result<(), WireVa
         (ClientKeySortField::Name, ClientKeyCursorValue::Name(value)) if !value.trim().is_empty()
     ) || matches!(
         (cursor.sort.field, &cursor.value),
-        (
-            ClientKeySortField::Enabled,
-            ClientKeyCursorValue::Enabled(_)
-        ) | (
-            ClientKeySortField::CreatedAt,
-            ClientKeyCursorValue::CreatedAt(_)
-        ) | (
-            ClientKeySortField::LastUsedAt,
-            ClientKeyCursorValue::LastUsedAt(_)
-        )
+        (ClientKeySortField::Manual, ClientKeyCursorValue::Manual)
+            | (
+                ClientKeySortField::Enabled,
+                ClientKeyCursorValue::Enabled(_)
+            )
+            | (
+                ClientKeySortField::CreatedAt,
+                ClientKeyCursorValue::CreatedAt(_)
+            )
+            | (
+                ClientKeySortField::LastUsedAt,
+                ClientKeyCursorValue::LastUsedAt(_)
+            )
     );
     if matching {
         Ok(())
@@ -683,6 +689,7 @@ fn validate_client_key_cursor(cursor: &ClientKeyCursorData) -> Result<(), WireVa
 const fn domain_sort(sort: ClientKeySort) -> DomainSort {
     DomainSort {
         field: match sort.field {
+            ClientKeySortField::Manual => DomainSortField::Manual,
             ClientKeySortField::Name => DomainSortField::Name,
             ClientKeySortField::Enabled => DomainSortField::Enabled,
             ClientKeySortField::CreatedAt => DomainSortField::CreatedAt,
@@ -698,6 +705,7 @@ const fn domain_sort(sort: ClientKeySort) -> DomainSort {
 const fn wire_sort(sort: DomainSort) -> ClientKeySort {
     ClientKeySort {
         field: match sort.field {
+            DomainSortField::Manual => ClientKeySortField::Manual,
             DomainSortField::Name => ClientKeySortField::Name,
             DomainSortField::Enabled => ClientKeySortField::Enabled,
             DomainSortField::CreatedAt => ClientKeySortField::CreatedAt,
@@ -712,6 +720,7 @@ const fn wire_sort(sort: DomainSort) -> ClientKeySort {
 
 fn domain_cursor(cursor: ClientKeyCursorData) -> Result<ClientKeyCursor, WireValidationError> {
     let value = match cursor.value {
+        ClientKeyCursorValue::Manual => DomainCursorValue::Manual,
         ClientKeyCursorValue::Name(value) => DomainCursorValue::Name(value),
         ClientKeyCursorValue::Enabled(value) => DomainCursorValue::Enabled(value),
         ClientKeyCursorValue::CreatedAt(value) => DomainCursorValue::CreatedAt(value),
@@ -726,6 +735,7 @@ fn domain_cursor(cursor: ClientKeyCursorData) -> Result<ClientKeyCursor, WireVal
 
 fn wire_cursor(cursor: ClientKeyCursor) -> Result<ClientKeyCursorData, WireValidationError> {
     let value = match cursor.value {
+        DomainCursorValue::Manual => ClientKeyCursorValue::Manual,
         DomainCursorValue::Name(value) => ClientKeyCursorValue::Name(value),
         DomainCursorValue::Enabled(value) => ClientKeyCursorValue::Enabled(value),
         DomainCursorValue::CreatedAt(value) => ClientKeyCursorValue::CreatedAt(value),

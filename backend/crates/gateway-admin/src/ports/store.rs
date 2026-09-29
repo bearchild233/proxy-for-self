@@ -455,6 +455,29 @@ pub trait ObservabilityStore: Send + Sync {
 /// Runtime settings 与管理员 API Key 写入。
 #[async_trait]
 pub trait SettingsStore: Send + Sync {
+    async fn reorder_display(
+        &self,
+        _command: crate::model::settings::ReorderDisplay,
+    ) -> AdminStoreResult<()> {
+        Err(AdminStoreError::new(
+            AdminStoreErrorKind::Unavailable,
+            "display order",
+            "unsupported",
+        ))
+    }
+    async fn update_location(
+        &self,
+        _context: &MutationContext,
+        _enabled: bool,
+        _location: gateway_core::account::RequestLocation,
+    ) -> AdminStoreResult<crate::model::Revision> {
+        Err(AdminStoreError::new(
+            AdminStoreErrorKind::Unavailable,
+            "request location",
+            "unsupported",
+        ))
+    }
+
     async fn load_pricing(&self) -> AdminStoreResult<crate::model::pricing::StoredPricing>;
     async fn sync_pricing(
         &self,

@@ -45,8 +45,8 @@ export function useApiKeysQuery() {
       cursor,
       limit,
       search,
-      sortBy: sort.value?.key,
-      sortDirection: sort.value?.direction,
+      sortBy: sort.value?.key ?? 'manual',
+      sortDirection: sort.value?.direction ?? 'asc',
     }, { signal })
   }
 

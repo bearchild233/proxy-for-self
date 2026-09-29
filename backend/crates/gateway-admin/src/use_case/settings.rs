@@ -23,6 +23,21 @@ use super::{map_store_error, publish_committed};
 /// API 消费的 Runtime settings 管理服务。
 #[async_trait]
 pub trait SettingsService: Send + Sync {
+    async fn reorder_display(
+        &self,
+        _command: crate::model::settings::ReorderDisplay,
+    ) -> Result<(), AdminError> {
+        Err(AdminError::invalid("展示排序暂不可用"))
+    }
+    async fn update_location(
+        &self,
+        _context: &MutationContext,
+        _enabled: bool,
+        _location: gateway_core::account::RequestLocation,
+    ) -> Result<(), AdminError> {
+        Err(AdminError::invalid("位置设置暂不可用"))
+    }
+
     async fn preview_pricing_sync(
         &self,
     ) -> Result<crate::model::pricing::PricingSyncPreview, AdminError>;
@@ -104,6 +119,33 @@ impl DefaultSettingsService {
 
 #[async_trait]
 impl SettingsService for DefaultSettingsService {
+    async fn reorder_display(
+        &self,
+        command: crate::model::settings::ReorderDisplay,
+    ) -> Result<(), AdminError> {
+        command.validate()?;
+        self.store
+            .reorder_display(command)
+            .await
+            .map_err(|e| map_store_error(e, "display order"))
+    }
+    async fn update_location(
+        &self,
+        context: &MutationContext,
+        enabled: bool,
+        location: gateway_core::account::RequestLocation,
+    ) -> Result<(), AdminError> {
+        let location = location
+            .normalized()
+            .map_err(|_| AdminError::invalid("请求位置无效"))?;
+        let revision = self
+            .store
+            .update_location(context, enabled, location)
+            .await
+            .map_err(|e| map_store_error(e, "request location"))?;
+        publish_committed(self.snapshot.as_ref(), revision).await
+    }
+
     async fn preview_pricing_sync(
         &self,
     ) -> Result<crate::model::pricing::PricingSyncPreview, AdminError> {

@@ -141,3 +141,30 @@ impl RuntimeSettings {
         }
     }
 }
+
+/// 仅调整展示位置，不改变调度；原顺序用于拒绝过期的并发编辑。
+#[derive(Debug, Clone)]
+pub struct ReorderDisplay {
+    pub scope: String,
+    pub original_ids: Vec<String>,
+    pub ordered_ids: Vec<String>,
+}
+impl ReorderDisplay {
+    pub fn validate(&self) -> Result<(), super::AdminError> {
+        let before: std::collections::BTreeSet<_> = self.original_ids.iter().collect();
+        let after: std::collections::BTreeSet<_> = self.ordered_ids.iter().collect();
+        if !matches!(
+            self.scope.as_str(),
+            "accounts" | "groups" | "keys" | "proxies"
+        ) || before.len() < 2
+            || before.len() > 200
+            || before.len() != self.original_ids.len()
+            || after.len() != self.ordered_ids.len()
+            || before != after
+            || before.iter().any(|id| id.is_empty() || id.len() > 256)
+        {
+            return Err(super::AdminError::invalid("展示排序参数无效"));
+        }
+        Ok(())
+    }
+}

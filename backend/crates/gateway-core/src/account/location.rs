@@ -25,9 +25,9 @@ impl Default for RequestLocation {
     fn default() -> Self {
         Self {
             country: "US".to_owned(),
-            region: "Ohio".to_owned(),
-            city: "Piketon".to_owned(),
-            timezone: chrono_tz::America::New_York,
+            region: "California".to_owned(),
+            city: "Los Angeles".to_owned(),
+            timezone: chrono_tz::America::Los_Angeles,
         }
     }
 }

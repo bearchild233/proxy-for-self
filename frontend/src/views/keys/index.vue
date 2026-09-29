@@ -12,6 +12,7 @@ import BaseTable from '@/components/base/BaseTable/index.vue'
 import LastUsedAtCell from '@/components/LastUsedAtCell.vue'
 import { useAccountGroupCatalog } from '@/composables/useAccountGroupCatalog'
 import { usePageSelection } from '@/composables/usePageSelection'
+import { useSharedOrder } from '@/composables/useSharedOrder'
 import ApiKeyActions from './components/ApiKeyActions.vue'
 import ApiKeyBudgetCell from './components/ApiKeyBudgetCell.vue'
 import ApiKeyBudgetResetModal from './components/ApiKeyBudgetResetModal.vue'
@@ -105,6 +106,7 @@ watch(
   showFormModal,
   open => open && void loadGroups(),
 )
+const { savingOrder, saveOrder } = useSharedOrder('keys', loadApiKeys)
 </script>
 
 <template>
@@ -131,6 +133,8 @@ watch(
       <template #body>
         <div class="flex h-full min-h-0 flex-col">
           <BaseTable
+            reorderable
+            :reorder-disabled="savingOrder"
             class="min-h-0 flex-1"
             :columns="apiKeyColumns"
             :rows="apiKeys"
@@ -138,6 +142,7 @@ watch(
             :selected-row-keys="selectedRowKeys"
             :sort="sort"
             empty-text="暂无 API Key"
+            @reorder="saveOrder"
             @sort-change="handleSortChange"
           >
             <template #header-selection>

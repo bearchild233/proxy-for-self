@@ -361,7 +361,7 @@ impl ProxyStore for PgProxyRepository {
             "select id, name, email, provider_kind, authentication_kind, plan_type, enabled from provider_accounts
              where outbound_proxy_id = $1 and (strpos(lower(name), lower($2)) > 0
                  or strpos(lower(coalesce(email, '')), lower($2)) > 0)
-             order by name, id limit $3 offset $4",
+             order by admin_display_rank('accounts', id), id limit $3 offset $4",
         )
         .bind(&query.proxy_id)
         .bind(&query.search)
@@ -485,7 +485,7 @@ impl ProxyStore for PgProxyRepository {
         builder
             .push(" where strpos(lower(p.name), lower(")
             .push_bind(&query.search)
-            .push(")) > 0 order by p.created_at desc, p.id limit ")
+            .push(")) > 0 order by admin_display_rank('proxies', p.id), p.id limit ")
             .push_bind(i64::from(query.page_size.get()))
             .push(" offset ")
             .push_bind(i64::from(query.page - 1) * i64::from(query.page_size.get()));

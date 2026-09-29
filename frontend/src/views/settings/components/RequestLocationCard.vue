@@ -11,7 +11,7 @@ const enabled = defineModel<boolean>('enabled', { required: true })
 </script>
 
 <template>
-  <BaseCard title="请求位置覆盖" description="覆盖 Codex 请求中的时区与位置字段，账号出站代理的自定义位置优先">
+  <BaseCard title="请求位置覆盖" description="自动保存到服务器；默认洛杉矶，账号出站代理的自定义位置优先">
     <template #body>
       <div>
         <BaseSwitch v-model="enabled" label="启用位置覆盖" show-label :disabled="disabled" />

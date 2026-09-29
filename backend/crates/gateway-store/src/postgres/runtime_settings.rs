@@ -602,3 +602,96 @@ fn valid_probe_model(value: Option<&str>) -> bool {
             && !value.bytes().any(|byte| byte.is_ascii_control())
     })
 }
+
+impl super::PgControlPlaneRepository {
+    pub(crate) async fn reorder_display(
+        &self,
+        command: gateway_admin::model::settings::ReorderDisplay,
+    ) -> StoreResult<()> {
+        let table = match command.scope.as_str() {
+            "accounts" => "provider_accounts",
+            "groups" => "account_groups",
+            "keys" => "client_api_keys",
+            "proxies" => "outbound_proxies",
+            _ => {
+                return Err(StoreError::InvalidData {
+                    entity: "display order",
+                    message: "invalid scope".to_owned(),
+                });
+            }
+        };
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| postgres_unavailable("begin display order"))?;
+        // 每种列表独立加锁，局部排序只替换选中项原有位置，其他页和筛选外的项保持不动。
+        sqlx::query("select scope from admin_display_orders where scope = $1 for update")
+            .bind(&command.scope)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|_| postgres_unavailable("lock display order"))?;
+        let mut query = sqlx::QueryBuilder::<Postgres>::new("select id from ");
+        query
+            .push(table)
+            .push(" order by admin_display_rank(")
+            .push_bind(&command.scope)
+            .push(", id), id");
+        let mut ids: Vec<String> = query
+            .build_query_scalar()
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|_| postgres_unavailable("read display order"))?;
+        let selected: std::collections::BTreeSet<_> = command.original_ids.iter().collect();
+        let current: Vec<_> = ids
+            .iter()
+            .filter(|id| selected.contains(id))
+            .cloned()
+            .collect();
+        if current != command.original_ids {
+            return Err(StoreError::Conflict {
+                entity: "display order",
+                id: command.scope,
+                kind: crate::ConflictKind::InvalidTransition,
+            });
+        }
+        let mut ordered = command.ordered_ids.into_iter();
+        for id in &mut ids {
+            if selected.contains(id) {
+                *id = ordered.next().expect("validated permutation");
+            }
+        }
+        sqlx::query(
+            "update admin_display_orders set ids = $2, updated_at = now() where scope = $1",
+        )
+        .bind(command.scope)
+        .bind(ids)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| postgres_unavailable("save display order"))?;
+        tx.commit()
+            .await
+            .map_err(|_| postgres_unavailable("commit display order"))
+    }
+
+    pub(crate) async fn update_location(
+        &self,
+        enabled: bool,
+        location: gateway_core::account::RequestLocation,
+        audit: super::AdminAuditEvent,
+    ) -> StoreResult<Revision> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| postgres_unavailable("begin location update"))?;
+        sqlx::query("update runtime_settings set request_location_enabled = $1, request_location_json = $2 where id = 1")
+            .bind(enabled).bind(sqlx::types::Json(location)).execute(&mut *tx).await.map_err(|_| postgres_unavailable("save request location"))?;
+        let revision = super::bump_config_revision_in_transaction(&mut tx).await?;
+        super::append_admin_audit_event_in_transaction(&mut tx, audit, revision).await?;
+        tx.commit()
+            .await
+            .map_err(|_| postgres_unavailable("commit location update"))?;
+        Ok(revision)
+    }
+}

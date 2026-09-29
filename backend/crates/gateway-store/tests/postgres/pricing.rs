@@ -35,6 +35,107 @@ async fn pricing_store(name: &str) -> Option<(TestDatabase, gateway_store::Store
 }
 
 #[tokio::test]
+async fn shared_order_preserves_hidden_items_paginates_and_location_survives_reload() {
+    use gateway_admin::model::settings::ReorderDisplay;
+    use gateway_store::postgres::{
+        ClientApiKeyListQuery, ClientApiKeyRepository as _, ClientApiKeySort,
+        ClientApiKeySortDirection, ClientApiKeySortField, PgClientApiKeyRepository,
+    };
+    let Some((database, bundle)) = pricing_store("shared_order").await else {
+        return;
+    };
+    let settings = bundle.admin_ports().settings();
+    for id in ["a", "b", "c", "d"] {
+        sqlx::query("insert into client_api_keys (id,name,key,created_at,updated_at) values ($1,$1,$2,now(),now())")
+            .bind(id).bind(format!("sk_{}", id.repeat(43))).execute(&database.pool).await.unwrap();
+    }
+    let reorder = || ReorderDisplay {
+        scope: "keys".to_owned(),
+        original_ids: vec!["a".into(), "c".into()],
+        ordered_ids: vec!["c".into(), "a".into()],
+    };
+    reorder().validate().unwrap();
+    let revision = settings
+        .load_runtime_settings()
+        .await
+        .unwrap()
+        .config_revision;
+    settings.reorder_display(reorder()).await.unwrap();
+    assert!(
+        settings.reorder_display(reorder()).await.is_err(),
+        "stale edit must not overwrite newer order"
+    );
+    assert_eq!(
+        settings
+            .load_runtime_settings()
+            .await
+            .unwrap()
+            .config_revision,
+        revision,
+        "display order must not change routing generation"
+    );
+    let repository = PgClientApiKeyRepository::new(database.pool.clone());
+    let mut cursor = None;
+    let mut ids = Vec::new();
+    loop {
+        let page = repository
+            .list_client_api_keys(ClientApiKeyListQuery {
+                cursor,
+                page_size: 1,
+                search: None,
+                sort: ClientApiKeySort {
+                    field: ClientApiKeySortField::Manual,
+                    direction: ClientApiKeySortDirection::Asc,
+                },
+            })
+            .await
+            .unwrap();
+        ids.extend(page.items.into_iter().map(|item| item.id));
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    assert_eq!(ids, ["c", "b", "a", "d"]);
+    let prior = settings.load_runtime_settings().await.unwrap();
+    let context = MutationContext {
+        actor: MutationActor::System,
+        request_id: "location-test".to_owned(),
+    };
+    let location = gateway_core::account::RequestLocation::default();
+    assert_eq!(location.timezone.to_string(), "America/Los_Angeles");
+    settings
+        .update_location(&context, true, location.clone())
+        .await
+        .unwrap();
+    let saved = bundle
+        .admin_ports()
+        .settings()
+        .load_runtime_settings()
+        .await
+        .unwrap();
+    assert!(saved.request_location_enabled);
+    assert_eq!(saved.request_location, location);
+    assert_eq!(
+        saved.max_concurrent_per_account,
+        prior.max_concurrent_per_account
+    );
+    settings
+        .update_location(&context, false, location.clone())
+        .await
+        .unwrap();
+    let saved = settings.load_runtime_settings().await.unwrap();
+    assert!(!saved.request_location_enabled);
+    assert_eq!(
+        saved.request_location, location,
+        "disabling preserves the saved place"
+    );
+    drop(settings);
+    drop(bundle);
+    database.close().await;
+}
+
+#[tokio::test]
 async fn concurrent_price_edits_preserve_other_models_and_sync_preserves_manual_prices() {
     let Some((database, bundle)) = pricing_store("pricing").await else {
         return;

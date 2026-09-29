@@ -114,3 +114,7 @@ export function getCodexDesktopWindowsDownloads(data: { refresh?: boolean } = {}
     params: data,
   })
 }
+
+export function updateRequestLocation(enabled: boolean, location: RequestLocation) {
+  return request({ url: '/api/admin/settings/request-location', method: 'POST', data: { enabled, location } })
+}
