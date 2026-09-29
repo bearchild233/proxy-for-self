@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { ChevronDown } from '@lucide/vue'
+import { ChevronDown, RefreshCw } from '@lucide/vue'
 import { ref } from 'vue'
 
 import AccountGroupMarks from '@/components/AccountGroupMarks.vue'
+import BaseButton from '@/components/base/BaseButton.vue'
 import BaseCard from '@/components/base/BaseCard.vue'
 import BaseCheckbox from '@/components/base/BaseCheckbox.vue'
 import BaseConfirmModal from '@/components/base/BaseConfirmModal.vue'
@@ -40,6 +41,9 @@ import { accountColumns, derivedAccountStatus } from './constants'
 const selectedIds = ref<Set<string>>(new Set())
 const { visibleColumns, columnOptions, setColumnVisible, setColumnOrder, resetColumns } = useTableColumns(accountColumns, 'accounts')
 const {
+  refreshing,
+  lastRefreshedAt,
+  refreshAccounts,
   loading,
   accounts,
   loadAccounts,
@@ -196,7 +200,15 @@ const {
       class="h-17"
       title="账号管理"
       description="维护账号池，查看可用性、配额与使用状态"
-    />
+    >
+      <template #actions>
+        <span class="text-cp-xs text-cp-text-secondary">每 30 秒自动刷新 · {{ lastRefreshedAt || '加载中' }}</span>
+        <BaseButton variant="secondary" :loading="refreshing" :disabled="loading || refreshing" @click="refreshAccounts()">
+          <RefreshCw class="size-4" />
+          刷新列表
+        </BaseButton>
+      </template>
+    </BasePageHeader>
 
     <AccountOverviewCards :summary="accountSummary" />
 

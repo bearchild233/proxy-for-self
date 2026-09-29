@@ -1,5 +1,5 @@
 import type { BaseTableSort } from '@/components/base/BaseTable/columns'
-import { watchDebounced } from '@vueuse/core'
+import { useDocumentVisibility, useIntervalFn, watchDebounced } from '@vueuse/core'
 
 import { computed, onMounted, shallowRef, watch } from 'vue'
 import { getAccounts } from '@/api'
@@ -8,6 +8,9 @@ import { usePagedQuery } from '@/composables/usePagedQuery'
 type AccountRow = Awaited<ReturnType<typeof getAccounts>>['items'][number]
 
 export function useAccountsQuery() {
+  const refreshing = shallowRef(false)
+  const lastRefreshedAt = shallowRef('')
+  const visibility = useDocumentVisibility()
   const searchQuery = shallowRef('')
   const providerQuery = shallowRef('')
   const statusQuery = shallowRef('')
@@ -37,7 +40,29 @@ export function useAccountsQuery() {
       }, options),
     onSuccess: (result) => {
       accountSummary.value = result.summary
+      lastRefreshedAt.value = new Date().toLocaleTimeString()
     },
+  })
+
+  async function refreshAccounts(silent = false) {
+    if (query.loading.value || refreshing.value)
+      return
+    refreshing.value = true
+    try {
+      await query.execute({ background: true, silent })
+    }
+    finally {
+      refreshing.value = false
+    }
+  }
+
+  useIntervalFn(() => {
+    if (visibility.value === 'visible')
+      void refreshAccounts(true)
+  }, 30_000)
+  watch(visibility, (value) => {
+    if (value === 'visible')
+      void refreshAccounts(true)
   })
 
   const accountPagination = computed(() => ({
@@ -97,6 +122,9 @@ export function useAccountsQuery() {
     pageSize: query.pageSize,
     totalAccounts: query.total,
     loading: query.loading,
+    refreshing,
+    lastRefreshedAt,
+    refreshAccounts,
     accounts: query.items,
     loadAccounts: query.execute,
     refreshAccountsSilently: () => query.execute({ silent: true }),

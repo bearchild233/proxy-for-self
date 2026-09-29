@@ -1,11 +1,11 @@
 <script setup lang="ts">
 import type { AccountGroup } from '@/api'
-import { Download, ListTodo, Pencil, Search, Trash2, Upload } from '@lucide/vue'
+import { Download, ListTodo, Pencil, Trash2, Upload } from '@lucide/vue'
 import { computed } from 'vue'
 
 import BaseButton from '@/components/base/BaseButton.vue'
-import BaseInput from '@/components/base/BaseInput.vue'
 import BaseSelect from '@/components/base/BaseSelect.vue'
+import CatalogFilter from '@/components/CatalogFilter.vue'
 import ProviderFilterSegmented from '@/components/ProviderFilterSegmented.vue'
 import { accountStatusFilterOptions } from '../constants'
 
@@ -50,15 +50,7 @@ const groupOptions = computed(() => [
     <div
       class="grid w-full min-w-0 grid-cols-2 items-center gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_7.75rem] xl:flex xl:w-auto xl:flex-none xl:flex-wrap xl:gap-3"
     >
-      <BaseInput
-        v-model="search"
-        placeholder="搜索账号"
-        class="col-span-2 min-w-0 sm:col-span-3 xl:w-80 xl:flex-none"
-      >
-        <template #prefix>
-          <Search class="size-4.5 text-cp-text-tertiary" />
-        </template>
-      </BaseInput>
+      <CatalogFilter v-model="search" kind="accounts" label="全部账号" class="col-span-2 min-w-0 sm:col-span-3 xl:w-96 xl:flex-none" />
 
       <BaseSelect
         v-model="status"

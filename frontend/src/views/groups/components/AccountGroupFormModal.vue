@@ -24,7 +24,7 @@ const open = defineModel<boolean>({ required: true })
 const form = defineModel<AccountGroupFormValue>('form', { required: true })
 const title = computed(() => props.group ? '编辑分组' : '创建分组')
 const description = computed(() => props.group
-  ? '修改分组名称、用途说明和 Fast 模式'
+  ? '修改分组名称、用途说明和 Fast 请求策略'
   : '创建后，可在账号管理中将账号加入这个分组')
 </script>
 
@@ -53,14 +53,14 @@ const description = computed(() => props.group
           :disabled="saving"
         />
       </BaseFormItem>
-      <BaseFormItem label="Fast 模式" description="关闭后按标准模式处理">
+      <BaseFormItem label="Fast 请求策略" description="跟随客户端不会强制加速，也不保证上游支持；禁用时将 Fast 请求改为标准档。仅作用于绑定此分组的 Key，绑定多组时任一组禁用即生效。">
         <BaseSegmented
           :model-value="form.disableFast ? 'disabled' : 'default'"
-          class="w-48 max-w-full"
+          class="w-64 max-w-full"
           label="Fast 模式"
           :options="[
-            { label: '默认', value: 'default' },
-            { label: '关闭', value: 'disabled' },
+            { label: '跟随客户端', value: 'default' },
+            { label: '禁用 Fast', value: 'disabled' },
           ]"
           :disabled="saving"
           @update:model-value="form.disableFast = $event === 'disabled'"

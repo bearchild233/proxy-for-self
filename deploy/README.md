@@ -38,3 +38,15 @@ Worker 安装到独立虚拟环境：安装 `plugins/excel-bridge/requirements.l
 systemd 模板 `Restart=on-failure` 保证异常退出重启。生产重启前必须验证 unit 能启动、路径/权限正确、自动恢复配置有效。单实例切换可能短暂断连；不能承诺零停机。不要为了更新前端随意重启反向代理并关闭已有 WebSocket。
 
 内置更新器默认指向本仓库；源码构建保持 source 类型。在独立发行包流程经验证之前，使用上述人工发布流程，不从上游仓库覆盖本产品。
+
+## 仅前端更新（无需重启）
+
+前端构建通过后，把 `frontend/dist` 中的文件按相对路径打包（只包含普通文件），校验 SHA256，再执行：
+
+```sh
+python3 scripts/deploy_frontend.py --archive /path/frontend.tar.gz --sha256 <SHA256> \
+  --destination /path/current/frontend --backup-root /path/backups \
+  --verify-url http://127.0.0.1:8080/
+```
+
+脚本备份现有前端，先发布资源、最后原子替换 index；保留旧资源供已打开页面加载。不修改数据库、配置、服务进程或反向代理。需要回退时，从回执记录的备份恢复 index.html（旧 hash 资源仍在）。后端接口必须与新前端兼容，涉及 Rust 逻辑的改动不能只按此流程发布。

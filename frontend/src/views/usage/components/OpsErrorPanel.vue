@@ -2,18 +2,18 @@
 import type { UsageTimeRangeParams } from '../composables/useUsageTimeRange'
 import type { OpsError } from '@/api'
 
-import { Eye, RefreshCw, Search } from '@lucide/vue'
+import { Eye, RefreshCw } from '@lucide/vue'
 import { shallowRef, toRef } from 'vue'
 import BaseIconButton from '@/components/base/BaseIconButton.vue'
-import BaseInput from '@/components/base/BaseInput.vue'
 import BaseTableColumnSettings from '@/components/base/BaseTable/BaseTableColumnSettings.vue'
 import BaseTablePagination from '@/components/base/BaseTable/BaseTablePagination.vue'
 import BaseTable from '@/components/base/BaseTable/index.vue'
 import { useTableColumns } from '@/components/base/BaseTable/useTableColumns'
+import CatalogFilter from '@/components/CatalogFilter.vue'
 import ProviderIconGroup from '@/components/ProviderIconGroup.vue'
 import { useOpsErrorsTable } from '../composables/useOpsErrorsTable'
 import { opsErrorColumns } from '../constants'
-import { opsErrorSummary } from '../utils/opsErrorPresentation'
+import { errorOriginText, opsErrorSummary } from '../utils/opsErrorPresentation'
 import { usageUserAgent } from '../utils/records'
 import OpsErrorDetailModal from './OpsErrorDetailModal.vue'
 import UsageClientIpCell from './UsageClientIpCell.vue'
@@ -92,16 +92,7 @@ function upstreamSendStateText(value: string | null | undefined) {
       aria-label="错误筛选与操作"
     >
       <div class="min-w-0 flex-1">
-        <BaseInput
-          v-model="searchQuery"
-          placeholder="请求 ID、密钥名称或账号"
-          aria-label="搜索错误：请求 ID、密钥名称或账号"
-          class="min-w-0 w-full lg:max-w-96"
-        >
-          <template #prefix>
-            <Search class="size-4.5 text-cp-text-tertiary" />
-          </template>
-        </BaseInput>
+        <CatalogFilter v-model="searchQuery" kind="errors" label="全部账号 / Key" class="min-w-0 w-full xl:max-w-xl" />
       </div>
 
       <div class="flex shrink-0 self-end items-center justify-end gap-2 lg:ml-auto">
@@ -170,7 +161,7 @@ function upstreamSendStateText(value: string | null | undefined) {
               v-if="row.message"
               class="mt-1 mb-0 line-clamp-1 text-cp-xs leading-[1.45] font-emphasis text-cp-text-secondary"
             >
-              {{ row.message }}
+              {{ errorOriginText(row) }} · {{ row.message }}
             </p>
           </div>
         </template>

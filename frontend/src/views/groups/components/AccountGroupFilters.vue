@@ -1,9 +1,9 @@
 <script setup lang="ts">
-import { Plus, Search, Trash2 } from '@lucide/vue'
+import { Plus, Trash2 } from '@lucide/vue'
 
 import BaseButton from '@/components/base/BaseButton.vue'
-import BaseInput from '@/components/base/BaseInput.vue'
 import BaseSelect from '@/components/base/BaseSelect.vue'
+import CatalogFilter from '@/components/CatalogFilter.vue'
 import { accountGroupStatusOptions } from '../constants'
 
 defineProps<{
@@ -20,16 +20,7 @@ const status = defineModel<string>('status', { required: true })
 
 <template>
   <div class="flex w-full flex-col gap-3 sm:flex-row sm:items-center">
-    <BaseInput
-      v-model="search"
-      class="sm:w-80"
-      aria-label="搜索账号分组"
-      placeholder="搜索分组名称..."
-    >
-      <template #prefix>
-        <Search class="size-4.5 text-cp-text-tertiary" />
-      </template>
-    </BaseInput>
+    <CatalogFilter v-model="search" kind="groups" label="全部分组名称" class="min-w-0 w-full xl:max-w-xl" />
     <BaseSelect
       v-model="status"
       :options="accountGroupStatusOptions"

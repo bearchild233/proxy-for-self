@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { Plus, Search, Trash2 } from '@lucide/vue'
+import { Plus, Trash2 } from '@lucide/vue'
 
 import BaseButton from '@/components/base/BaseButton.vue'
-import BaseInput from '@/components/base/BaseInput.vue'
+import CatalogFilter from '@/components/CatalogFilter.vue'
 
 defineProps<{
   batchDeleting: boolean
@@ -24,11 +24,7 @@ const search = defineModel<string>('search', { required: true })
     aria-label="API Key 筛选与操作"
   >
     <div class="min-w-0 flex-1 md:w-96 md:flex-none">
-      <BaseInput v-model="search" placeholder="搜索名称或标签" aria-label="搜索 API Key 名称或标签" class="w-full">
-        <template #prefix>
-          <Search class="size-4.5 text-cp-text-tertiary" />
-        </template>
-      </BaseInput>
+      <CatalogFilter v-model="search" kind="keys" label="全部 API Key" class="min-w-0 w-full xl:max-w-xl" />
     </div>
 
     <div class="flex shrink-0 items-center justify-end gap-2 md:ml-auto">

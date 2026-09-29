@@ -4,7 +4,7 @@ import type { OpsError } from '@/api'
 import { computed } from 'vue'
 import BaseButton from '@/components/base/BaseButton.vue'
 import BaseModal from '@/components/base/BaseModal/index.vue'
-import { failureClassText } from '../utils/opsErrorPresentation'
+import { errorOriginText, failureClassText } from '../utils/opsErrorPresentation'
 import RequestDiagnosticsPanel from './RequestDiagnosticsPanel.vue'
 import UsageDetailCodePanel from './UsageDetailCodePanel.vue'
 import UsageDetailFieldGrid from './UsageDetailFieldGrid.vue'
@@ -32,6 +32,7 @@ const accountLabel = computed(() => props.record?.accountEmail
   || props.record?.accountId)
 
 const errorFields = computed(() => visibleFields([
+  { label: '错误来源', value: errorOriginText(props.record) },
   {
     label: '处理状态',
     value: props.record?.metadata.recoveredAt ? '已自动恢复' : null,

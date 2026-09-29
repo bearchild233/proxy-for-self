@@ -107,7 +107,7 @@ const { allSelected, indeterminate, selectedRowKeys, toggleSelection, toggleAll 
                     v-if="row.disableFast"
                     class="inline-flex h-6 shrink-0 items-center rounded-lg bg-cp-fill-tertiary px-2 text-cp-xs font-bold text-cp-text-secondary"
                   >
-                    Fast 已关闭
+                    禁用 Fast
                   </span>
                 </div>
                 <span v-if="row.description" class="truncate text-cp-xs font-emphasis text-cp-text-quaternary">
