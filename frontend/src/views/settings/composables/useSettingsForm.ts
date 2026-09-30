@@ -131,7 +131,7 @@ export function useSettingsForm() {
 
   function versionError(value: string): string {
     const normalized = value.trim()
-    return normalized && !isSemver(normalized) ? '请输入标准 SemVer，例如 0.152.0' : ''
+    return normalized && !isSemver(normalized) ? '请输入标准 SemVer，例如 0.159.2' : ''
   }
 
   function applySettings(data: Awaited<ReturnType<typeof getSettings>>) {

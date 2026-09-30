@@ -127,3 +127,35 @@ impl SystemOperationAccepted {
         }
     }
 }
+
+/// 受信任插件状态；不包含主机路径、凭据和任意执行参数。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginStatus {
+    pub id: String,
+    pub name: String,
+    pub protocol: u32,
+    pub installed: bool,
+    pub enabled: bool,
+    pub version: Option<String>,
+    pub available_version: String,
+    pub operation: PluginOperation,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PluginOperation {
+    pub id: Option<String>,
+    pub action: Option<PluginAction>,
+    pub status: String,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginAction {
+    Install,
+    Enable,
+    Disable,
+    Uninstall,
+    Update,
+}

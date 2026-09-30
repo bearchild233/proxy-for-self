@@ -232,6 +232,18 @@ struct PricingRule {
 // 已按 https://developers.openai.com/api/docs/deprecations 核验至 2026-09-13，
 // 移除已关闭的型号；仅宣布弃用但尚未到关闭日期的型号继续保留。
 const PRICING_RULES: &[PricingRule] = &[
+    // GPT-6.1 Sol：https://developers.openai.com/api/docs/models/gpt-6.1-sol
+    // 这里只补计量能力；是否可选仍以账号上游模型目录为准。
+    PricingRule {
+        model: "gpt-6.1-sol",
+        pricing: ModelPricing::new(20_000, 100_000, 1_000)
+            .with_cache_write(125)
+            .with_flex(10_000, 50_000, 500)
+            .with_fast(40_000, 200_000, 2_000)
+            .with_long(40_000, 150_000, 2_000)
+            .with_long_flex(20_000, 75_000, 1_000)
+            .with_long_fast(80_000, 300_000, 4_000),
+    },
     // Astra：https://developers.openai.com/api/docs/models/gpt-6-astra
     // 已于 2026-09-09 对照官方价目表核验。
     PricingRule {
@@ -843,6 +855,7 @@ fn reasoning_model(model: &str) -> bool {
     let model = pricing_model_name(&normalized);
     model.starts_with("gpt-5")
         || model == "gpt-6-astra"
+        || model == "gpt-6.1-sol"
         || model.starts_with("o1")
         || model.starts_with("o3")
         || model.starts_with("o4")

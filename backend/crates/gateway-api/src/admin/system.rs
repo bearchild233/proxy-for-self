@@ -221,6 +221,8 @@ where
     S: SessionState + Clone + Send + Sync + 'static,
 {
     Router::new()
+        .route("/api/admin/system/plugins", get(plugins::<S>))
+        .route("/api/admin/system/plugins/action", post(plugin_action::<S>))
         .route("/api/admin/system/version", get(version::<S>))
         .route("/api/admin/system/update/detail", get(update_detail::<S>))
         .route(
@@ -480,4 +482,50 @@ const fn update_event_level_name(level: SystemUpdateEventLevel) -> &'static str 
 
 fn map_system_error(error: gateway_admin::model::AdminError) -> AdminError {
     map_admin_service_error(error)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PluginActionRequest {
+    id: String,
+    action: gateway_admin::model::system::PluginAction,
+}
+
+async fn plugins<S>(
+    _auth: AdminAuth,
+    State(state): State<S>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let plugins = state
+        .admin_services()
+        .system()
+        .plugins()
+        .await
+        .map_err(map_system_error)?;
+    Ok(AdminResponse::new(
+        StatusCode::OK,
+        AdminEnvelope::ok(plugins),
+    ))
+}
+
+async fn plugin_action<S>(
+    _auth: AdminAuth,
+    State(state): State<S>,
+    AdminJson(request): AdminJson<PluginActionRequest>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let id = state
+        .admin_services()
+        .system()
+        .plugin_action(request.id, request.action)
+        .await
+        .map_err(map_system_error)?;
+    Ok(AdminResponse::new(
+        StatusCode::ACCEPTED,
+        AdminEnvelope::ok(serde_json::json!({"operationId": id})),
+    ))
 }

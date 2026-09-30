@@ -31,10 +31,11 @@ const selectedGroupIds = defineModel<string[]>('selectedGroupIds', { required: t
   <div class="grid gap-5">
     <AccountModelAccessField v-model="modelAccess" :account-id="accountId" :disabled="disabled" :allow-preserve="preserveModelAccess" />
     <div class="flex min-h-6 items-center justify-between gap-3">
-      <span class="text-cp leading-none font-medium text-cp-text-secondary">调度</span>
+      <span class="text-cp leading-none font-medium text-cp-text-secondary">参与请求分配</span>
       <BaseSwitch
         v-model="enabled"
-        label="切换账号调度"
+        label="参与请求分配"
+        title="关闭后不再向该账号分配新请求"
         :disabled="disabled"
       />
     </div>
@@ -51,7 +52,7 @@ const selectedGroupIds = defineModel<string[]>('selectedGroupIds', { required: t
           :disabled="disabled"
         />
       </BaseFormItem>
-      <BaseFormItem label="权重">
+      <BaseFormItem label="权重" description="1～100，越高越优先；新账号默认 50">
         <BaseInput
           v-model="weight"
           aria-label="账号调度权重"

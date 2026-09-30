@@ -20,7 +20,7 @@ import { keyUsageTime } from './utils/format'
 
 const { period, model, kind, refreshInterval, overview, overviewLoading, overviewError, refreshing, recordsStale, records, refresh, changePageSize, changePage } = useKeyUsage()
 const { items, currentPage, pageSize, total, loading: recordsLoading, error: recordsError } = records
-const { showConfig, configKey, configuring, apiBaseUrl, openConfig, copyConfig } = useKeyConfig()
+const { showConfig, configKey, configError, configuring, apiBaseUrl, openConfig, copyConfig } = useKeyConfig()
 const aboutOpen = shallowRef(false)
 const version = shallowRef<KeyUsageVersion | null>(null)
 const versionLoading = shallowRef(false)
@@ -58,6 +58,9 @@ async function openAbout() {
             </BaseInput>
           </div>
         </div>
+        <p v-if="configError" role="alert" class="m-0 rounded-cp-lg bg-cp-error-container px-4 py-3 text-cp-sm text-cp-error-text">
+          {{ configError }}，请点击“导入配置”重试。
+        </p>
         <p v-if="overviewError" role="alert" class="m-0 rounded-cp-lg bg-cp-error-container px-4 py-3 text-cp-sm text-cp-error-text">
           {{ overviewError }}{{ overview ? '，暂时保留上次结果' : '，请点击顶部刷新重试' }}
         </p>
@@ -73,7 +76,7 @@ async function openAbout() {
         <KeyUsageRecords v-model:kind="kind" :rows="items" :pagination="{ currentPage, pageSize, total }" :loading="recordsLoading" :error="recordsError" :stale="recordsStale" @page-change="changePage" @page-size-change="changePageSize" />
       </div>
     </BaseScrollbar>
-    <ApiKeyConfigModal v-model="showConfig" title="密钥配置" :api-key="configKey" :api-base-url="apiBaseUrl" @copy="copyConfig" />
+    <ApiKeyConfigModal v-model="showConfig" title="导入客户端配置" :api-key="configKey" :api-base-url="apiBaseUrl" @copy="copyConfig" />
     <AppAboutModal v-model="aboutOpen" :version="version" />
   </main>
 </template>

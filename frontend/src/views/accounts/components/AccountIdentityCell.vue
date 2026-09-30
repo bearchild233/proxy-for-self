@@ -1,13 +1,13 @@
 <script setup lang="ts">
 import type { getAccounts } from '@/api'
+import { Grok, Openai } from '@boxicons/vue'
+import { CircleHelp } from '@lucide/vue'
 import { computed } from 'vue'
-
-import { stablePresetVisualToneClass } from '../utils/visualTone'
 import AccountNotesPopover from './AccountNotesPopover.vue'
 import AccountPlanBadge from './AccountPlanBadge.vue'
 
 type AccountRow = Awaited<ReturnType<typeof getAccounts>>['items'][number]
-type AccountIdentity = Pick<AccountRow, 'id' | 'email' | 'planType' | 'planTypeDisplay'>
+type AccountIdentity = Pick<AccountRow, 'id' | 'email' | 'planType' | 'planTypeDisplay' | 'provider'>
   & Partial<Pick<AccountRow, 'accountId' | 'notes' | 'name' | 'authenticationKind'>>
 
 const props = withDefaults(
@@ -49,7 +49,8 @@ const secondaryText = computed(() =>
   props.account.name?.trim() ? props.account.email : props.titleMode === 'email' || props.account.authenticationKind === 'api_key' ? null : emailText.value,
 )
 
-const initial = computed(() => displayTitle.value.slice(0, 1).toUpperCase())
+const provider = computed(() => props.account.provider.trim().toLowerCase())
+const avatarLabel = computed(() => provider.value === 'openai' ? 'Codex' : provider.value === 'xai' ? 'Grok' : '未知平台')
 
 const avatarSizeClass = computed(() =>
   props.size === 'lg' ? 'size-10 text-cp-xl' : 'size-9 text-cp',
@@ -62,20 +63,20 @@ const secondaryClass = computed(() =>
 )
 
 const metaGapClass = computed(() => props.metaSize === 'xs' ? 'gap-1' : 'gap-1.5')
-
-const avatarToneClass = computed(() => {
-  const identity = props.account.id || props.account.email || displayTitle.value
-  return stablePresetVisualToneClass(identity)
-})
 </script>
 
 <template>
   <div class="flex min-w-0 items-center gap-3">
     <span
-      class="inline-flex shrink-0 items-center justify-center rounded-lg font-extrabold"
-      :class="[avatarSizeClass, avatarToneClass]"
+      class="inline-flex shrink-0 items-center justify-center rounded-lg bg-cp-fill-quaternary text-cp-text"
+      :class="avatarSizeClass"
+      role="img"
+      :aria-label="avatarLabel"
+      :title="avatarLabel"
     >
-      {{ initial }}
+      <Openai v-if="provider === 'openai'" class="size-6" aria-hidden="true" />
+      <Grok v-else-if="provider === 'xai'" class="size-6" aria-hidden="true" />
+      <CircleHelp v-else class="size-6" aria-hidden="true" />
     </span>
     <div class="min-w-0 flex-1">
       <div class="flex min-w-0 items-center gap-2">

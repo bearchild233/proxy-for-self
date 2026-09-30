@@ -95,6 +95,7 @@ async fn config_reveals_only_the_session_keys_name_and_plaintext() {
             "name": "Development",
             "plaintextKey": format!("sk_{}", "a".repeat(43)),
             "boundAccountId": "acct_test_binding",
+            "routing": null,
             "excelBridgeEnabled": false,
         })
     );
@@ -470,5 +471,27 @@ async fn namespace_errors_remain_json_and_uncacheable() {
         assert_eq!(response.status(), status);
         assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
         assert!(response_json(response).await["code"].is_number());
+    }
+}
+
+#[tokio::test]
+async fn key_session_can_export_own_config_but_cannot_manage_plugins() {
+    let fixture = fixtures::fixture().await;
+    let app = crate::openai::api_router_with_admin(fixture.services.clone());
+    let cookie = login(&app, "key").await;
+    assert_eq!(
+        get(&app, "config", "", &cookie).await.status(),
+        StatusCode::OK
+    );
+    for (method, path) in [
+        (Method::GET, "/api/admin/system/plugins"),
+        (Method::POST, "/api/admin/system/plugins/action"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(cookie_request(method, path, &cookie))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 }

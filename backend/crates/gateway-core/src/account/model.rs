@@ -103,7 +103,7 @@ impl From<NonZeroU32> for AccountConcurrency {
 pub struct AccountWeight(NonZeroU16);
 
 impl AccountWeight {
-    pub const DEFAULT: Self = Self(NonZeroU16::MIN);
+    pub const DEFAULT: Self = Self(NonZeroU16::new(50).expect("default account weight is nonzero"));
     pub const MAX: u16 = 100;
 
     #[must_use]
@@ -763,6 +763,7 @@ const fn status_projection(status: AccountStatus) -> AccountStatusProjection {
 /// 账号持久事实；代理认证信息只通过显式 secret accessor 读取。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderAccount {
+    lifecycle: Option<Box<super::AccountLifecycle>>,
     id: ProviderAccountId,
     provider: ProviderKind,
     name: String,
@@ -812,6 +813,7 @@ impl ProviderAccount {
             enabled: true,
             concurrency_limit: None,
             weight: AccountWeight::DEFAULT,
+            lifecycle: None,
             model_access: super::AccountModelAccess::all(),
             credential_state: CredentialState::Unknown,
             quota: QuotaState::unknown(),
@@ -983,8 +985,8 @@ impl ProviderAccount {
     }
 
     #[must_use]
-    pub const fn enabled(&self) -> bool {
-        self.enabled
+    pub fn enabled(&self) -> bool {
+        self.enabled && !self.lifecycle().archived
     }
 
     #[must_use]
@@ -993,6 +995,30 @@ impl ProviderAccount {
     }
 
     #[must_use]
+    pub fn with_lifecycle(mut self, lifecycle: super::AccountLifecycle) -> Self {
+        self.lifecycle = Some(Box::new(lifecycle));
+        self
+    }
+
+    pub fn lifecycle(&self) -> &super::AccountLifecycle {
+        self.lifecycle
+            .as_deref()
+            .unwrap_or(&super::AccountLifecycle::EMPTY)
+    }
+
+    pub fn is_plus(&self) -> bool {
+        self.provider().as_str() == "openai"
+            && self.authentication_kind() == "oauth"
+            && self
+                .plan_type()
+                .is_some_and(|plan| plan.eq_ignore_ascii_case("plus"))
+    }
+
+    pub fn effective_weight(&self, now: SystemTime) -> AccountWeight {
+        self.lifecycle()
+            .effective_weight(self.weight, self.is_plus(), now.into())
+    }
+
     pub const fn weight(&self) -> AccountWeight {
         self.weight
     }

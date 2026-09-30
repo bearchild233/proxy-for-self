@@ -13,6 +13,7 @@ import AccountAutoFreezeCard from './components/AccountAutoFreezeCard.vue'
 import SettingsBackupSection from './components/backup/SettingsBackupSection.vue'
 import ClientProfileCard from './components/ClientProfileCard.vue'
 import ModelAliasesCard from './components/ModelAliasesCard.vue'
+import PluginsSection from './components/PluginsSection.vue'
 import RequestLocationCard from './components/RequestLocationCard.vue'
 import RequestQueueCard from './components/RequestQueueCard.vue'
 import RotationStrategyCard from './components/RotationStrategyCard.vue'
@@ -31,6 +32,7 @@ const sectionOptions = [
   { label: '模型定价', value: 'pricing' },
   { label: '安全与访问', value: 'access' },
   { label: '数据备份', value: 'backup' },
+  { label: '插件管理', value: 'plugins' },
 ]
 const section = computed(() => {
   switch (route.name) {
@@ -38,10 +40,11 @@ const section = computed(() => {
     case 'settings-access': return 'access'
     case 'settings-pricing': return 'pricing'
     case 'settings-backup': return 'backup'
+    case 'settings-plugins': return 'plugins'
     default: return 'runtime'
   }
 })
-const isBasicSection = computed(() => section.value !== 'pricing' && section.value !== 'backup')
+const isBasicSection = computed(() => !['pricing', 'backup', 'plugins'].includes(section.value))
 const visited = reactive(new Set<string>())
 const settingsVisited = shallowRef(false)
 
@@ -197,6 +200,7 @@ watch(section, (value) => {
     </div>
 
     <SettingsBackupSection v-if="visited.has('backup')" v-show="section === 'backup'" class="mt-5" :active="section === 'backup'" />
+    <PluginsSection v-if="visited.has('plugins')" v-show="section === 'plugins'" class="mt-5" :active="section === 'plugins'" />
     <PricingSection v-if="visited.has('pricing')" v-show="section === 'pricing'" class="mt-5 min-h-0 flex-1" />
   </div>
 </template>

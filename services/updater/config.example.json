@@ -1,0 +1,18 @@
+{
+  "release_root": "/opt/api-hub",
+  "service": "api-hub.service",
+  "initial_version": "0.1.0",
+  "socket": "/run/proxy-for-self-updater/control.sock",
+  "socket_group": "api-hub",
+  "state_file": "/var/lib/proxy-for-self-updater/state.json",
+  "backup_root": "/root/backups/proxy-for-self-updates",
+  "config_directory": "/etc/api-hub",
+  "health_url": "http://127.0.0.1:8320/healthz",
+  "database": {
+    "host": "127.0.0.1",
+    "port": 18321,
+    "name": "api_hub",
+    "user": "api_hub_bootstrap",
+    "pgpass_file": "/etc/proxy-for-self/updater.pgpass"
+  }
+}

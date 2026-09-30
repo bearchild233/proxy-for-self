@@ -57,6 +57,7 @@ pub struct AccountSort {
 /// 账号列表的存储查询条件。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountListQuery {
+    pub archived: bool,
     pub page: u32,
     pub page_size: PageSize,
     pub provider_kind: Option<ProviderKind>,
@@ -93,6 +94,7 @@ pub enum AccountGroupFilter {
 /// 账号公共存储投影；Provider 专属字段不进入此结构。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountRecord {
+    pub lifecycle: gateway_core::account::AccountLifecycle,
     pub id: String,
     pub provider_kind: ProviderKind,
     pub groups: Vec<AccountGroupRef>,
@@ -251,6 +253,8 @@ pub struct AccountUpdateResult {
 /// 仅修改显式字段的批量账号设置命令。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BatchUpdateAccounts {
+    pub expiry_priority: Option<bool>,
+    pub restore_archived: bool,
     pub account_ids: Vec<String>,
     pub enabled: Option<bool>,
     pub concurrency_limit: Option<Option<AccountConcurrencyLimit>>,

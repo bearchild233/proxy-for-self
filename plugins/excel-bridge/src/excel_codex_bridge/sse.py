@@ -11,7 +11,7 @@ import codecs
 import json
 
 import httpx
-from fastapi.responses import JSONResponse
+from starlette.responses import JSONResponse
 
 
 def _openai_error_type_for_status(status_code: int) -> str:

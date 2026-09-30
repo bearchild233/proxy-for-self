@@ -74,7 +74,7 @@ impl HttpProxyProbe {
         proxy: &OutboundProxy,
         endpoint: &str,
     ) -> Result<IpAddr, &'static str> {
-        let proxy = reqwest::Proxy::all(proxy.expose_url()).map_err(|_| "代理地址不合法")?;
+        let proxy = reqwest::Proxy::all(proxy.transport_url()).map_err(|_| "代理地址不合法")?;
         let builder = reqwest::Client::builder()
             .no_proxy()
             .proxy(proxy)

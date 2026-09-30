@@ -11,7 +11,74 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use crate::support::{MemoryAccountStore, profile, secret};
 
-fn wire_profile() -> CodexWireProfileState {
+#[tokio::test]
+async fn profile_and_subscription_use_bound_proxy_without_direct_fallback() {
+    for reject in [false, true] {
+        let direct = MockServer::start().await;
+        let proxy = MockServer::start().await;
+        let (store, service) = service("acct_proxy_profile", &direct).await;
+        store.set_egress(
+            "acct_proxy_profile",
+            Some(gateway_core::account::OutboundProxy::parse(&proxy.uri()).unwrap()),
+            None,
+        );
+        let account = store.account("acct_proxy_profile").unwrap();
+        for (route, body) in [
+            (
+                "/api/codex/profiles/me",
+                json!({"profile":{"display_name":"Proxy"}, "stats":{}, "metadata":{"stats_error":null}}),
+            ),
+            (
+                "/backend-api/subscriptions",
+                json!({"active_until":"2026-10-01T00:00:00Z", "will_renew":true}),
+            ),
+        ] {
+            Mock::given(path(route))
+                .respond_with(
+                    ResponseTemplate::new(if reject { 407 } else { 200 }).set_body_json(body),
+                )
+                .expect(1)
+                .mount(&proxy)
+                .await;
+        }
+        assert_eq!(
+            service.profile_statistics(account.id()).await.is_err(),
+            reject
+        );
+        let subscription = service.subscription(account.id()).await;
+        if reject {
+            assert!(subscription.is_err() || subscription.unwrap().is_none());
+        } else {
+            assert!(subscription.unwrap().is_some());
+        }
+        assert!(direct.received_requests().await.unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn profile_refresh_reuses_success_until_credential_revision_changes() {
+    let server = MockServer::start().await;
+    Mock::given(path("/api/codex/profiles/me"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "profile":{"display_name":"Cached"}, "stats":{}, "metadata":{"stats_error":null}
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let (store, service) = service("acct_cache_revision", &server).await;
+    let account = store.account("acct_cache_revision").unwrap();
+    service.profile_statistics(account.id()).await.unwrap();
+    service.profile_statistics(account.id()).await.unwrap();
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    store
+        .repository()
+        .rotate_refreshed_oauth_secret(&account, secret("new-revision-token"), None, None)
+        .await
+        .unwrap();
+    service.profile_statistics(account.id()).await.unwrap();
+}
+
+pub(super) fn wire_profile() -> CodexWireProfileState {
     CodexWireProfileState::new(CodexWireProfile {
         client_kind: provider_openai::transport::profile::selection::ClientKind::Desktop,
         originator: "codex_cli_rs".to_owned(),
@@ -295,4 +362,141 @@ async fn subscription_discards_response_when_credential_rotates_during_query() {
             .unwrap();
     });
     assert!(result.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn lifecycle_archives_only_confirmed_expiry_and_uses_bound_egress() {
+    for (status, renew, expired, archived) in [
+        (200, false, true, true),
+        (200, true, true, false),
+        (200, false, false, false),
+        (429, false, true, false),
+        (503, false, true, false),
+    ] {
+        let direct = MockServer::start().await;
+        let proxy = MockServer::start().await;
+        let (store, service) = service("acct_lifecycle", &direct).await;
+        store.set_egress(
+            "acct_lifecycle",
+            Some(gateway_core::account::OutboundProxy::parse(&proxy.uri()).unwrap()),
+            None,
+        );
+        Mock::given(path("/backend-api/subscriptions"))
+            .respond_with(ResponseTemplate::new(status).set_body_json(json!({
+                "active_until": (Utc::now() + chrono::Duration::days(if expired { -2 } else { 2 })).to_rfc3339(), "will_renew": renew
+            }))).expect(1).mount(&proxy).await;
+        service.maintain_lifecycle().await.unwrap();
+        let account = store.account("acct_lifecycle").unwrap();
+        assert_eq!(account.lifecycle().archived, archived);
+        assert_eq!(account.enabled(), !archived);
+        service.maintain_lifecycle().await.unwrap();
+        assert!(direct.received_requests().await.unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn lifecycle_archives_confirmed_invalid_credentials_even_when_already_disabled() {
+    use gateway_core::account::{AccountStateChange, CredentialState, ProviderAccountStore};
+    for (state, reason, archived) in [
+        (CredentialState::Invalid, None, true),
+        (CredentialState::Banned, None, true),
+        (CredentialState::Expired, None, false),
+        (
+            CredentialState::Expired,
+            Some(gateway_core::account::AccountErrorReason::CredentialExpired),
+            true,
+        ),
+    ] {
+        let server = MockServer::start().await;
+        let (store, service) = service("acct_invalid_lifecycle", &server).await;
+        let account = store.account("acct_invalid_lifecycle").unwrap();
+        store
+            .apply_state_change(AccountStateChange {
+                account_id: account.id().clone(),
+                expected_revision: account.revision(),
+                credential_state: state,
+                observed_at: std::time::SystemTime::now(),
+                error_reason: reason,
+                message: None,
+            })
+            .await
+            .unwrap();
+        store.set_enabled(account.id(), false).await.unwrap();
+        service.maintain_lifecycle().await.unwrap();
+        assert_eq!(
+            store
+                .account("acct_invalid_lifecycle")
+                .unwrap()
+                .lifecycle()
+                .archived,
+            archived
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn lifecycle_archives_expired_paid_subscription_after_live_free_downgrade() {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    for (status, plan, days, same_identity, archived) in [
+        (200, "free", Some(-1), true, true),
+        (200, "plus", Some(-1), true, false),
+        (200, "pro", Some(-1), true, false),
+        (200, "free", Some(1), true, false),
+        (200, "free", None, true, false),
+        (200, "free", Some(-1), false, false),
+        (429, "free", Some(-1), true, false),
+    ] {
+        let direct = MockServer::start().await;
+        let proxy = MockServer::start().await;
+        let store = Arc::new(MemoryAccountStore::default());
+        let mut credential = secret("downgraded-access-token");
+        let claims = json!({"https://api.openai.com/auth": {
+            "chatgpt_account_id": if same_identity { "chatgpt-acct_downgrade" } else { "other-account" },
+            "chatgpt_plan_type": "free",
+            "chatgpt_subscription_active_until": days.map(|days| (Utc::now() + chrono::Duration::days(days)).to_rfc3339()),
+        }});
+        credential.id_token =
+            Some(format!("e30.{}.test", URL_SAFE_NO_PAD.encode(claims.to_string())).into());
+        store
+            .seed_oauth_credential(ImportCodexOAuthCredential {
+                account_id: "acct_downgrade".to_owned(),
+                name: "expired subscription".to_owned(),
+                secret: credential,
+                verified_account: profile("chatgpt-acct_downgrade"),
+                next_refresh_at: None,
+                enabled: true,
+            })
+            .await;
+        store.set_egress(
+            "acct_downgrade",
+            Some(gateway_core::account::OutboundProxy::parse(&proxy.uri()).unwrap()),
+            None,
+        );
+        Mock::given(path("/backend-api/subscriptions"))
+            .respond_with(ResponseTemplate::new(403))
+            .expect(1)
+            .mount(&proxy)
+            .await;
+        Mock::given(path("/api/codex/usage"))
+            .respond_with(
+                ResponseTemplate::new(status)
+                    .set_body_json(json!({"plan_type":plan,"rate_limit":{}})),
+            )
+            .expect(1)
+            .mount(&proxy)
+            .await;
+        let service = CodexCredentialProfileService::new(
+            store.repository(),
+            wire_profile(),
+            reqwest::Client::new(),
+            direct.uri(),
+        );
+        service.maintain_lifecycle().await.unwrap();
+        service.maintain_lifecycle().await.unwrap();
+        let account = store.account("acct_downgrade").unwrap();
+        assert_eq!(account.lifecycle().archived, archived);
+        assert_eq!(account.enabled(), !archived);
+        assert!(direct.received_requests().await.unwrap().is_empty());
+    }
 }

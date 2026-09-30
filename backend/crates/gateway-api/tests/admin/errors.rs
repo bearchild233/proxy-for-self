@@ -469,6 +469,7 @@ mod provider {
         };
         AccountPageItem {
             account: AccountRecord {
+                lifecycle: Default::default(),
                 notes: None,
                 model_access: Default::default(),
                 id: "acct_error_test".to_owned(),

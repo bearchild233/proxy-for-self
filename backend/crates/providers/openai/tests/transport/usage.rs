@@ -16,6 +16,28 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const OVERSIZED_BODY_ERROR: &str = "upstream usage response exceeded the body limit";
 
+#[test]
+fn sol_6_1_billing_preserves_cache_and_long_context_prices() {
+    for (tier, input, expected) in [
+        (None, 272_000, [20_000, 1_000, 25_000, 100_000]),
+        (None, 272_001, [40_000, 2_000, 50_000, 150_000]),
+        (Some("fast"), 272_001, [80_000, 4_000, 100_000, 300_000]),
+        (Some("flex"), 272_001, [20_000, 1_000, 25_000, 75_000]),
+    ] {
+        let value =
+            openai_billing_breakdown("gpt-6.1-sol", billing_usage(input, 5, 20, 10), tier).unwrap();
+        let actual = [
+            value.input_price_per_million(),
+            value.cache_read_price_per_million(),
+            value.cache_write_price_per_million(),
+            value.output_price_per_million(),
+        ]
+        .map(|price| price.amount().scaled());
+        // Decimal 使用 10^10 精度，价目表内部使用每百万美元的 10^4 单位。
+        assert_eq!(actual, expected.map(|price| price * 1_000_000));
+    }
+}
+
 fn billing_usage(
     input_tokens: u64,
     output_tokens: u64,

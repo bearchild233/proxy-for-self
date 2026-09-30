@@ -267,7 +267,7 @@ async fn selected_proxy_location_overrides_global_and_reloads_without_mutating_c
 }
 
 const OFFICIAL_FIXTURE: &[u8] =
-    include_bytes!("../transport/fixtures/official_models_snapshot.json");
+    include_bytes!("../../transport/fixtures/official_models_snapshot.json");
 
 #[tokio::test]
 async fn replay_compatibility_should_remove_only_reasoning_status_on_both_transports() {
@@ -795,6 +795,67 @@ fn http_generate_operation() -> Operation {
     .expect("OpenAI payload")
     .with_context(Map::from_iter([("use_websocket".to_owned(), json!(false))]));
     Operation::Generate(GenerateRequest::from_protocol_payload(payload))
+}
+
+#[tokio::test]
+async fn cache_identifiers_are_observed_without_changing_the_wire_request() {
+    let store = Arc::new(MemoryAccountStore::default());
+    create_account(&store, "acct_provider_contract").await;
+    let server = MockServer::start().await;
+    Mock::given(path("/codex/responses"))
+        .and(header("session-id", "observed-session"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(CAPTURE_COMPLETED_SSE, "text/event-stream"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let provider = provider_with_base_url(&store, server.uri());
+    let payload = ProtocolPayload::json_object(
+        "openai",
+        Map::from_iter([
+            ("model".to_owned(), json!("gpt-5.4")),
+            ("input".to_owned(), json!("hello")),
+            ("prompt_cache_key".to_owned(), json!("observed-cache-key")),
+        ]),
+    )
+    .unwrap()
+    .with_context(Map::from_iter([
+        ("use_websocket".to_owned(), json!(false)),
+        ("session_id".to_owned(), json!("observed-session")),
+    ]));
+    let mut stream = provider
+        .execute(
+            planned_request(
+                "openai",
+                Operation::Generate(GenerateRequest::from_protocol_payload(payload)),
+            ),
+            context("req_cache_observation", CancellationToken::new()),
+        )
+        .await
+        .unwrap();
+    let mut observed = false;
+    while let Some(event) = stream.next().await {
+        let event = event.unwrap();
+        if let Some(metadata) = event
+            .response_observation()
+            .and_then(|observation| observation.provider_metadata())
+        {
+            let metadata: Value = serde_json::from_str(metadata.as_json()).unwrap();
+            assert_eq!(
+                metadata["requestSummary"]["promptCacheKey"],
+                "observed-cache-key"
+            );
+            assert_eq!(metadata["requestSummary"]["sessionId"], "observed-session");
+            observed = true;
+        }
+    }
+    assert!(observed);
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        captured_request_body(&requests[0])["prompt_cache_key"],
+        "observed-cache-key"
+    );
 }
 
 fn planned_request(provider_name: &str, operation: Operation) -> ProviderRequest {
@@ -7694,6 +7755,9 @@ async fn exact_websocket_busy_then_replay_scope_relaxation_is_rejected_before_se
         Some("connection_local")
     );
 
+    let mut payload = session_state.payload().clone();
+    payload.remove("replay_history");
+    let session_state = ProviderSessionState::new("openai", payload).unwrap();
     let continuation = operation(Some(CLIENT_PREVIOUS_RESPONSE_ID), session_state);
     let mut busy = provider
         .execute(

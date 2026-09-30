@@ -2,6 +2,7 @@
 
 mod capacity_freeze;
 mod recovery;
+mod refresh_queue;
 mod refresh_timing;
 mod scheduling;
 mod slots;
@@ -27,6 +28,37 @@ use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use crate::support::{MemoryAccountStore, profile, secret};
+
+#[tokio::test]
+async fn quota_refresh_uses_bound_proxy_and_never_falls_back_to_direct() {
+    let direct = MockServer::start().await;
+    let proxy = MockServer::start().await;
+    let store = Arc::new(MemoryAccountStore::default());
+    create_account(&store, "acct_proxy_quota").await;
+    store.set_egress(
+        "acct_proxy_quota",
+        Some(gateway_core::account::OutboundProxy::parse(&proxy.uri()).unwrap()),
+        None,
+    );
+    let account = store.account("acct_proxy_quota").unwrap();
+    Mock::given(path("/api/codex/usage"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "rate_limit": {"allowed": true, "primary_window": {"used_percent": 8, "reset_at": 1900000000}}
+        })))
+        .expect(1).mount(&proxy).await;
+    let service = quota_service_with_base_url(&store, reqwest::Client::new(), direct.uri());
+    service.refresh_account(account.id()).await.unwrap();
+    proxy.verify().await;
+    proxy.reset().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(407))
+        .expect(1)
+        .mount(&proxy)
+        .await;
+    let service = quota_service_with_base_url(&store, reqwest::Client::new(), direct.uri());
+    assert!(service.refresh_account(account.id()).await.is_err());
+    assert!(direct.received_requests().await.unwrap().is_empty());
+}
 
 fn wire_profile() -> CodexWireProfileState {
     CodexWireProfileState::new(CodexWireProfile {
@@ -393,6 +425,10 @@ async fn websocket_additional_rate_limit_resolves_by_name_without_touching_core(
 #[tokio::test]
 async fn quota_refresh_synchronizes_plan_changes_without_losing_subtypes() {
     for (current_plan, observed_plan, expected) in [
+        ("free", Some("plus"), "plus"),
+        ("free", Some("pro"), "pro"),
+        ("plus", Some("prolite"), "prolite"),
+        ("prolite", Some("pro"), "pro"),
         ("plus", Some("pro"), "pro"),
         ("pro", Some("plus"), "plus"),
         ("plus", Some("free"), "free"),
@@ -440,6 +476,7 @@ async fn quota_refresh_synchronizes_plan_changes_without_losing_subtypes() {
             })
             .await;
         let before = store.account(account_id).unwrap();
+        assert!(before.access_token_expires_at().unwrap() > SystemTime::now());
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/codex/usage"))

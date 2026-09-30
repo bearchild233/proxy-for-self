@@ -13,6 +13,9 @@ const EOCD_SIGNATURE: &[u8; 4] = b"PK\x05\x06";
 const CENTRAL_SIGNATURE: &[u8; 4] = b"PK\x01\x02";
 const LOCAL_SIGNATURE: &[u8; 4] = b"PK\x03\x04";
 const CORE_PATH_SUFFIX: &[u8] = b"/Contents/Resources/codex";
+// 新版把 Core 放入独立签名的 CodexCLI.app；bin/codex 是启动脚本，不扫描它。
+const SIGNED_CORE_PATH_SUFFIX: &[u8] =
+    b"/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex";
 const CORE_VERSION_ANCHOR: &[u8] = b"codex-mcp-client/";
 const MAX_EOCD_SEARCH_BYTES: u64 = 65_535 + 22;
 const MAX_CENTRAL_DIRECTORY_BYTES: u64 = 16 * 1024 * 1024;
@@ -277,7 +280,7 @@ pub fn find_core_entry(
         let name = entry
             .get(46..46 + name_length)
             .ok_or(CodexDesktopArtifactError::InvalidArchive)?;
-        if name.ends_with(CORE_PATH_SUFFIX) {
+        if name.ends_with(CORE_PATH_SUFFIX) || name.ends_with(SIGNED_CORE_PATH_SUFFIX) {
             if core.is_some() {
                 return Err(CodexDesktopArtifactError::MissingCore);
             }

@@ -1,10 +1,11 @@
 <script setup lang="ts" generic="Row extends object = Record<string, unknown>">
 import type { BaseTableProps, BaseTableSort, ResolvedTableColumn } from './columns'
 
-import { GripVertical, Triangle } from '@lucide/vue'
+import { ChevronLeft, ChevronRight, GripVertical, Triangle } from '@lucide/vue'
 import { useResizeObserver } from '@vueuse/core'
 import { useSortable } from '@vueuse/integrations/useSortable'
 import { computed, nextTick, onMounted, shallowRef, useSlots, useTemplateRef, watch } from 'vue'
+import BaseButton from '../BaseButton.vue'
 import BaseEmpty from '../BaseEmpty.vue'
 import BaseScrollbar from '../BaseScrollbar.vue'
 import {
@@ -20,6 +21,7 @@ import {
   tableStyle,
 } from './columns'
 import { useTableColumnMotion } from './useTableColumnMotion'
+import { useTableExpansionMotion } from './useTableExpansionMotion'
 
 const props = withDefaults(defineProps<BaseTableProps<Row>>(), {
   rowKey: 'id',
@@ -95,6 +97,12 @@ useTableColumnMotion(tableRef, () => computedColumns.value.map(column => column.
 const horizontalScrolled = shallowRef(false)
 const horizontalCanScrollRight = shallowRef(false)
 
+function scrollHorizontally(direction: number) {
+  const wrap = scrollbarRef.value?.wrapRef
+  if (wrap)
+    wrap.scrollBy({ left: direction * Math.max(240, wrap.clientWidth * 0.65), behavior: 'smooth' })
+}
+
 function updateScrollLayout() {
   scrollbarRef.value?.update()
   const wrap = scrollbarRef.value?.wrapRef
@@ -160,6 +168,12 @@ function isRowSelected(row: Row, index: number) {
 function isRowExpanded(row: Row, index: number) {
   return props.expandedRowKeys.includes(getRowKey(row, index))
 }
+
+const expansionMotion = useTableExpansionMotion(
+  () => scrollbarRef.value?.wrapRef,
+  tableRef,
+  () => props.scrollToExpanded,
+)
 
 function rowBackgroundClass(row: Row, index: number) {
   if (isRowSelected(row, index))
@@ -243,6 +257,15 @@ function sortButtonLabel(column: ResolvedTableColumn<Row>) {
         拖动左侧手柄调整当前页顺序，自动保存并全站共享；也可聚焦手柄后按 Alt + ↑ / ↓
       </template>
     </div>
+    <div v-if="horizontalControls && (horizontalScrolled || horizontalCanScrollRight)" class="flex shrink-0 items-center justify-end gap-2 px-4 pb-2 text-cp-xs text-cp-text-secondary">
+      <span>更多列</span>
+      <BaseButton size="sm" variant="secondary" aria-label="向左滚动表格" :disabled="!horizontalScrolled" @click="scrollHorizontally(-1)">
+        <ChevronLeft class="size-4" />
+      </BaseButton>
+      <BaseButton size="sm" variant="secondary" aria-label="向右滚动表格" :disabled="!horizontalCanScrollRight" @click="scrollHorizontally(1)">
+        <ChevronRight class="size-4" />
+      </BaseButton>
+    </div>
     <div v-loading="loading && (hasRows || !showHeaderWhenEmpty)" class="relative flex min-h-0 max-w-full flex-1 overflow-hidden">
       <BaseScrollbar
         v-if="hasRows || showHeaderWhenEmpty"
@@ -315,7 +338,7 @@ function sortButtonLabel(column: ResolvedTableColumn<Row>) {
               </th>
             </tr>
           </thead>
-          <tbody v-for="(row, index) in displayRows" :key="getRowKey(row, index)" data-row-group>
+          <tbody v-for="(row, index) in displayRows" :key="getRowKey(row, index)" data-row-group :data-row-key="getRowKey(row, index)">
             <tr :class="rowClass(row, index)" :aria-selected="isRowSelected(row, index) || undefined">
               <td
                 v-for="(column, columnIndex) in computedColumns"
@@ -354,15 +377,21 @@ function sortButtonLabel(column: ResolvedTableColumn<Row>) {
                 </div>
               </td>
             </tr>
-            <tr v-if="isRowExpanded(row, index)">
-              <td
-                :colspan="computedColumns.length"
-                class="rounded-cp border-y-transparent bg-cp-fill-quaternary bg-clip-padding p-0"
-                :class="bodyCellFrameClass"
-              >
-                <slot name="expanded" :row="row" :index="index" />
-              </td>
-            </tr>
+            <Transition
+              :css="false"
+              @enter="expansionMotion.enter"
+              @leave="expansionMotion.leave"
+              @enter-cancelled="expansionMotion.cancel"
+              @leave-cancelled="expansionMotion.cancel"
+            >
+              <tr v-if="isRowExpanded(row, index)">
+                <td :colspan="computedColumns.length" class="rounded-cp bg-cp-fill-quaternary p-0">
+                  <div data-expansion-panel class="overflow-hidden">
+                    <div><slot name="expanded" :row="row" :index="index" /></div>
+                  </div>
+                </td>
+              </tr>
+            </Transition>
           </tbody>
         </table>
       </BaseScrollbar>

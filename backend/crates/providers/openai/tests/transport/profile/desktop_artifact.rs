@@ -52,25 +52,31 @@ fn scanner_skips_an_invalid_marker_before_the_bundled_version() {
 
 #[test]
 fn central_directory_requires_one_deflated_core_entry() {
-    let name = b"ChatGPT.app/Contents/Resources/codex";
-    let mut central = vec![0_u8; 46 + name.len()];
-    central[..4].copy_from_slice(b"PK\x01\x02");
-    central[10..12].copy_from_slice(&8_u16.to_le_bytes());
-    central[20..24].copy_from_slice(&100_u32.to_le_bytes());
-    central[24..28].copy_from_slice(&200_u32.to_le_bytes());
-    central[28..30].copy_from_slice(
-        &u16::try_from(name.len())
-            .expect("name length")
-            .to_le_bytes(),
-    );
-    central[42..46].copy_from_slice(&50_u32.to_le_bytes());
-    central[46..].copy_from_slice(name);
+    for name in [
+        b"ChatGPT.app/Contents/Resources/codex".as_slice(),
+        b"ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex".as_slice(),
+    ] {
+        let mut central = vec![0_u8; 46 + name.len()];
+        central[..4].copy_from_slice(b"PK\x01\x02");
+        central[10..12].copy_from_slice(&8_u16.to_le_bytes());
+        central[20..24].copy_from_slice(&100_u32.to_le_bytes());
+        central[24..28].copy_from_slice(&200_u32.to_le_bytes());
+        central[28..30].copy_from_slice(
+            &u16::try_from(name.len())
+                .expect("name length")
+                .to_le_bytes(),
+        );
+        central[42..46].copy_from_slice(&50_u32.to_le_bytes());
+        central[46..].copy_from_slice(name);
 
-    let entry = find_core_entry(&central, 1).expect("core entry");
-    assert_eq!(entry.name, name);
-    assert_eq!(entry.compressed_size, 100);
-    assert_eq!(entry.uncompressed_size, 200);
-    assert_eq!(entry.local_header_offset, 50);
+        let entry = find_core_entry(&central, 1).expect("core entry");
+        assert_eq!(entry.name, name);
+        assert_eq!(entry.compressed_size, 100);
+        assert_eq!(entry.uncompressed_size, 200);
+        assert_eq!(entry.local_header_offset, 50);
+        let duplicated = [central.clone(), central].concat();
+        assert!(find_core_entry(&duplicated, 2).is_err());
+    }
 }
 
 #[test]

@@ -280,23 +280,19 @@ fn sequence(target: DesktopTarget, release: &ClientRelease) -> io::Result<u64> {
 }
 
 fn baseline_artifacts() -> BTreeMap<DesktopTarget, VerifiedArtifact> {
-    // 2026-09-18 分别读取四个官方安装包，版本元组与 ETag 均来自同一个包。
+    // 2026-09-30 分别读取四个官方安装包，版本元组与 ETag 均来自同一个包。
     // 离线可直接选择自动模式；ETag 变化后必须重新核验，不能延用另一平台的版本。
     let identities = [
-        (774_919_598, "\"0x8DF141FFDF86290\""),
-        (771_727_321, "\"0x8DF14202C49201F\""),
-        (417_337_930, "\"0x8DF150AE1091545\""),
-        (395_993_890, "\"0x8DF150ADC810C82\""),
+        (905_731_855, "\"0x8DF1E604E352652\""),
+        (902_520_426, "\"0x8DF1E60555B9041\""),
+        (474_740_114, "\"0x8DF1E514960BB94\""),
+        (453_009_574, "\"0x8DF1E5144495C97\""),
     ];
     TARGETS
         .into_iter()
         .zip(identities)
         .map(|(target, (size, etag))| {
-            let (core, version, build) = if target.platform == ClientPlatform::Windows {
-                ("0.154.0-alpha.6.2", "26.908.70816", "9275")
-            } else {
-                ("0.155.0-alpha.9", "26.915.31029", "9771")
-            };
+            let (core, version, build) = ("0.159.0", "26.928.20755", "12246");
             (
                 target,
                 VerifiedArtifact {
@@ -308,7 +304,7 @@ fn baseline_artifacts() -> BTreeMap<DesktopTarget, VerifiedArtifact> {
                         codex_version: core.to_owned(),
                         desktop_version: Some(version.to_owned()),
                         desktop_build: Some(build.to_owned()),
-                        verified_at: chrono::DateTime::parse_from_rfc3339("2026-09-18T00:00:00Z")
+                        verified_at: chrono::DateTime::parse_from_rfc3339("2026-09-30T00:00:00Z")
                             .ok()
                             .map(|time| time.with_timezone(&Utc)),
                     },

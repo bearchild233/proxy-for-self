@@ -229,7 +229,7 @@ async fn dial_account(
     let Some(proxy) = connection.outbound_proxy.as_ref() else {
         return Ok(MaybeTlsStream::Plain(connect_tcp(host, port).await?));
     };
-    let mut proxy_url = url::Url::parse(proxy.expose_url()).map_err(|_| invalid())?;
+    let mut proxy_url = url::Url::parse(&proxy.transport_url()).map_err(|_| invalid())?;
     let tls_proxy = proxy_url.scheme() == "https";
     let proxy_port = proxy_url.port_or_known_default().ok_or_else(invalid)?;
     if tls_proxy {

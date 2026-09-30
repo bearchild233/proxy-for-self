@@ -158,12 +158,12 @@ pub async fn initialize(
         Arc::clone(&leases),
         Arc::clone(&runtime_policy),
     ));
-    let profile_statistics = Arc::new(CodexCredentialProfileService::new(
+    let profile_statistics = CodexCredentialProfileService::new(
         repository.clone(),
         profile.clone(),
         http.clone(),
         config.base_url().to_owned(),
-    ));
+    );
     let selector = Arc::new(CodexCredentialSelector::new(
         provider_kind.clone(),
         repository.clone(),
@@ -189,6 +189,7 @@ pub async fn initialize(
         .map_err(OpenAiInitializeError::Provider)?
         .with_session_identity(session_identity)
         .with_pinned_cli_profile(config.pinned_cli_profile.clone())
+        .with_excel_plugin_state_file(config.excel_plugin_state_file.clone())
         .with_excel_worker_socket(config.excel_worker_socket.as_deref())
         .map_err(|_| OpenAiInitializeError::Transport)?,
     );
@@ -216,6 +217,11 @@ pub async fn initialize(
         credential_state,
         Arc::clone(&runtime_policy),
     ));
+    let profile_statistics = Arc::new(if config.oauth_refresh_enabled() {
+        profile_statistics.with_refresher(Arc::clone(&refresh))
+    } else {
+        profile_statistics
+    });
     let pending = Arc::new(OpenAiOAuthPendingStore::new(
         ports.oauth_pending(),
         provider_kind.clone(),
@@ -237,7 +243,7 @@ pub async fn initialize(
         OpenAiAdminServices {
             credentials: credential_admin,
             oauth: oauth_admin,
-            profile_statistics,
+            profile_statistics: Arc::clone(&profile_statistics),
             quota: Arc::clone(&quota),
             catalog: Arc::clone(&catalog),
         },
@@ -256,6 +262,7 @@ pub async fn initialize(
             cli: cli_release,
             platforms: platform_releases,
         },
+        profile_statistics,
     )
     .map_err(|_| OpenAiInitializeError::Worker)?;
 

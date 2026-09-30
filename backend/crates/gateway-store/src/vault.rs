@@ -197,35 +197,3 @@ pub(crate) async fn migrate_existing(pool: &sqlx::PgPool) -> StoreResult<()> {
     }
     transaction.commit().await.map_err(|_| failure())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn authenticated_encryption_is_randomized_and_scope_bound() {
-        let vault = Vault::new(&[7; 32]).unwrap();
-        let a = vault.seal("account:a", b"test-secret").unwrap();
-        let b = vault.seal("account:a", b"test-secret").unwrap();
-        assert_ne!(a, b);
-        assert_eq!(&*vault.open("account:a", &a).unwrap(), b"test-secret");
-        assert!(vault.open("account:b", &a).is_err());
-        assert!(vault.open("client-key:a", &a).is_err());
-        assert!(Vault::new(&[8; 32]).unwrap().open("account:a", &a).is_err());
-    }
-    #[test]
-    fn tampering_truncation_and_cleartext_are_rejected() {
-        let vault = Vault::new(&[7; 32]).unwrap();
-        let value = vault.seal("account:a", b"secret").unwrap();
-        let mut changed = value.clone();
-        let last = changed.pop().unwrap();
-        changed.push(if last == '0' { '1' } else { '0' });
-        for bad in [
-            changed,
-            value[..value.len() - 2].to_owned(),
-            "secret".to_owned(),
-            "hubenc1:00".to_owned(),
-        ] {
-            assert!(vault.open("account:a", &bad).is_err());
-        }
-    }
-}

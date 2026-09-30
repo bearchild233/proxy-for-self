@@ -19,6 +19,7 @@ export function useAccountsQuery() {
   const refreshMessage = shallowRef('')
   let syncController: AbortController | undefined
   const visibility = useDocumentVisibility()
+  const archivedQuery = shallowRef(false)
   const searchQuery = shallowRef('')
   const providerQuery = shallowRef('')
   const statusQuery = shallowRef('')
@@ -49,6 +50,7 @@ export function useAccountsQuery() {
     const params = {
       page,
       pageSize,
+      archived: archivedQuery.value,
       search: searchQuery.value,
       provider: providerQuery.value || undefined,
       status: statusQuery.value || undefined,
@@ -164,7 +166,7 @@ export function useAccountsQuery() {
     total: query.total.value,
   }))
 
-  watch([query.page, query.pageSize, searchQuery, providerQuery, statusQuery, groupQuery, attentionQuery, sort], () => {
+  watch([query.page, query.pageSize, searchQuery, providerQuery, statusQuery, groupQuery, archivedQuery, attentionQuery, sort], () => {
     // 翻页或切换筛选后，不把上一页的同步结果显示成当前页已更新。
     syncController?.abort()
     lastRefreshedAt.value = ''
@@ -208,7 +210,7 @@ export function useAccountsQuery() {
     { debounce: 250 },
   )
 
-  watch([providerQuery, statusQuery, groupQuery, attentionQuery], () => {
+  watch([providerQuery, statusQuery, groupQuery, archivedQuery, attentionQuery], () => {
     query.page.value = 1
     void query.execute()
   })
@@ -231,6 +233,7 @@ export function useAccountsQuery() {
     accounts: query.items,
     loadAccounts: query.execute,
     refreshAccountsSilently: () => query.execute({ silent: true }),
+    archivedQuery,
     searchQuery,
     providerQuery,
     statusQuery,

@@ -34,7 +34,7 @@ export function emptyAccountCreateForm(): AccountCreateForm {
     notes: '',
     enabled: true,
     concurrencyLimit: '',
-    weight: '1',
+    weight: '50',
     groupIds: [],
     step: 'settings',
     mode: 'oauth',

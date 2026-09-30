@@ -120,6 +120,7 @@ pub(crate) fn parse_error_reason(value: Option<String>) -> StoreResult<Option<Ac
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderAccountSummary {
+    pub lifecycle: gateway_core::account::AccountLifecycle,
     pub request_location: Option<gateway_core::account::RequestLocation>,
     pub outbound_proxy: Option<gateway_core::account::OutboundProxy>,
     pub id: String,
@@ -320,6 +321,8 @@ impl fmt::Debug for RotateProviderAccount {
 
 #[derive(Debug, Clone)]
 pub struct BatchUpdateProviderAccountsAdmin {
+    pub expiry_priority: Option<bool>,
+    pub restore_archived: bool,
     pub name: Option<String>,
     pub outbound_proxy: Option<gateway_admin::model::proxies::AccountProxySelection>,
     pub account_ids: Vec<String>,
@@ -392,7 +395,7 @@ impl ProviderAccountStateUpdate {
 
 pub(crate) const ACCOUNT_SELECT: &str = "select location_country, location_region, location_city, location_timezone, outbound_proxy_url, id, provider_kind, name, notes, email, upstream_user_id,
             upstream_account_id, plan_type, authentication_kind, provider_credentials_json, credential_revision,
-            has_refresh_token, access_token_expires_at, next_refresh_at, enabled, concurrency_limit, weight, model_access_json, credential_state,
+            has_refresh_token, access_token_expires_at, next_refresh_at, enabled, concurrency_limit, weight, lifecycle_json, model_access_json, credential_state,
             provider_quota_json, quota_access_state, quota_evidence, quota_access_observed_at, quota_reset_at,
             last_error_reason, last_error_message,
             credential_observed_at, quota_observed_at, created_at, updated_at
@@ -403,7 +406,7 @@ pub(crate) const ACCOUNT_SELECT: &str = "select location_country, location_regio
 
 pub(crate) const ACCOUNT_SELECT_BY_IDS: &str = "select location_country, location_region, location_city, location_timezone, outbound_proxy_url, id, provider_kind, name, notes, email, upstream_user_id,
             upstream_account_id, plan_type, authentication_kind, provider_credentials_json, credential_revision,
-            has_refresh_token, access_token_expires_at, next_refresh_at, enabled, concurrency_limit, weight, model_access_json, credential_state,
+            has_refresh_token, access_token_expires_at, next_refresh_at, enabled, concurrency_limit, weight, lifecycle_json, model_access_json, credential_state,
             provider_quota_json, quota_access_state, quota_evidence, quota_access_observed_at, quota_reset_at,
             last_error_reason, last_error_message,
             credential_observed_at, quota_observed_at, created_at, updated_at
@@ -415,7 +418,7 @@ pub(crate) const ACCOUNT_SELECT_BY_IDS: &str = "select location_country, locatio
 
 pub(crate) const REFRESH_CANDIDATES_SELECT: &str = "select location_country, location_region, location_city, location_timezone, outbound_proxy_url, id, provider_kind, name, notes, email, upstream_user_id,
             upstream_account_id, plan_type, authentication_kind, provider_credentials_json, credential_revision,
-            has_refresh_token, access_token_expires_at, next_refresh_at, enabled, concurrency_limit, weight, model_access_json, credential_state,
+            has_refresh_token, access_token_expires_at, next_refresh_at, enabled, concurrency_limit, weight, lifecycle_json, model_access_json, credential_state,
             provider_quota_json, quota_access_state, quota_evidence, quota_access_observed_at, quota_reset_at,
             last_error_reason, last_error_message,
             credential_observed_at, quota_observed_at, created_at, updated_at
@@ -494,6 +497,7 @@ pub(crate) fn core_account_from_summary(
         summary.last_error_message,
     )
     .with_scheduling(summary.concurrency_limit, summary.weight)
+    .with_lifecycle(summary.lifecycle)
     .with_model_access(summary.model_access)
     .with_outbound_proxy(summary.outbound_proxy)
     .with_request_location(summary.request_location)
@@ -555,6 +559,8 @@ pub(crate) fn account_summary_from_row(
         .and_then(AccountWeight::new)
         .ok_or_else(|| invalid("invalid weight"))?;
     Ok(ProviderAccountSummary {
+        lifecycle: serde_json::from_value(get::<serde_json::Value>(&row, "lifecycle_json")?)
+            .map_err(|_| invalid("invalid account lifecycle"))?,
         request_location: super::super::proxies::location_from_row(&row)?,
         outbound_proxy: get::<Option<String>>(&row, "outbound_proxy_url")?
             .map(|url| {

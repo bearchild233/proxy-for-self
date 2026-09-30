@@ -13,6 +13,27 @@ fn loaded_credential_from_record(
 
 #[async_trait]
 impl ProviderAccountStore for PgProviderAccountRepository {
+    async fn compare_and_swap_lifecycle(
+        &self,
+        account: &CoreProviderAccount,
+        lifecycle: gateway_core::account::AccountLifecycle,
+    ) -> Result<bool, CoreStoreError> {
+        // 设置开关由管理事务独立写入；后台事实不能覆盖刚修改的开关。
+        let patch = serde_json::to_value(&lifecycle)
+            .map_err(|_| CoreStoreError::new(CoreStoreErrorKind::InvalidData))?;
+        let result = sqlx::query("update provider_accounts set
+            lifecycle_json = lifecycle_json || ($4::jsonb - 'expiryPriority'),
+            enabled = case when $5 then false else enabled end, updated_at = greatest(now(), updated_at)
+            where id=$1 and credential_revision=$2 and upstream_account_id is not distinct from $3
+              and $6::jsonb @> lifecycle_json and enabled = $7 and credential_state = $8")
+            .bind(account.id().as_str()).bind(to_i64(account.revision().get()).map_err(core_store_error)?)
+            .bind(account.upstream_account_id()).bind(patch).bind(lifecycle.archived)
+            .bind(serde_json::to_value(account.lifecycle()).map_err(|_| CoreStoreError::new(CoreStoreErrorKind::InvalidData))?)
+            .bind(account.enabled()).bind(account.credential_state().as_str())
+            .execute(&self.pool).await.map_err(|_| CoreStoreError::new(CoreStoreErrorKind::Unavailable))?;
+        Ok(result.rows_affected() == 1)
+    }
+
     async fn create_account(&self, account: CoreNewProviderAccount) -> Result<(), CoreStoreError> {
         if account.account.revision().get() != 1 {
             return Err(CoreStoreError::new(CoreStoreErrorKind::InvalidData));

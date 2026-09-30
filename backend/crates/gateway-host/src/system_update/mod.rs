@@ -2,6 +2,7 @@
 
 mod archive;
 mod download;
+mod managed;
 mod process;
 mod release;
 mod state;
@@ -68,6 +69,8 @@ pub struct SystemUpdateConfig {
     pub update_lock_file: PathBuf,
     pub update_temp_dir: PathBuf,
     pub self_restart_enabled: bool,
+    /// 独立 systemd 更新服务；网关退出不影响版本切换、健康检查和回退。
+    pub managed_socket: Option<PathBuf>,
 }
 
 impl Default for SystemUpdateConfig {
@@ -112,6 +115,7 @@ impl Default for SystemUpdateConfig {
             update_temp_dir,
             self_restart_enabled: environment_value("CPR_ENABLE_SELF_RESTART").as_deref()
                 == Some("true"),
+            managed_socket: None,
         }
     }
 }
@@ -149,6 +153,15 @@ impl SystemUpdateConfig {
         if self.version.trim().is_empty() {
             return Err(ConfigError::InvalidField("host.system_update.version"));
         }
+        if self
+            .managed_socket
+            .as_ref()
+            .is_some_and(|path| !path.is_absolute())
+        {
+            return Err(ConfigError::InvalidField(
+                "host.system_update.managed_socket",
+            ));
+        }
         if !matches!(
             self.deployment_mode.as_str(),
             "source" | "binary" | "docker"
@@ -161,8 +174,21 @@ impl SystemUpdateConfig {
     }
 
     fn update_support_error(&self) -> Option<String> {
-        if !matches!(self.build_type.as_str(), "release" | "experimental") {
+        if self.managed_socket.is_some()
+            && (self.update_repository.as_deref() != Some(DEFAULT_UPDATE_REPOSITORY)
+                || self.github_api_base != DEFAULT_GITHUB_API_BASE)
+        {
+            return Some("独立更新服务仅接受本项目的 GitHub 发布源".to_owned());
+        }
+        if self.managed_socket.is_none()
+            && !matches!(self.build_type.as_str(), "release" | "experimental")
+        {
             return Some("在线更新需要官方发布构建".to_owned());
+        }
+        if self.managed_socket.is_none()
+            && self.update_repository.as_deref() == Some(DEFAULT_UPDATE_REPOSITORY)
+        {
+            return Some("本项目发布包需要先配置独立更新服务 managed_socket".to_owned());
         }
         let Some(channel) = version_channel(&self.version) else {
             return Some("当前版本不符合发行命名规范，无法确定更新通道".to_owned());
@@ -428,6 +454,22 @@ impl ProcessSystemOperations {
 
 #[async_trait]
 impl SystemOperations for ProcessSystemOperations {
+    async fn plugins(
+        &self,
+    ) -> Result<Vec<gateway_admin::model::system::PluginStatus>, OperationError> {
+        if self.config.managed_socket.is_none() {
+            return Ok(Vec::new());
+        }
+        managed::plugins(&self.config).await
+    }
+    async fn plugin_action(
+        &self,
+        id: String,
+        action: gateway_admin::model::system::PluginAction,
+    ) -> Result<String, OperationError> {
+        managed::plugin_action(&self.config, &id, action).await
+    }
+
     async fn version(&self) -> Result<SystemVersion, OperationError> {
         let detail = self.update_detail(false).await?;
         Ok(SystemVersion {
@@ -488,10 +530,31 @@ impl SystemOperations for ProcessSystemOperations {
         &self,
         target_version: Option<String>,
     ) -> Result<SystemOperationAccepted, OperationError> {
+        if self.config.managed_socket.is_some() {
+            if let Some(reason) = self.config.update_support_error() {
+                return Err(conflict(reason));
+            }
+            let target = confirmed_target(target_version)?;
+            validate_update_target(&self.config.version, &target)?;
+            let detail = self.update_detail(true).await?;
+            if !detail.has_update || detail.latest_version != target {
+                return Err(conflict("发布版本已变化，请重新检查更新"));
+            }
+            let operation_id = managed::submit(&self.config, "update", Some(&target)).await?;
+            return Ok(SystemOperationAccepted::Update {
+                operation_id,
+                deployment_mode: self.config.deployment_mode.clone(),
+                message: "独立更新服务已受理，将备份、排空请求并自动重启".to_owned(),
+                target_version: target,
+            });
+        }
         self.start_update(target_version)
     }
 
     async fn update_status(&self) -> Result<SystemUpdateStatus, OperationError> {
+        if self.config.managed_socket.is_some() {
+            return managed::status(&self.config).await;
+        }
         if let Ok(_operation) = self.operation_lock.try_lock() {
             recover_interrupted(
                 &self.config.update_state_file,
@@ -502,6 +565,13 @@ impl SystemOperations for ProcessSystemOperations {
     }
 
     async fn rollback(&self) -> Result<SystemOperationAccepted, OperationError> {
+        if self.config.managed_socket.is_some() {
+            return Ok(SystemOperationAccepted::Rollback {
+                operation_id: managed::submit(&self.config, "rollback", None).await?,
+                message: "已受理回滚，将检查数据库兼容性并优雅重启".to_owned(),
+                need_restart: false,
+            });
+        }
         let _operation = self
             .operation_lock
             .try_lock()
@@ -547,6 +617,15 @@ impl SystemOperations for ProcessSystemOperations {
     }
 
     async fn restart(&self) -> Result<SystemOperationAccepted, OperationError> {
+        if self.config.managed_socket.is_some() {
+            if !self.config.self_restart_enabled {
+                return Err(conflict("self restart is disabled"));
+            }
+            return Ok(SystemOperationAccepted::Restart {
+                operation_id: managed::submit(&self.config, "restart", None).await?,
+                message: "独立更新服务已安排优雅重启".to_owned(),
+            });
+        }
         // 与 update/rollback 互斥：更新替换文件期间触发自重启会让新进程
         // 载入半成品产物。
         let _operation = self

@@ -155,6 +155,7 @@ pub struct CodexProvider {
     session_transport_recovery: CodexSessionTransportRecovery,
     stream_max_retries: u32,
     excel_worker: Option<Client>,
+    excel_plugin_state_file: Option<std::path::PathBuf>,
     pinned_cli_profile: Option<crate::transport::profile::CodexWireProfile>,
 }
 
@@ -211,6 +212,7 @@ impl CodexProvider {
             session_transport_recovery: CodexSessionTransportRecovery::default(),
             stream_max_retries,
             excel_worker: None,
+            excel_plugin_state_file: None,
             pinned_cli_profile: None,
         })
     }

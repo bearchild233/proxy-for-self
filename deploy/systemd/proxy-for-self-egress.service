@@ -1,0 +1,33 @@
+[Unit]
+Description=proxy-for-self VLESS and Hysteria2 egress bridge
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+DynamicUser=yes
+ExecStart=/usr/bin/python3 /opt/proxy-for-self-egress/bridge.py
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=GOMEMLIMIT=32MiB
+Environment=GOMAXPROCS=1
+Environment=EGRESS_MAX_NODES=2
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=15
+MemoryHigh=100M
+MemoryMax=128M
+TasksMax=64
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+# sing-box 使用 netlink 读取网络接口；不授予 NET_ADMIN，也不启用 TUN。
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+CapabilityBoundingSet=
+UMask=0077
+StandardOutput=null
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

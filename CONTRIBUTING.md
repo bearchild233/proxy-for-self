@@ -16,7 +16,7 @@ git push -u origin feat/account-ui
 
 - 前端：`pnpm --dir frontend install --frozen-lockfile`、`pnpm --dir frontend lint`、`pnpm --dir frontend build`、`node --test frontend/tests/*.test.mjs`。
 - Rust：在 backend 执行 `cargo fmt --check`、`cargo clippy --all-targets --all-features --locked -- -D warnings`。完整测试需要测试专用 PostgreSQL/Redis，设置 `CPR_TEST_DATABASE_URL`、`CPR_TEST_REDIS_URL` 后执行 `cargo test --test main --locked`；CI 提供隔离服务。
-- Worker：`python -m venv .venv`，安装 `plugins/excel-bridge/requirements.lock` 和 `pip install -e 'plugins/excel-bridge[test]'`，执行 `python -m pytest plugins/excel-bridge -q`。
+- Worker：Python 3.10+ 执行 `python tools/test-excel-worker.py`。与 CI 共用入口：每次创建临时隔离环境，安装锁定依赖及实际安装包，执行 `pip check` 和测试后清理。禁止以开发环境里直接运行 pytest 的结果替代此检查；新增依赖同步维护 `pyproject.toml` 与对应 lock。可追加 pytest 参数缩小检查范围。
 - 迁移：在 backend/migrations 执行 `sha256sum --check --strict .frozen-sha256`。已登记迁移的内容和哈希不得改变；新增迁移追加登记。
 
 ## 规则

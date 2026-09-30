@@ -210,6 +210,38 @@ impl CodexCredentialRefreshService {
         }
     }
 
+    /// 上游已拒绝 AT 时，通过同一出口及刷新租约验证 RT；不等待本地 JWT 到期。
+    pub async fn refresh_rejected_account(
+        &self,
+        account: &ProviderAccount,
+    ) -> Result<CodexCredentialRefreshOutcome, CodexCredentialRefreshError> {
+        if !account.enabled()
+            || !account.has_refresh_token()
+            || account
+                .next_refresh_at()
+                .is_some_and(|at| at > SystemTime::now())
+        {
+            return Ok(CodexCredentialRefreshOutcome::Stale {
+                account_id: account.id().to_string(),
+            });
+        }
+        let runtime = self.repository.load_runtime_credential(account).await?;
+        let secret = runtime
+            .authentication
+            .oauth()
+            .ok_or(CodexCredentialRefreshError::InvalidRefreshResponse)?
+            .clone();
+        let policy = self.runtime_policy.load_refresh_policy().await?;
+        self.refresh_one_with_policy(
+            DueCodexCredential {
+                account: account.clone(),
+                secret,
+            },
+            policy,
+        )
+        .await
+    }
+
     pub async fn refresh_due(
         &self,
     ) -> Result<Vec<CodexCredentialRefreshOutcome>, CodexCredentialRefreshError> {

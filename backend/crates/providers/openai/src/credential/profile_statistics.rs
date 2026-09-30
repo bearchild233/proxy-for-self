@@ -106,10 +106,12 @@ struct CachedProfileAvatarSource {
 }
 
 pub struct CodexCredentialProfileService {
+    refresher: Option<std::sync::Arc<super::CodexCredentialRefreshService>>,
     repository: CodexCredentialRepository,
     profile: CodexWireProfileState,
     http: Client,
     base_url: String,
+    lifecycle_attempts: Mutex<HashMap<ProviderAccountId, Instant>>,
     avatar_sources: Mutex<HashMap<ProviderAccountId, CachedProfileAvatarSource>>,
     subscription_queue:
         super::refresh_queue::RefreshQueue<Option<CodexSubscription>, CodexProfileStatisticsError>,
@@ -126,14 +128,166 @@ impl CodexCredentialProfileService {
         base_url: String,
     ) -> Self {
         Self {
+            refresher: None,
             repository,
             profile,
             http,
             base_url,
+            lifecycle_attempts: Mutex::new(HashMap::new()),
             avatar_sources: Mutex::new(HashMap::new()),
             subscription_queue: Default::default(),
             statistics_queue: Default::default(),
         }
+    }
+
+    #[must_use]
+    pub fn with_refresher(
+        mut self,
+        refresher: std::sync::Arc<super::CodexCredentialRefreshService>,
+    ) -> Self {
+        self.refresher = Some(refresher);
+        self
+    }
+
+    /// 独立维护订阅事实，所有查询复用账号自己的出口；临时错误不会归档。
+    pub async fn maintain_lifecycle(&self) -> Result<(), CodexProfileStatisticsError> {
+        use gateway_core::account::CredentialState;
+        let accounts = self
+            .repository
+            .store()
+            .list_accounts()
+            .await
+            .map_err(|error| CodexProfileStatisticsError::Store {
+                detail: error.to_string(),
+            })?;
+        let now = chrono::Utc::now();
+        for mut account in accounts {
+            if account.provider().as_str() != "openai"
+                || account.authentication_kind() != "oauth"
+                || account.lifecycle().archived
+                || (!account.enabled() && account.lifecycle().archived_at.is_some())
+            {
+                continue;
+            }
+            let mut lifecycle = account.lifecycle().clone();
+            if matches!(
+                account.credential_state(),
+                CredentialState::Invalid | CredentialState::Banned
+            ) || (account.credential_state() == CredentialState::Expired
+                && account.last_error_reason()
+                    == Some(gateway_core::account::AccountErrorReason::CredentialExpired))
+            {
+                lifecycle.archived = true;
+                lifecycle.archive_reason = Some("credential_invalid".to_owned());
+                lifecycle.archived_at = Some(now);
+            } else {
+                if !account.enabled() {
+                    continue;
+                }
+                let should_probe = {
+                    let mut attempts = self
+                        .lifecycle_attempts
+                        .lock()
+                        .expect("lifecycle attempts mutex");
+                    attempts.retain(|_, at| at.elapsed() < Duration::from_secs(3600));
+                    if attempts.contains_key(account.id()) {
+                        false
+                    } else {
+                        attempts.insert(account.id().clone(), Instant::now());
+                        true
+                    }
+                };
+                if !should_probe {
+                    continue;
+                }
+                let mut result = self.subscription(account.id()).await;
+                if matches!(
+                    result,
+                    Err(CodexProfileStatisticsError::CredentialRefreshRequired { .. })
+                ) {
+                    let Some(refresher) = &self.refresher else {
+                        continue;
+                    };
+                    let outcome = refresher.refresh_rejected_account(&account).await;
+                    if !matches!(
+                        outcome,
+                        Ok(super::CodexCredentialRefreshOutcome::Refreshed { .. }
+                            | super::CodexCredentialRefreshOutcome::Invalidated { .. }
+                            | super::CodexCredentialRefreshOutcome::Banned { .. })
+                    ) {
+                        continue;
+                    }
+                    let Some(current) = self
+                        .repository
+                        .store()
+                        .get_account(account.id())
+                        .await
+                        .map_err(|error| CodexProfileStatisticsError::Store {
+                            detail: error.to_string(),
+                        })?
+                    else {
+                        continue;
+                    };
+                    // 刷新期间可能重新授权或人工恢复；只归档仍然确认失效的当前凭据。
+                    if current.lifecycle().archived
+                        || (!current.enabled() && current.lifecycle().archived_at.is_some())
+                        || current.upstream_account_id() != account.upstream_account_id()
+                    {
+                        continue;
+                    }
+                    account = current;
+                    lifecycle = account.lifecycle().clone();
+                    if matches!(
+                        outcome,
+                        Ok(super::CodexCredentialRefreshOutcome::Invalidated { .. }
+                            | super::CodexCredentialRefreshOutcome::Banned { .. })
+                    ) {
+                        if !matches!(
+                            account.credential_state(),
+                            CredentialState::Invalid | CredentialState::Banned
+                        ) && !(account.credential_state() == CredentialState::Expired
+                            && account.last_error_reason()
+                                == Some(
+                                    gateway_core::account::AccountErrorReason::CredentialExpired,
+                                ))
+                        {
+                            continue;
+                        }
+                        lifecycle.archived = true;
+                        lifecycle.archive_reason = Some("credential_invalid".to_owned());
+                        lifecycle.archived_at = Some(now);
+                        self.repository
+                            .store()
+                            .compare_and_swap_lifecycle(&account, lifecycle)
+                            .await
+                            .map_err(|error| CodexProfileStatisticsError::Store {
+                                detail: error.to_string(),
+                            })?;
+                        continue;
+                    }
+                    result = self.subscription(account.id()).await;
+                }
+                let Ok(Some(subscription)) = result else {
+                    continue;
+                };
+                lifecycle.subscription_expires_at = Some(subscription.expires_at);
+                lifecycle.subscription_observed_at = Some(subscription.observed_at);
+                // 自动续费周期切换时不以旧账期判死；只有确认不续费的到期订阅自动归档。
+                if subscription.expires_at <= now && subscription.will_renew == Some(false) {
+                    lifecycle.archived = true;
+                    lifecycle.archive_reason = Some("subscription_expired".to_owned());
+                    lifecycle.archived_at = Some(now);
+                }
+            }
+            self.repository
+                .store()
+                .compare_and_swap_lifecycle(&account, lifecycle)
+                .await
+                .map_err(|error| CodexProfileStatisticsError::Store {
+                    detail: error.to_string(),
+                })?;
+        }
+        Ok(())
     }
 
     /// 订阅只按需读取；多设备共享短期结果，不刷新凭据或更新额度状态。
@@ -162,7 +316,7 @@ impl CodexCredentialProfileService {
                     )
                     .for_account(&account)
                     .map_err(map_client_error)?
-                    .fetch_subscription(
+                    .fetch_subscription_checked(
                         CodexRequestContext::auxiliary(
                             authorization.expose_secret(),
                             Some(&upstream_account_id),
@@ -171,8 +325,63 @@ impl CodexCredentialProfileService {
                         ),
                         &upstream_account_id,
                     )
-                    .await;
-                    Ok(subscription)
+                    .await
+                    .map_err(|_| {
+                        CodexProfileStatisticsError::CredentialRefreshRequired {
+                            upstream_body: None,
+                        }
+                    })?;
+                    if subscription.is_some() {
+                        return Ok(subscription);
+                    }
+                    // 订阅接口可能被防护页拦截。实时额度仍能确认认证状态及已降级的套餐。
+                    let client = CodexBackendClient::new(
+                        self.http.clone(),
+                        self.base_url.clone(),
+                        self.profile.clone(),
+                    )
+                    .for_account(&account)
+                    .map_err(map_client_error)?;
+                    let usage = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        client.fetch_usage(CodexRequestContext::auxiliary(
+                            authorization.expose_secret(),
+                            Some(&upstream_account_id),
+                            &request_id,
+                            None,
+                        )),
+                    )
+                    .await
+                    .map_err(|_| CodexProfileStatisticsError::TransportUnavailable)?
+                    .map_err(map_client_error)?;
+                    if usage.get("plan_type").and_then(serde_json::Value::as_str) != Some("free") {
+                        return Ok(None);
+                    }
+                    let runtime = self
+                        .repository
+                        .load_runtime_credential(&account)
+                        .await
+                        .map_err(|_| CodexProfileStatisticsError::InvalidCredentialData)?;
+                    let expiry = runtime
+                        .authentication
+                        .oauth()
+                        .and_then(|secret| secret.id_token.as_ref())
+                        .and_then(|token| {
+                            super::types::subscription_expiration(
+                                token.expose_secret(),
+                                &upstream_account_id,
+                            )
+                        })
+                        .filter(|expiry| *expiry <= chrono::Utc::now());
+                    // 免费账号本身不会被归档；必须同时有已结束的付费订阅记录。
+                    Ok(expiry.map(|expires_at| CodexSubscription {
+                        starts_at: None,
+                        expires_at,
+                        will_renew: Some(false),
+                        billing_period: None,
+                        billing_currency: None,
+                        observed_at: chrono::Utc::now(),
+                    }))
                 },
             )
             .await?;

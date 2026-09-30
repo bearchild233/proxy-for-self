@@ -44,6 +44,9 @@ pub struct OpenAiConfig {
     /// 仅供本机私有 worker 使用，不接受客户端提供目标地址。
     #[serde(default)]
     pub excel_worker_socket: Option<PathBuf>,
+    /// 管理器持久化的插件准入状态；配置后读取失败按禁用处理。
+    #[serde(default)]
+    pub excel_plugin_state_file: Option<PathBuf>,
     /// 显式固定官方 CLI 基线；启用后忽略管理端及 Key 的客户端身份覆盖。
     #[serde(default)]
     pub pinned_cli_profile: Option<crate::transport::profile::CodexWireProfile>,
@@ -77,6 +80,15 @@ impl OpenAiConfig {
         {
             return Err(OpenAiConfigError::InvalidField(
                 "openai.excel_worker_socket",
+            ));
+        }
+        if self
+            .excel_plugin_state_file
+            .as_ref()
+            .is_some_and(|path| !path.is_absolute())
+        {
+            return Err(OpenAiConfigError::InvalidField(
+                "openai.excel_plugin_state_file",
             ));
         }
         self.identity_secret_path = runtime_data_dir.join("identity_hmac_secret");
@@ -140,6 +152,7 @@ impl Default for OpenAiConfig {
             stream_max_retries: DEFAULT_STREAM_MAX_RETRIES,
             residency: None,
             excel_worker_socket: None,
+            excel_plugin_state_file: None,
             pinned_cli_profile: None,
             identity_secret_path: PathBuf::new(),
         }

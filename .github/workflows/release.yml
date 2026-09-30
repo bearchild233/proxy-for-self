@@ -1,0 +1,83 @@
+name: Publish release
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Stable version from release/version.yaml, without v'
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: publish-release
+  cancel-in-progress: false
+jobs:
+  quality:
+    uses: ./.github/workflows/_quality.yml
+    with:
+      ref: ${{ github.sha }}
+  publish:
+    needs: quality
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    env:
+      RUST_MIN_STACK: 16777216
+      RELEASE_VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Validate release version
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, re
+          version = os.environ['RELEASE_VERSION']
+          assert re.fullmatch(r'\d+\.\d+\.\d+', version), 'stable version required'
+          source = pathlib.Path('release/version.yaml').read_text()
+          assert re.search(r'^version:\s*"' + re.escape(version) + r'"\s*$', source, re.M), 'version.yaml mismatch'
+          PY
+          if git ls-remote --exit-code --tags origin "refs/tags/v$RELEASE_VERSION"; then
+            echo 'Version tag already exists; publish a new version instead.' >&2
+            exit 1
+          else
+            result=$?
+            [ "$result" -eq 2 ] || exit "$result"
+          fi
+      - uses: dtolnay/rust-toolchain@1a3a6d54512beeaffd394f8d516ca16f2c506a20
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          workspaces: backend -> target
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413
+        with:
+          version: 11.7.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+      - name: Build frontend
+        run: |
+          pnpm --dir frontend install --frozen-lockfile
+          pnpm --dir frontend build
+      - name: Verify updater contracts
+        run: python3 -m unittest discover -s services/updater -v
+      - name: Verify Worker in clean environment
+        run: python3 tools/test-excel-worker.py
+      - name: Build gateway
+        working-directory: backend
+        env:
+          CPR_VERSION: ${{ inputs.version }}
+          CPR_GIT_SHA: ${{ github.sha }}
+          CPR_BUILD_TYPE: release
+        run: |
+          export CPR_BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          cargo build --release --locked -p codex-proxy-rs
+      - name: Package release
+        run: python3 services/updater/release_package.py --version "$RELEASE_VERSION" --binary backend/target/release/codex-proxy-rs --output dist
+      - name: Publish immutable version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v$RELEASE_VERSION" dist/*.tar.gz dist/checksums.txt \
+            --target "$GITHUB_SHA" --title "proxy-for-self v$RELEASE_VERSION" --generate-notes

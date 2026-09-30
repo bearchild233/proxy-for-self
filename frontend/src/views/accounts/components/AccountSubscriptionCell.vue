@@ -5,10 +5,10 @@ import { computed } from 'vue'
 import { useUiClock } from '@/composables/useUiClock'
 import { formatDateTime } from '@/utils/date'
 
-const props = defineProps<{ account: Account, state?: SubscriptionState }>()
+const props = defineProps<{ account: Account, state?: SubscriptionState, compact?: boolean }>()
 const now = useUiClock()
 const supported = computed(() => props.account.provider === 'openai' && props.account.authenticationKind === 'oauth')
-const expiresAt = computed(() => props.state?.subscription?.expiresAt)
+const expiresAt = computed(() => props.state?.subscription?.expiresAt ?? props.account.lifecycle.subscriptionExpiresAt ?? undefined)
 const remaining = computed(() => expiresAt.value ? Date.parse(expiresAt.value) - now.value.getTime() : Number.NaN)
 const hasDate = computed(() => Number.isFinite(remaining.value))
 const label = computed(() => {
@@ -30,9 +30,11 @@ const label = computed(() => {
 
 <template>
   <div class="grid gap-1 text-cp-xs">
-    <span class="font-emphasis" :class="hasDate && remaining < 3 * 86_400_000 ? 'text-cp-warning-text' : 'text-cp-text'">{{ label }}</span>
-    <time v-if="hasDate" :datetime="expiresAt" class="whitespace-nowrap text-cp-text-secondary" :title="`本期订阅结束：${formatDateTime(expiresAt)}`">{{ formatDateTime(expiresAt).slice(0, 16) }}</time>
-    <span v-if="state?.failed && hasDate" class="text-cp-text-secondary">更新失败，显示上次数据</span>
-    <span v-else-if="state?.subscription?.willRenew" class="text-cp-text-secondary">自动续费</span>
+    <span class="font-emphasis" :class="hasDate && remaining < 3 * 86_400_000 ? 'text-cp-warning-text' : 'text-cp-text'" :title="state?.failed && hasDate ? '更新失败，显示上次数据' : undefined">{{ label }}</span>
+    <template v-if="!compact">
+      <time v-if="hasDate" :datetime="expiresAt" class="whitespace-nowrap text-cp-text-secondary">{{ formatDateTime(expiresAt) }}</time>
+      <span v-if="state?.failed && hasDate" class="text-cp-text-secondary">更新失败，显示上次数据</span>
+      <span v-if="supported && hasDate" class="text-cp-text-secondary">{{ state?.subscription?.willRenew === true ? '自动续费' : state?.subscription?.willRenew === false ? '不自动续费' : '续费状态未知' }}</span>
+    </template>
   </div>
 </template>

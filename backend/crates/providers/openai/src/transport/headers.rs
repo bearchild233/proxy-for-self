@@ -183,9 +183,7 @@ impl CodexBackendClient {
         let cache_session = if matches!(self.protocol, OpenAiUpstreamProtocol::Codex)
             && context.session_id.is_none()
         {
-            request.prompt_cache_key().filter(|key| {
-                !key.is_empty() && key.len() <= 1024 && HeaderValue::from_str(key).is_ok()
-            })
+            request.cache_session_id()
         } else {
             None
         };

@@ -40,6 +40,23 @@ fn catalog() -> Result<Vec<ProviderModelDescriptor>, ProviderCatalogUnavailable>
 }
 
 impl CodexProvider {
+    pub fn with_excel_plugin_state_file(mut self, path: Option<std::path::PathBuf>) -> Self {
+        self.excel_plugin_state_file = path;
+        self
+    }
+
+    fn excel_plugin_enabled(&self) -> bool {
+        let Some(path) = &self.excel_plugin_state_file else {
+            return true;
+        };
+        // 本地小型原子状态文件；不缓存，使禁用立即影响新的目录和请求。
+        std::fs::read(path)
+            .ok()
+            .filter(|bytes| bytes.len() <= 16384)
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .is_some_and(|state| state.get("enabled").and_then(Value::as_bool) == Some(true))
+    }
+
     pub fn with_excel_worker_socket(
         mut self,
         socket: Option<&Path>,
@@ -72,6 +89,9 @@ impl CodexProvider {
     pub(super) fn excel_catalog(
         &self,
     ) -> Result<Vec<ProviderModelDescriptor>, ProviderCatalogUnavailable> {
+        if !self.excel_plugin_enabled() {
+            return Err(ProviderCatalogUnavailable);
+        }
         self.excel_worker
             .as_ref()
             .ok_or(ProviderCatalogUnavailable)?;
@@ -83,6 +103,12 @@ impl CodexProvider {
         request: ProviderRequest,
         context: AttemptContext,
     ) -> Result<ProviderStream, ProviderError> {
+        if !self.excel_plugin_enabled() {
+            return Err(provider_error(
+                ProviderErrorKind::Unavailable,
+                UpstreamSendState::NotSent,
+            ));
+        }
         let fail = || {
             provider_error(
                 ProviderErrorKind::InvalidRequest,
@@ -146,7 +172,7 @@ impl CodexProvider {
             "binding": {"key_id": context.client_api_key_ref().as_str(), "account_id": lease.account_id().as_str(), "revision": revision, "excel_enabled": true},
             "credential": {"account_id": lease.account_id().as_str(), "chatgpt_account_id": upstream_account,
                 "access_token": secret.access_token.expose_secret(), "user_id": lease.account().upstream_user_id(),
-                "proxy": lease.account().outbound_proxy().map(|proxy| proxy.expose_url())},
+                "proxy": lease.account().outbound_proxy().map(|proxy| proxy.transport_url())},
             "body": body,
         });
         let encoded = serde_json::to_vec(&envelope).map_err(|_| fail())?;

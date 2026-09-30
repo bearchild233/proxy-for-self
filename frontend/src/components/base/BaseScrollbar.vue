@@ -167,7 +167,8 @@ function measureVerticalScrollbar(wrap: HTMLElement) {
   const scrollRange = clamp(scrollHeight - clientHeight, 0, Number.POSITIVE_INFINITY)
   const availableTrackHeight = trackLength(verticalTrackRef.value, clientHeight, 'top', 'bottom')
   if (scrollRange <= overflowTolerance || availableTrackHeight <= 0) {
-    wrap.scrollTop = 0
+    if (wrap.scrollTop !== 0)
+      wrap.scrollTop = 0
     verticalMetrics.scrollRange = 0
     verticalMetrics.thumbRange = 0
     thumbHeight.value = 0
@@ -194,7 +195,9 @@ function measureHorizontalScrollbar(wrap: HTMLElement) {
   const scrollRange = clamp(scrollWidth - clientWidth, 0, Number.POSITIVE_INFINITY)
   const availableTrackWidth = trackLength(horizontalTrackRef.value, clientWidth, 'left', 'right')
   if (scrollRange <= overflowTolerance || availableTrackWidth <= 0) {
-    wrap.scrollLeft = 0
+    // 重复写入另一轴的 0 也会取消浏览器正在执行的平滑滚动。
+    if (wrap.scrollLeft !== 0)
+      wrap.scrollLeft = 0
     horizontalMetrics.scrollRange = 0
     horizontalMetrics.thumbRange = 0
     horizontalThumbWidth.value = 0

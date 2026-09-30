@@ -17,7 +17,7 @@ import { errorMessage } from '@/utils/async'
 
 const maxUpdateLogs = 200
 const updateEventReadyTimeoutMs = 3_000
-const restartReadyTimeoutMs = 60_000
+const restartReadyTimeoutMs = 13 * 60_000
 const restartProbeTimeoutMs = 2_000
 const restartReadyPollIntervalMs = 500
 const updateStatusPollIntervalMs = 1_000
@@ -196,7 +196,16 @@ export const useSystemUpdateStore = defineStore('system-update', () => {
     unconfirmedPreviousId = undefined
     activeOperationId = operation.operationId
     updateError.value = ''
-    updateSuccess.value = operation.status === 'succeeded' && status.needRestart
+    updateSuccess.value = operation.status === 'succeeded' && operation.kind === 'update'
+    if (operation.operationId && operation.message) {
+      appendUpdateLog({
+        id: `${operation.operationId}:${operation.status}:${operation.message}`,
+        operationId: operation.operationId,
+        level: operation.status === 'failed' ? 'error' : operation.status === 'succeeded' ? 'success' : 'info',
+        message: operation.message,
+        at: new Date().toISOString(),
+      })
+    }
     needRestart.value = status.needRestart
     restartTargetVersion.value = status.needRestart ? normalizeSystemVersion(status.currentVersion) : ''
     if (operation.status === 'running') {
@@ -208,6 +217,11 @@ export const useSystemUpdateStore = defineStore('system-update', () => {
     }
     statusPoll.pause()
     disconnectUpdateEvents()
+    if (operation.status === 'succeeded' && operation.kind === 'update' && !status.needRestart && updateInfo.value) {
+      updateInfo.value = { ...updateInfo.value, hasUpdate: false }
+      if (version.value?.version !== status.currentVersion)
+        void loadVersion()
+    }
     if (operation.status === 'failed') {
       updateError.value = operation.error || operation.message || '更新失败'
       setPhase({ kind: 'failed' })

@@ -38,7 +38,7 @@ async fn response_json(response: axum::response::Response) -> Value {
 fn update_body() -> Value {
     json!({
         "requestLocationEnabled": false,
-        "requestLocation": {"country":"US", "region":"Ohio", "city":"Piketon", "timezone":"America/New_York"},
+        "requestLocation": {"country":"US", "region":"California", "city":"Los Angeles", "timezone":"America/Los_Angeles"},
         "modelMappings": {
             "gpt-5.4": "gpt-5.5",
             "grok-latest": "grok-4.5"
@@ -160,7 +160,7 @@ fn settings_response_should_cover_the_full_runtime_settings_contract() {
             "openaiClientProfile": null,
             "xaiClientProfile": null,
         "requestLocationEnabled": false,
-        "requestLocation": {"country":"US", "region":"Ohio", "city":"Piketon", "timezone":"America/New_York"},
+        "requestLocation": {"country":"US", "region":"California", "city":"Los Angeles", "timezone":"America/Los_Angeles"},
             "modelMappings": {
                 "gpt-5.4": "gpt-5.5",
                 "grok-latest": "grok-4.5"

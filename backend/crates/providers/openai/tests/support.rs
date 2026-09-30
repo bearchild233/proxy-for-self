@@ -200,6 +200,25 @@ impl MemoryAccountStore {
 
 #[async_trait]
 impl ProviderAccountStore for MemoryAccountStore {
+    async fn compare_and_swap_lifecycle(
+        &self,
+        account: &ProviderAccount,
+        lifecycle: gateway_core::account::AccountLifecycle,
+    ) -> Result<bool, StoreError> {
+        let mut accounts = self.accounts.lock().expect("account store lock");
+        let Some(stored) = accounts.get_mut(account.id()) else {
+            return Ok(false);
+        };
+        if stored.account.revision() != account.revision()
+            || stored.account.lifecycle() != account.lifecycle()
+            || stored.account.upstream_account_id() != account.upstream_account_id()
+        {
+            return Ok(false);
+        }
+        stored.account = stored.account.clone().with_lifecycle(lifecycle);
+        Ok(true)
+    }
+
     async fn create_account(&self, input: NewProviderAccount) -> Result<(), StoreError> {
         let mut accounts = self.accounts.lock().expect("account store lock");
         if accounts.contains_key(input.account.id()) {
@@ -632,6 +651,9 @@ fn rebuild_account(current: &ProviderAccount, rebuild: AccountRebuild) -> Provid
         rebuild.last_error_message,
     )
     .with_scheduling(current.concurrency_limit(), current.weight())
+    .with_outbound_proxy(current.outbound_proxy().cloned())
+    .with_request_location(current.request_location().cloned())
+    .with_lifecycle(current.lifecycle().clone())
     .with_refresh_schedule(rebuild.has_refresh_token, rebuild.next_refresh_at)
 }
 

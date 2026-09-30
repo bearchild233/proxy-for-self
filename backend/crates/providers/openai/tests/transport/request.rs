@@ -1,5 +1,5 @@
 use chrono::{Datelike as _, Utc};
-use chrono_tz::America::New_York;
+use chrono_tz::America::Los_Angeles;
 use gateway_core::operation::{GenerateRequest, ProtocolPayload};
 use serde_json::{Map, Value, json};
 
@@ -228,7 +228,7 @@ fn encoder_should_align_structured_location_fields_without_rewriting_chat_text()
     .as_object()
     .expect("request object")
     .clone();
-    let before = Utc::now().with_timezone(&New_York);
+    let before = Utc::now().with_timezone(&Los_Angeles);
 
     let encoded = encode_generate_request(
         &request(body),
@@ -237,7 +237,7 @@ fn encoder_should_align_structured_location_fields_without_rewriting_chat_text()
     )
     .expect("encode");
 
-    let after = Utc::now().with_timezone(&New_York);
+    let after = Utc::now().with_timezone(&Los_Angeles);
     let encoded = Value::Object(encoded.body().clone());
     let environment = encoded
         .pointer("/input/0/content/0/text")
@@ -262,15 +262,15 @@ fn encoder_should_align_structured_location_fields_without_rewriting_chat_text()
             .iter()
             .any(|date| environment.contains(&format!("<current_date>{date}</current_date>")))
     );
-    assert!(environment.contains("<timezone>America/New_York</timezone>"));
+    assert!(environment.contains("<timezone>America/Los_Angeles</timezone>"));
     assert_eq!(
         encoded.pointer("/tools/0/user_location"),
         Some(&json!({
             "type": "approximate",
             "country": "US",
-            "region": "Ohio",
-            "city": "Piketon",
-            "timezone": "America/New_York"
+            "region": "California",
+            "city": "Los Angeles",
+            "timezone": "America/Los_Angeles"
         }))
     );
     assert_eq!(

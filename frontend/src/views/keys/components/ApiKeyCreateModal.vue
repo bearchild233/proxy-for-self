@@ -5,6 +5,7 @@ import { Copy, DollarSign, KeyRound, Upload } from '@lucide/vue'
 import { computed, shallowRef, watch } from 'vue'
 
 import { getAccounts } from '@/api'
+import { getPlugins } from '@/api/modules/system'
 import AccountGroupCheckboxGrid from '@/components/AccountGroupCheckboxGrid.vue'
 import BaseButton from '@/components/base/BaseButton.vue'
 import BaseCheckbox from '@/components/base/BaseCheckbox.vue'
@@ -36,6 +37,18 @@ const form = defineModel<ApiKeyFormValue>('form', { required: true })
 const title = computed(() => props.editing ? '编辑密钥' : '创建 API Key')
 const accounts = shallowRef<Account[]>([])
 const accountLoading = shallowRef(false)
+const excelAvailable = shallowRef(false)
+watch(open, async (active) => {
+  if (!active)
+    return
+  excelAvailable.value = false
+  try {
+    excelAvailable.value = (await getPlugins({ silent: true })).some(plugin => plugin.id === 'excel-bridge' && plugin.enabled)
+  }
+  catch {
+    // 状态不明时不能为新密钥启用插件，已有关联继续保留。
+  }
+})
 const accountError = shallowRef('')
 const accountSearch = shallowRef('')
 const filterGroup = shallowRef('')
@@ -195,7 +208,10 @@ watch(open, async (active, _previous, onCleanup) => {
         {{ accountError }}
       </p>
       <BaseFormItem label="当前 Key 的 Excel 插件">
-        <BaseSwitch v-model="form.excelBridgeEnabled" label="启用 Excel Bridge" :disabled="saving" />
+        <p v-if="!excelAvailable" class="text-cp-xs text-cp-text-secondary">
+          Excel 插件未启用或状态暂不可用，可在“设置 → 插件管理”中查看；已有配置保留。
+        </p>
+        <BaseSwitch v-model="form.excelBridgeEnabled" label="启用 Excel Bridge" :disabled="saving || (!excelAvailable && !form.excelBridgeEnabled)" />
         <p class="text-cp-xs text-cp-text-secondary">
           关闭走 Native，开启走 Excel Bridge，同账号其他 Key 不改变
         </p>

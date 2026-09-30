@@ -28,6 +28,7 @@ pub(crate) fn worker_contributions(
     quota_refresh_policy: CodexQuotaRefreshPolicy,
     oauth_refresh_enabled: bool,
     releases: ClientReleaseServices,
+    profiles: Arc<crate::credential::CodexCredentialProfileService>,
 ) -> Result<Vec<WorkerContribution>, WorkerDefinitionError> {
     let refresh_id = WorkerId::try_new(WorkerKind::OAuthRefresh, PROVIDER_NAME)?;
     let quota_id = WorkerId::try_new(WorkerKind::QuotaCatalogHealth, PROVIDER_NAME)?;
@@ -36,7 +37,11 @@ pub(crate) fn worker_contributions(
     let desktop_release_id =
         WorkerId::try_new(WorkerKind::QuotaCatalogHealth, DESKTOP_RELEASE_WORKER_OWNER)?;
     let cli_release_id = WorkerId::try_new(WorkerKind::QuotaCatalogHealth, "openai-cli-release")?;
-    let mut contributions = Vec::new();
+    let mut contributions = vec![WorkerContribution::Registration(scheduled_registration(
+        WorkerId::try_new(WorkerKind::QuotaCatalogHealth, "openai-account-lifecycle")?,
+        Duration::from_secs(60),
+        Box::new(OpenAiLifecycleTask { service: profiles }),
+    )?)];
     if oauth_refresh_enabled {
         contributions.push(WorkerContribution::Registration(scheduled_registration(
             refresh_id,
@@ -333,6 +338,23 @@ impl ScheduledTask for OpenAiPlatformDesktopReleaseTask {
                 () = self.service.refresh() => {},
             }
             Ok(())
+        })
+    }
+}
+
+struct OpenAiLifecycleTask {
+    service: Arc<crate::credential::CodexCredentialProfileService>,
+}
+impl ScheduledTask for OpenAiLifecycleTask {
+    fn run_cycle(&self, context: WorkerCycleContext) -> BoxFuture<'_, Result<(), WorkerTaskError>> {
+        Box::pin(async move {
+            tokio::select! {
+                () = context.cancellation().cancelled() => Ok(()),
+                result = self.service.maintain_lifecycle() => result.map_err(|error| {
+                    tracing::warn!(error = %error, "OpenAI account lifecycle maintenance failed");
+                    WorkerTaskError::safe("account lifecycle maintenance failed")
+                }),
+            }
         })
     }
 }

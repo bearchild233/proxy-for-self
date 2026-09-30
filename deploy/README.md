@@ -29,6 +29,8 @@ Worker 安装到独立虚拟环境：安装 `plugins/excel-bridge/requirements.l
 
 ## 升级与自动恢复
 
+VLESS / Hysteria2 是可选的独立出口桥接服务，安装、资源限制与支持范围见 [出口桥接说明](../services/egress/README.md)。旧 HTTP/SOCKS 代理不依赖该服务；新增代理仍可选择表单或完整链接。
+
 1. 在开发机/CI 构建和验证，服务器不承担大型 Rust 编译。
 2. 备份数据库、vault、配置与旧发行目录，验证备份可读取；新产物写入新的发行目录。
 3. 确认迁移兼容，等正在进行的模型请求排空，再切换发行目录并重启。不要把管理面板 SSE 当成模型请求；其取消信号必须能结束事件流。
@@ -50,3 +52,15 @@ python3 scripts/deploy_frontend.py --archive /path/frontend.tar.gz --sha256 <SHA
 ```
 
 脚本备份现有前端，先发布资源、最后原子替换 index；保留旧资源供已打开页面加载。不修改数据库、配置、服务进程或反向代理。需要回退时，从回执记录的备份恢复 index.html（旧 hash 资源仍在）。后端接口必须与新前端兼容，涉及 Rust 逻辑的改动不能只按此流程发布。
+# 面板系统更新
+
+GitHub 发布源为 `ckcyian23/proxy-for-self`。维护者手动运行 `Publish release` 工作流才会发布版本，普通 push 不发布也不部署。Linux amd64 的独立更新服务与 systemd 接入见 [updater 文档](../services/updater/README.md)。
+
+自动安装限于数据库迁移清单完全相同的版本；先备份、等待请求结束，再由独立服务切换程序并检查健康。数据库迁移版本需要维护升级。Excel Worker 和出口代理运行时独立保留，不随主程序更新覆盖。
+
+
+### 插件部署必须检查实际服务依赖
+
+主网关不得通过 Requires、Requisite、BindsTo 或 PartOf 依赖可禁用的 Excel socket/service。显式停止依赖会连带停止网关，`Restart=on-failure` 对这种停止不生效。检查 `systemctl show <网关> -p Requires -p Requisite -p BindsTo -p PartOf` 的实际值；systemd 不能通过空的 drop-in 依赖字段删除原 unit 的依赖，需修正定义后 daemon-reload 再检查。插件管理器在受理和实际停止前均检查此条件；违反时不得改变准入状态或停止服务。
+
+整批部署应由独立 systemd unit 执行，并配置独立 OnFailure 恢复 unit、有限执行时间、受保护的旧版本/配置备份和健康检查。恢复任务不得依赖正在更新的 API 或交互式终端。单实例二进制切换仍可能需要客户端重连；服务自动恢复和当前流不中断是不同保证，不能宣称无感更新。

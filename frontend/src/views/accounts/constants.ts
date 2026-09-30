@@ -1,6 +1,5 @@
 import type { AccountErrorReason, AccountStatus, getAccounts } from '@/api'
 import { defineTableColumns } from '@/components/base/BaseTable/columns'
-import { formatProviderLabel } from '@/utils/providers'
 
 export type AccountRow = Awaited<ReturnType<typeof getAccounts>>['items'][number]
 export type AccountQuotaWindow = AccountRow['quota']['windows'][number]
@@ -25,24 +24,16 @@ export const accountColumns = defineTableColumns<AccountRow>([
     hideable: false,
     label: '账号',
     kind: 'identity',
-    size: '3xl',
+    size: '2xl',
     sortable: 'email',
   },
-  {
-    key: 'provider',
-    label: '平台/类型',
-    kind: 'meta',
-    size: 'md',
-    align: 'center',
-    format: value => accountProviderLabel(typeof value === 'string' ? value : null),
-  },
   { key: 'status', label: '状态', kind: 'status', align: 'left', sortable: true },
-  { key: 'planType', label: '套餐', kind: 'status', sortable: true },
-  { key: 'subscription', label: '订阅剩余', kind: 'custom', size: 'xl' },
-  { key: 'usage', label: '用量', kind: 'custom', size: '2xl', sortable: true },
-  { key: 'groups', label: '账号分组', kind: 'status' },
+  { key: 'subscription', label: '订阅 / 权重', kind: 'custom', size: 'xl' },
+  { key: 'usage', label: '用量', kind: 'custom', size: 'xl', sortable: true },
+  { key: 'groups', defaultHidden: true, label: '账号分组', kind: 'status' },
   {
     key: 'lastUsedAt',
+    defaultHidden: true,
     label: '最后使用',
     kind: 'datetime',
     sortable: true,
@@ -50,6 +41,7 @@ export const accountColumns = defineTableColumns<AccountRow>([
   },
   {
     key: 'accessTokenExpiresAtDisplay',
+    defaultHidden: true,
     label: '令牌过期',
     kind: 'datetime',
     sortable: 'expiresAt',
@@ -198,10 +190,6 @@ function quotaLimitLabel(window: AccountQuotaWindow) {
   if (window.limitId === 'codex')
     return '通用额度'
   return window.limitName
-}
-
-function accountProviderLabel(value?: string | null) {
-  return formatProviderLabel(value)
 }
 
 function optionalAccountCell(value: unknown) {

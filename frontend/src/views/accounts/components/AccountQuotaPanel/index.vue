@@ -1,12 +1,14 @@
 <script setup lang="ts">
+import type { SubscriptionState } from '../../composables/useAccountSubscriptions'
 import type { AccountRow } from '../../constants'
 import { RefreshCw, UserRound } from '@lucide/vue'
 
 import { computed, shallowRef } from 'vue'
+import BaseCheckbox from '@/components/base/BaseCheckbox.vue'
 import BaseEmpty from '@/components/base/BaseEmpty.vue'
 import BaseIconButton from '@/components/base/BaseIconButton.vue'
+import { formatDateTime } from '@/utils/date'
 import { groupedAccountQuotaWindows, orderedPanelQuotaWindows } from '../../constants'
-import AccountPlanBadge from '../AccountPlanBadge.vue'
 import AccountProfileModal from '../AccountProfileModal/index.vue'
 import AccountQuotaPanelEntry from './Entry.vue'
 import AccountResetCredits from './ResetCredits.vue'
@@ -14,17 +16,22 @@ import AccountResetCredits from './ResetCredits.vue'
 const props = defineProps<{
   account: AccountRow
   refreshing: boolean
+  subscriptionState?: SubscriptionState
+  saving: boolean
 }>()
 
 const emit = defineEmits<{
   refreshQuota: [accountId: string]
   quotaReset: [accountId: string]
+  expiryPriorityChange: [value: boolean]
 }>()
 
 const quotaEntries = computed(() => groupedAccountQuotaWindows(
   orderedPanelQuotaWindows(props.account.quota.windows),
 ))
 const profileOpen = shallowRef(false)
+const expiresAt = computed(() => props.subscriptionState?.subscription?.expiresAt ?? props.account.lifecycle.subscriptionExpiresAt)
+const canPrioritize = computed(() => !props.account.lifecycle.archived && props.account.planType?.toLowerCase() === 'plus')
 </script>
 
 <template>
@@ -39,10 +46,6 @@ const profileOpen = shallowRef(false)
           class="m-0 mt-1 flex min-w-0 items-center gap-1.5 text-cp-xs font-emphasis text-cp-text-secondary"
         >
           <span>{{ account.provider === 'xai' ? 'xAI 用量窗口' : 'Codex 额度' }}</span>
-          <template v-if="account.provider === 'openai' && account.authenticationKind === 'oauth'">
-            <span>·</span>
-            <AccountPlanBadge :plan-type="account.planType" :plan-type-display="account.planTypeDisplay" size="sm" />
-          </template>
           <span>·</span>
           <span>最近刷新: {{ account.quota.refreshedAtDisplay }}</span>
         </p>
@@ -92,6 +95,22 @@ const profileOpen = shallowRef(false)
       <p v-if="quotaEntries.length === 0" class="m-0 text-cp-sm font-emphasis text-cp-text-secondary">
         额度待观测
       </p>
+    </div>
+    <div
+      v-if="account.provider === 'openai' && account.authenticationKind === 'oauth' && (expiresAt || canPrioritize)"
+      class="mt-5 grid gap-3 text-cp-xs text-cp-text-secondary"
+    >
+      <div v-if="expiresAt" class="flex flex-wrap items-baseline gap-x-3 gap-y-1" :title="subscriptionState?.failed ? '更新失败，显示上次数据' : undefined">
+        <span>订阅到期</span>
+        <time :datetime="expiresAt">{{ formatDateTime(expiresAt) }}</time>
+        <span v-if="subscriptionState?.subscription?.willRenew != null">{{ subscriptionState.subscription.willRenew ? '自动续费' : '不自动续费' }}</span>
+      </div>
+      <BaseCheckbox
+        v-if="canPrioritize"
+        :model-value="account.lifecycle.expiryPriority" :disabled="saving" label="临期优先" show-label
+        title="订阅到期前 5 天自动提高到 100；续费后恢复基础权重"
+        @update:model-value="emit('expiryPriorityChange', $event)"
+      />
     </div>
   </section>
 

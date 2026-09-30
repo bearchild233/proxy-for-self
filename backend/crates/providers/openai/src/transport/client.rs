@@ -81,7 +81,7 @@ pub fn build_account_http_client(
         .http2_keep_alive_while_idle(true);
     if let Some(proxy) = proxy {
         builder = builder.proxy(
-            reqwest::Proxy::all(proxy.expose_url())
+            reqwest::Proxy::all(proxy.transport_url())
                 .map_err(|_| CustomCaError::ProxyConfiguration)?,
         );
     }

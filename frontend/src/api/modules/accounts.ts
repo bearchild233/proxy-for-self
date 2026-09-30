@@ -139,6 +139,15 @@ export interface Account {
   enabled: boolean
   concurrencyLimit: number | null
   weight: number
+  effectiveWeight: number
+  lifecycle: {
+    expiryPriority: boolean
+    archived: boolean
+    archiveReason: string | null
+    archivedAt: string | null
+    subscriptionExpiresAt: string | null
+    subscriptionObservedAt: string | null
+  }
   modelAccess: AccountModelAccess
   accessTokenExpiresAt: string | null
   accessTokenExpiresAtDisplay: string | null
@@ -353,6 +362,7 @@ export interface AccountOAuthStartResponse {
 
 // 请求参数类型：仅定义 API 边界的形状，调用方不依赖显式声明。
 interface AccountListParams {
+  archived?: boolean
   page: number
   pageSize: number
   search?: string
@@ -386,6 +396,8 @@ interface AccountUpdateParam {
 }
 
 interface AccountBatchUpdateParam {
+  expiryPriority?: boolean
+  restoreArchived?: boolean
   outboundProxyUrl?: string
   outboundProxyId?: string
   accountIds: string[]

@@ -15,6 +15,15 @@ use super::{
 /// `provider_accounts` 的数据库中立端口。
 #[async_trait]
 pub trait ProviderAccountStore: Send + Sync {
+    /// 只写入同一凭据版本的生命周期事实，避免旧刷新覆盖重新授权。
+    async fn compare_and_swap_lifecycle(
+        &self,
+        _account: &ProviderAccount,
+        _lifecycle: super::AccountLifecycle,
+    ) -> Result<bool, StoreError> {
+        Err(StoreError::new(crate::error::StoreErrorKind::Unavailable))
+    }
+
     async fn create_account(&self, account: NewProviderAccount) -> Result<(), StoreError>;
 
     async fn get_account(

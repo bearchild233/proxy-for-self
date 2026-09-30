@@ -48,6 +48,7 @@ pub(super) fn proxy_selection(
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ListQuery {
+    pub archived: Option<bool>,
     pub page: Option<u32>,
     pub page_size: Option<u32>,
     pub provider: Option<String>,
@@ -61,6 +62,9 @@ pub struct ListQuery {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BatchUpdateAccountsRequest {
+    pub expiry_priority: Option<bool>,
+    #[serde(default)]
+    pub restore_archived: bool,
     pub outbound_proxy_id: Option<String>,
     pub outbound_proxy_url: Option<AccountProxyUpdate>,
     pub account_ids: Vec<String>,
@@ -117,7 +121,9 @@ impl BatchUpdateAccountsRequest {
             .map(parse_concurrency_limit)
             .transpose()?;
         self.weight.map(parse_account_weight).transpose()?;
-        if self.enabled.is_none()
+        if self.expiry_priority.is_none()
+            && !self.restore_archived
+            && self.enabled.is_none()
             && self.concurrency_limit.is_none()
             && self.weight.is_none()
             && self.group_ids.is_none()
@@ -133,6 +139,8 @@ impl BatchUpdateAccountsRequest {
     pub(super) fn into_command(self) -> Result<BatchUpdateAccounts, WireValidationError> {
         self.validate()?;
         Ok(BatchUpdateAccounts {
+            expiry_priority: self.expiry_priority,
+            restore_archived: self.restore_archived,
             outbound_proxy: proxy_selection(self.outbound_proxy_id, self.outbound_proxy_url)?,
             account_ids: self.account_ids,
             enabled: self.enabled,
@@ -197,6 +205,7 @@ impl ListQuery {
             _ => return Err(WireValidationError::new("sort")),
         };
         Ok(AccountListQuery {
+            archived: self.archived.unwrap_or(false),
             page,
             page_size: PageSize::new(
                 u16::try_from(page_size).map_err(|_| WireValidationError::new("pageSize"))?,
@@ -290,6 +299,8 @@ pub struct AccountView {
     pub enabled: bool,
     pub concurrency_limit: Option<u32>,
     pub weight: u16,
+    pub effective_weight: u16,
+    pub lifecycle: gateway_core::account::AccountLifecycle,
     pub model_access: gateway_core::account::AccountModelAccess,
     pub access_token_expires_at: Option<String>,
     pub access_token_expires_at_display: Option<String>,

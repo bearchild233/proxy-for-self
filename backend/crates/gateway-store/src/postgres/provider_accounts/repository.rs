@@ -111,7 +111,7 @@ impl ProviderAccountRepository for PgProviderAccountRepository {
         let rows = sqlx::query(
             "select location_country, location_region, location_city, location_timezone, outbound_proxy_url, id, provider_kind, name, notes, email, upstream_user_id,
                     upstream_account_id, plan_type, authentication_kind, credential_revision, has_refresh_token,
-                    access_token_expires_at, next_refresh_at, enabled, concurrency_limit, weight, model_access_json, credential_state,
+                    access_token_expires_at, next_refresh_at, enabled, concurrency_limit, weight, lifecycle_json, model_access_json, credential_state,
                     credential_observed_at, quota_access_state, quota_evidence,
                     quota_access_observed_at, quota_reset_at,
                     quota_observed_at, last_error_reason, last_error_message, created_at, updated_at
@@ -291,7 +291,7 @@ impl ProviderAccountRepository for PgProviderAccountRepository {
     async fn set_provider_account_enabled(&self, id: &str, enabled: bool) -> StoreResult<bool> {
         require_nonempty(ENTITY, "id", id)?;
         let result = sqlx::query(
-            "update provider_accounts set enabled = $2, updated_at = greatest(now(), updated_at) where id = $1",
+            "update provider_accounts set enabled = $2 and coalesce(lifecycle_json->>'archived', 'false') <> 'true', updated_at = greatest(now(), updated_at) where id = $1",
         )
         .bind(id)
         .bind(enabled)
@@ -646,6 +646,31 @@ impl ProviderAccountAdminRepository for PgProviderAccountRepository {
                 command.outbound_proxy.as_ref(),
             )
             .await?;
+            if command.expiry_priority == Some(true) {
+                let valid: i64 = sqlx::query_scalar("select count(*) from provider_accounts where id=any($1)
+                    and provider_kind='openai' and authentication_kind='oauth' and lower(plan_type)='plus'")
+                    .bind(&command.account_ids).fetch_one(&mut *transaction).await
+                    .map_err(|_| postgres_unavailable("validate expiry priority"))?;
+                if usize::try_from(valid).ok() != Some(command.account_ids.len()) {
+                    return Err(StoreError::InvalidData { entity: "provider account", message: "expiry priority requires Plus accounts".to_owned() });
+                }
+            }
+            if let Some(priority) = command.expiry_priority {
+                sqlx::query("update provider_accounts set lifecycle_json=jsonb_set(lifecycle_json, '{expiryPriority}', to_jsonb($2::boolean)) where id=any($1)")
+                    .bind(&command.account_ids).bind(priority).execute(&mut *transaction).await
+                    .map_err(|_| postgres_unavailable("set expiry priority"))?;
+            }
+            // 保留上次归档时间：恢复后停用期间不被维护任务立即重新归档。
+            if command.restore_archived {
+                sqlx::query("update provider_accounts set enabled=false,
+                    lifecycle_json=lifecycle_json || '{\"archived\":false,\"archiveReason\":null}'::jsonb
+                    where id=any($1) and lifecycle_json->>'archived'='true'")
+                    .bind(&command.account_ids).execute(&mut *transaction).await
+                    .map_err(|_| postgres_unavailable("restore archived accounts"))?;
+            }
+            sqlx::query("update provider_accounts set enabled=false where id=any($1) and lifecycle_json->>'archived'='true'")
+                .bind(&command.account_ids).execute(&mut *transaction).await
+                .map_err(|_| postgres_unavailable("preserve archived state"))?;
             if let Some(group_ids) = &command.group_ids {
                 replace_account_group_assignments_in_transaction(
                     &mut transaction,
@@ -692,7 +717,7 @@ impl ProviderAccountAdminRepository for PgProviderAccountRepository {
             let revision = bump_config_revision_in_transaction(&mut transaction).await?;
             let recovered = sqlx::query_scalar::<_, String>(
                 "update provider_accounts
-                 set enabled = true,
+                 set enabled = coalesce(lifecycle_json->>'archived', 'false') <> 'true',
                      credential_state = case when credential_state = 'unknown' then 'unknown' else 'ready' end,
                      credential_observed_at = now(),
                      access_token_expires_at = case
@@ -860,7 +885,7 @@ pub(crate) async fn upsert_provider_account_in_transaction(
            has_refresh_token = excluded.has_refresh_token,
            access_token_expires_at = excluded.access_token_expires_at,
            next_refresh_at = excluded.next_refresh_at,
-           enabled = excluded.enabled,
+           enabled = excluded.enabled and coalesce(provider_accounts.lifecycle_json->>'archived', 'false') <> 'true',
            credential_state = excluded.credential_state,
            provider_quota_json = null,
            quota_access_state = 'unknown',
@@ -942,6 +967,8 @@ pub(crate) async fn rotate_provider_account_in_transaction(
              next_refresh_at = $10,
              upstream_user_id = case when $11::boolean then $12::text else upstream_user_id end,
              upstream_account_id = case when $11::boolean then $13::text else upstream_account_id end,
+             lifecycle_json = case when $11::boolean and upstream_account_id is distinct from $13::text
+                 then lifecycle_json - 'subscriptionExpiresAt' - 'subscriptionObservedAt' else lifecycle_json end,
              credential_state = case
                  when not enabled then credential_state
                  when $11::boolean or credential_state <> 'unknown' then 'ready'
@@ -1013,7 +1040,7 @@ pub(crate) async fn update_provider_accounts_scheduling_in_transaction(
     };
     let updated = sqlx::query_scalar::<_, String>(
         "update provider_accounts
-         set enabled = coalesce($2, enabled), concurrency_limit = case when $9 then $3 else concurrency_limit end, weight = coalesce($4, weight), updated_at = greatest(now(), updated_at),
+         set enabled = coalesce($2, enabled) and coalesce(lifecycle_json->>'archived', 'false') <> 'true', concurrency_limit = case when $9 then $3 else concurrency_limit end, weight = coalesce($4, weight), updated_at = greatest(now(), updated_at),
              outbound_proxy_url = case when $5 then $6 else outbound_proxy_url end,
              outbound_proxy_id = case when $5 then $7 else outbound_proxy_id end,
              model_access_json = coalesce($8, model_access_json)

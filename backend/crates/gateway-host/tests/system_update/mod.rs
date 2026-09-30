@@ -1,4 +1,5 @@
 use std::fs;
+mod managed;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1575,6 +1576,7 @@ impl Fixture {
             update_lock_file: self.lock(),
             update_temp_dir: self.root.path().join("tmp"),
             self_restart_enabled: false,
+            managed_socket: None,
         }
     }
 

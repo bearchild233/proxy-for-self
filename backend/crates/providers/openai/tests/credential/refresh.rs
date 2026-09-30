@@ -723,3 +723,68 @@ async fn scheduled_refresh_respects_retry_not_before_until_it_has_elapsed() {
     ));
     assert_eq!(refresher.calls(), 1);
 }
+
+#[tokio::test]
+async fn lifecycle_recovers_rejected_unexpired_tokens_and_archives_only_terminal_failure() {
+    for (invalid, subscription_status) in [(true, 401), (false, 401), (true, 403), (false, 403)] {
+        let store = Arc::new(MemoryAccountStore::default());
+        let server = MockServer::start().await;
+        let account_id = "acct_rejected_lifecycle";
+        seed_refreshable_account(
+            &store,
+            account_id,
+            SystemTime::now() + Duration::from_secs(86400),
+            None,
+        )
+        .await;
+        Mock::given(path("/backend-api/subscriptions"))
+            .respond_with(ResponseTemplate::new(subscription_status))
+            .expect(1)
+            .mount(&server)
+            .await;
+        if subscription_status == 403 {
+            Mock::given(path("/api/codex/usage"))
+                .respond_with(ResponseTemplate::new(401))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let refresh = Arc::new(CodexCredentialRefreshService::new(
+            store.repository(),
+            Arc::new(FailingRefresher {
+                failure: if invalid {
+                    RefreshFailure::InvalidGrant {
+                        message: None,
+                        upstream: None,
+                    }
+                } else {
+                    RefreshFailure::Transport {
+                        message: None,
+                        upstream: None,
+                    }
+                },
+            }),
+            Arc::new(RefreshLeases),
+            Arc::new(RefreshCredentialState),
+            MutableRuntimePolicy::new(Duration::from_secs(300)),
+        ));
+        let service = provider_openai::credential::CodexCredentialProfileService::new(
+            store.repository(),
+            super::profile_statistics::wire_profile(),
+            reqwest::Client::new(),
+            server.uri(),
+        )
+        .with_refresher(refresh);
+        service.maintain_lifecycle().await.unwrap();
+        service.maintain_lifecycle().await.unwrap();
+        let account = store.account(account_id).unwrap();
+        assert_eq!(account.lifecycle().archived, invalid);
+        assert_eq!(account.enabled(), !invalid);
+        if invalid {
+            assert_eq!(
+                account.last_error_reason(),
+                Some(AccountErrorReason::CredentialExpired)
+            );
+        }
+    }
+}

@@ -3,6 +3,8 @@
 mod error;
 mod location;
 pub use location::{InvalidRequestLocation, RequestLocation};
+mod lifecycle;
+pub use lifecycle::AccountLifecycle;
 mod model;
 mod model_access;
 pub use model_access::{

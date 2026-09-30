@@ -98,6 +98,37 @@ async fn seed_account(store: &Arc<MemoryAccountStore>, account_id: &str) -> Prov
     seed_account_with_plan(store, account_id, "pro").await
 }
 
+#[tokio::test]
+async fn catalog_refresh_uses_bound_proxy_and_never_falls_back_to_direct() {
+    let direct = MockServer::start().await;
+    let proxy = MockServer::start().await;
+    let store = Arc::new(MemoryAccountStore::default());
+    let account = seed_account(&store, "acct_proxy_catalog").await;
+    store.set_egress(
+        "acct_proxy_catalog",
+        Some(gateway_core::account::OutboundProxy::parse(&proxy.uri()).unwrap()),
+        None,
+    );
+    Mock::given(path("/codex/models"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(OFFICIAL_FIXTURE.to_vec(), "application/json"),
+        )
+        .expect(1)
+        .mount(&proxy)
+        .await;
+    let service = service_with_catalog_cache(&store, direct.uri(), catalog_cache());
+    service.refresh_account_catalog(account.id()).await.unwrap();
+    proxy.verify().await;
+    proxy.reset().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(407))
+        .expect(1)
+        .mount(&proxy)
+        .await;
+    assert!(service.refresh_account_catalog(account.id()).await.is_err());
+    assert!(direct.received_requests().await.unwrap().is_empty());
+}
+
 async fn seed_account_with_plan(
     store: &Arc<MemoryAccountStore>,
     account_id: &str,

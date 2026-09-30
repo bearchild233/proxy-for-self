@@ -245,7 +245,11 @@ def main():
     os.umask(0o077)
     import uvicorn
     binding = {"fd": args.fd} if args.fd is not None else {"uds": str(socket_path)}
-    uvicorn.run(HubWorker(max_concurrency=args.max_concurrency, idle_timeout=args.idle_timeout), **binding,
+    app = HubWorker(max_concurrency=args.max_concurrency, idle_timeout=args.idle_timeout)
+    if state_file := os.environ.get("EXCEL_PLUGIN_STATE_FILE"):
+        from .plugin_gate import PluginGate
+        app = PluginGate(app, state_file)
+    uvicorn.run(app, **binding,
                 access_log=False, log_level="warning", server_header=False,
                 timeout_keep_alive=5, limit_concurrency=args.max_concurrency + 4)
 

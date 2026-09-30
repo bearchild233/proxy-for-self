@@ -508,7 +508,6 @@ async fn codex_backend_client_stream_should_keep_reused_socket_after_structural_
         )
         .await
         .expect("seed response should populate pool");
-    tokio::time::pause();
     let response = backend
         .create_response_stream(
             &request,
@@ -1230,17 +1229,19 @@ async fn websocket_pool_should_replace_idle_connection_after_pong_deadline() {
     tokio::time::pause();
     tokio::time::advance(PING_INTERVAL).await;
     tokio::task::yield_now().await;
+    tokio::time::resume();
     ping_seen_rx
         .await
         .expect("server should report the keepalive ping");
+    tokio::time::pause();
     tokio::time::advance(PONG_TIMEOUT + Duration::from_secs(1)).await;
     tokio::task::yield_now().await;
     tokio::task::yield_now().await;
+    tokio::time::resume();
     inspect_close_tx.send(()).unwrap();
     pong_timeout_closed_rx
         .await
         .expect("server should report the Pong-timeout close");
-    tokio::time::resume();
     let mut continuation = request.clone();
     continuation.set_previous_response_id(Some("resp_no_pong_first".to_owned()));
     continuation.previous_response_scope = Some(PreviousResponseScope::ConnectionLocal);
@@ -1557,6 +1558,7 @@ async fn codex_backend_client_should_keep_idle_pooled_websocket_alive_across_rep
 async fn codex_backend_client_should_treat_active_business_frames_as_ping_liveness() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let mut websocket = accept_codex_test_websocket(stream).await;
@@ -1582,6 +1584,8 @@ async fn codex_backend_client_should_treat_active_business_frames_as_ping_livene
             ))
             .await
             .unwrap();
+        // 等客户端收到 terminal 再关闭，单独验证业务帧可替代 Pong 的存活语义。
+        completed_rx.await.unwrap();
         websocket.close(None).await.unwrap();
     });
     let pool = Arc::new(CodexWebSocketPool::with_config(CodexWebSocketPoolConfig {
@@ -1604,7 +1608,10 @@ async fn codex_backend_client_should_treat_active_business_frames_as_ping_livene
             request_context("req_active_without_pong", Some("chatgpt-account")),
         )
         .await
-        .expect("active business frames should satisfy the Ping liveness probe");
+        .unwrap_or_else(|error| {
+            panic!("active business frames should satisfy the Ping liveness probe: {error}")
+        });
+    completed_tx.send(()).unwrap();
     server.await.unwrap();
 
     assert!(response.body.contains("active-0;"));
@@ -1901,11 +1908,11 @@ async fn codex_backend_client_should_close_idle_pooled_websocket_after_liveness_
     tokio::time::pause();
     tokio::time::advance(LIVENESS_TIMEOUT).await;
     tokio::task::yield_now().await;
+    tokio::time::resume();
     liveness_closed_rx
         .await
         .expect("liveness watchdog should close the idle connection");
     pool.maintain_idle_connections().await;
-    tokio::time::resume();
     let second = backend
         .create_response(
             &request,

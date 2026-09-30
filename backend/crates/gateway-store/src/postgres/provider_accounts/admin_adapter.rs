@@ -715,6 +715,8 @@ impl AccountStore for PgAdminAccountStore {
         let config_revision = self
             .accounts
             .batch_update_provider_accounts_admin(BatchUpdateProviderAccountsAdmin {
+                expiry_priority: None,
+                restore_archived: false,
                 name: command.name,
                 account_ids: vec![command.account_id.clone()],
                 notes: command.notes,
@@ -868,6 +870,8 @@ impl AccountStore for PgAdminAccountStore {
             (command.enabled.is_some(), "enabled"),
             (command.concurrency_limit.is_some(), "concurrency_limit"),
             (command.weight.is_some(), "weight"),
+            (command.expiry_priority.is_some(), "expiry_priority"),
+            (command.restore_archived, "restore_archived"),
             (command.group_ids.is_some(), "groups"),
         ] {
             if changed {
@@ -883,6 +887,8 @@ impl AccountStore for PgAdminAccountStore {
         let config_revision = self
             .accounts
             .batch_update_provider_accounts_admin(BatchUpdateProviderAccountsAdmin {
+                expiry_priority: command.expiry_priority,
+                restore_archived: command.restore_archived,
                 name: None,
                 account_ids: command.account_ids,
                 notes: None,

@@ -1,0 +1,11 @@
+# 测试与构建工具固定版本；运行时依赖统一来自 requirements.lock。
+-r requirements.lock
+setuptools==80.9.0
+wheel==0.45.1
+pytest==9.1.1
+iniconfig==2.3.0
+packaging==26.3
+pluggy==1.6.0
+pygments==2.21.0
+tomli==2.4.1; python_version < "3.11"
+colorama==0.4.6; sys_platform == "win32"

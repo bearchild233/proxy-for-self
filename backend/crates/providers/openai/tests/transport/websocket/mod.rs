@@ -1438,6 +1438,7 @@ async fn websocket_execute_response_create_request_should_return_error_terminal_
 
 #[tokio::test(start_paused = true)]
 async fn codex_backend_client_should_timeout_when_upstream_is_silent() {
+    tokio::time::resume();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
@@ -1447,6 +1448,9 @@ async fn codex_backend_client_should_timeout_when_upstream_is_silent() {
             let mut websocket = accept_codex_test_websocket(stream).await;
             let _message = websocket.next().await.unwrap().unwrap();
             websockets.push(websocket);
+            if websockets.len() == 1 {
+                tokio::time::pause();
+            }
         }
         futures::future::pending::<()>().await;
     });
@@ -1516,6 +1520,8 @@ async fn websocket_stream_should_allow_silence_below_idle_timeout() {
     tokio::task::yield_now().await;
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(30)).await;
+    tokio::task::yield_now().await;
+    tokio::time::resume();
     let response = response_task
         .await
         .expect("websocket task should finish")
@@ -1668,10 +1674,12 @@ async fn codex_backend_client_stream_should_reject_binary_websocket_event() {
 
 #[tokio::test(start_paused = true)]
 async fn codex_backend_client_stream_should_keep_socket_after_structural_activity() {
+    tokio::time::resume();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let accepted_connections = Arc::new(AtomicUsize::new(0));
     let accepted_connections_for_server = Arc::clone(&accepted_connections);
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
         let (first_stream, _) = listener.accept().await.unwrap();
         accepted_connections_for_server.fetch_add(1, Ordering::SeqCst);
@@ -1692,7 +1700,7 @@ async fn codex_backend_client_stream_should_keep_socket_after_structural_activit
             .await
             .unwrap();
 
-        tokio::time::sleep(Duration::from_secs(30)).await;
+        release_rx.await.unwrap();
         first_websocket
             .send(Message::Text(
                 json!({
@@ -1728,7 +1736,13 @@ async fn codex_backend_client_stream_should_keep_socket_after_structural_activit
         .expect("structural activity should keep the websocket stream open");
     let decision = response.websocket_pool_decision;
     let mut stream = response.body;
-    let mut body = String::new();
+    let first = stream.next().await.unwrap().unwrap();
+    let mut body = std::str::from_utf8(&first).unwrap().to_owned();
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(30)).await;
+    tokio::task::yield_now().await;
+    tokio::time::resume();
+    release_tx.send(()).unwrap();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.expect("delayed websocket stream chunk should be valid");
         body.push_str(std::str::from_utf8(&chunk).unwrap());
@@ -2006,6 +2020,7 @@ async fn codex_backend_client_stream_should_cancel_while_inbound_is_backpressure
 
 #[tokio::test(start_paused = true)]
 async fn codex_backend_client_stream_should_wait_for_terminal_after_active_websocket_gap() {
+    tokio::time::resume();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
@@ -2056,8 +2071,10 @@ async fn codex_backend_client_stream_should_wait_for_terminal_after_active_webso
         .expect("stream should yield partial frame")
         .expect("partial frame should be valid");
     assert!(std::str::from_utf8(&first).unwrap().contains("partial"));
+    tokio::time::pause();
     tokio::time::advance(Duration::from_secs(30)).await;
     tokio::task::yield_now().await;
+    tokio::time::resume();
     let terminal = response
         .body
         .next()
@@ -2075,6 +2092,7 @@ async fn codex_backend_client_stream_should_wait_for_terminal_after_active_webso
 
 #[tokio::test(start_paused = true)]
 async fn codex_backend_client_stream_should_timeout_when_active_websocket_stalls() {
+    tokio::time::resume();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
@@ -2118,8 +2136,10 @@ async fn codex_backend_client_stream_should_timeout_when_active_websocket_stalls
         .expect("stream should yield partial frame")
         .expect("partial frame should be valid");
     assert!(std::str::from_utf8(&first).unwrap().contains("partial"));
+    tokio::time::pause();
     tokio::time::advance(Duration::from_secs(5 * 60)).await;
     tokio::task::yield_now().await;
+    tokio::time::resume();
     let error = response
         .body
         .next()

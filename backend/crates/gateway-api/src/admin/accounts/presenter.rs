@@ -76,7 +76,19 @@ pub(super) fn account_view(item: AccountDirectoryItem, now: DateTime<Utc>) -> Ac
         usage.window_label_display = "通用额度".to_owned();
     }
     let (quota, refresh_token_expires_at) = account_quota_view(quota, cooldown, now);
+    let is_plus = account.provider_kind.as_str() == "openai"
+        && account.authentication_kind == "oauth"
+        && account
+            .plan_type
+            .as_deref()
+            .is_some_and(|plan| plan.eq_ignore_ascii_case("plus"));
+    let effective_weight = account
+        .lifecycle
+        .effective_weight(account.weight, is_plus, now)
+        .get();
     AccountView {
+        lifecycle: account.lifecycle,
+        effective_weight,
         id: account.id.clone(),
         name: account.name,
         notes: account.notes,

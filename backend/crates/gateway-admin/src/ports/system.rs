@@ -2,6 +2,7 @@
 
 use std::pin::Pin;
 
+use crate::model::system::{PluginAction, PluginStatus};
 use async_trait::async_trait;
 use futures::Stream;
 
@@ -54,6 +55,20 @@ pub type SystemUpdateEventStream = Pin<Box<dyn Stream<Item = SystemUpdateEvent> 
 /// 版本、自更新、回滚和重启能力；实现唯一归 gateway-host。
 #[async_trait]
 pub trait SystemOperations: Send + Sync {
+    async fn plugins(&self) -> Result<Vec<PluginStatus>, SystemOperationError> {
+        Ok(Vec::new())
+    }
+    async fn plugin_action(
+        &self,
+        _id: String,
+        _action: PluginAction,
+    ) -> Result<String, SystemOperationError> {
+        Err(SystemOperationError::new(
+            SystemOperationErrorKind::Conflict,
+            "插件管理未配置",
+        ))
+    }
+
     async fn version(&self) -> Result<SystemVersion, SystemOperationError>;
 
     async fn update_detail(

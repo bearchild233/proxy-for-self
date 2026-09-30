@@ -1,3 +1,4 @@
+mod lifecycle;
 mod location;
 mod model_access;
 mod proxy;

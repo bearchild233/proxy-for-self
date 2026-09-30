@@ -321,7 +321,7 @@ impl OpenAiTokenClient {
         };
         let builder = Client::builder()
             .no_proxy()
-            .proxy(reqwest::Proxy::all(proxy.expose_url()).map_err(|_| TokenClientBuildError)?)
+            .proxy(reqwest::Proxy::all(proxy.transport_url()).map_err(|_| TokenClientBuildError)?)
             .redirect(Policy::none())
             .connect_timeout(TOKEN_CONNECT_TIMEOUT)
             .timeout(TOKEN_REQUEST_TIMEOUT);

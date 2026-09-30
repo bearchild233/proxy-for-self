@@ -82,16 +82,16 @@ impl Default for CodexWireProfile {
         Self {
             client_kind: ClientKind::Desktop,
             originator: "Codex Desktop".to_owned(),
-            codex_version: "0.153.4".to_owned(),
-            desktop_version: "26.901.51231".to_owned(),
-            desktop_build: "8109".to_owned(),
+            codex_version: "0.159.0".to_owned(),
+            desktop_version: "26.928.20755".to_owned(),
+            desktop_build: "12246".to_owned(),
             os_type: "Mac OS".to_owned(),
             os_version: "15.7.1".to_owned(),
             arch: "arm64".to_owned(),
             terminal: "unknown".to_owned(),
             residency: None,
-            // 制品核验于 2026-09-06T03:26:12.084Z；进程启动不构成重新核验。
-            verified_at: DateTime::UNIX_EPOCH + chrono::Duration::milliseconds(1_788_665_172_084),
+            // 2026-09-30 核验官方 macOS 制品内的签名 Core；进程启动不构成重新核验。
+            verified_at: DateTime::UNIX_EPOCH + chrono::Duration::milliseconds(1790739958221),
         }
     }
 }

@@ -106,3 +106,21 @@ export function getSystemUpdateStatus(options: RequestOptions = {}) {
     ...options,
   })
 }
+
+export type PluginAction = 'install' | 'enable' | 'disable' | 'uninstall' | 'update'
+export interface PluginStatus {
+  id: string
+  name: string
+  protocol: number
+  installed: boolean
+  enabled: boolean
+  version: string | null
+  availableVersion: string
+  operation: { id?: string, action?: PluginAction, status: string, message?: string }
+}
+export function getPlugins(options: RequestOptions = {}) {
+  return request<PluginStatus[]>({ url: '/api/admin/system/plugins', method: 'GET', ...options })
+}
+export function performPluginAction(id: string, action: PluginAction) {
+  return request<{ operationId: string }>({ url: '/api/admin/system/plugins/action', method: 'POST', data: { id, action } })
+}

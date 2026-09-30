@@ -3,3 +3,4 @@ mod config;
 mod postgres;
 mod redis;
 mod support;
+mod vault;

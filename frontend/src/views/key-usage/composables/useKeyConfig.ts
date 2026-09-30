@@ -43,5 +43,5 @@ export function useKeyConfig() {
     configKey.value = null
   })
 
-  return { showConfig, configKey, configuring: request.loading, apiBaseUrl, openConfig, copyConfig }
+  return { showConfig, configKey, configError: request.error, configuring: request.loading, apiBaseUrl, openConfig, copyConfig }
 }

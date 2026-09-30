@@ -673,6 +673,15 @@ impl CodexResponsesRequest {
         self.body.get("prompt_cache_key").and_then(Value::as_str)
     }
 
+    /// OAuth Codex 缺省会话头的补齐值；发送与诊断使用同一校验。
+    pub(crate) fn cache_session_id(&self) -> Option<&str> {
+        self.prompt_cache_key().filter(|key| {
+            !key.is_empty()
+                && key.len() <= 1024
+                && reqwest::header::HeaderValue::from_str(key).is_ok()
+        })
+    }
+
     /// client metadata（透传原值）。
     pub fn client_metadata(&self) -> Option<&Value> {
         self.body.get("client_metadata")

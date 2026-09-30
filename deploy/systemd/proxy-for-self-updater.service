@@ -1,0 +1,27 @@
+[Unit]
+Description=proxy-for-self independent release updater
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=api-hub
+ExecStart=/usr/bin/python3 -I /opt/proxy-for-self-updater/updater.py --config /etc/proxy-for-self/updater.json
+Restart=on-failure
+RestartSec=5
+RuntimeDirectory=proxy-for-self-updater
+RuntimeDirectoryMode=0750
+StateDirectory=proxy-for-self-updater
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/opt/api-hub /var/lib/proxy-for-self-updater /run/proxy-for-self-updater /root/backups -/opt/proxy-for-self-plugins /etc/systemd/system
+MemoryMax=192M
+TasksMax=32
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

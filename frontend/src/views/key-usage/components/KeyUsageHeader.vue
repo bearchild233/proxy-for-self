@@ -50,7 +50,7 @@ async function logout() {
         </BaseIconButton>
         <BaseButton variant="secondary" :loading="configuring" @click="$emit('configure')">
           <Terminal class="size-4" />
-          密钥配置
+          导入配置
         </BaseButton>
         <BaseSelect v-model="period" aria-label="统计时间范围" class="w-29" :options="[{ label: '今天', value: 'today' }, { label: '近 7 天', value: '7d' }, { label: '近 30 天', value: '30d' }]" />
         <BaseSelect v-model="refreshInterval" aria-label="自动刷新频率" class="w-30" :options="[{ label: '30 秒刷新', value: '30' }, { label: '60 秒刷新', value: '60' }, { label: '暂停刷新', value: '0' }]" />

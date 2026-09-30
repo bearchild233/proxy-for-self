@@ -48,10 +48,12 @@ export interface BaseTableProps<Row extends TableRow> {
   rowKey?: string | ((row: Row, index: number) => string | number)
   selectedRowKeys?: Array<string | number>
   expandedRowKeys?: Array<string | number>
+  scrollToExpanded?: boolean
   density?: 'compact' | 'default'
   loading?: boolean
   emptyText?: string
   showHeaderWhenEmpty?: boolean
+  horizontalControls?: boolean
   scrollbarAlwaysVisible?: boolean
   sort?: BaseTableSort
 }

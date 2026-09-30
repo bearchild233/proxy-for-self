@@ -701,7 +701,7 @@ fn build_official_client(
         // 保留 reqwest 的代理解析语义（socks5 本地解析、socks5h 远端解析）；
         // 只允许官方 host 的直连 resolver 不能用于解析代理端点。
         builder = builder.proxy(
-            reqwest::Proxy::all(proxy.expose_url())
+            reqwest::Proxy::all(proxy.transport_url())
                 .map_err(|_| GrokReqwestTransportBuildError::ClientInitialization)?,
         );
     } else {

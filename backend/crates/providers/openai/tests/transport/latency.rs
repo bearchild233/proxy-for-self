@@ -117,6 +117,7 @@ async fn cold_websocket_should_fall_back_without_recording_a_successful_connect(
 
 #[tokio::test(start_paused = true)]
 async fn downstream_websocket_new_chain_should_preserve_continuation_after_slow_opening() {
+    tokio::time::resume();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
@@ -190,6 +191,7 @@ async fn downstream_websocket_new_chain_should_preserve_continuation_after_slow_
 
 #[tokio::test(start_paused = true)]
 async fn external_continuation_should_wait_for_a_cold_websocket() {
+    tokio::time::resume();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
@@ -227,6 +229,7 @@ async fn external_continuation_should_wait_for_a_cold_websocket() {
 
 #[tokio::test(start_paused = true)]
 async fn timed_out_websocket_should_finish_in_background_and_serve_the_next_request() {
+    tokio::time::resume();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (websocket_ready_tx, websocket_ready_rx) = tokio::sync::oneshot::channel();

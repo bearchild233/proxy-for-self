@@ -1,8 +1,10 @@
 <script setup lang="ts">
+import type { Account } from '@/api'
 import { ChevronDown, RefreshCw } from '@lucide/vue'
 import { ref } from 'vue'
-
+import { batchUpdateAccounts } from '@/api'
 import AccountGroupMarks from '@/components/AccountGroupMarks.vue'
+
 import BaseButton from '@/components/base/BaseButton.vue'
 import BaseCard from '@/components/base/BaseCard.vue'
 import BaseCheckbox from '@/components/base/BaseCheckbox.vue'
@@ -12,8 +14,8 @@ import BaseTableColumnSettings from '@/components/base/BaseTable/BaseTableColumn
 import BaseTablePagination from '@/components/base/BaseTable/BaseTablePagination.vue'
 import BaseTable from '@/components/base/BaseTable/index.vue'
 import { useTableColumns } from '@/components/base/BaseTable/useTableColumns'
+import { toast } from '@/components/base/BaseToast'
 import LastUsedAtCell from '@/components/LastUsedAtCell.vue'
-import ProviderIconGroup from '@/components/ProviderIconGroup.vue'
 import { useAccountGroupCatalog } from '@/composables/useAccountGroupCatalog'
 import { useSharedOrder } from '@/composables/useSharedOrder'
 import AccountBatchEditModal from './components/AccountBatchEditModal.vue'
@@ -24,7 +26,6 @@ import AccountFilters from './components/AccountFilters.vue'
 import AccountIdentityCell from './components/AccountIdentityCell.vue'
 import AccountImportTasks from './components/AccountImportTasks/index.vue'
 import AccountOverviewCards from './components/AccountOverviewCards.vue'
-import AccountPlanBadge from './components/AccountPlanBadge.vue'
 import AccountQuotaPanel from './components/AccountQuotaPanel/index.vue'
 import AccountQuotaSummaryCell from './components/AccountQuotaSummaryCell/index.vue'
 import AccountStatusBadge from './components/AccountStatusBadge/index.vue'
@@ -56,6 +57,7 @@ const {
   providerQuery,
   statusQuery,
   groupQuery,
+  archivedQuery,
   attentionQuery,
   attentionNote,
   sort,
@@ -204,6 +206,16 @@ const {
   reloadGroups: loadGroups,
 })
 const { savingOrder, saveOrder } = useSharedOrder('accounts', loadAccounts)
+const lifecycleSaving = ref(new Set<string>())
+async function updateLifecycle(account: Account, changes: { expiryPriority?: boolean, restoreArchived?: boolean }) {
+  lifecycleSaving.value.add(account.id)
+  try {
+    await batchUpdateAccounts({ accountIds: [account.id], ...changes })
+    toast.success(changes.restoreArchived ? '已恢复到主列表，重新授权后可启用' : '临期优先已保存')
+    await loadAccounts()
+  }
+  finally { lifecycleSaving.value.delete(account.id) }
+}
 </script>
 
 <template>
@@ -251,6 +263,12 @@ const { savingOrder, saveOrder } = useSharedOrder('accounts', loadAccounts)
           @edit-selected="openBatchEdit"
         >
           <template #actions>
+            <BaseButton size="sm" :variant="archivedQuery ? 'secondary' : 'primary'" @click="archivedQuery = false; selectedIds.clear()">
+              当前账号
+            </BaseButton>
+            <BaseButton size="sm" :variant="archivedQuery ? 'primary' : 'secondary'" @click="archivedQuery = true; selectedIds.clear()">
+              已归档
+            </BaseButton>
             <BaseTableColumnSettings
               :options="columnOptions"
               @change="setColumnVisible"
@@ -259,6 +277,9 @@ const { savingOrder, saveOrder } = useSharedOrder('accounts', loadAccounts)
             />
           </template>
         </AccountFilters>
+        <p v-if="archivedQuery" class="mt-2 mb-0 text-cp-xs text-cp-text-secondary">
+          已归档账号不参与调度，资料和使用记录保留。恢复后保持停用。
+        </p>
         <p v-if="attentionQuery && attentionNote" role="status" class="mt-2 mb-0 text-cp-xs leading-normal text-cp-text-secondary">
           {{ attentionNote }}
         </p>
@@ -268,13 +289,16 @@ const { savingOrder, saveOrder } = useSharedOrder('accounts', loadAccounts)
         <div class="flex min-h-0 flex-col xl:h-full">
           <BaseTable
             reorderable
+            horizontal-controls
+            scrollbar-always-visible
             :reorder-disabled="savingOrder || refreshing"
-            class="h-100! min-h-100 flex-none [--cp-table-row-height:72px] xl:h-auto! xl:min-h-0 xl:flex-1"
+            class="h-100! min-h-100 flex-none [--cp-table-row-height:72px] [&_.base-scrollbar-track-x]:h-4 [&_.base-scrollbar-track-x>div]:h-2.5 xl:h-auto! xl:min-h-0 xl:flex-1"
             :columns="visibleColumns"
             :rows="accounts"
             :loading="loading"
             :selected-row-keys="selectedRowKeys"
             :expanded-row-keys="expandedRowKeys"
+            scroll-to-expanded
             :sort="sort"
             empty-text="暂无账号数据"
             @reorder="saveOrder"
@@ -284,7 +308,7 @@ const { savingOrder, saveOrder } = useSharedOrder('accounts', loadAccounts)
               <button
                 type="button"
                 class="inline-flex size-6 cursor-pointer items-center justify-center rounded-md border-0 bg-transparent text-cp-text-secondary transition hover:bg-cp-bg-text-hover hover:text-cp-text"
-                :title="expandedAccountIds.has(row.id) ? '收起统计' : '展开统计'"
+                :title="expandedAccountIds.has(row.id) ? '收起账号详情' : '展开账号详情'"
                 @click.stop="toggleExpanded(row.id)"
               >
                 <ChevronDown
@@ -312,14 +336,7 @@ const { savingOrder, saveOrder } = useSharedOrder('accounts', loadAccounts)
             </template>
 
             <template #identity="{ row }">
-              <AccountIdentityCell :account="row" show-notes />
-            </template>
-
-            <template #provider="{ row }">
-              <ProviderIconGroup
-                :provider="row.provider"
-                :authentication-kind="row.authenticationKind"
-              />
+              <AccountIdentityCell :account="row" show-notes show-plan meta-position="secondary" />
             </template>
 
             <template #status="{ row }">
@@ -334,16 +351,15 @@ const { savingOrder, saveOrder } = useSharedOrder('accounts', loadAccounts)
               />
             </template>
 
-            <template #planType="{ row }">
-              <AccountPlanBadge :authentication-kind="row.authenticationKind" :plan-type="row.planType" :plan-type-display="row.planTypeDisplay" />
-            </template>
-
             <template #usage="{ row }">
               <AccountQuotaSummaryCell :account="row" />
             </template>
 
             <template #subscription="{ row }">
-              <AccountSubscriptionCell :account="row" :state="subscriptionStates[row.id]" />
+              <div class="flex flex-col gap-1 text-cp-xs leading-normal">
+                <AccountSubscriptionCell :account="row" :state="subscriptionStates[row.id]" compact />
+                <span class="text-cp-text-secondary">权重 {{ row.effectiveWeight }}</span>
+              </div>
             </template>
 
             <template #groups="{ row }">
@@ -357,7 +373,11 @@ const { savingOrder, saveOrder } = useSharedOrder('accounts', loadAccounts)
             </template>
 
             <template #actions="{ row }">
+              <BaseButton v-if="row.lifecycle.archived" size="sm" :disabled="lifecycleSaving.has(row.id)" @click="updateLifecycle(row, { restoreArchived: true })">
+                恢复到主列表
+              </BaseButton>
               <AccountTableActions
+                v-else
                 :account="row"
                 :deleting="deletingAccount"
                 :recovering="recoveringAccountIds.has(row.id)"
@@ -376,7 +396,10 @@ const { savingOrder, saveOrder } = useSharedOrder('accounts', loadAccounts)
               <div class="grid items-stretch gap-3 p-4 lg:grid-cols-[1.05fr_2.45fr] xl:min-h-77">
                 <AccountQuotaPanel
                   :account="row"
+                  :subscription-state="subscriptionStates[row.id]"
+                  :saving="lifecycleSaving.has(row.id)"
                   :refreshing="refreshingQuotaAccountIds.has(row.id)"
+                  @expiry-priority-change="updateLifecycle(row, { expiryPriority: $event })"
                   @quota-reset="handleQuotaReset"
                   @refresh-quota="handleRefreshQuota"
                 />

@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use crate::model::system::{PluginAction, PluginStatus};
 use async_trait::async_trait;
 
 use crate::{
@@ -17,6 +18,17 @@ use crate::{
 /// API 消费的系统管理服务。
 #[async_trait]
 pub trait SystemService: Send + Sync {
+    async fn plugins(&self) -> Result<Vec<PluginStatus>, AdminError> {
+        Ok(Vec::new())
+    }
+    async fn plugin_action(
+        &self,
+        _id: String,
+        _action: PluginAction,
+    ) -> Result<String, AdminError> {
+        Err(AdminError::new(AdminErrorKind::Conflict, "插件管理未配置"))
+    }
+
     async fn version(&self) -> Result<SystemVersion, AdminError>;
     async fn update_detail(&self, refresh: bool) -> Result<SystemUpdateDetail, AdminError>;
     fn update_events(&self) -> SystemUpdateEventStream;
@@ -43,6 +55,19 @@ impl DefaultSystemService {
 
 #[async_trait]
 impl SystemService for DefaultSystemService {
+    async fn plugins(&self) -> Result<Vec<PluginStatus>, AdminError> {
+        self.operations.plugins().await.map_err(map_system_error)
+    }
+    async fn plugin_action(&self, id: String, action: PluginAction) -> Result<String, AdminError> {
+        if id != "excel-bridge" {
+            return Err(AdminError::new(AdminErrorKind::Invalid, "未知插件"));
+        }
+        self.operations
+            .plugin_action(id, action)
+            .await
+            .map_err(map_system_error)
+    }
+
     async fn version(&self) -> Result<SystemVersion, AdminError> {
         self.operations.version().await.map_err(map_system_error)
     }

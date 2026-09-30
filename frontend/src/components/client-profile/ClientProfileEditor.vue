@@ -182,7 +182,7 @@ onMounted(load)
         </p>
         <div v-if="model.versionMode === 'fixed'" class="grid gap-4 sm:grid-cols-2">
           <BaseFormItem label="Codex Core 版本" required>
-            <BaseInput :model-value="model.codexVersion ?? ''" :disabled="disabled" placeholder="例如 0.155.0" @update:model-value="updateField('codexVersion', $event)" />
+            <BaseInput :model-value="model.codexVersion ?? ''" :disabled="disabled" placeholder="例如 0.159.2" @update:model-value="updateField('codexVersion', $event)" />
           </BaseFormItem>
           <template v-if="model.client === 'desktop'">
             <BaseFormItem label="Desktop 版本" required>

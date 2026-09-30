@@ -542,7 +542,7 @@ impl AccountSelector {
         }
         let highest_weight = eligible
             .iter()
-            .map(|candidate| candidate.account.weight())
+            .map(|candidate| candidate.account.effective_weight(context.now))
             .max()?;
         let preferred = if let Some(preferred) = context.preferred_account.as_ref() {
             match candidates
@@ -552,7 +552,7 @@ impl AccountSelector {
                 Some(candidate) => match self.scheduling_blocker(candidate, context) {
                     Some(blocker) => PreferredAccountSelection::Blocked(blocker),
                     None if !context.preferred_account_overrides_weight
-                        && candidate.account.weight() < highest_weight =>
+                        && candidate.account.effective_weight(context.now) < highest_weight =>
                     {
                         PreferredAccountSelection::Blocked(AccountSchedulingBlocker::LowerWeight)
                     }
@@ -568,7 +568,8 @@ impl AccountSelector {
         } else {
             PreferredAccountSelection::NotRequested
         };
-        eligible.retain(|candidate| candidate.account.weight() == highest_weight);
+        eligible
+            .retain(|candidate| candidate.account.effective_weight(context.now) == highest_weight);
 
         let candidate = match context.policy.strategy() {
             RotationStrategy::QuotaResetPriority => {
@@ -643,7 +644,7 @@ impl AccountSelector {
         candidates.sort_by_key(|candidate| {
             (
                 context.preferred_account.as_ref() != Some(candidate.account.id()),
-                Reverse(candidate.account.weight()),
+                Reverse(candidate.account.effective_weight(context.now)),
                 candidate.account.id().clone(),
             )
         });

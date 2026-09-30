@@ -67,7 +67,7 @@ const minCodexCliVersion = defineModel<string>('minCodexCliVersion', { required:
 
       <BaseFormItem
         label="Codex CLI 最低版本"
-        description="只检查独立终端版本，例如 0.152.0"
+        description="只检查独立终端版本，例如 0.159.2"
         :error="cliError"
       >
         <BaseInput

@@ -98,7 +98,7 @@ fn openai_config_defaults_to_the_provider_owned_operating_values() {
     );
     assert_eq!(
         provider_openai::transport::profile::CodexWireProfile::default().user_agent(),
-        "Codex Desktop/0.153.4 (Mac OS 15.7.1; arm64) unknown (Codex Desktop; 26.901.51231)"
+        "Codex Desktop/0.159.0 (Mac OS 15.7.1; arm64) unknown (Codex Desktop; 26.928.20755)"
     );
 }
 

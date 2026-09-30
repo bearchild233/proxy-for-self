@@ -69,6 +69,7 @@ impl OpenAiResponseObservationState {
     pub(super) fn from_backend_response(
         response: &CodexBackendStreamingResponse,
         request: &CodexResponsesRequest,
+        codex_oauth: bool,
     ) -> Self {
         Self {
             transport: response.transport,
@@ -76,7 +77,11 @@ impl OpenAiResponseObservationState {
             response_metadata: response.response_metadata.clone(),
             metrics: response.transport_metrics.clone(),
             websocket_pool_decision: response.websocket_pool_decision,
-            request_summary: openai_response_request_summary(request, response.transport),
+            request_summary: openai_response_request_summary(
+                request,
+                response.transport,
+                codex_oauth,
+            ),
             stream: request.stream(),
             requested_service_tier: normalize_service_tier(request.service_tier()),
             upstream_service_tier: None,
@@ -431,6 +436,7 @@ pub(super) fn openai_processing_ms(response_metadata: &CodexResponseMetadata) ->
 pub(super) fn openai_response_request_summary(
     request: &CodexResponsesRequest,
     transport: CodexBackendTransport,
+    codex_oauth: bool,
 ) -> Value {
     let body = request.body();
     let input = body.get("input");
@@ -451,6 +457,10 @@ pub(super) fn openai_response_request_summary(
         "toolsCount": tools.and_then(Value::as_array).map(Vec::len),
         "topLevelFields": body.keys().cloned().collect::<Vec<_>>(),
         "previousResponseIdPresent": request.previous_response_id().is_some(),
+        // 只记录缓存诊断标识，不保存完整提示词，也不修改转发内容。
+        "promptCacheKey": request.prompt_cache_key(),
+        "clientSessionId": request.client_session_id,
+        "sessionId": request.client_session_id.as_deref().or_else(|| codex_oauth.then(|| request.cache_session_id()).flatten()),
         "serviceTier": request.service_tier(),
         "localTransport": {
             "useWebsocket": request.use_websocket,

@@ -106,6 +106,18 @@ pub(crate) fn parse_access_token_expiration(jwt: &str) -> Option<DateTime<Utc>> 
         .and_then(|seconds| DateTime::<Utc>::from_timestamp(seconds, 0))
 }
 
+/// 只投影同一账号的旧订阅到期时间；归档还必须取得实时 Free 套餐证据。
+pub(super) fn subscription_expiration(jwt: &str, account_id: &str) -> Option<DateTime<Utc>> {
+    let claims = decode_jwt_payload::<serde_json::Value>(jwt).ok()?;
+    let auth = claims.get("https://api.openai.com/auth")?;
+    if auth.get("chatgpt_account_id")?.as_str()? != account_id {
+        return None;
+    }
+    DateTime::parse_from_rfc3339(auth.get("chatgpt_subscription_active_until")?.as_str()?)
+        .ok()
+        .map(|value| value.with_timezone(&Utc))
+}
+
 #[derive(Deserialize)]
 struct IdClaims {
     #[serde(default)]

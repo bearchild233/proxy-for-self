@@ -566,6 +566,8 @@ impl AccountsService for DefaultAccountsService {
             self.accounts
                 .batch_update_accounts(
                     BatchUpdateAccounts {
+                        expiry_priority: None,
+                        restore_archived: false,
                         account_ids: vec![account_id.to_string()],
                         enabled: Some(true),
                         concurrency_limit: None,

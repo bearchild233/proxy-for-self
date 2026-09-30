@@ -538,6 +538,8 @@ async fn dropping_the_connection_aborts_and_drops_the_socket_owner() {
 
 #[tokio::test(start_paused = true)]
 async fn idle_connection_reaches_the_official_limit_without_starting_an_execution() {
+    // TCP 握手和帧交付使用真实时钟；仅推进连接年龄时暂停时间。
+    tokio::time::resume();
     let trace = Arc::new(AtomicFailureTrace::default());
     let execution = Arc::new(AtomicFailureExecution {
         client: authenticated_client("sk_ws_atomic"),
@@ -565,10 +567,28 @@ async fn idle_connection_reaches_the_official_limit_without_starting_an_executio
     let (mut socket, response) = connect_async(request).await.expect("upgrade WebSocket");
     assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
 
+    // 收到 Pong 才能证明服务端 pump 已启动，避免先推进时钟再创建 max_age 定时器。
+    socket
+        .send(ClientMessage::Ping(Vec::new().into()))
+        .await
+        .unwrap();
+    loop {
+        let frame = tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        if matches!(frame, ClientMessage::Pong(_)) {
+            break;
+        }
+        assert!(matches!(frame, ClientMessage::Ping(_)));
+    }
+    tokio::time::pause();
     tokio::time::advance(Duration::from_secs(60 * 60)).await;
     tokio::task::yield_now().await;
+    tokio::time::resume();
     let text = loop {
-        let message = tokio::time::timeout(Duration::from_secs(1), socket.next())
+        let message = tokio::time::timeout(Duration::from_secs(5), socket.next())
             .await
             .expect("connection limit response timeout")
             .expect("connection remains available for the limit error")

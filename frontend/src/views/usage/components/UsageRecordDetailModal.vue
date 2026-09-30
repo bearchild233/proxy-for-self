@@ -10,6 +10,7 @@ import BaseTable from '@/components/base/BaseTable/index.vue'
 import BaseChart from '@/components/charts/BaseChart.vue'
 import { chartTooltipStyle } from '@/components/charts/tooltip'
 import { useChartPalette } from '@/composables/useChartPalette'
+import { isRecord } from '@/utils/object'
 import { displayValue, fieldLabelClass, fieldValueBaseClass, fieldValueClass } from '../utils/detail'
 import { formatDuration } from '../utils/format'
 import {
@@ -97,12 +98,20 @@ const clientUpstreamItems = computed(() => [
   },
 ])
 
+const cacheIdentifiers = computed(() => {
+  const summary = props.record?.providerMetadata.requestSummary
+  return isRecord(summary) ? summary : {}
+})
+
 const identifierItems = computed(() => [
   { label: '请求 ID', value: props.record?.requestId, mono: true, wrap: true, fullWidth: true },
   { label: '响应 ID', value: props.record?.responseId, mono: true, wrap: true },
   { label: '上游请求 ID', value: props.record?.upstreamRequestId, mono: true, wrap: true },
   { label: '账号 ID', value: props.record?.accountId, mono: true, wrap: true },
   { label: '客户端 Key ID', value: props.record?.clientApiKeyId, mono: true, wrap: true },
+  { label: 'prompt_cache_key', value: cacheIdentifiers.value.promptCacheKey, mono: true, wrap: true, fullWidth: true },
+  { label: '请求 session_id', value: cacheIdentifiers.value.sessionId, mono: true, wrap: true, fullWidth: true },
+  { label: '客户端 session_id（原始值）', value: cacheIdentifiers.value.clientSessionId, mono: true, wrap: true, fullWidth: true },
 ])
 
 interface AttemptRow {

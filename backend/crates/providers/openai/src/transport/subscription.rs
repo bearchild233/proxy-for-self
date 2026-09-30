@@ -18,6 +18,10 @@ pub struct CodexSubscription {
     pub observed_at: DateTime<Utc>,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("subscription authentication rejected")]
+pub struct SubscriptionUnauthorized;
+
 impl CodexBackendClient {
     /// 可选展示查询失败只返回未知；自定义路由的 404 回退也计入同一查询预算。
     pub async fn fetch_subscription(
@@ -25,8 +29,19 @@ impl CodexBackendClient {
         context: CodexRequestContext<'_>,
         account_id: &str,
     ) -> Option<CodexSubscription> {
+        self.fetch_subscription_checked(context, account_id)
+            .await
+            .ok()
+            .flatten()
+    }
+
+    pub async fn fetch_subscription_checked(
+        &self,
+        context: CodexRequestContext<'_>,
+        account_id: &str,
+    ) -> Result<Option<CodexSubscription>, SubscriptionUnauthorized> {
         if account_id.is_empty() || account_id.len() > 512 {
-            return None;
+            return Ok(None);
         }
         tokio::time::timeout(Duration::from_secs(5), async {
             let headers = self.account_request_headers(context).ok()?;
@@ -56,6 +71,9 @@ impl CodexBackendClient {
                 .send_account_request(request(&self.base_url)?, request(&self.official_base_url)?)
                 .await
                 .ok()?;
+            if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+                return Some(Err(SubscriptionUnauthorized));
+            }
             if !response.status().is_success() {
                 return None;
             }
@@ -70,7 +88,7 @@ impl CodexBackendClient {
                 DateTime::parse_from_rfc3339(value.get("active_until")?.as_str()?.trim())
                     .ok()?
                     .with_timezone(&Utc);
-            Some(CodexSubscription {
+            Some(Ok(CodexSubscription {
                 starts_at: value
                     .get("active_start")
                     .and_then(serde_json::Value::as_str)
@@ -81,11 +99,12 @@ impl CodexBackendClient {
                 billing_period: optional_short_text(&value, "billing_period"),
                 billing_currency: optional_short_text(&value, "billing_currency"),
                 observed_at: Utc::now(),
-            })
+            }))
         })
         .await
         .ok()
         .flatten()
+        .transpose()
     }
 }
 

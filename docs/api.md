@@ -457,7 +457,7 @@ config 返回 `{ name, plaintextKey }`，仅读取服务端会话绑定的当前
 | `POST` | `/api/admin/accounts/recover` | `{ accountId }` | 停用账号只启用调度；已启用账号强制清除本地错误/额度/cooldown 事实，不访问上游 |
 | `POST` | `/api/admin/accounts/rotate` | OpenAI rotation 字段 | 更新指定 OpenAI 账号的 OAuth token 或 API Key 上游设置 |
 | `POST` | `/api/admin/accounts/update` | `{ accountId, name?, enabled, concurrencyLimit, weight, groupIds, notes?, modelAccess?, outboundProxyId?, outboundProxyUrl? }` | 一次更新账号名称、备注、调度状态、并发上限（`null` 表示继承运行参数）、权重（1–100）、所属分组与出站代理 |
-| `POST` | `/api/admin/accounts/batch-update` | `{ accountIds, enabled?, concurrencyLimit?, weight?, groupIds?, modelAccess?, outboundProxyId?, outboundProxyUrl? }` | 一次事务更新所选账号；仅修改提供的字段，至少提供一项修改 |
+| `POST` | `/api/admin/accounts/batch-update` | `{ accountIds, enabled?, concurrencyLimit?, weight?, expiryPriority?, restoreArchived?, groupIds?, modelAccess?, outboundProxyId?, outboundProxyUrl? }` | 一次事务更新所选账号；仅修改提供的字段，至少提供一项修改 |
 | `POST` | `/api/admin/accounts/delete` | `{ provider, accountIds }` | 批量删除 1–200 个账号 |
 | `GET` | `/api/admin/accounts/quota` | `accountId` | 读取当前额度，不强制访问上游 |
 | `GET` | `/api/admin/accounts/quota-forecast` | `accountId` | 按需读取周/月容量预测、源窗口剩余估算与采样依据，不刷新上游额度 |
@@ -470,6 +470,12 @@ config 返回 `{ name, plaintextKey }`，仅读取服务端会话绑定的当前
 | `GET` | `/api/admin/accounts/connection-test` | `accountId`、`modelId` | 通过 SSE 返回实时连接测试事件，不作为业务 Responses 用量记录 |
 | `POST` | `/api/admin/accounts/oauth/start` | `{ provider, name, accountId?, outboundProxyId?, outboundProxyUrl? }` | 创建 OpenAI 或 xAI OAuth flow；`accountId` 表示重新授权 |
 | `POST` | `/api/admin/accounts/oauth/complete` | `{ provider, flowId, callbackUrl, settings? }` | 消费 OAuth callback；首次授权可附带账号设置，重新授权保留原设置 |
+
+账号列表默认 `archived=false`，传 `archived=true` 查询已归档账号。响应中的 `weight` 为基础权重，`effectiveWeight` 为当前调度权重，`lifecycle` 包含临期优先、订阅观察时间和归档原因。新增账号默认权重 50，存量权重保持原值。
+
+`expiryPriority=true` 仅可用于 OpenAI OAuth Plus 账号。勾选账号在订阅剩余 5 天内且订阅事实不超过 24 小时时，有效权重为 100；取消勾选、续费或事实失效时恢复基础权重。现有会话的账号亲和优先于权重。后台每分钟检查凭据状态；已启用账号最多每小时查询一次订阅，使用该账号绑定的出口。手动恢复的账号在停用期间不会再次自动归档。
+
+明确凭据失效/封禁，或上游确认订阅到期且不续费时自动归档并停用。订阅查询返回401时，开启自动凭据刷新的实例会使用账号出口、刷新租约及退避策略尝试刷新；只有刷新确认凭据失效才归档，401本身不作为失效结论。订阅接口不可用时，可用同出口实时额度返回的Free套餐与同账号ID token中的已过期订阅时间共同确认付费订阅已结束；缺少到期记录的免费账号不归档。请求超时、代理失败、429、未知订阅和普通 access token 过期不触发归档。`restoreArchived=true` 恢复到主列表并保持停用；重新授权后可再启用。归档保留账号、分组绑定和使用记录。
 
 账号列表支持以下稳定值：
 
@@ -497,7 +503,7 @@ OpenAI 主动额度刷新和正常响应携带的明确套餐会同步到账号�
 中的明确套餐值补全 `planType` 和 `planTypeDisplay`；两处均无套餐信息时才显示“未知套餐”。
 
 `outboundProxyId` 绑定已保存的代理，不要求出口测试成功；省略或 `null` 保留当前绑定，空字符串清除绑定。
-`outboundProxyUrl` 兼容 HTTP、HTTPS、SOCKS5、SOCKS5H 代理 URL，可带用户名和密码；不能与 ID 同时设置。
+`outboundProxyUrl` 兼容 HTTP、HTTPS、SOCKS5、SOCKS5H 代理 URL，以及受支持的 VLESS、Hysteria2 / hy2 分享链接；不能与 ID 同时设置。新协议需要安装[可选出口桥接](../services/egress/README.md)，不支持的传输或链接参数会拒绝，桥接不可用时不会回退直连。列表端点不返回认证或节点查询参数。
 编辑时省略或 `null` 表示保持原配置，空字符串表示清除代理并直连。列表和详情只返回
 不含认证信息的 `outboundProxyEndpoint`（直连时为 `null`）；只有显式敏感导出包含完整 URL。
 指定代理后，推理、OAuth 服务端交换/刷新及账号辅助请求使用同一出口；代理失败不会退回直连。
@@ -1497,3 +1503,11 @@ Host 关闭或任务取消会记录失败终态；状态查询会收敛无执行
 OpenAI OAuth 额度的手动请求、页面自动刷新和后台同步共用只读查询队列，同账号同凭据 revision 的重叠请求共享结果；新的一轮手动额度刷新仍查询上游。每类队列最多 2 个执行任务、64 个等待调用，后台额度任务最多占 1 个槽，手动请求可提升同账号未执行的后台任务。等待或执行超时会释放占位，失败结果仅向同轮等待者共享。现有额度证据、冻结与 revision 写入规则保持不变。订阅和资料也使用有界合并队列，成功结果共享 15 秒。
 
 账号页快捷筛选与账号、平台、状态、分组条件共同生效，读取全部匹配目录后筛选并分页，不仅筛当前页。3 天内到期按官方订阅结束时间判断；额度不足表示任一已知窗口剩余不超过 10% 或已确认耗尽；需要授权包含身份未确认、凭据无效/过期，以及缺少刷新令牌的 Access Token 过期；封禁不伪装成可重新授权恢复。订阅未知独立显示。订阅筛选至多 2 个客户端并发，页面缓存 5 分钟，手动刷新清除该缓存；短期后端缓存仍可能复用最近 15 秒的结果。
+
+
+## 管理插件
+
+- `GET /api/admin/system/plugins`：管理员读取受信任插件状态，含 `id/name/protocol/installed/enabled/version/availableVersion/operation`。
+- `POST /api/admin/system/plugins/action`：管理员提交 `{ "id": "excel-bridge", "action": "install|enable|disable|uninstall|update" }`，返回 202 与 `operationId`；轮询 GET 获取结果。action 为单个枚举值，拒绝额外字段，不接收路径、Shell、下载 URL。
+- 禁用/卸载先停止新请求，排空已有 Excel 流后停止 Worker；不改变 Key 绑定，不将 Excel 请求回退 Native。卸载保留审计和 Key 配置。
+- 普通 API Key 登录仍可 `GET /api/key-usage/config` 导出自身明文 Key 与客户端配置；响应不缓存，不能指定其他 Key。插件管理需要管理员角色。
