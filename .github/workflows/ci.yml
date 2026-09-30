@@ -10,11 +10,28 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      backend: ${{ steps.scope.outputs.backend }}
+      frontend: ${{ steps.scope.outputs.frontend }}
+      worker: ${{ steps.scope.outputs.worker }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+      - id: scope
+        run: python3 tools/ci-scope.py
   quality:
+    needs: changes
     uses: ./.github/workflows/_quality.yml
     with:
       ref: ${{ github.sha }}
+      run_backend: ${{ needs.changes.outputs.backend == 'true' }}
+      run_frontend: ${{ needs.changes.outputs.frontend == 'true' }}
   excel-worker:
+    needs: changes
+    if: needs.changes.outputs.worker == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1

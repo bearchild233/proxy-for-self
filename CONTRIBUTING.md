@@ -19,6 +19,12 @@ git push -u origin feat/account-ui
 - Worker：Python 3.10+ 执行 `python tools/test-excel-worker.py`。与 CI 共用入口：每次创建临时隔离环境，安装锁定依赖及实际安装包，执行 `pip check` 和测试后清理。禁止以开发环境里直接运行 pytest 的结果替代此检查；新增依赖同步维护 `pyproject.toml` 与对应 lock。可追加 pytest 参数缩小检查范围。
 - 迁移：在 backend/migrations 执行 `sha256sum --check --strict .frozen-sha256`。已登记迁移的内容和哈希不得改变；新增迁移追加登记。
 
+## CI 范围与速度
+
+push/PR 按改动选择 backend、frontend 或 Python 组件；文档改动保留工作流检查，发布/部署配置或未知路径改动执行全部检查。手动 CI 和正式发布保持全量校验。
+
+后端 CI 关闭 dev/test 调试符号，保留 Clippy、完整测试、调试断言和迁移冻结检查；Rust 缓存包含工作区模块，失败时也保存。首次配置或依赖变化仍需重建，观察 Actions 的 Compile Rust tests 与 Rust tests 分别判断编译和执行耗时。
+
 ## 规则
 
 API 负责协议，Admin/Core 负责用例，Store 负责持久化。前端不得绕过管理 API。Worker 不可读取本机认证或自行换账号。对已输出内容、结果未知的请求和未完成工具调用，不得盲目重试。

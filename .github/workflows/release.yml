@@ -71,7 +71,8 @@ jobs:
           CPR_GIT_SHA: ${{ github.sha }}
           CPR_BUILD_TYPE: release
         run: |
-          export CPR_BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          CPR_BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          export CPR_BUILD_TIME
           cargo build --release --locked -p codex-proxy-rs
       - name: Package release
         run: python3 services/updater/release_package.py --version "$RELEASE_VERSION" --binary backend/target/release/codex-proxy-rs --output dist
