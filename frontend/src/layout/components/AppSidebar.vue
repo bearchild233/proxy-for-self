@@ -12,6 +12,7 @@ import {
   Palette,
   PanelLeftClose,
   PanelLeftOpen,
+  Puzzle,
   Settings,
   Sun,
   Users,
@@ -26,6 +27,8 @@ import AppBrandMark from '@/components/AppBrandMark.vue'
 import BaseIconButton from '@/components/base/BaseIconButton.vue'
 import BaseMotionIcon from '@/components/base/BaseMotionIcon.vue'
 import BaseScrollbar from '@/components/base/BaseScrollbar.vue'
+import { prefetchPluginRoute } from '@/plugins/pageResources'
+import { platformPlugins } from '@/plugins/platform'
 import { useAuthStore } from '@/stores/modules/auth'
 import { useSystemUpdateStore } from '@/stores/modules/system-update'
 import { useThemeStore } from '@/stores/modules/theme'
@@ -57,7 +60,7 @@ const { effectiveTheme } = storeToRefs(themeStore)
 const { toggleTheme } = themeStore
 const preferredMotion = usePreferredReducedMotion()
 
-const navItems = [
+const navItems = computed(() => [
   { label: '概览', icon: LayoutDashboard, path: '/' },
   { label: '账号管理', icon: Users, path: '/accounts' },
   { label: '代理管理', icon: Network, path: '/proxies' },
@@ -66,16 +69,18 @@ const navItems = [
   { label: '使用统计', icon: ChartNoAxesColumn, path: '/usage' },
   { label: '主题设置', icon: Palette, path: '/theme' },
   { label: '系统设置', icon: Settings, path: '/settings' },
-]
+  { label: '插件管理', icon: Puzzle, path: '/settings/plugins' },
+  ...platformPlugins.value.flatMap(plugin => plugin.pages.filter(page => page.route?.startsWith('/extensions/')).map(page => ({ label: page.title, icon: Puzzle, path: page.route! }))),
+].filter(item => item.path === '/settings/plugins' || platformPlugins.value.some(plugin => plugin.pages.some(page => page.route === item.path))))
 
 function isActive(path: string) {
   if (path === '/')
     return route.path === '/'
-  return route.path.startsWith(path)
+  return route.path === path || (route.path.startsWith(`${path}/`) && !navItems.value.some(item => item.path !== path && item.path === route.path))
 }
 
 const activeNavIndex = computed(() => {
-  const index = navItems.findIndex(item => isActive(item.path))
+  const index = navItems.value.findIndex(item => isActive(item.path))
   return Math.max(0, index)
 })
 const activeNavIndicatorStyle = computed(() => ({
@@ -86,7 +91,7 @@ const { start: restoreNavFeedback, stop: stopNavFeedbackRestore } = useTimeoutFn
   () => {
     navFeedbackMuted.value = false
   },
-  300,
+  160,
   { immediate: false },
 )
 
@@ -100,6 +105,9 @@ function navigate(path: string) {
   muteNavFeedbackDuringMove()
   void router.push(path)
   emit('navigate')
+}
+function warmRoute(path: string) {
+  void prefetchPluginRoute(platformPlugins.value, path)
 }
 
 function openSystemUpdate() {
@@ -363,7 +371,7 @@ onBeforeUnmount(() => {
       <div class="px-4">
         <nav class="relative grid gap-3" :class="isCollapsed ? 'mx-auto w-11.5' : 'w-full'" aria-label="主导航">
           <span
-            class="pointer-events-none absolute inset-x-0 top-0 h-11.5 overflow-hidden rounded-cp bg-cp-menu-item-selected-bg transition-transform duration-260 ease-[cubic-bezier(0.22,1,0.36,1)] motion-reduce:transition-none"
+            class="pointer-events-none absolute inset-x-0 top-0 h-11.5 overflow-hidden rounded-cp bg-cp-menu-item-selected-bg transition-transform duration-140 ease-[cubic-bezier(0.22,1,0.36,1)] motion-reduce:transition-none"
             :style="activeNavIndicatorStyle"
           >
             <span
@@ -387,6 +395,8 @@ onBeforeUnmount(() => {
                   : 'bg-transparent font-semibold text-cp-text-secondary transition-colors duration-200 hover:bg-cp-fill-quaternary hover:text-cp-text',
             ]"
             @click="navigate(item.path)"
+            @pointerenter="warmRoute(item.path)"
+            @focus="warmRoute(item.path)"
           >
             <component :is="item.icon" class="shrink-0" :size="20" />
             <span

@@ -1,0 +1,23 @@
+[Unit]
+Description=proxy-for-self gateway slot B
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=api-hub
+Group=api-hub
+WorkingDirectory=/opt/api-hub/slots/b
+ExecStart=/opt/api-hub/slots/b/current/bin/api-hub serve
+Restart=on-failure
+RestartSec=3
+KillSignal=SIGTERM
+TimeoutStopSec=670
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+
+# 不提供 Install：开机只能启动已验证的活动槽；不得同时 enable A、B。

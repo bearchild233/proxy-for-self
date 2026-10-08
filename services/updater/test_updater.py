@@ -104,6 +104,28 @@ class TransactionTests(unittest.TestCase):
         self.assertEqual(self.updater.status()["current_version"],"0.1.1")
         self.assertEqual(self.updater.status()["operation"]["status"],"succeeded")
 
+    def test_slot_configuration_blocks_legacy_restart_and_update(self):
+        self.updater.config['slot_config'] = '/etc/proxy-for-self/slots.json'
+        with patch.object(self.updater, 'run') as run:
+            for action in ('update', 'rollback', 'restart'):
+                with self.assertRaisesRegex(ValueError, 'A/B'):
+                    self.updater.submit(action, '0.1.1')
+            with self.assertRaisesRegex(ValueError, 'A/B'):
+                self.updater.restart()
+            self.execute()
+        run.assert_not_called()
+        self.assertEqual((self.root / 'current').resolve(), self.previous)
+        self.assertEqual(self.updater.status()['operation']['status'], 'failed')
+
+    def test_explicit_restart_delegates_drain_without_waiting_for_idle_traffic(self):
+        with patch.object(self.updater,"ensure_restart_protection"), \
+             patch.object(self.updater,"sql",side_effect=AssertionError("restart must not wait for idle")), \
+             patch.object(self.updater,"restart") as restart:
+            self.updater.execute("restart",None)
+        restart.assert_called_once()
+        self.assertEqual(self.updater.status()["operation"]["status"],"succeeded")
+        self.assertEqual((self.root / "current").resolve(),self.previous)
+
     def test_failed_health_rolls_back_and_reports_failure(self):
         with patch.object(self.updater,"restart",side_effect=[RuntimeError("health failed"),None]) as restart, \
              patch.object(self.updater,"run"):
@@ -149,11 +171,11 @@ class TransactionTests(unittest.TestCase):
 
     def test_plugin_and_system_operations_are_mutually_exclusive(self):
         from types import SimpleNamespace
-        self.updater.plugins = SimpleNamespace(state={"operation": {"status": "running"}})
+        self.updater.plugins = SimpleNamespace(running=True)
         self.updater.state["operation"]["status"] = "idle"
         with self.assertRaises(ValueError):
             self.updater.submit("restart", None)
-        self.updater.plugins.state["operation"]["status"] = "idle"
+        self.updater.plugins.running = False
         self.updater.state["operation"]["status"] = "running"
         with self.assertRaises(ValueError):
             self.updater.plugin_submit("excel-bridge", "disable")

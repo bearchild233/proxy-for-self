@@ -40,6 +40,22 @@ class PluginTests(unittest.TestCase):
         self.assertTrue(self.manager.state['enabled'])
         self.assertFalse(self.commands)
 
+    def test_required_module_rejects_disable_and_uninstall_without_side_effects(self):
+        self.manager.config["required"] = True
+        original = (self.root / 'state.json').read_bytes()
+        for action in ['disable', 'uninstall']:
+            with self.subTest(action=action), self.assertRaisesRegex(ValueError, '基础模块不可'):
+                self.manager.begin('excel-bridge', action)
+            self.assertEqual((self.root / 'state.json').read_bytes(), original)
+            self.assertTrue(self.manager.status()['enabled'])
+            self.assertTrue(self.manager.status()['required'])
+            self.assertFalse(self.commands)
+
+    def test_required_module_still_accepts_update(self):
+        self.manager.config["required"] = True
+        operation_id = self.manager.begin('excel-bridge', 'update')
+        self.assertTrue(operation_id.startswith('plugin-'))
+
     def package(self, extra=None):
         archive = self.root / 'package.tar.gz'
         files = {'plugin.json': json.dumps({'id': 'excel-bridge', 'version': '2', 'protocol': 1}).encode(),
@@ -90,14 +106,14 @@ class PluginTests(unittest.TestCase):
         self.assertTrue(self.manager.status()['enabled'])
         self.assertEqual(self.manager.status()['version'], '2')
 
-    def test_invalid_archive_keeps_previous_runtime_disabled(self):
+    def test_invalid_archive_restores_previous_runtime_and_enabled_state(self):
         member = tarfile.TarInfo('../escape')
         self.package(member)
         self.manager.begin('excel-bridge', 'update')
         self.manager.execute('update')
         self.assertEqual(self.manager.status()['operation']['status'], 'failed')
         self.assertTrue(self.manager.status()['installed'])
-        self.assertFalse(self.manager.status()['enabled'])
+        self.assertTrue(self.manager.status()['enabled'])
 
     def test_failed_worker_health_never_enables_plugin(self):
         self.package()
@@ -121,3 +137,58 @@ class PluginTests(unittest.TestCase):
         recovered.begin('excel-bridge', 'disable')
         with self.assertRaises(ValueError):
             recovered.begin('excel-bridge', 'enable')
+
+    def test_failed_update_restores_old_runtime_without_leaving_backup(self):
+        old = self.root / "runtime"
+        (old / "marker").write_text("old-runtime")
+        (old / "plugin.json").write_text(json.dumps({"id": "excel-bridge", "version": "1", "protocol": 1}))
+        self.package()
+        self.manager.check_health.side_effect = ValueError("unhealthy")
+        self.manager.begin("excel-bridge", "update")
+        self.manager.execute("update")
+        self.assertEqual((old / "marker").read_text(), "old-runtime")
+        self.assertEqual(self.manager.status()["version"], "1")
+        self.assertFalse((self.root / ".previous-runtime").exists())
+        self.assertEqual(self.manager.status()["operation"]["status"], "failed")
+
+    def test_interrupted_swap_recovers_old_runtime_on_disable(self):
+        previous = self.root / ".previous-runtime"
+        previous.mkdir()
+        (previous / "marker").write_text("old-runtime")
+        self.manager.begin("excel-bridge", "update")
+        recovered = PluginManager(self.manager.config, self.run_command)
+        recovered.begin("excel-bridge", "disable")
+        recovered.execute("disable")
+        self.assertEqual((self.root / "runtime/marker").read_text(), "old-runtime")
+        self.assertFalse(previous.exists())
+        self.assertFalse(recovered.status()["enabled"])
+
+    def test_candidate_failure_restores_healthy_enabled_previous_worker(self):
+        old=self.root/'runtime'
+        (old/'plugin.json').write_text(json.dumps({'id':'excel-bridge','version':'1','protocol':1}))
+        (old/'marker').write_text('previous')
+        self.package()
+        self.manager.check_health.side_effect=[ValueError('candidate unhealthy'),None]
+        self.manager.begin('excel-bridge','update');self.manager.execute('update')
+        self.assertTrue(self.manager.status()['enabled'])
+        self.assertEqual(self.manager.status()['version'],'1')
+        self.assertEqual(self.manager.check_health.call_count,2)
+        self.assertFalse((self.root/'.previous-runtime').exists())
+
+    def test_disabled_plugin_update_stays_disabled(self):
+        self.manager.state['enabled']=False;self.manager.save();self.package()
+        self.manager.begin('excel-bridge','update');self.manager.execute('update')
+        self.assertFalse(self.manager.status()['enabled'])
+        self.assertEqual(self.manager.status()['version'],'2')
+        self.manager.check_health.assert_not_called()
+
+    def test_interrupted_valid_update_restores_enabled_previous_worker(self):
+        from unittest.mock import patch
+        old=self.root/'runtime'
+        (old/'plugin.json').write_text(json.dumps({'id':'excel-bridge','version':'1','protocol':1}))
+        self.manager.begin('excel-bridge','update')
+        with patch.object(PluginManager,'check_health') as health:
+            recovered=PluginManager(self.manager.config,self.run_command)
+        self.assertTrue(recovered.status()['enabled'])
+        self.assertEqual(recovered.status()['operation']['status'],'succeeded')
+        health.assert_called_once()

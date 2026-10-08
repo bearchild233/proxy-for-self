@@ -1,0 +1,29 @@
+{
+  "id": "appearance",
+  "version": "0.3.0",
+  "protocol": 2,
+  "kind": "ui",
+  "sdk": 1,
+  "pages": [
+    {
+      "id": "main",
+      "title": "主题外观",
+      "entry": "ui/module.js",
+      "roles": [
+        "admin"
+      ],
+      "route": "/theme"
+    }
+  ],
+  "capabilities": [
+    "auth.get.auth.status",
+    "auth.post.auth.logout"
+  ],
+  "releasedAt": "2026-10-08T18:14:04.567687+00:00",
+  "releaseNotes": [
+    "使用宿主共享 Vue 与公共组件，按需挂载页面并保留切换状态。",
+    "插件代码与样式可预载，后台任务不依赖页面打开。"
+  ],
+  "runtime": "vue-component",
+  "hostApi": 1
+}

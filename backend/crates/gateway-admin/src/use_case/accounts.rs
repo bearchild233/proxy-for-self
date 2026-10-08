@@ -146,6 +146,14 @@ pub trait AccountsService: Send + Sync {
         refresh: bool,
     ) -> Result<ProviderModels, AdminError>;
 
+    async fn diagnostic(
+        &self,
+        _account_id: ProviderAccountId,
+        _input: crate::model::provider_credentials::ProviderDocument,
+    ) -> Result<crate::model::provider_credentials::ProviderDocument, AdminError> {
+        Err(AdminError::invalid("当前 Provider 不支持诊断"))
+    }
+
     async fn test_connection(
         &self,
         account_id: ProviderAccountId,
@@ -895,6 +903,52 @@ impl AccountsService for DefaultAccountsService {
             .map_err(|error| map_provider_error(error, "provider model catalog"))
     }
 
+    async fn diagnostic(
+        &self,
+        account_id: ProviderAccountId,
+        input: crate::model::provider_credentials::ProviderDocument,
+    ) -> Result<crate::model::provider_credentials::ProviderDocument, AdminError> {
+        let (stored, provider) = self.provider_for_account(&account_id).await?;
+        if let Some((upstream_model, operation)) = provider
+            .diagnostic_operation(&input)
+            .map_err(|error| map_provider_error(error, "diagnostic operation"))?
+        {
+            let started = std::time::Instant::now();
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                self.probe.probe(AccountProbeRequest {
+                    account_id,
+                    provider_kind: stored.account.provider_kind,
+                    upstream_model,
+                    operation,
+                }),
+            )
+            .await
+            .map_err(|_| AdminError::bad_gateway("账号测试超时"))?;
+            let value = match result {
+                Ok(result) => {
+                    serde_json::json!({"phase":"text","status":200,"text":result.text.concat(),"failed":false})
+                }
+                Err(error) => {
+                    serde_json::json!({"phase":"text","status":error.upstream_response().map(gateway_core::engine::probe::AccountProbeUpstreamResponse::status),"failed":true,"reason":error.client_message()})
+                }
+            };
+            let mut value = value.as_object().cloned().unwrap_or_default();
+            value.insert(
+                "durationMs".into(),
+                serde_json::json!(started.elapsed().as_millis()),
+            );
+            value.insert("at".into(), serde_json::json!(Utc::now().to_rfc3339()));
+            return Ok(crate::model::provider_credentials::ProviderDocument::new(
+                gateway_core::account::OpaqueProviderData::new(value),
+            ));
+        }
+        provider
+            .diagnostic(&account_id, input)
+            .await
+            .map_err(|error| map_provider_error(error, "account diagnostic"))
+    }
+
     async fn test_connection(
         &self,
         account_id: ProviderAccountId,
@@ -978,6 +1032,7 @@ fn map_reset_credits_error_after_refresh(
 /// 账号目录中单个账号 quota 读取失败时使用的空额度投影。
 fn empty_quota() -> ProviderQuota {
     ProviderQuota {
+        credits: None,
         plan_type: None,
         observed_at: None,
         refresh_token_expires_at: None,

@@ -20,7 +20,7 @@ use super::{
 use crate::ApiState;
 
 /// 构造 OpenAI 客户端协议路由。
-pub(crate) fn router() -> Router<ApiState> {
+pub(crate) fn router(state: ApiState) -> Router<ApiState> {
     Router::new()
         .route("/v1/chat/completions", post(unsupported_protocol))
         .route("/v1beta", any(unsupported_protocol))
@@ -33,8 +33,11 @@ pub(crate) fn router() -> Router<ApiState> {
         // 官方 OpenAI 模型详情合同使用 path ID；它不属于 Admin API 约束。
         .route("/v1/models/{model_id}", get(model_detail))
         .merge(usage::router())
-        // OpenAI 数据面正文属于客户端/上游协议；代理不能用私有大小上限提前拒绝
-        // 上游本可接受的未来 payload。
+        .route_layer(axum::middleware::from_fn_with_state(
+            state,
+            super::resources::protect,
+        ))
+        // 正文上限由实例显式配置，不使用 Axum 默认的 2 MiB 限制。
         .layer(DefaultBodyLimit::disable())
 }
 

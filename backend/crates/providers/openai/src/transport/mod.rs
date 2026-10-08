@@ -9,6 +9,7 @@ pub mod diagnostics;
 mod downstream;
 pub mod endpoints;
 pub mod headers;
+mod probe;
 pub mod profile;
 pub mod profile_avatar;
 pub mod profile_statistics;

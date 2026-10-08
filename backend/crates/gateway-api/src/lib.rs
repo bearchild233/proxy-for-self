@@ -30,19 +30,28 @@ use crate::openai::service::OpenAiService;
 
 pub mod admin;
 pub mod auth;
+mod client_ip;
 mod health;
 mod key_usage;
 pub mod openai;
+mod plugins;
 mod session_cookie;
 
 /// API-owned HTTP 与静态资源配置。
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct ApiConfig {
+    /// Only these TCP peers may supply a single X-Real-IP, overwritten by the proxy.
+    #[serde(default)]
+    pub trusted_proxy_ips: Vec<std::net::IpAddr>,
+    #[serde(default)]
+    pub inference_limits: InferenceLimits,
     pub asset_directory: PathBuf,
     pub cors_allowed_origins: Vec<String>,
     pub request_timeout_seconds: Option<u64>,
     pub request_id_header: String,
 }
+
+pub use gateway_core::policy::InferenceLimits;
 
 impl ApiConfig {
     /// 解析静态资源相对路径并校验全部 HTTP 配置。
@@ -69,6 +78,9 @@ impl ApiConfig {
     }
 
     fn validate(&mut self) -> Result<(), ApiConfigError> {
+        if !self.inference_limits.is_valid() {
+            return Err(ApiConfigError::InvalidInferenceLimits);
+        }
         if self.asset_directory.as_os_str().is_empty() {
             return Err(ApiConfigError::InvalidAssetDirectory);
         }
@@ -96,6 +108,8 @@ impl ApiConfig {
 /// API 配置非法的稳定分类。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ApiConfigError {
+    #[error("in-flight body budget must cover the configured positive single-body limit")]
+    InvalidInferenceLimits,
     #[error("API asset directory is invalid")]
     InvalidAssetDirectory,
     #[error("API CORS origin is invalid")]
@@ -134,16 +148,17 @@ pub fn initialize(
         .map_err(|_| ApiError::Config(ApiConfigError::InvalidRequestIdHeader))?;
     let state = ApiState {
         admin,
-        openai: OpenAiService::new(execution, lifecycle),
+        openai: OpenAiService::new(execution, lifecycle).with_limits(config.inference_limits),
         health: HealthStatus::new(probes, worker_health),
     };
     let index = config.asset_directory.join("index.html");
     let mut router = Router::new()
         .route("/healthz", get(health::healthz))
-        .merge(openai::router::router())
+        .merge(openai::router::router(state.clone()))
         .merge(admin::router::<ApiState>())
         .merge(auth::router::<ApiState>())
         .merge(key_usage::router::<ApiState>())
+        .merge(plugins::router::<ApiState>())
         .fallback_service(ServeDir::new(config.asset_directory).fallback(ServeFile::new(index)));
     if !config.cors_allowed_origins.is_empty() {
         let origins = config
@@ -203,6 +218,10 @@ pub fn initialize(
         .layer(PropagateRequestIdLayer::new(request_id_header.clone()))
         .layer(trace_layer)
         .layer(SetRequestIdLayer::new(request_id_header, MakeRequestUuid))
+        .layer(axum::middleware::from_fn_with_state(
+            config.trusted_proxy_ips,
+            client_ip::resolve,
+        ))
         .with_state(state);
     Ok(ApiBundle { router })
 }
@@ -234,6 +253,9 @@ impl ApiState {
 }
 
 impl auth::SessionState for ApiState {
+    fn default_inference_limits(&self) -> InferenceLimits {
+        self.openai.default_inference_limits()
+    }
     fn admin_services(&self) -> &AdminServices {
         &self.admin
     }

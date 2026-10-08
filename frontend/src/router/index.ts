@@ -1,5 +1,6 @@
 import { createRouter, createWebHistory } from 'vue-router'
 
+import request from '@/api/request'
 import { useAuthStore } from '@/stores/modules/auth'
 import { routes } from './routes'
 
@@ -23,6 +24,10 @@ router.beforeEach(async (to) => {
   if (!authStore.sessionChecked) {
     try {
       await authStore.checkAuth()
+      if (!authStore.isAuthenticated && window.location.origin === 'http://127.0.0.1:18335') {
+        await request({ url: '/api/plugin-platform/local-login', method: 'POST', data: {}, silent: true })
+        await authStore.checkAuth()
+      }
     }
     catch {
       // 暂时无法确认会话时不进入受保护页面，也不缓存成“已退出”。

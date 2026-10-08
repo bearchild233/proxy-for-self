@@ -19,20 +19,40 @@ use super::responses::{ContinuationIntent, DecodedResponsesRequest};
 /// OpenAI HTTP/WS adapter 共享的 Core 与连接生命周期能力。
 #[derive(Clone)]
 pub(crate) struct OpenAiService {
+    pub(super) resources: super::resources::RequestResources,
     execution: Arc<dyn ExecutionService>,
     lifecycle: Arc<dyn ConnectionLifecycle>,
 }
 
 impl OpenAiService {
     #[must_use]
-    pub(crate) const fn new(
+    pub(crate) fn new(
         execution: Arc<dyn ExecutionService>,
         lifecycle: Arc<dyn ConnectionLifecycle>,
     ) -> Self {
         Self {
+            resources: super::resources::RequestResources::default(),
             execution,
             lifecycle,
         }
+    }
+
+    pub(crate) fn with_limits(mut self, limits: crate::InferenceLimits) -> Self {
+        self.resources = super::resources::RequestResources::new(limits);
+        self
+    }
+
+    pub(crate) fn inference_limits(&self) -> Result<crate::InferenceLimits, GatewayError> {
+        self.execution
+            .inference_limits()
+            .map(|limits| limits.unwrap_or_else(|| self.resources.defaults()))
+            .map_err(|_| {
+                GatewayError::new(GatewayErrorKind::Internal, "runtime snapshot unavailable")
+            })
+    }
+
+    pub(crate) fn default_inference_limits(&self) -> crate::InferenceLimits {
+        self.resources.defaults()
     }
 
     pub(crate) fn authenticate(

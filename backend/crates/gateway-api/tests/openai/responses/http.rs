@@ -618,7 +618,7 @@ async fn xai_http_should_leave_compaction_trigger_for_the_xai_provider_adapter()
 }
 
 #[tokio::test]
-async fn request_context_should_resolve_forwarded_precedence_and_peer_fallback() {
+async fn request_context_should_ignore_untrusted_forwarding_headers() {
     let peer = "192.0.2.10:443".parse().expect("peer address");
 
     let mut headers = HeaderMap::new();
@@ -634,18 +634,13 @@ async fn request_context_should_resolve_forwarded_precedence_and_peer_fallback()
         CapturedClientContext {
             public_model: "smart-code".to_owned(),
             wire_model: Some("smart-code".to_owned()),
-            client_ip: Some("198.51.100.1".parse().expect("expected IP")),
+            client_ip: Some("192.0.2.10".parse().expect("expected IP")),
             user_agent: Some("Codex-CLI/1.0".to_owned()),
             endpoint: "/v1/responses".to_owned(),
             operation_kind: OperationKind::Generate,
             input: Some(json!("hello")),
             client_metadata: None,
-            // 客户端 User-Agent 仅用于本地展示，不再透传给上游指纹上下文。
-            protocol_context: Some(json!({"opaque_request_headers": [
-                ["cf-connecting-ip", STANDARD.encode(b"198.51.100.1")],
-                ["x-real-ip", STANDARD.encode(b"198.51.100.2")],
-                ["x-forwarded-for", STANDARD.encode(b"10.0.0.2, 203.0.113.3")]
-            ]})),
+            protocol_context: None,
             prompt_cache_key: None,
             previous_response_id: None,
         }
@@ -658,7 +653,7 @@ async fn request_context_should_resolve_forwarded_precedence_and_peer_fallback()
     );
     assert_eq!(
         captured_client_context(headers, peer).await.client_ip,
-        Some("203.0.113.3".parse().expect("expected IP"))
+        Some("192.0.2.10".parse().expect("expected IP"))
     );
 
     assert_eq!(

@@ -299,7 +299,8 @@ impl CodexCredentialRefreshService {
             .await?;
         let _capacity_guard = match capacity {
             ProviderLeaseAcquisition::Acquired(guard) => guard,
-            ProviderLeaseAcquisition::Busy { .. } => {
+            ProviderLeaseAcquisition::Busy { .. }
+            | ProviderLeaseAcquisition::IntervalPending { .. } => {
                 return Ok(CodexCredentialRefreshOutcome::LeaseUnavailable { account_id });
             }
         };
@@ -311,7 +312,8 @@ impl CodexCredentialRefreshService {
             .await?;
         let _guard = match acquisition {
             ProviderLeaseAcquisition::Acquired(guard) => guard,
-            ProviderLeaseAcquisition::Busy { .. } => {
+            ProviderLeaseAcquisition::Busy { .. }
+            | ProviderLeaseAcquisition::IntervalPending { .. } => {
                 return Ok(CodexCredentialRefreshOutcome::LeaseUnavailable { account_id });
             }
         };

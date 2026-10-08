@@ -1,0 +1,8 @@
+[Unit]
+Description=Single A/B operation recovery attempt
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/proxy-for-self-updater/slots.py --config /etc/proxy-for-self/slots.json resume
+TimeoutStartSec=900
+Restart=no

@@ -1489,6 +1489,7 @@ dependencies = [
  "gateway-admin",
  "gateway-core",
  "gateway-protocol",
+ "http-body-util",
  "secrecy",
  "serde",
  "serde_json",

@@ -94,9 +94,16 @@ async fn login_rate_limit_should_enforce_source_and_global_buckets_atomically() 
             .expect("source rejection")
             .is_some()
     );
-    assert!(
+    assert_eq!(
         repository
             .consume_login_attempt("203.0.113.11", 2, 3, window)
+            .await
+            .expect("blocked source must not consume global quota"),
+        None
+    );
+    assert!(
+        repository
+            .consume_login_attempt("203.0.113.12", 2, 3, window)
             .await
             .expect("global rejection")
             .is_some()

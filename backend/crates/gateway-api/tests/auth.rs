@@ -533,3 +533,37 @@ async fn key_auth_should_issue_restore_and_clear_a_unified_cookie() {
         .expect("logged out");
     assert_eq!(response_json(status).await["data"]["authenticated"], false);
 }
+
+#[tokio::test]
+async fn login_protection_management_is_admin_only() {
+    let (app, _) = auth_app().await;
+    let response = login(&app, json!({"mode":"key","apiKey":RAW_KEY}), None).await;
+    let key_cookie = session_cookie(&response);
+    for (method, path, payload) in [
+        (Method::GET, "/api/admin/system/login-protection", json!({})),
+        (
+            Method::POST,
+            "/api/admin/system/login-protection/policy",
+            json!({"site":"api","maxFailures":5,"windowSeconds":600,"banSeconds":900,"maxBanSeconds":86400}),
+        ),
+        (
+            Method::POST,
+            "/api/admin/system/login-protection/unban",
+            json!({"site":"api","ip":"198.51.100.1"}),
+        ),
+    ] {
+        let request = json_request(method.clone(), path, payload.clone());
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let mut request = json_request(method, path, payload);
+        request
+            .headers_mut()
+            .insert(header::COOKIE, key_cookie.parse().unwrap());
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+}

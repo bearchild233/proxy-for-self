@@ -24,12 +24,14 @@ export function usePagedQuery<Result extends PageResult>(options: {
   const pageSize = shallowRef(options.initialPageSize)
   const total = shallowRef(0)
   const items = shallowRef<Result['items'][number][]>([])
+  const pending = shallowRef(0)
   const request = useRequestState(options.onError)
   const { loading, error, invalidate } = request
 
   async function execute(execution: { silent?: boolean, background?: boolean } = {}) {
     // 保留当前列表的刷新不一定静默；手动刷新仍需由请求层提示失败。
     const background = execution.background || execution.silent
+    pending.value++
     const requestId = request.start(background)
 
     try {
@@ -57,6 +59,7 @@ export function usePagedQuery<Result extends PageResult>(options: {
       return false
     }
     finally {
+      pending.value--
       request.finish(requestId)
     }
   }
@@ -67,6 +70,7 @@ export function usePagedQuery<Result extends PageResult>(options: {
     total,
     items,
     loading,
+    pending,
     error,
     execute,
     invalidate,

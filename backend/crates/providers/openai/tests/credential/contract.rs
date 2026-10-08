@@ -53,6 +53,26 @@ fn create_account(store: &Arc<MemoryAccountStore>, id: &str, token: &str) {
     }));
 }
 
+#[test]
+fn snapshot_capacity_blocker_reports_busy_without_queueing() {
+    let store = Arc::new(MemoryAccountStore::default());
+    create_account(&store, "acct_primary", "at-primary");
+    let leases = Arc::new(TestLeaseCoordinator::default());
+    *leases.in_flight.lock().unwrap() = 2;
+    let selector = selector(&store, Arc::clone(&leases));
+    let attempt = attempt(BTreeSet::new());
+    let result = block_on(selector.select(&SelectCodexCredential {
+        upstream_model: "gpt-5.4",
+        request_url: &Url::parse("https://chatgpt.com/backend-api/codex/responses").unwrap(),
+        attempt: &attempt,
+        session_affinity_key: None,
+    }));
+    assert!(matches!(
+        result,
+        Err(CredentialSelectionError::CapacityUnavailable { .. })
+    ));
+}
+
 fn contract_account_scope() -> Arc<FrozenAccountScope> {
     let provider = ProviderKind::new("openai").expect("provider");
     let accounts = [
@@ -2019,4 +2039,109 @@ fn model_access_queue_waits_for_allowed_account_without_using_free_forbidden_acc
             .iter()
             .all(|lease| lease.account_id() == &allowed)
     );
+}
+
+#[tokio::test]
+async fn interval_wait_retains_selection_and_affinity_with_queue_disabled() {
+    for bound_session in [false, true] {
+        let store = Arc::new(MemoryAccountStore::default());
+        create_account(&store, "acct_first", "at-first");
+        create_account(&store, "acct_second", "at-second");
+        store.set_scheduling(
+            if bound_session {
+                "acct_second"
+            } else {
+                "acct_first"
+            },
+            None,
+            AccountWeight::new(100).expect("weight"),
+        );
+        let leases = Arc::new(TestLeaseCoordinator::default());
+        *leases.interval_once.lock().expect("interval") = Some(Duration::from_millis(52));
+        let affinity = Arc::new(MemorySessionAffinity::default());
+        let provider = ProviderKind::new("openai").expect("provider");
+        let key = ProviderSessionAffinityKey::try_new("interval-session").expect("key");
+        let account = ProviderAccountId::new("acct_first").expect("account");
+        if bound_session {
+            affinity
+                .bind(&provider, &key, &account, Duration::from_secs(60))
+                .await
+                .expect("bind");
+        }
+        let selector = selector_with_affinity(&store, leases.clone(), affinity.clone());
+        let request_url =
+            Url::parse("https://chatgpt.com/backend-api/codex/responses").expect("url");
+        let request_attempt = attempt(BTreeSet::new());
+        assert_eq!(
+            request_attempt
+                .account_selection_policy()
+                .queue_policy()
+                .max_waiting,
+            0
+        );
+        let started = std::time::Instant::now();
+        let selected = selector
+            .select(&SelectCodexCredential {
+                upstream_model: "gpt-5.4",
+                request_url: &request_url,
+                attempt: &request_attempt,
+                session_affinity_key: Some(&key),
+            })
+            .await
+            .expect("interval independently waits");
+        assert!(started.elapsed() >= Duration::from_millis(52));
+        assert_eq!(selected.account_id(), &account);
+        assert!(!selected.account_switch());
+        assert_eq!(selected.escape_reason(), None);
+        assert_eq!(
+            affinity.load(&provider, &key).await.expect("binding"),
+            Some(account.clone())
+        );
+        let requests = leases.requests.lock().expect("requests");
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.account_id() == &account)
+        );
+    }
+}
+
+#[tokio::test]
+async fn interval_wait_respects_cancellation_and_deadline_without_binding_session() {
+    for cancel in [false, true] {
+        let store = Arc::new(MemoryAccountStore::default());
+        create_account(&store, "acct_first", "at-first");
+        let leases = Arc::new(TestLeaseCoordinator::default());
+        *leases.interval_once.lock().expect("interval") =
+            Some(Duration::from_secs(if cancel { 1 } else { 31 }));
+        let affinity = Arc::new(MemorySessionAffinity::default());
+        let selector = selector_with_affinity(&store, leases.clone(), affinity.clone());
+        let request_attempt = attempt(BTreeSet::new());
+        let key = ProviderSessionAffinityKey::try_new("cancelled-interval").expect("key");
+        let request_url =
+            Url::parse("https://chatgpt.com/backend-api/codex/responses").expect("url");
+        let request = SelectCodexCredential {
+            upstream_model: "gpt-5.4",
+            request_url: &request_url,
+            attempt: &request_attempt,
+            session_affinity_key: Some(&key),
+        };
+        let (result, ()) = tokio::join!(selector.select(&request), async {
+            if cancel {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+                request_attempt.cancellation().cancel();
+            }
+        });
+        if cancel {
+            assert!(matches!(result, Err(CredentialSelectionError::Cancelled)));
+        } else {
+            assert!(matches!(
+                result,
+                Err(CredentialSelectionError::IntervalDeadline)
+            ));
+        }
+        assert_eq!(affinity.binding_count(), 0);
+        assert_eq!(leases.requests.lock().expect("requests").len(), 1);
+    }
 }

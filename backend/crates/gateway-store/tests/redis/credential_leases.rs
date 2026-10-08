@@ -7,6 +7,61 @@ use gateway_store::redis::{
 use redis::aio::ConnectionManager;
 use uuid::Uuid;
 
+#[tokio::test]
+async fn restart_clears_occupancy_without_erasing_rate_limits_or_affinity() {
+    let Some((repository, mut connection, namespace)) = repository().await else {
+        return;
+    };
+    let active = format!("{namespace}:client:{{test}}:active");
+    let requests = format!("{namespace}:client:{{test}}:requests");
+    let affinity = format!("{namespace}:session:test");
+    for key in [&active, &requests, &affinity] {
+        redis::cmd("SET")
+            .arg(key)
+            .arg("preserve")
+            .arg("EX")
+            .arg(60)
+            .query_async::<()>(&mut connection)
+            .await
+            .unwrap();
+    }
+    let request = scheduling_request("acct_restart", "dead-process", 1, Duration::ZERO);
+    let old = acquired(
+        repository
+            .try_acquire_bounded_lease(&request)
+            .await
+            .unwrap(),
+    );
+    repository.clear_interrupted_leases().await.unwrap();
+    let new = acquired(
+        repository
+            .try_acquire_bounded_lease(&request)
+            .await
+            .unwrap(),
+    );
+    assert!(
+        !old.release().await.unwrap(),
+        "old guard cannot free the new slot"
+    );
+    assert_eq!(
+        repository
+            .credential_runtime_signals(std::slice::from_ref(&request.resource_id))
+            .await
+            .unwrap()[0]
+            .in_flight,
+        1
+    );
+    for (key, expected) in [(&active, false), (&requests, true), (&affinity, true)] {
+        let exists: bool = redis::cmd("EXISTS")
+            .arg(key)
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        assert_eq!(exists, expected);
+    }
+    new.release().await.unwrap();
+}
+
 #[test]
 fn credential_lease_rejects_zero_ttl() {
     let request = CredentialLeaseRequest {
@@ -92,7 +147,7 @@ async fn unlimited_scheduling_leases_still_count_release_and_enforce_request_int
     .await
     .expect("release interval slot");
     assert!(
-        matches!(repository.try_acquire_bounded_lease(&interval).await.expect("interval decision"), CredentialBoundedLeaseAcquisition::Busy { retry_after: Some(value) } if value > Duration::ZERO)
+        matches!(repository.try_acquire_bounded_lease(&interval).await.expect("interval decision"), CredentialBoundedLeaseAcquisition::IntervalPending { retry_after: value } if value > Duration::ZERO)
     );
     let keys = redis::cmd("KEYS")
         .arg(format!("{namespace}:*"))
@@ -214,8 +269,8 @@ async fn scheduling_lease_counts_concurrency_interval_and_drop_release() {
         .expect("interval decision");
     assert!(matches!(
         interval_denied,
-        CredentialBoundedLeaseAcquisition::Busy {
-            retry_after: Some(value)
+        CredentialBoundedLeaseAcquisition::IntervalPending {
+            retry_after: value
         } if value > Duration::ZERO && value <= Duration::from_secs(30)
     ));
 
@@ -501,6 +556,9 @@ fn acquired(
 ) -> gateway_store::redis::CredentialLeaseGuard {
     match acquisition {
         CredentialBoundedLeaseAcquisition::Acquired(guard) => guard,
+        CredentialBoundedLeaseAcquisition::IntervalPending { retry_after } => {
+            panic!("interval pending {retry_after:?}")
+        }
         CredentialBoundedLeaseAcquisition::Busy { retry_after } => {
             panic!("expected acquired lease, retry after {retry_after:?}")
         }

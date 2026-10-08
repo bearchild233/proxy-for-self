@@ -146,13 +146,23 @@ impl<T> ProviderLeaseGuard for T where T: Send + Sync + 'static {}
 
 pub enum ProviderLeaseAcquisition {
     Acquired(Box<dyn ProviderLeaseGuard>),
-    Busy { retry_after: Option<Duration> },
+    Busy {
+        retry_after: Option<Duration>,
+    },
+    /// 仅请求间隔未到：等待后重试原账号，不触发并发回退。
+    IntervalPending {
+        retry_after: Duration,
+    },
 }
 
 impl fmt::Debug for ProviderLeaseAcquisition {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Acquired(_) => formatter.write_str("Acquired([LEASE])"),
+            Self::IntervalPending { retry_after } => formatter
+                .debug_struct("IntervalPending")
+                .field("retry_after", retry_after)
+                .finish(),
             Self::Busy { retry_after } => formatter
                 .debug_struct("Busy")
                 .field("retry_after", retry_after)

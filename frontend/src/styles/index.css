@@ -1,6 +1,9 @@
 @import 'tailwindcss';
 @import './tokens.css';
 @import './base.css';
+@source '../../../plugins';
+@source '../../../packages/plugin-sdk';
+@source '../../../packages/ui-kit';
 
 @theme inline {
   /* 基础 */

@@ -79,6 +79,7 @@ pub(crate) struct OpenAiAdminProvider {
     credentials: Arc<CodexCredentialAdminService>,
     oauth: Arc<dyn CodexOAuthAdmin>,
     profile_statistics: Arc<CodexCredentialProfileService>,
+    diagnostic: Arc<crate::credential::diagnostic::DiagnosticService>,
     quota: Arc<CodexCredentialQuotaService>,
     catalog: Arc<CodexCredentialCatalogService>,
     websocket_pool: Arc<CodexWebSocketPool>,
@@ -89,6 +90,7 @@ pub(crate) struct OpenAiAdminServices {
     pub(crate) credentials: Arc<CodexCredentialAdminService>,
     pub(crate) oauth: Arc<dyn CodexOAuthAdmin>,
     pub(crate) profile_statistics: Arc<CodexCredentialProfileService>,
+    pub(crate) diagnostic: Arc<crate::credential::diagnostic::DiagnosticService>,
     pub(crate) quota: Arc<CodexCredentialQuotaService>,
     pub(crate) catalog: Arc<CodexCredentialCatalogService>,
 }
@@ -110,6 +112,7 @@ impl OpenAiAdminProvider {
             credentials: services.credentials,
             oauth: services.oauth,
             profile_statistics: services.profile_statistics,
+            diagnostic: services.diagnostic,
             quota: services.quota,
             catalog: services.catalog,
             websocket_pool,
@@ -228,6 +231,53 @@ impl ProviderAdmin for OpenAiAdminProvider {
                 "OpenAI model catalog invalidation failed after account commit"
             );
         }
+    }
+
+    async fn diagnostic(
+        &self,
+        account_id: &ProviderAccountId,
+        input: ProviderDocument,
+    ) -> Result<ProviderDocument, ProviderAdminError> {
+        self.diagnostic
+            .run(self.account(account_id).await?, input)
+            .await
+    }
+
+    fn diagnostic_operation(
+        &self,
+        input: &gateway_admin::model::provider_credentials::ProviderDocument,
+    ) -> Result<Option<(UpstreamModelId, Operation)>, ProviderAdminError> {
+        let data = input.expose_to_provider().expose_to_provider();
+        if data.get("phase").and_then(Value::as_str) != Some("text") {
+            return Ok(None);
+        }
+        let invalid = || provider_admin_error(ProviderAdminErrorKind::Invalid);
+        let model = UpstreamModelId::new(
+            data.get("model")
+                .and_then(Value::as_str)
+                .ok_or_else(invalid)?,
+        )
+        .map_err(|_| invalid())?;
+        let prompt = data
+            .get("prompt")
+            .and_then(Value::as_str)
+            .filter(|v| v.len() <= 32768)
+            .ok_or_else(invalid)?;
+        let effort = data.get("effort").and_then(Value::as_str).unwrap_or("low");
+        if !matches!(
+            effort,
+            "none" | "minimal" | "low" | "medium" | "high" | "xhigh"
+        ) {
+            return Err(invalid());
+        }
+        let body = serde_json::json!({"model":model.as_str(),"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":prompt}]}],"stream":true,"store":false,"tools":[],"tool_choice":"none","reasoning":{"effort":effort}});
+        let payload =
+            ProtocolPayload::json_object("openai", body.as_object().cloned().ok_or_else(invalid)?)
+                .map_err(|_| invalid())?;
+        Ok(Some((
+            model,
+            Operation::Generate(GenerateRequest::from_protocol_payload(payload)),
+        )))
     }
 
     fn connection_test_operation(
@@ -1037,6 +1087,7 @@ fn account_matches_record(account: &ProviderAccount, record: &AccountRecord) -> 
 
 fn empty_quota() -> ProviderQuota {
     ProviderQuota {
+        credits: None,
         plan_type: None,
         observed_at: None,
         refresh_token_expires_at: None,
@@ -1098,6 +1149,18 @@ fn project_quota_snapshot(snapshot: CodexAccountQuotaSnapshot) -> ProviderQuota 
     // 在窗口全部过期后继续维持限流。
     let limit_reached = quota_windows_limit_reached(&windows);
     ProviderQuota {
+        credits: snapshot.credits().map(|credits| {
+            // 官方 Codex 与 API 标准 Token 单价对应 25 Credits / USD；仅展示等值。
+            // 无限或未知余额不伪造美元金额，也不改变调度判断。
+            let balance = (!credits.unlimited).then_some(credits.balance).flatten();
+            gateway_admin::model::provider_credentials::ProviderCreditBalance {
+                balance: balance.map(gateway_core::metering::Decimal::canonical),
+                unlimited: credits.unlimited,
+                usd_equivalent: balance
+                    .and_then(|value| value.checked_div_u64(25))
+                    .map(gateway_core::metering::Decimal::canonical),
+            }
+        }),
         plan_type: snapshot.plan_type().map(str::to_owned),
         observed_at: Some(DateTime::<Utc>::from(snapshot.observed_at())),
         refresh_token_expires_at: None,

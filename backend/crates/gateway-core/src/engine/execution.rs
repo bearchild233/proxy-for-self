@@ -184,6 +184,13 @@ pub trait ExecutionSession: Send {
 }
 
 pub trait ExecutionService: Send + Sync {
+    fn inference_limits(
+        &self,
+    ) -> Result<Option<crate::policy::InferenceLimits>, crate::runtime::RuntimeSnapshotUnavailable>
+    {
+        Ok(None)
+    }
+
     fn authenticate(
         &self,
         plaintext: &str,
@@ -1004,6 +1011,13 @@ impl ExecutionStore for TransientExecutionStore {
 }
 
 impl ExecutionService for DefaultExecutionService {
+    fn inference_limits(
+        &self,
+    ) -> Result<Option<crate::policy::InferenceLimits>, crate::runtime::RuntimeSnapshotUnavailable>
+    {
+        Ok(self.snapshots.acquire()?.inference_limits())
+    }
+
     fn authenticate(
         &self,
         plaintext: &str,

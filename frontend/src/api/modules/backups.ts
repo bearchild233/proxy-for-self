@@ -96,10 +96,11 @@ export interface DownloadUrlResult {
   expiresInSeconds: number
 }
 
-export function getBackupSettings() {
+export function getBackupSettings(options: RequestOptions = {}) {
   return request<BackupSettingsView>({
     url: '/api/admin/settings/backups',
     method: 'GET',
+    ...options,
   })
 }
 

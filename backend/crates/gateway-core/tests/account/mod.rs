@@ -507,7 +507,11 @@ fn highest_priority_affinity_should_still_obey_existing_scheduling_constraints()
                 selected.candidate().account.id().as_str(),
                 selected.preferred()
             ),
-            ("acct_higher", PreferredAccountSelection::Blocked(blocker))
+            if blocker == AccountSchedulingBlocker::RequestInterval {
+                ("acct_preferred", PreferredAccountSelection::Hit)
+            } else {
+                ("acct_higher", PreferredAccountSelection::Blocked(blocker))
+            }
         );
     }
 }
@@ -785,9 +789,12 @@ fn selector_should_reject_account_at_concurrency_limit() {
 }
 
 #[test]
-fn selector_should_enforce_request_interval_until_boundary() {
+fn selector_should_choose_highest_weight_before_waiting_for_interval() {
     let now = SystemTime::now();
     let mut cooling = candidate("acct_cooling", 0, Some(100));
+    cooling.account = cooling
+        .account
+        .with_scheduling(None, AccountWeight::new(100).expect("weight"));
     cooling.signals.last_started_at = Some(now - Duration::from_millis(9));
     let mut ready = candidate("acct_ready", 0, Some(1));
     ready.signals.last_started_at = Some(now - Duration::from_millis(10));
@@ -803,7 +810,7 @@ fn selector_should_enforce_request_interval_until_boundary() {
         .select(&candidates, &context)
         .expect("candidate available");
 
-    assert_eq!(selected.candidate().account.id().as_str(), "acct_ready");
+    assert_eq!(selected.candidate().account.id().as_str(), "acct_cooling");
 }
 
 #[test]

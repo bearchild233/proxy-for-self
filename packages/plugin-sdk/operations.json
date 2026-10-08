@@ -1,0 +1,691 @@
+{
+  "account-groups.get.admin.account-groups": {
+    "method": "GET",
+    "path": "/api/admin/account-groups",
+    "roles": [
+      "admin"
+    ]
+  },
+  "account-groups.post.admin.account-groups.create": {
+    "method": "POST",
+    "path": "/api/admin/account-groups/create",
+    "roles": [
+      "admin"
+    ]
+  },
+  "account-groups.post.admin.account-groups.update": {
+    "method": "POST",
+    "path": "/api/admin/account-groups/update",
+    "roles": [
+      "admin"
+    ]
+  },
+  "account-groups.post.admin.account-groups.enable": {
+    "method": "POST",
+    "path": "/api/admin/account-groups/enable",
+    "roles": [
+      "admin"
+    ]
+  },
+  "account-groups.post.admin.account-groups.disable": {
+    "method": "POST",
+    "path": "/api/admin/account-groups/disable",
+    "roles": [
+      "admin"
+    ]
+  },
+  "account-groups.post.admin.account-groups.delete": {
+    "method": "POST",
+    "path": "/api/admin/account-groups/delete",
+    "roles": [
+      "admin"
+    ]
+  },
+  "accounts.get.admin.accounts": {
+    "method": "GET",
+    "path": "/api/admin/accounts",
+    "roles": [
+      "admin"
+    ]
+  },
+  "accounts.get.admin.accounts.export": {
+    "method": "GET",
+    "path": "/api/admin/accounts/export",
+    "roles": [
+      "admin"
+    ]
+  },
+  "accounts.post.admin.accounts.refresh": {
+    "method": "POST",
+    "path": "/api/admin/accounts/refresh",
+    "roles": [
+      "admin"
+    ]
+  },
+  "accounts.post.admin.accounts.recover": {
+    "method": "POST",
+    "path": "/api/admin/accounts/recover",
+    "roles": [
+      "admin"
+    ]
+  },
+  "accounts.get.admin.accounts.personal-info": {
+    "method": "GET",
+    "path": "/api/admin/accounts/personal-info",
+    "roles": [
+      "admin"
+    ]
+  },
+  "accounts.get.admin.accounts.quota-forecast": {
+    "method": "GET",
+    "path": "/api/admin/accounts/quota-forecast",
+    "roles": [
+      "admin"
+    ]
+  },
+  "accounts.post.admin.accounts.quota.refresh": {
+    "method": "POST",
+    "path": "/api/admin/accounts/quota/refresh",
+    "roles": [
+      "admin"
+    ]
+  },
+  "accounts.get.admin.accounts.reset-credits": {
+    "method": "GET",
+    "path": "/api/admin/accounts/reset-credits",
+    "roles": [
+      "admin"
+    ]
+  },
+  "accounts.post.admin.accounts.reset-credits": {
+    "method": "POST",
+    "path": "/api/admin/accounts/reset-credits",
+    "roles": [
+      "admin"
+    ]
+  },
+  "accounts.get.admin.accounts.models": {
+    "method": "GET",
+    "path": "/api/admin/accounts/models",
+    "roles": [
+      "admin"
+    ]
+  },
+  "accounts.post.admin.accounts.models.refresh": {
+    "method": "POST",
+    "path": "/api/admin/accounts/models/refresh",
+    "roles": [
+      "admin"
+    ]
+  },
+  "accounts.post.admin.accounts.import": {
+    "method": "POST",
+    "path": "/api/admin/accounts/import",
+    "roles": [
+      "admin"
+    ]
+  },
+  "accounts.post.admin.accounts.import-tasks": {
+    "method": "POST",
+    "path": "/api/admin/accounts/import-tasks",
+    "roles": [
+      "admin"
+    ]
+  },
+  "accounts.get.admin.accounts.import-tasks": {
+    "method": "GET",
+    "path": "/api/admin/accounts/import-tasks",
+    "roles": [
+      "admin"
+    ]
+  },
+  "accounts.get.admin.accounts.import-tasks.detail": {
+    "method": "GET",
+    "path": "/api/admin/accounts/import-tasks/detail",
+    "roles": [
+      "admin"
+    ]
+  },
+  "accounts.post.admin.accounts.import-tasks.stop": {
+    "method": "POST",
+    "path": "/api/admin/accounts/import-tasks/stop",
+    "roles": [
+      "admin"
+    ]
+  },
+  "accounts.post.admin.accounts.update": {
+    "method": "POST",
+    "path": "/api/admin/accounts/update",
+    "roles": [
+      "admin"
+    ]
+  },
+  "accounts.post.admin.accounts.batch-update": {
+    "method": "POST",
+    "path": "/api/admin/accounts/batch-update",
+    "roles": [
+      "admin"
+    ]
+  },
+  "accounts.post.admin.accounts.delete": {
+    "method": "POST",
+    "path": "/api/admin/accounts/delete",
+    "roles": [
+      "admin"
+    ]
+  },
+  "accounts.post.admin.accounts.oauth.start": {
+    "method": "POST",
+    "path": "/api/admin/accounts/oauth/start",
+    "roles": [
+      "admin"
+    ]
+  },
+  "accounts.post.admin.accounts.oauth.complete": {
+    "method": "POST",
+    "path": "/api/admin/accounts/oauth/complete",
+    "roles": [
+      "admin"
+    ]
+  },
+  "accounts.get.admin.accounts.detail": {
+    "method": "GET",
+    "path": "/api/admin/accounts/detail",
+    "roles": [
+      "admin"
+    ]
+  },
+  "accounts.post.admin.accounts.rotate": {
+    "method": "POST",
+    "path": "/api/admin/accounts/rotate",
+    "roles": [
+      "admin"
+    ]
+  },
+  "api-keys.get.admin.client-keys": {
+    "method": "GET",
+    "path": "/api/admin/client-keys",
+    "roles": [
+      "admin"
+    ]
+  },
+  "api-keys.post.admin.client-keys.bindings": {
+    "method": "POST",
+    "path": "/api/admin/client-keys/bindings",
+    "roles": [
+      "admin"
+    ]
+  },
+  "api-keys.post.admin.client-keys.set-binding": {
+    "method": "POST",
+    "path": "/api/admin/client-keys/set-binding",
+    "roles": [
+      "admin"
+    ]
+  },
+  "api-keys.post.admin.client-keys.create-bound": {
+    "method": "POST",
+    "path": "/api/admin/client-keys/create-bound",
+    "roles": [
+      "admin"
+    ]
+  },
+  "api-keys.post.admin.client-keys.create": {
+    "method": "POST",
+    "path": "/api/admin/client-keys/create",
+    "roles": [
+      "admin"
+    ]
+  },
+  "api-keys.post.admin.client-keys.update": {
+    "method": "POST",
+    "path": "/api/admin/client-keys/update",
+    "roles": [
+      "admin"
+    ]
+  },
+  "api-keys.get.admin.client-keys.reveal": {
+    "method": "GET",
+    "path": "/api/admin/client-keys/reveal",
+    "roles": [
+      "admin"
+    ]
+  },
+  "api-keys.post.admin.client-keys.delete": {
+    "method": "POST",
+    "path": "/api/admin/client-keys/delete",
+    "roles": [
+      "admin"
+    ]
+  },
+  "api-keys.post.admin.client-keys.reset-budget": {
+    "method": "POST",
+    "path": "/api/admin/client-keys/reset-budget",
+    "roles": [
+      "admin"
+    ]
+  },
+  "api-keys.post.admin.client-keys.disable": {
+    "method": "POST",
+    "path": "/api/admin/client-keys/disable",
+    "roles": [
+      "admin"
+    ]
+  },
+  "api-keys.post.admin.client-keys.enable": {
+    "method": "POST",
+    "path": "/api/admin/client-keys/enable",
+    "roles": [
+      "admin"
+    ]
+  },
+  "auth.get.auth.status": {
+    "method": "GET",
+    "path": "/api/auth/status",
+    "roles": [
+      "admin",
+      "key"
+    ]
+  },
+  "auth.post.auth.logout": {
+    "method": "POST",
+    "path": "/api/auth/logout",
+    "roles": [
+      "admin",
+      "key"
+    ]
+  },
+  "backups.get.admin.settings.backups": {
+    "method": "GET",
+    "path": "/api/admin/settings/backups",
+    "roles": [
+      "admin"
+    ]
+  },
+  "backups.post.admin.settings.backups.storage.update": {
+    "method": "POST",
+    "path": "/api/admin/settings/backups/storage/update",
+    "roles": [
+      "admin"
+    ]
+  },
+  "backups.post.admin.settings.backups.storage.test": {
+    "method": "POST",
+    "path": "/api/admin/settings/backups/storage/test",
+    "roles": [
+      "admin"
+    ]
+  },
+  "backups.post.admin.settings.backups.schedule.update": {
+    "method": "POST",
+    "path": "/api/admin/settings/backups/schedule/update",
+    "roles": [
+      "admin"
+    ]
+  },
+  "backups.get.admin.settings.backups.records": {
+    "method": "GET",
+    "path": "/api/admin/settings/backups/records",
+    "roles": [
+      "admin"
+    ]
+  },
+  "backups.post.admin.settings.backups.create": {
+    "method": "POST",
+    "path": "/api/admin/settings/backups/create",
+    "roles": [
+      "admin"
+    ]
+  },
+  "backups.post.admin.settings.backups.download-url": {
+    "method": "POST",
+    "path": "/api/admin/settings/backups/download-url",
+    "roles": [
+      "admin"
+    ]
+  },
+  "backups.post.admin.settings.backups.delete": {
+    "method": "POST",
+    "path": "/api/admin/settings/backups/delete",
+    "roles": [
+      "admin"
+    ]
+  },
+  "client-profiles.get.admin.settings.client-profiles.openai": {
+    "method": "GET",
+    "path": "/api/admin/settings/client-profiles/openai",
+    "roles": [
+      "admin"
+    ]
+  },
+  "client-profiles.post.admin.settings.client-profiles.openai.preview": {
+    "method": "POST",
+    "path": "/api/admin/settings/client-profiles/openai/preview",
+    "roles": [
+      "admin"
+    ]
+  },
+  "client-profiles.get.admin.settings.client-profiles.xai": {
+    "method": "GET",
+    "path": "/api/admin/settings/client-profiles/xai",
+    "roles": [
+      "admin"
+    ]
+  },
+  "client-profiles.post.admin.settings.client-profiles.xai.preview": {
+    "method": "POST",
+    "path": "/api/admin/settings/client-profiles/xai/preview",
+    "roles": [
+      "admin"
+    ]
+  },
+  "dashboard.get.admin.dashboard.summary": {
+    "method": "GET",
+    "path": "/api/admin/dashboard/summary",
+    "roles": [
+      "admin"
+    ]
+  },
+  "dashboard.get.admin.dashboard.trend": {
+    "method": "GET",
+    "path": "/api/admin/dashboard/trend",
+    "roles": [
+      "admin"
+    ]
+  },
+  "key-usage.get.key-usage.overview": {
+    "method": "GET",
+    "path": "/api/key-usage/overview",
+    "roles": [
+      "key"
+    ]
+  },
+  "key-usage.get.key-usage.version": {
+    "method": "GET",
+    "path": "/api/key-usage/version",
+    "roles": [
+      "key"
+    ]
+  },
+  "key-usage.get.key-usage.config": {
+    "method": "GET",
+    "path": "/api/key-usage/config",
+    "roles": [
+      "key"
+    ]
+  },
+  "key-usage.get.key-usage.records": {
+    "method": "GET",
+    "path": "/api/key-usage/records",
+    "roles": [
+      "key"
+    ]
+  },
+  "pricing.get.admin.settings.pricing": {
+    "method": "GET",
+    "path": "/api/admin/settings/pricing",
+    "roles": [
+      "admin"
+    ]
+  },
+  "pricing.post.admin.settings.pricing.update": {
+    "method": "POST",
+    "path": "/api/admin/settings/pricing/update",
+    "roles": [
+      "admin"
+    ]
+  },
+  "pricing.post.admin.settings.pricing.sync.preview": {
+    "method": "POST",
+    "path": "/api/admin/settings/pricing/sync/preview",
+    "roles": [
+      "admin"
+    ]
+  },
+  "pricing.post.admin.settings.pricing.sync": {
+    "method": "POST",
+    "path": "/api/admin/settings/pricing/sync",
+    "roles": [
+      "admin"
+    ]
+  },
+  "proxies.get.admin.proxies.accounts": {
+    "method": "GET",
+    "path": "/api/admin/proxies/accounts",
+    "roles": [
+      "admin"
+    ]
+  },
+  "proxies.post.admin.proxies.accounts.remove": {
+    "method": "POST",
+    "path": "/api/admin/proxies/accounts/remove",
+    "roles": [
+      "admin"
+    ]
+  },
+  "proxies.get.admin.proxies": {
+    "method": "GET",
+    "path": "/api/admin/proxies",
+    "roles": [
+      "admin"
+    ]
+  },
+  "proxies.post.admin.proxies.create": {
+    "method": "POST",
+    "path": "/api/admin/proxies/create",
+    "roles": [
+      "admin"
+    ]
+  },
+  "proxies.post.admin.proxies.update": {
+    "method": "POST",
+    "path": "/api/admin/proxies/update",
+    "roles": [
+      "admin"
+    ]
+  },
+  "proxies.post.admin.proxies.delete": {
+    "method": "POST",
+    "path": "/api/admin/proxies/delete",
+    "roles": [
+      "admin"
+    ]
+  },
+  "proxies.post.admin.proxies.test": {
+    "method": "POST",
+    "path": "/api/admin/proxies/test",
+    "roles": [
+      "admin"
+    ]
+  },
+  "proxies.post.admin.proxies.probe": {
+    "method": "POST",
+    "path": "/api/admin/proxies/probe",
+    "roles": [
+      "admin"
+    ]
+  },
+  "settings.get.admin.settings": {
+    "method": "GET",
+    "path": "/api/admin/settings",
+    "roles": [
+      "admin"
+    ]
+  },
+  "settings.post.admin.settings.update": {
+    "method": "POST",
+    "path": "/api/admin/settings/update",
+    "roles": [
+      "admin"
+    ]
+  },
+  "settings.get.admin.settings.admin-api-key": {
+    "method": "GET",
+    "path": "/api/admin/settings/admin-api-key",
+    "roles": [
+      "admin"
+    ]
+  },
+  "settings.post.admin.settings.admin-api-key.regenerate": {
+    "method": "POST",
+    "path": "/api/admin/settings/admin-api-key/regenerate",
+    "roles": [
+      "admin"
+    ]
+  },
+  "settings.post.admin.settings.admin-api-key.delete": {
+    "method": "POST",
+    "path": "/api/admin/settings/admin-api-key/delete",
+    "roles": [
+      "admin"
+    ]
+  },
+  "settings.get.admin.settings.client-downloads.codex-desktop.windows": {
+    "method": "GET",
+    "path": "/api/admin/settings/client-downloads/codex-desktop/windows",
+    "roles": [
+      "admin"
+    ]
+  },
+  "settings.post.admin.settings.request-location": {
+    "method": "POST",
+    "path": "/api/admin/settings/request-location",
+    "roles": [
+      "admin"
+    ]
+  },
+  "system.get.admin.system.version": {
+    "method": "GET",
+    "path": "/api/admin/system/version",
+    "roles": [
+      "admin"
+    ]
+  },
+  "system.get.admin.system.update.detail": {
+    "method": "GET",
+    "path": "/api/admin/system/update/detail",
+    "roles": [
+      "admin"
+    ]
+  },
+  "system.post.admin.system.update": {
+    "method": "POST",
+    "path": "/api/admin/system/update",
+    "roles": [
+      "admin"
+    ]
+  },
+  "system.post.admin.system.restart": {
+    "method": "POST",
+    "path": "/api/admin/system/restart",
+    "roles": [
+      "admin"
+    ]
+  },
+  "system.get.admin.system.update.status": {
+    "method": "GET",
+    "path": "/api/admin/system/update/status",
+    "roles": [
+      "admin"
+    ]
+  },
+  "system.get.admin.system.plugins": {
+    "method": "GET",
+    "path": "/api/admin/system/plugins",
+    "roles": [
+      "admin"
+    ]
+  },
+  "system.post.admin.system.plugins.action": {
+    "method": "POST",
+    "path": "/api/admin/system/plugins/action",
+    "roles": [
+      "admin"
+    ]
+  },
+  "system.get.admin.system.login-protection": {
+    "method": "GET",
+    "path": "/api/admin/system/login-protection",
+    "roles": [
+      "admin"
+    ]
+  },
+  "system.post.admin.system.login-protection.policy": {
+    "method": "POST",
+    "path": "/api/admin/system/login-protection/policy",
+    "roles": [
+      "admin"
+    ]
+  },
+  "system.post.admin.system.login-protection.unban": {
+    "method": "POST",
+    "path": "/api/admin/system/login-protection/unban",
+    "roles": [
+      "admin"
+    ]
+  },
+  "usage.get.admin.usage.records": {
+    "method": "GET",
+    "path": "/api/admin/usage/records",
+    "roles": [
+      "admin"
+    ]
+  },
+  "usage.get.admin.operations.errors": {
+    "method": "GET",
+    "path": "/api/admin/operations/errors",
+    "roles": [
+      "admin"
+    ]
+  },
+  "usage.get.admin.usage.records.detail": {
+    "method": "GET",
+    "path": "/api/admin/usage/records/detail",
+    "roles": [
+      "admin"
+    ]
+  },
+  "usage.get.admin.usage.records.summary": {
+    "method": "GET",
+    "path": "/api/admin/usage/records/summary",
+    "roles": [
+      "admin"
+    ]
+  },
+  "usage.get.admin.usage.insights.overview": {
+    "method": "GET",
+    "path": "/api/admin/usage/insights/overview",
+    "roles": [
+      "admin"
+    ]
+  },
+  "usage.get.admin.usage.insights.diagnostics": {
+    "method": "GET",
+    "path": "/api/admin/usage/insights/diagnostics",
+    "roles": [
+      "admin"
+    ]
+  },
+  "display-order.save": {
+    "method": "POST",
+    "path": "/api/admin/settings/display-order",
+    "roles": [
+      "admin"
+    ]
+  },
+  "diagnostic.observe": {
+    "method": "POST",
+    "path": "/api/admin/accounts/diagnostic",
+    "roles": [
+      "admin"
+    ]
+  },
+  "client.models": {
+    "method": "GET",
+    "path": "/v1/models",
+    "roles": [
+      "admin",
+      "key"
+    ]
+  }
+}

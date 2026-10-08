@@ -353,6 +353,7 @@ impl CodexCredentialSelector {
             request.attempt.concurrency_wait_budget(),
         );
         let mut snapshot_retries = 0;
+        let mut interval_account = None;
         'capacity: loop {
             let diagnostic = request.attempt.is_diagnostic_required_account();
             let mut accounts = self.repository.list_for_provider().await?;
@@ -545,8 +546,9 @@ impl CodexCredentialSelector {
             loop {
                 let preferred = pinned_account
                     .clone()
-                    .or_else(|| affinity.preferred_account().cloned());
-                let mut context = AccountSelectionContext {
+                    .or_else(|| affinity.preferred_account().cloned())
+                    .or_else(|| interval_account.clone());
+                let context = AccountSelectionContext {
                     policy,
                     now: SystemTime::now(),
                     excluded_accounts: excluded.clone(),
@@ -566,13 +568,6 @@ impl CodexCredentialSelector {
                 };
                 let wait_candidates = AccountSelector.wait_candidates(&candidates, &wait_context);
                 let capacity = AccountSelector.capacity_snapshot(&candidates, &context);
-                for candidate in &candidates {
-                    if !waiting.can_try(candidate.account.id()) {
-                        context
-                            .excluded_accounts
-                            .insert(candidate.account.id().clone());
-                    }
-                }
                 let selection = AccountSelector.select(&candidates, &context);
                 request.attempt.trace().account_selection(
                     &candidates,
@@ -611,10 +606,25 @@ impl CodexCredentialSelector {
                         Some(retry_after) => Err(CredentialSelectionError::CapacityUnavailable {
                             retry_after: Some(retry_after),
                         }),
+                        None if !wait_candidates.is_empty() => {
+                            Err(CredentialSelectionError::CapacityUnavailable {
+                                retry_after: Some(Duration::from_secs(1)),
+                            })
+                        }
                         None if quota_exhausted => Err(CredentialSelectionError::QuotaExhausted),
                         None => Err(CredentialSelectionError::NoEligibleCredential),
                     };
                 };
+                // 等待队列的先来者也不能导致较低权重账号被抢先选择。
+                if !diagnostic
+                    && queue_policy.max_waiting > 0
+                    && !waiting.can_try(selection.candidate().account.id())
+                {
+                    waiting
+                        .wait(&[selection.candidate().account.id().clone()])
+                        .await?;
+                    continue 'capacity;
+                }
                 affinity.observe_preferred_selection(selection.preferred());
                 let selected = selection.candidate();
                 let account = candidates
@@ -647,7 +657,29 @@ impl CodexCredentialSelector {
                     ))
                     .await?
                 {
+                    ProviderLeaseAcquisition::IntervalPending { retry_after } => {
+                        interval_account = Some(account.id().clone());
+                        request.attempt.trace().record("account.interval.wait", serde_json::json!({
+                            "accountId": account.id().as_str(), "waitMs": retry_after.as_millis() as u64
+                        }));
+                        let remaining = request
+                            .attempt
+                            .deadline()
+                            .duration_since(SystemTime::now())
+                            .unwrap_or_default();
+                        if remaining <= retry_after {
+                            return Err(CredentialSelectionError::IntervalDeadline);
+                        }
+                        tokio::select! {
+                            biased;
+                            () = request.attempt.cancellation().cancelled() => return Err(CredentialSelectionError::Cancelled),
+                            () = tokio::time::sleep(retry_after) => {}
+                        }
+                        // 重读资格和并发，保留本次选择；不占并发排队名额或更改亲和。
+                        continue 'capacity;
+                    }
                     ProviderLeaseAcquisition::Busy { retry_after } => {
+                        interval_account = None;
                         affinity.observe_lease_busy(account.id());
                         shortest_retry = minimum_duration(shortest_retry, retry_after);
                         excluded.insert(account.id().clone());
@@ -1509,6 +1541,10 @@ fn retry_account_snapshot(
 
 #[derive(Debug, Error)]
 pub enum CredentialSelectionError {
+    #[error("request cancelled during account interval wait")]
+    Cancelled,
+    #[error("request deadline elapsed during account interval wait")]
+    IntervalDeadline,
     #[error(transparent)]
     QueueRejected(#[from] QueueRejection),
     #[error("no eligible Codex account")]

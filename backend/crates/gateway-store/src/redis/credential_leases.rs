@@ -45,13 +45,18 @@ if max_concurrent > 0 and in_flight >= max_concurrent then
   end
 end
 
+-- Concurrency saturation permits fallback; interval alone must retain selection.
+if max_concurrent > 0 and in_flight >= max_concurrent then
+  return {0, '0', '0', tostring(math.max(1, retry_ms))}
+end
+
 local last_started = tonumber(redis.call('GET', KEYS[3]) or '0')
-if last_started > 0 and now_ms - last_started < interval_ms then
+if interval_ms > 0 and last_started > 0 and now_ms - last_started < interval_ms then
   retry_ms = math.max(retry_ms, interval_ms - (now_ms - last_started))
 end
 
 if retry_ms > 0 then
-  return {0, '0', '0', tostring(math.max(1, retry_ms))}
+  return {2, '0', '0', tostring(math.max(1, retry_ms))}
 end
 
 local fence = redis.call('INCR', KEYS[2])
@@ -212,13 +217,23 @@ pub struct CredentialRuntimeSignal {
 
 pub enum CredentialBoundedLeaseAcquisition {
     Acquired(CredentialLeaseGuard),
-    Busy { retry_after: Option<Duration> },
+    Busy {
+        retry_after: Option<Duration>,
+    },
+    /// 仅请求间隔未到：等待后重试原账号，不触发并发回退。
+    IntervalPending {
+        retry_after: Duration,
+    },
 }
 
 impl fmt::Debug for CredentialBoundedLeaseAcquisition {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Acquired(_) => formatter.write_str("Acquired([LEASE_GUARD])"),
+            Self::IntervalPending { retry_after } => formatter
+                .debug_struct("IntervalPending")
+                .field("retry_after", retry_after)
+                .finish(),
             Self::Busy { retry_after } => formatter
                 .debug_struct("Busy")
                 .field("retry_after", retry_after)
@@ -315,6 +330,40 @@ impl RedisCredentialLeaseRepository {
             connection,
             namespace: namespace(key_namespace)?,
         })
+    }
+
+    /// 仅在持有数据库实例锁且尚未接收流量时调用；保留 RPM、亲和、额度和 fencing。
+    pub async fn clear_interrupted_leases(&self) -> StoreResult<()> {
+        let mut connection = self.connection.clone();
+        for pattern in [
+            format!("{}:lease:*:active", self.namespace),
+            format!("{}:client:*:active", self.namespace),
+        ] {
+            let mut cursor = 0_u64;
+            loop {
+                let (next, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                    .arg(cursor)
+                    .arg("MATCH")
+                    .arg(&pattern)
+                    .arg("COUNT")
+                    .arg(128)
+                    .query_async(&mut connection)
+                    .await
+                    .map_err(|_| redis_unavailable("scan interrupted leases"))?;
+                if !keys.is_empty() {
+                    redis::cmd("DEL")
+                        .arg(&keys)
+                        .query_async::<u64>(&mut connection)
+                        .await
+                        .map_err(|_| redis_unavailable("clear interrupted leases"))?;
+                }
+                cursor = next;
+                if cursor == 0 {
+                    break;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// 获取带 Drop 释放语义的通用 lease guard，供 Provider refresh/task 组合器使用。
@@ -419,15 +468,17 @@ impl RedisCredentialLeaseRepository {
                 .invoke_async(&mut connection)
                 .await
                 .map_err(|_| redis_unavailable("acquire credential lease"))?;
-        if acquired == 0 {
+        if acquired == 0 || acquired == 2 {
             return Ok(LeaseAttempt {
                 grant: None,
                 retry_after: Some(duration(&retry_after)?),
+                interval_pending: acquired == 2,
             });
         }
         Ok(LeaseAttempt {
             grant: Some(grant(lease_id, &fence, &expires_at)?),
             retry_after: None,
+            interval_pending: false,
         })
     }
 
@@ -565,6 +616,9 @@ impl RedisProviderLeaseCoordinator {
             CredentialBoundedLeaseAcquisition::Acquired(guard) => {
                 ProviderLeaseAcquisition::Acquired(Box::new(guard))
             }
+            CredentialBoundedLeaseAcquisition::IntervalPending { retry_after } => {
+                ProviderLeaseAcquisition::IntervalPending { retry_after }
+            }
             CredentialBoundedLeaseAcquisition::Busy { retry_after } => {
                 ProviderLeaseAcquisition::Busy { retry_after }
             }
@@ -590,6 +644,9 @@ impl RedisProviderLeaseCoordinator {
         Ok(match acquisition {
             CredentialBoundedLeaseAcquisition::Acquired(guard) => {
                 ProviderLeaseAcquisition::Acquired(Box::new(guard))
+            }
+            CredentialBoundedLeaseAcquisition::IntervalPending { retry_after } => {
+                ProviderLeaseAcquisition::IntervalPending { retry_after }
             }
             CredentialBoundedLeaseAcquisition::Busy { retry_after } => {
                 ProviderLeaseAcquisition::Busy { retry_after }
@@ -774,6 +831,11 @@ impl CredentialLeaseRepository for RedisCredentialLeaseRepository {
                     grant: Some(grant),
                 },
             )),
+            None if attempt.interval_pending => {
+                Ok(CredentialBoundedLeaseAcquisition::IntervalPending {
+                    retry_after: attempt.retry_after.unwrap_or(Duration::from_millis(1)),
+                })
+            }
             None => Ok(CredentialBoundedLeaseAcquisition::Busy {
                 retry_after: attempt.retry_after,
             }),
@@ -784,6 +846,7 @@ impl CredentialLeaseRepository for RedisCredentialLeaseRepository {
 struct LeaseAttempt {
     grant: Option<CredentialLeaseGrant>,
     retry_after: Option<Duration>,
+    interval_pending: bool,
 }
 
 fn grant(lease_id: String, fence: &str, expires_at: &str) -> StoreResult<CredentialLeaseGrant> {

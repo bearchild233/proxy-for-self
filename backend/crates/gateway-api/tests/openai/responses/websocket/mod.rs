@@ -1074,6 +1074,7 @@ impl Provider for ChargedWebSocketProvider {
 #[derive(Default)]
 struct SettlementConnectionLifecycle {
     closed: Arc<tokio::sync::Notify>,
+    cancellation: CancellationToken,
 }
 
 struct SettlementConnectionGuard(Arc<tokio::sync::Notify>);
@@ -1092,7 +1093,7 @@ impl ConnectionLifecycle for SettlementConnectionLifecycle {
     }
 
     fn cancellation(&self) -> CancellationToken {
-        CancellationToken::new()
+        self.cancellation.clone()
     }
 
     fn is_draining(&self) -> bool {
@@ -1102,6 +1103,15 @@ impl ConnectionLifecycle for SettlementConnectionLifecycle {
 
 #[tokio::test]
 async fn websocket_disconnect_during_core_settlement_finishes_charge_before_releasing_admission() {
+    settlement_during_disconnect_or_drain(false).await;
+}
+
+#[tokio::test]
+async fn websocket_deployment_drain_delivers_terminal_before_close_and_charges_once() {
+    settlement_during_disconnect_or_drain(true).await;
+}
+
+async fn settlement_during_disconnect_or_drain(draining: bool) {
     let (release_settlement, gate) = tokio::sync::oneshot::channel();
     let ports = Arc::new(SettlementPorts {
         settlement_gate: Mutex::new(Some(gate)),
@@ -1124,6 +1134,8 @@ async fn websocket_disconnect_during_core_settlement_finishes_charge_before_rele
     let admin = crate::admin::AdminTestFixture::new().await;
     let app = gateway_api::initialize(
         gateway_api::ApiConfig {
+            trusted_proxy_ips: Vec::new(),
+            inference_limits: Default::default(),
             asset_directory: std::env::temp_dir(),
             cors_allowed_origins: Vec::new(),
             request_timeout_seconds: None,
@@ -1177,14 +1189,47 @@ async fn websocket_disconnect_during_core_settlement_finishes_charge_before_rele
 
     // 等到生产连接 guard 释放，保证 forward 的 select 已因断连取消 next_event；
     // 在此之前不能打开结算屏障，否则只会验证正常完成而错过取消窗口。
-    socket.close(None).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(5), lifecycle.closed.notified())
-        .await
-        .expect("production WebSocket handler exited");
+    if draining {
+        lifecycle.cancellation.cancel();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), lifecycle.closed.notified())
+                .await
+                .is_err(),
+            "drain closed the websocket before settlement finished"
+        );
+    } else {
+        socket.close(None).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), lifecycle.closed.notified())
+            .await
+            .expect("production WebSocket handler exited");
+    }
     assert!(ports.active.load(Ordering::SeqCst));
     release_settlement
         .send(())
         .expect("the original settlement future survived disconnect");
+    if draining {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut completed = false;
+            loop {
+                match socket.next().await.unwrap().unwrap() {
+                    ClientMessage::Text(text) => {
+                        let event: Value = serde_json::from_str(&text).unwrap();
+                        if event["type"] == "response.completed" {
+                            completed = true;
+                        }
+                    }
+                    ClientMessage::Close(Some(frame)) => {
+                        assert!(completed, "closed before response.completed");
+                        assert_eq!(u16::from(frame.code), 1001);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
     tokio::time::timeout(Duration::from_secs(5), ports.released.notified())
         .await
         .expect("detached Core cleanup released admission");

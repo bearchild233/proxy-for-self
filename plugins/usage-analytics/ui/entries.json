@@ -1,0 +1,26 @@
+{
+  "dashboard": {
+    "source": "dashboard/index.vue",
+    "route": "/",
+    "title": "概览",
+    "roles": [
+      "admin"
+    ]
+  },
+  "usage": {
+    "source": "usage/index.vue",
+    "route": "/usage",
+    "title": "使用统计",
+    "roles": [
+      "admin"
+    ]
+  },
+  "key-usage": {
+    "source": "key-usage/index.vue",
+    "route": "/key-usage",
+    "title": "我的用量",
+    "roles": [
+      "key"
+    ]
+  }
+}

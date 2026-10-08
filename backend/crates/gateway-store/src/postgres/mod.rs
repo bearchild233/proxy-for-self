@@ -57,6 +57,22 @@ pub async fn connect_and_migrate(
     database_url: &str,
     pool_config: StorePoolConfig,
 ) -> StoreResult<PgPool> {
+    connect_database(database_url, pool_config, true).await
+}
+
+/// 滚动发布只接受完全相同的已应用迁移，不在存活槽旁执行 schema 变更。
+pub async fn connect_for_slot(
+    database_url: &str,
+    pool_config: StorePoolConfig,
+) -> StoreResult<PgPool> {
+    connect_database(database_url, pool_config, false).await
+}
+
+async fn connect_database(
+    database_url: &str,
+    pool_config: StorePoolConfig,
+    migrate: bool,
+) -> StoreResult<PgPool> {
     if database_url.trim().is_empty() {
         return Err(postgres_unavailable("connect PostgreSQL"));
     }
@@ -73,7 +89,30 @@ pub async fn connect_and_migrate(
         )
         .await
         .map_err(|_| postgres_unavailable("connect PostgreSQL for migrations"))?;
-    if let Err(error) = MIGRATOR.run(&migration_pool).await {
+    if !migrate {
+        let applied = sqlx::query_as::<_, (i64, Vec<u8>, bool)>(
+            "select version, checksum, success from _sqlx_migrations order by version",
+        )
+        .fetch_all(&migration_pool)
+        .await
+        .map_err(|_| postgres_unavailable("validate slot schema"))?;
+        let expected = MIGRATOR.iter().collect::<Vec<_>>();
+        if applied.len() != expected.len()
+            || applied
+                .iter()
+                .zip(expected)
+                .any(|((version, checksum, success), migration)| {
+                    !success
+                        || *version != migration.version
+                        || checksum.as_slice() != migration.checksum.as_ref()
+                })
+        {
+            migration_pool.close().await;
+            return Err(postgres_unavailable(
+                "slot schema differs; rolling migration rejected",
+            ));
+        }
+    } else if let Err(error) = MIGRATOR.run(&migration_pool).await {
         migration_pool.close().await;
         return Err(StoreError::Unavailable {
             backend: StoreBackend::PostgreSql,

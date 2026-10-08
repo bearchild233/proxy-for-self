@@ -891,7 +891,8 @@ impl CodexCredentialAdminService {
             .map_err(|_| CodexCredentialAdminError::RefreshUnavailable)?
         {
             ProviderLeaseAcquisition::Acquired(guard) => guard,
-            ProviderLeaseAcquisition::Busy { .. } => {
+            ProviderLeaseAcquisition::Busy { .. }
+            | ProviderLeaseAcquisition::IntervalPending { .. } => {
                 return Err(CodexCredentialAdminError::RefreshLeaseUnavailable);
             }
         };
@@ -904,7 +905,8 @@ impl CodexCredentialAdminService {
             .map_err(|_| CodexCredentialAdminError::RefreshUnavailable)?
         {
             ProviderLeaseAcquisition::Acquired(guard) => guard,
-            ProviderLeaseAcquisition::Busy { .. } => {
+            ProviderLeaseAcquisition::Busy { .. }
+            | ProviderLeaseAcquisition::IntervalPending { .. } => {
                 return Err(CodexCredentialAdminError::RefreshLeaseUnavailable);
             }
         };

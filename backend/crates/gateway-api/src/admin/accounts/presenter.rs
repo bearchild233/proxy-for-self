@@ -223,6 +223,11 @@ pub(super) fn account_quota_view(
     let recovery_probe_required = cooldown.is_some_and(|value| value.kind.requires_probe());
     (
         AccountQuotaView {
+            credits: quota.credits.map(|credits| AccountCreditBalanceView {
+                balance: credits.balance,
+                unlimited: credits.unlimited,
+                usd_equivalent: credits.usd_equivalent,
+            }),
             refreshed_at_display,
             limit_reached: quota.limit_reached,
             rate_limited_until,
@@ -267,6 +272,7 @@ pub(crate) fn quota_window_view(window: ProviderQuotaWindow) -> AccountQuotaWind
             .map_or_else(|| "—".to_owned(), |value| format!("{value:.1}%")),
         limit_reached,
         local_usage: local_usage.as_ref().map(quota_local_usage),
+        reset_at: reset_at.map(|value| value.to_rfc3339()),
         reset_at_display: reset_at.map_or_else(|| "—".to_owned(), |value| china_datetime(&value)),
     }
 }

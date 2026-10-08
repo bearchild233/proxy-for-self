@@ -6,6 +6,162 @@ use gateway_store::postgres::{
 use sqlx::PgPool;
 
 use super::TestDatabase;
+// TestDatabase 隔离 schema；advisory lock 属于整个数据库，实例锁场景必须串行。
+static INSTANCE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[tokio::test]
+async fn ab_slots_preserve_live_requests_and_recover_only_after_both_exit() {
+    let _serial = INSTANCE_TEST_LOCK.lock().await;
+    let Some(database) = TestDatabase::create("ab_slots").await else {
+        return;
+    };
+    let repository = PgClientAdmissionRecoveryRepository::new(database.pool.clone());
+    let mut a = repository.acquire_slot("a").await.expect("cold A");
+    assert!(a.needs_recovery());
+    assert!(
+        repository.acquire_slot("b").await.is_err(),
+        "cold recovery is a startup barrier"
+    );
+    a.complete_startup().await.unwrap();
+    let now = Utc::now();
+    seed_request(
+        &database.pool,
+        "live-a",
+        now,
+        now + Duration::minutes(10),
+        "running",
+    )
+    .await;
+    let mut b = repository.acquire_slot("b").await.expect("join B");
+    assert!(!b.needs_recovery());
+    b.complete_startup().await.unwrap();
+    assert!(
+        repository.acquire_slot("a").await.is_err(),
+        "duplicate A rejected"
+    );
+    let outcome: String =
+        sqlx::query_scalar("select outcome from model_requests where id='live-a'")
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+    assert_eq!(outcome, "running", "B cannot mark A requests interrupted");
+    a.close().await.unwrap();
+    let mut next_a = repository
+        .acquire_slot("a")
+        .await
+        .expect("next release uses A");
+    assert!(!next_a.needs_recovery());
+    next_a.complete_startup().await.unwrap();
+    b.close().await.unwrap();
+    next_a.close().await.unwrap();
+    let mut cold = repository.acquire_slot("b").await.unwrap();
+    assert!(cold.needs_recovery());
+    let outcome: String =
+        sqlx::query_scalar("select outcome from model_requests where id='live-a'")
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+    assert_eq!(outcome, "incomplete");
+    cold.complete_startup().await.unwrap();
+    cold.close().await.unwrap();
+    database.close().await;
+}
+
+#[tokio::test]
+async fn ab_slot_refuses_legacy_exclusive_gateway_without_mutation() {
+    let _serial = INSTANCE_TEST_LOCK.lock().await;
+    use sqlx::Connection;
+    let Some(database) = TestDatabase::create("ab_legacy").await else {
+        return;
+    };
+    let repository = PgClientAdmissionRecoveryRepository::new(database.pool.clone());
+    let legacy = repository.recover_after_restart().await.unwrap();
+    let now = Utc::now();
+    seed_request(
+        &database.pool,
+        "legacy-live",
+        now,
+        now + Duration::minutes(10),
+        "running",
+    )
+    .await;
+    assert!(repository.acquire_slot("b").await.is_err());
+    let outcome: String =
+        sqlx::query_scalar("select outcome from model_requests where id='legacy-live'")
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+    assert_eq!(outcome, "running");
+    legacy.close().await.unwrap();
+    database.close().await;
+}
+
+#[tokio::test]
+async fn restart_recovers_future_deadline_and_refuses_a_second_instance() {
+    let _serial = INSTANCE_TEST_LOCK.lock().await;
+    use sqlx::Connection;
+    let Some(database) = TestDatabase::create("restart_recovery").await else {
+        return;
+    };
+    let now = Utc::now();
+    seed_request(
+        &database.pool,
+        "interrupted",
+        now,
+        now + Duration::minutes(10),
+        "running",
+    )
+    .await;
+    seed_request(
+        &database.pool,
+        "complete",
+        now,
+        now + Duration::minutes(10),
+        "succeeded",
+    )
+    .await;
+    let repository = PgClientAdmissionRecoveryRepository::new(database.pool.clone());
+    let guard = repository
+        .recover_after_restart()
+        .await
+        .expect("first instance");
+    let outcome: (String, String) =
+        sqlx::query_as("select outcome,error_kind from model_requests where id='interrupted'")
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+    assert_eq!(outcome, ("incomplete".into(), "process_interrupted".into()));
+    seed_request(
+        &database.pool,
+        "live",
+        now,
+        now + Duration::minutes(10),
+        "running",
+    )
+    .await;
+    assert!(repository.recover_after_restart().await.is_err());
+    let outcome: String = sqlx::query_scalar("select outcome from model_requests where id='live'")
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome, "running",
+        "duplicate startup must not touch live requests"
+    );
+    guard.close().await.unwrap();
+    let restarted = repository
+        .recover_after_restart()
+        .await
+        .expect("restart after close");
+    let outcome: String =
+        sqlx::query_scalar("select outcome from model_requests where id='complete'")
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+    assert_eq!(outcome, "succeeded");
+    restarted.close().await.unwrap();
+    database.close().await;
+}
 
 #[tokio::test]
 async fn recovery_loads_precise_window_and_running_request_facts() {

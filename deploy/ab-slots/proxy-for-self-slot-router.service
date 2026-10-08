@@ -1,0 +1,19 @@
+[Unit]
+Description=Stable local ingress for gateway A/B slots
+After=network.target
+StartLimitIntervalSec=120
+StartLimitBurst=3
+
+[Service]
+User=caddy
+Group=caddy
+ExecStart=/usr/bin/caddy run --config /etc/caddy/slot-router/Caddyfile --adapter caddyfile
+Environment=XDG_CONFIG_HOME=/var/lib/caddy/slot-router
+Restart=on-failure
+RestartSec=2
+MemoryMax=96M
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

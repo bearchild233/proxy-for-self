@@ -50,6 +50,9 @@ pub struct OpenAiConfig {
     /// 显式固定官方 CLI 基线；启用后忽略管理端及 Key 的客户端身份覆盖。
     #[serde(default)]
     pub pinned_cli_profile: Option<crate::transport::profile::CodexWireProfile>,
+    /// 保留固定 CLI 身份，每日跟随官方稳定版本；失败保留上次版本。
+    #[serde(default)]
+    pub pinned_cli_auto_update: bool,
     #[serde(skip)]
     identity_secret_path: PathBuf,
 }
@@ -154,6 +157,7 @@ impl Default for OpenAiConfig {
             excel_worker_socket: None,
             excel_plugin_state_file: None,
             pinned_cli_profile: None,
+            pinned_cli_auto_update: false,
             identity_secret_path: PathBuf::new(),
         }
     }

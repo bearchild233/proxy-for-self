@@ -2,7 +2,9 @@
 
 use std::sync::Arc;
 
-use crate::model::system::{PluginAction, PluginStatus};
+use crate::model::system::{
+    LoginProtectionPolicy, LoginProtectionStatus, LoginUnban, PluginAction, PluginStatus,
+};
 use async_trait::async_trait;
 
 use crate::{
@@ -18,6 +20,35 @@ use crate::{
 /// API 消费的系统管理服务。
 #[async_trait]
 pub trait SystemService: Send + Sync {
+    async fn plugin_request(
+        &self,
+        request: crate::model::system::PluginRequest,
+    ) -> Result<serde_json::Value, AdminError> {
+        if request.kind == "catalog" {
+            return Ok(serde_json::json!([]));
+        }
+        Err(AdminError::new(AdminErrorKind::Conflict, "插件平台未配置"))
+    }
+
+    async fn login_protection(&self) -> Result<LoginProtectionStatus, AdminError> {
+        Ok(LoginProtectionStatus {
+            available: false,
+            healthy: false,
+            policies: Vec::new(),
+            bans: Vec::new(),
+            total_bans: 0,
+        })
+    }
+    async fn set_login_protection(
+        &self,
+        _policy: LoginProtectionPolicy,
+    ) -> Result<LoginProtectionStatus, AdminError> {
+        Err(AdminError::new(AdminErrorKind::Conflict, "登录防护未配置"))
+    }
+    async fn unban_login(&self, _request: LoginUnban) -> Result<LoginProtectionStatus, AdminError> {
+        Err(AdminError::new(AdminErrorKind::Conflict, "登录防护未配置"))
+    }
+
     async fn plugins(&self) -> Result<Vec<PluginStatus>, AdminError> {
         Ok(Vec::new())
     }
@@ -55,11 +86,54 @@ impl DefaultSystemService {
 
 #[async_trait]
 impl SystemService for DefaultSystemService {
+    async fn plugin_request(
+        &self,
+        request: crate::model::system::PluginRequest,
+    ) -> Result<serde_json::Value, AdminError> {
+        self.operations
+            .plugin_request(request)
+            .await
+            .map_err(map_system_error)
+    }
+    async fn login_protection(&self) -> Result<LoginProtectionStatus, AdminError> {
+        self.operations
+            .login_protection()
+            .await
+            .map_err(map_system_error)
+    }
+    async fn set_login_protection(
+        &self,
+        policy: LoginProtectionPolicy,
+    ) -> Result<LoginProtectionStatus, AdminError> {
+        if !(3..=20).contains(&policy.max_failures)
+            || !(60..=3600).contains(&policy.window_seconds)
+            || !(60..=86400).contains(&policy.ban_seconds)
+            || !(policy.ban_seconds..=604800).contains(&policy.max_ban_seconds)
+        {
+            return Err(AdminError::invalid("登录防护阈值不合法"));
+        }
+        self.operations
+            .set_login_protection(policy)
+            .await
+            .map_err(map_system_error)
+    }
+    async fn unban_login(&self, request: LoginUnban) -> Result<LoginProtectionStatus, AdminError> {
+        self.operations
+            .unban_login(request)
+            .await
+            .map_err(map_system_error)
+    }
+
     async fn plugins(&self) -> Result<Vec<PluginStatus>, AdminError> {
         self.operations.plugins().await.map_err(map_system_error)
     }
     async fn plugin_action(&self, id: String, action: PluginAction) -> Result<String, AdminError> {
-        if id != "excel-bridge" {
+        if id.is_empty()
+            || id.len() > 64
+            || !id
+                .bytes()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+        {
             return Err(AdminError::new(AdminErrorKind::Invalid, "未知插件"));
         }
         self.operations

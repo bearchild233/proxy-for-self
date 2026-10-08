@@ -1,0 +1,42 @@
+{
+  "id": "account-diagnostics",
+  "version": "0.3.1",
+  "protocol": 2,
+  "kind": "ui",
+  "sdk": 1,
+  "pages": [
+    {
+      "id": "main",
+      "title": "账号诊断",
+      "entry": "ui/module.js",
+      "roles": [
+        "admin"
+      ],
+      "slot": "account-menu"
+    }
+  ],
+  "capabilities": [
+    "accounts.get.admin.accounts.models",
+    "auth.get.auth.status",
+    "auth.post.auth.logout",
+    "diagnostic.observe",
+    "diagnostics.history",
+    "tasks.cancel",
+    "tasks.start",
+    "tasks.status",
+    "templates.read",
+    "templates.write"
+  ],
+  "worker": "worker/main.py",
+  "dataFiles": [
+    "templates.json"
+  ],
+  "releasedAt": "2026-10-08T18:39:16.698798+00:00",
+  "releaseNotes": [
+    "宽版双栏测试面板，操作按钮固定可见，统一字体与表单控件。",
+    "使用宿主共享 Vue 与公共组件，按需挂载页面并保留切换状态。",
+    "插件代码与样式可预载，后台任务不依赖页面打开。"
+  ],
+  "runtime": "vue-component",
+  "hostApi": 1
+}

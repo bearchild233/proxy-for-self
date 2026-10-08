@@ -833,6 +833,79 @@ async fn openai_admin_quota_refresh_updates_the_account_plan() {
 }
 
 #[tokio::test]
+async fn openai_admin_quota_projects_credit_balances_on_refresh_and_read() {
+    for (raw, balance, usd, unlimited) in [
+        (
+            json!({"balance":"62500","unlimited":false}),
+            Some("62500"),
+            Some("2500"),
+            false,
+        ),
+        (json!({"balance":12.5}), Some("12.5"), Some("0.5"), false),
+        (json!({"balance":"0"}), Some("0"), Some("0"), false),
+        (json!({"balance":null}), None, None, false),
+        (json!({"balance":"-3"}), None, None, false),
+        (json!({"balance":"invalid"}), None, None, false),
+        (
+            json!({"balance":"62500","unlimited":true}),
+            None,
+            None,
+            true,
+        ),
+    ] {
+        let store = Arc::new(MemoryAccountStore::default());
+        let mut verified_account = profile("chatgpt-upgraded-plan");
+        verified_account.plan_type = Some("plus".to_owned());
+        store
+            .seed_oauth_credential(ImportCodexOAuthCredential {
+                account_id: "acct_upgraded_plan".to_owned(),
+                name: "upgraded plan".to_owned(),
+                secret: secret("upgraded-plan-test-token"),
+                verified_account,
+                next_refresh_at: None,
+                enabled: true,
+            })
+            .await;
+        let account = store.account("acct_upgraded_plan").unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/api/codex/usage"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "credits": raw, "plan_type": "pro", "rate_limit": {"allowed": true, "primary_window": {"used_percent": 1}}
+        })))
+        .expect(1).mount(&server).await;
+        let mut config = valid_config();
+        config.config.api.base_url = server.uri();
+        let bundle = provider_openai::initialize(
+            config.config,
+            provider_ports_with(store.clone(), Arc::new(TestOAuthPending::default())),
+        )
+        .await
+        .unwrap();
+        for refresh in [true, false] {
+            let quota = bundle
+                .admin_provider()
+                .quota(ProviderQuotaRequest {
+                    account_id: account.id().clone(),
+                    refresh,
+                    rolling_usage: None,
+                })
+                .await
+                .unwrap();
+            let credits = quota.credits.expect("credit projection");
+            assert_eq!(credits.balance.as_deref(), balance);
+            assert_eq!(credits.usd_equivalent.as_deref(), usd);
+            assert_eq!(credits.unlimited, unlimited);
+            assert!(!quota.limit_reached);
+            assert_eq!(quota.plan_type.as_deref(), Some("pro"));
+            assert_eq!(
+                store.account("acct_upgraded_plan").unwrap().plan_type(),
+                Some("pro")
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn openai_admin_projects_free_plan_from_cached_quota_when_account_claims_omit_it() {
     let store = Arc::new(MemoryAccountStore::default());
     let mut verified_account = profile("chatgpt-free-plan");
@@ -2326,5 +2399,146 @@ async fn api_key_admin_exposes_only_configuration_and_preserves_key_when_rotatin
     assert_eq!(
         admin.reset_credits(account.id()).await.unwrap_err().kind(),
         ProviderAdminErrorKind::Unsupported
+    );
+}
+
+#[tokio::test]
+async fn pinned_cli_registers_only_cli_updates_when_enabled() {
+    use provider_openai::transport::profile::{CodexWireProfile, selection::ClientKind};
+    for automatic in [false, true] {
+        let mut config = valid_config();
+        config.config.pinned_cli_profile = Some(CodexWireProfile {
+            client_kind: ClientKind::Cli,
+            ..Default::default()
+        });
+        config.config.pinned_cli_auto_update = automatic;
+        let mut bundle = provider_openai::initialize(config.config, provider_ports())
+            .await
+            .unwrap();
+        let contributions = bundle.take_worker_contributions();
+        let owners: Vec<_> = contributions
+            .iter()
+            .filter_map(|item| match item {
+                WorkerContribution::Registration(registration) => Some(registration.id.owner()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(owners.contains(&"openai-cli-release"), automatic);
+        assert!(!owners.contains(&"openai-desktop-release"));
+        assert!(!owners.contains(&"openai-platform-desktop-release"));
+    }
+}
+
+#[tokio::test]
+async fn diagnostic_headers_close_without_reading_sse_or_exposing_material() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    for status in [200, 401, 429] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut header = Vec::new();
+            loop {
+                let mut byte = [0u8; 1];
+                stream.read_exact(&mut byte).await.unwrap();
+                header.push(byte[0]);
+                if header.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let text = String::from_utf8(header).unwrap();
+            let length: usize = text
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|v| v.trim().parse().unwrap())
+                })
+                .unwrap();
+            let mut body = vec![0; length];
+            stream.read_exact(&mut body).await.unwrap();
+            stream.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nx-codex-turn-state: secret-state-marker\r\nSet-Cookie: __cf_bm=cookie-secret; Path=/\r\n\r\n").as_bytes()).await.unwrap();
+            // 不交付正文。只有调用方主动释放响应才能完成。
+            let mut remaining = Vec::new();
+            let closed =
+                tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut remaining))
+                    .await;
+            assert!(
+                closed.is_ok(),
+                "diagnostic must drop upstream response after headers"
+            );
+        });
+        let account_id = "acct_diagnostic_headers";
+        let store = Arc::new(MemoryAccountStore::default());
+        store
+            .seed_oauth_credential(ImportCodexOAuthCredential {
+                account_id: account_id.into(),
+                name: account_id.into(),
+                secret: secret("diagnostic-token"),
+                verified_account: profile("diagnostic-upstream"),
+                next_refresh_at: None,
+                enabled: true,
+            })
+            .await;
+        let mut config = valid_config();
+        config.config.api.base_url = format!("http://{address}");
+        let bundle = provider_openai::initialize(
+            config.config,
+            provider_ports_with(store, Arc::new(TestOAuthPending::default())),
+        )
+        .await
+        .unwrap();
+        let input = ProviderDocument::new(OpaqueProviderData::new(
+            json!({"phase":"prepare","model":"gpt-6-astra","effort":"low"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        ));
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            bundle
+                .admin_provider()
+                .diagnostic(&ProviderAccountId::new(account_id).unwrap(), input),
+        )
+        .await
+        .expect("headers only")
+        .unwrap();
+        let value = result.into_provider_data().into_inner();
+        assert_eq!(value["status"], status);
+        assert_eq!(value["bootstrap"], true);
+        // 本地非官方 Cookie 域必须被拒绝，无法配对就不生成票。
+        assert_eq!(value["prepared"], false);
+        let encoded = serde_json::to_string(&value).unwrap();
+        assert!(!encoded.contains("secret-state-marker"));
+        assert!(!encoded.contains("cookie-secret"));
+        upstream.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn diagnostic_template_preserves_prompt_and_effort_in_core_operation() {
+    let config = valid_config();
+    let bundle = provider_openai::initialize(config.config.clone(), provider_ports())
+        .await
+        .unwrap();
+    let document = ProviderDocument::new(OpaqueProviderData::new(serde_json::json!({
+        "phase":"text", "model":"test-model", "prompt":"custom diagnostic input", "effort":"high"
+    }).as_object().unwrap().clone()));
+    let (model, operation) = bundle
+        .admin_provider()
+        .diagnostic_operation(&document)
+        .unwrap()
+        .unwrap();
+    assert_eq!(model.as_str(), "test-model");
+    let gateway_core::operation::Operation::Generate(request) = operation else {
+        panic!("generate expected")
+    };
+    assert_eq!(
+        request.protocol_payload().body()["reasoning"]["effort"],
+        "high"
+    );
+    assert_eq!(
+        request.protocol_payload().body()["input"][0]["content"][0]["text"],
+        "custom diagnostic input"
     );
 }

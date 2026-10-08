@@ -5,6 +5,7 @@ import { RouterView, useRoute } from 'vue-router'
 
 import AppAboutModal from '@/components/AppAboutModal.vue'
 import BaseScrollbar from '@/components/base/BaseScrollbar.vue'
+import PluginRoute from '@/plugins/PluginRoute.vue'
 import { useSystemUpdateStore } from '@/stores/modules/system-update'
 import { useUiStore } from '@/stores/modules/ui'
 
@@ -79,7 +80,9 @@ watch(
     />
     <FloatingSidebarToggle v-if="!mobileSidebarOpen" @open="openMobileSidebar" />
     <main class="relative isolate h-dvh min-w-0 flex-1 overflow-hidden">
-      <BaseScrollbar ref="pageScrollbarRef">
+      <!-- 插件自带滚动容器，直接获得完整视口。 -->
+      <PluginRoute v-show="route.name !== 'settings-plugins'" />
+      <BaseScrollbar v-if="route.name === 'settings-plugins'" ref="pageScrollbarRef">
         <div class="flex min-h-full min-w-0 flex-col p-4 min-[961px]:p-6">
           <RouterView v-slot="{ Component }">
             <component :is="Component" class="min-h-0 flex-1" />

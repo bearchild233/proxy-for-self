@@ -68,6 +68,20 @@ fn update_body() -> Value {
 }
 
 #[test]
+fn inference_limits_validate_budget_and_keep_old_clients_compatible() {
+    let mut body = update_body();
+    let old: UpdateRuntimeSettingsRequest = serde_json::from_value(body.clone()).unwrap();
+    assert_eq!(old.inference_limits, None);
+    body["inferenceLimits"] =
+        json!({"maxRequests": 40, "maxBodyBytes": 50, "maxInFlightBodyBytes": 512});
+    let request: UpdateRuntimeSettingsRequest = serde_json::from_value(body.clone()).unwrap();
+    assert!(request.validate().is_ok());
+    body["inferenceLimits"]["maxInFlightBodyBytes"] = json!(49);
+    let request: UpdateRuntimeSettingsRequest = serde_json::from_value(body).unwrap();
+    assert_eq!(request.validate().unwrap_err().field(), "inferenceLimits");
+}
+
+#[test]
 fn settings_request_should_reject_unknown_rotation_strategy() {
     let mut body = update_body();
     body["rotationStrategy"] = json!("random");
@@ -133,6 +147,7 @@ fn settings_response_should_cover_the_full_runtime_settings_contract() {
         max_waiting_per_key: 0,
         max_waiting_per_account: 0,
         concurrency_wait_timeout_seconds: 30,
+        inference_limits: None,
         responses_max_decompressed_body_bytes: 64 * 1024 * 1024,
         rotation_strategy: RotationStrategy::RoundRobin,
         min_codex_desktop_version: Some("26.825.6671".to_owned()),
@@ -172,6 +187,7 @@ fn settings_response_should_cover_the_full_runtime_settings_contract() {
             "maxWaitingPerKey": 0,
             "maxWaitingPerAccount": 0,
             "concurrencyWaitTimeoutSeconds": 30,
+            "inferenceLimits": null,
             "responsesMaxDecompressedBodyBytes": 67108864,
             "rotationStrategy": "round_robin",
             "minCodexDesktopVersion": "26.825.6671",
@@ -235,6 +251,7 @@ fn settings_request_and_response_fields_should_stay_in_lockstep() {
         max_waiting_per_key: 0,
         max_waiting_per_account: 0,
         concurrency_wait_timeout_seconds: 30,
+        inference_limits: None,
         responses_max_decompressed_body_bytes: 64 * 1024 * 1024,
         rotation_strategy: RotationStrategy::parse(&request.rotation_strategy)
             .expect("fixture rotation strategy"),
@@ -265,6 +282,7 @@ fn settings_request_and_response_fields_should_stay_in_lockstep() {
     expected_fields.insert("openaiClientProfile".to_owned());
     expected_fields.insert("xaiClientProfile".to_owned());
     expected_fields.insert("updatedAt".to_owned());
+    expected_fields.insert("inferenceLimits".to_owned());
 
     assert_eq!(response_fields, expected_fields);
 }

@@ -1184,7 +1184,7 @@ models.dev 同步只导入可表示为当前文本 Token 计价的 OpenAI/xAI �
 ### OpenAI 上游客户端身份
 
 `openaiClientProfile` 保存通用选择，首次默认 `MacOS · Desktop · 自动最新`。
-设置更新省略该字段保留现值，不能提交 `null`。初始化不读取 YAML 身份字段；内置默认只用于初始化，不形成第三层运行时回退。
+设置更新省略该字段保留现值，不能提交 `null`。配置 `openai.pinned_cli_profile` 时由服务器统一身份，覆盖通用及 Key 级选择。`openai.pinned_cli_auto_update: true` 允许该身份每日跟随官方 npm 稳定版，核对全部平台依赖并拒绝降级；检查失败保留当前版本，重启优先恢复有效缓存。更新只影响后续请求捕获的版本，不重启服务或更换账号。
 该配置作用于 Client Key 的 OpenAI 模型请求与原生模型目录，适用于 HTTP/SSE、WebSocket、Images 和 Search。
 不改变 xAI、入站客户端版本门禁、账号认证或后台 Desktop 专属操作。
 
@@ -1452,6 +1452,10 @@ Provider metadata 分别保留 `requestedServiceTier` 与 `upstreamServiceTier` 
 原始 `response.service_tier` 不变。用量中的 Fast 仅表示发送档位，不能证明上游实际加速，本地费用
 估算也不能代替官方账单。档位与费用在请求记录生成时确定；查询不会回填历史档位或重算已存储费用。
 
+使用统计的推理强度列以机器人表示子代理，以金色闪电表示最终发送档位为 `priority`/`fast`；
+分组关闭 Fast 后发送 `default`，不显示 Fast 标识。详情并列展示发送档位和上游回传档位；费用明细标为本地估算，
+不用于换算 Plus/Pro 订阅额度的实际扣减。
+
 `/api/admin/usage/records` 与 `/api/admin/ops/errors` 的记录返回 `clientApiKeyName`，为关联 Key 的当前名称；
 Key 已删除或未关联时为 `null`，不影响记录返回，不包含密钥原文。
 
@@ -1511,3 +1515,21 @@ OpenAI OAuth 额度的手动请求、页面自动刷新和后台同步共用只�
 - `POST /api/admin/system/plugins/action`：管理员提交 `{ "id": "excel-bridge", "action": "install|enable|disable|uninstall|update" }`，返回 202 与 `operationId`；轮询 GET 获取结果。action 为单个枚举值，拒绝额外字段，不接收路径、Shell、下载 URL。
 - 禁用/卸载先停止新请求，排空已有 Excel 流后停止 Worker；不改变 Key 绑定，不将 Excel 请求回退 Native。卸载保留审计和 Key 配置。
 - 普通 API Key 登录仍可 `GET /api/key-usage/config` 导出自身明文 Key 与客户端配置；响应不缓存，不能指定其他 Key。插件管理需要管理员角色。
+
+### 网关入口容量设置
+
+`GET /api/admin/settings` 返回有效的 `inferenceLimits: { maxRequests, maxBodyBytes, maxInFlightBodyBytes }`。`POST /api/admin/settings/update` 可随其他运行参数提交该对象；省略或 null 保留已有覆盖。三个字段分别为实例并发（0–65535）、单请求正文上限及在途正文总预算（字节，最大 4294967295），0 表示对应维度不限。启用总预算时，单请求上限必须为正且不超过预算，否则返回400。
+
+保存后持久化并热发布，HTTP/SSE与WS生成共用全局占用。减少限制不会取消已准入请求。已有WS连接增加收帧上限需重连。面板统一正文大小，同时更新 `responsesMaxDecompressedBodyBytes`；API单独提交时两种限制取较小值。繁忙返回503 `gateway_busy`，HTTP带 `Retry-After: 1`。
+
+### 登录防护
+
+管理员专用：`GET /api/admin/system/login-protection` 获取状态、两个入口的策略与最近 100 个有效封禁；`POST /api/admin/system/login-protection/policy` 保存 `{site,maxFailures,windowSeconds,banSeconds,maxBanSeconds}`；`POST /api/admin/system/login-protection/unban` 接收 `{site,ip}`。`site` 仅允许 `api`、`panel`。普通 Key 登录不能使用这些接口。失败次数 3–20、窗口 60–3600 秒、首次封禁 60–86400 秒、累计封禁上限不小于首次且不超过 604800 秒。封禁仅影响登录，返回 429 和 Retry-After。
+
+账号额度窗口新增 `resetAt`（RFC3339 或 null），供前端倒计时；`resetAtDisplay` 保留准确时间展示。已到重置时间仅提示等待刷新，不据此虚构额度恢复。
+
+### 账号 Credits
+
+账号额度安全视图 `quota.credits` 为 `null` 或 `{ balance, unlimited, usdEquivalent }`。余额和美元等值均为十进制字符串，缺失或非法余额为 `null`，零余额为 `"0"`；无限余额不折算金额。随现有额度刷新读取，不增加独立上游请求，不参与调度或改变窗口限额。
+
+美元等值按 [Codex 标准 Credits 单价](https://developers.openai.com/codex/pricing/) 与对应 [API 标准美元单价](https://developers.openai.com/api/docs/models/gpt-6.1-sol) 换算：25 Credits ≈ $1。此值是标准用量等值，不是实际购入金额或账单。

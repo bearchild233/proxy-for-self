@@ -1,0 +1,1 @@
+{"extends":"../../frontend/tsconfig.app.json","compilerOptions":{"composite":false,"tsBuildInfoFile":"../../frontend/node_modules/.tmp/plugin-groups.tsbuildinfo"},"include":["ui/**/*.ts","ui/**/*.vue","../../frontend/env.d.ts"]}

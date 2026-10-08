@@ -81,7 +81,8 @@ pub async fn initialize(
                 ..Default::default()
             }),
     )
-    .with_locked_identity(config.pinned_cli_profile.is_some());
+    .with_locked_identity(config.pinned_cli_profile.is_some())
+    .with_cli_auto_update(config.pinned_cli_profile.is_some() && config.pinned_cli_auto_update);
     let artifact_cache =
         CodexArtifactProfileCache::new(provider_kind.clone(), ports.artifact_profiles());
     let configured_build = profile.snapshot().desktop_build.parse::<u64>().ok();
@@ -121,7 +122,7 @@ pub async fn initialize(
         )
         .map_err(|_| OpenAiInitializeError::DesktopRelease)?,
     );
-    if config.pinned_cli_profile.is_none() {
+    if config.pinned_cli_profile.is_none() || config.pinned_cli_auto_update {
         cli_release.restore().await;
     }
     let platform_releases = Arc::new(
@@ -173,6 +174,14 @@ pub async fn initialize(
         Arc::clone(&quota),
         Arc::clone(&account_feedback),
         CodexCookiePolicy::official().map_err(|_| OpenAiInitializeError::CookiePolicy)?,
+    ));
+    let diagnostic = Arc::new(credential::diagnostic::DiagnosticService::new(
+        repository.clone(),
+        transport::CodexBackendClient::new(
+            http.clone(),
+            config.base_url().to_owned(),
+            profile.clone(),
+        ),
     ));
     let core_provider: Arc<dyn Provider> = Arc::new(
         CodexProvider::new(
@@ -241,6 +250,7 @@ pub async fn initialize(
         profile,
         accounts,
         OpenAiAdminServices {
+            diagnostic,
             credentials: credential_admin,
             oauth: oauth_admin,
             profile_statistics: Arc::clone(&profile_statistics),
@@ -258,6 +268,7 @@ pub async fn initialize(
         config.oauth_refresh_enabled(),
         provider::ClientReleaseServices {
             enabled: config.pinned_cli_profile.is_none(),
+            cli_enabled: config.pinned_cli_profile.is_none() || config.pinned_cli_auto_update,
             desktop: desktop_release,
             cli: cli_release,
             platforms: platform_releases,

@@ -2,7 +2,9 @@
 
 use std::pin::Pin;
 
-use crate::model::system::{PluginAction, PluginStatus};
+use crate::model::system::{
+    LoginProtectionPolicy, LoginProtectionStatus, LoginUnban, PluginAction, PluginStatus,
+};
 use async_trait::async_trait;
 use futures::Stream;
 
@@ -55,6 +57,47 @@ pub type SystemUpdateEventStream = Pin<Box<dyn Stream<Item = SystemUpdateEvent> 
 /// 版本、自更新、回滚和重启能力；实现唯一归 gateway-host。
 #[async_trait]
 pub trait SystemOperations: Send + Sync {
+    async fn plugin_request(
+        &self,
+        request: crate::model::system::PluginRequest,
+    ) -> Result<serde_json::Value, SystemOperationError> {
+        if request.kind == "catalog" {
+            return Ok(serde_json::json!([]));
+        }
+        Err(SystemOperationError::new(
+            SystemOperationErrorKind::Conflict,
+            "插件平台未配置",
+        ))
+    }
+
+    async fn login_protection(&self) -> Result<LoginProtectionStatus, SystemOperationError> {
+        Ok(LoginProtectionStatus {
+            available: false,
+            healthy: false,
+            policies: Vec::new(),
+            bans: Vec::new(),
+            total_bans: 0,
+        })
+    }
+    async fn set_login_protection(
+        &self,
+        _policy: LoginProtectionPolicy,
+    ) -> Result<LoginProtectionStatus, SystemOperationError> {
+        Err(SystemOperationError::new(
+            SystemOperationErrorKind::Conflict,
+            "登录防护未配置",
+        ))
+    }
+    async fn unban_login(
+        &self,
+        _request: LoginUnban,
+    ) -> Result<LoginProtectionStatus, SystemOperationError> {
+        Err(SystemOperationError::new(
+            SystemOperationErrorKind::Conflict,
+            "登录防护未配置",
+        ))
+    }
+
     async fn plugins(&self) -> Result<Vec<PluginStatus>, SystemOperationError> {
         Ok(Vec::new())
     }

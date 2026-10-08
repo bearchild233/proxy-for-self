@@ -1,0 +1,10 @@
+{
+  "main": {
+    "source": "page/BackupPage.vue",
+    "route": "/settings/backup",
+    "title": "数据备份",
+    "roles": [
+      "admin"
+    ]
+  }
+}

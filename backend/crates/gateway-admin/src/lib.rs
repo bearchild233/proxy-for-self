@@ -21,6 +21,7 @@ pub mod backup;
 pub mod freeze_recovery;
 pub mod model;
 pub mod ports;
+pub mod pricing_sync;
 mod use_case;
 
 pub use use_case::key_usage::KeyUsageService;
@@ -296,6 +297,8 @@ impl AdminBundle {
 
 /// 组合根提供给控制面的运行能力；与配置和存储端口分别传入。
 pub struct AdminRuntimePorts {
+    pub pricing_policy: Option<Arc<dyn ports::pricing::PricingSyncPolicy>>,
+    pub backup_policy: Option<Arc<dyn ports::backup::BackupPolicyPort>>,
     pub pricing_source: Arc<dyn ports::pricing::PricingSource>,
     pub providers: Vec<Arc<dyn ProviderAdmin>>,
     pub snapshot: Arc<dyn SnapshotControl>,
@@ -318,6 +321,8 @@ pub async fn initialize(
     runtime: AdminRuntimePorts,
 ) -> Result<AdminBundle, AdminError> {
     let AdminRuntimePorts {
+        pricing_policy,
+        backup_policy,
         pricing_source,
         providers,
         snapshot,
@@ -369,7 +374,8 @@ pub async fn initialize(
         backup_ports.repository(),
         backup_ports.dump(),
         backup_ports.object_store(),
-    );
+    )
+    .with_policy(backup_policy);
     let system = Arc::new(DefaultSystemService::new(system));
     let key_usage = Arc::new(use_case::key_usage::DefaultKeyUsageService::new(
         auth.clone(),
@@ -440,6 +446,34 @@ pub async fn initialize(
             settings: store.settings(),
         });
     let mut worker_contributions = backup_worker_contribution(backup_task)?;
+    {
+        let policy = pricing_policy;
+        let id = WorkerId::try_new(WorkerKind::PricingSync, "pricing-plugin")
+            .map_err(|_| AdminError::internal("定价 Worker ID 不合法"))?;
+        let schedule = WorkerSchedule::try_new(
+            Duration::from_secs(60),
+            Duration::from_secs(10),
+            Duration::from_secs(60),
+            Duration::from_secs(300),
+            Duration::from_secs(60),
+        )
+        .map_err(|_| AdminError::internal("定价 Worker 调度配置不合法"))?;
+        let lease = WorkerLeaseRequest::try_new(id.clone(), Duration::from_secs(300))
+            .map_err(|_| AdminError::internal("定价 Worker 租约不合法"))?;
+        let registration = WorkerRegistration::try_new(
+            id,
+            WorkerRunnable::Scheduled {
+                schedule,
+                lease: Some(lease),
+                task: Box::new(pricing_sync::PricingSyncTask {
+                    settings: services.settings.clone(),
+                    policy,
+                }),
+            },
+        )
+        .map_err(|_| AdminError::internal("定价 Worker 注册失败"))?;
+        worker_contributions.push(WorkerContribution::Registration(registration));
+    }
     let id = WorkerId::try_new(WorkerKind::AccountImport, "admin")
         .map_err(|_| AdminError::internal("导入 Worker ID 不合法"))?;
     let restart = DaemonRestartPolicy::try_new(Duration::from_secs(1), Duration::from_secs(60))

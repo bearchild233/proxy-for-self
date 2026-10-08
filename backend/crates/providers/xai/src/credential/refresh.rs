@@ -451,7 +451,8 @@ impl GrokCredentialRefreshService {
             .await?
         {
             ProviderLeaseAcquisition::Acquired(guard) => guard,
-            ProviderLeaseAcquisition::Busy { .. } => {
+            ProviderLeaseAcquisition::Busy { .. }
+            | ProviderLeaseAcquisition::IntervalPending { .. } => {
                 return Err(GrokCredentialRefreshError::LeaseBusy);
             }
         };
@@ -463,7 +464,8 @@ impl GrokCredentialRefreshService {
             .await?
         {
             ProviderLeaseAcquisition::Acquired(guard) => guard,
-            ProviderLeaseAcquisition::Busy { .. } => {
+            ProviderLeaseAcquisition::Busy { .. }
+            | ProviderLeaseAcquisition::IntervalPending { .. } => {
                 return Err(GrokCredentialRefreshError::LeaseBusy);
             }
         };
@@ -620,7 +622,8 @@ impl GrokCredentialRefreshService {
             .await?;
         let _capacity_guard = match capacity {
             ProviderLeaseAcquisition::Acquired(guard) => guard,
-            ProviderLeaseAcquisition::Busy { .. } => {
+            ProviderLeaseAcquisition::Busy { .. }
+            | ProviderLeaseAcquisition::IntervalPending { .. } => {
                 return Ok(GrokCredentialRefreshOutcome::LeaseUnavailable { account_id });
             }
         };
@@ -635,7 +638,8 @@ impl GrokCredentialRefreshService {
             .await?;
         let _guard = match lease {
             ProviderLeaseAcquisition::Acquired(guard) => guard,
-            ProviderLeaseAcquisition::Busy { .. } => {
+            ProviderLeaseAcquisition::Busy { .. }
+            | ProviderLeaseAcquisition::IntervalPending { .. } => {
                 return Ok(GrokCredentialRefreshOutcome::LeaseUnavailable { account_id });
             }
         };

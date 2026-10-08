@@ -440,3 +440,12 @@ fn disabled_infra() -> BackupError {
         "backup infrastructure is disabled in this configuration".to_owned(),
     )
 }
+
+/// 不含凭据的插件策略输入/输出；宿主执行独立版本的受信任插件。
+#[async_trait]
+pub trait BackupPolicyPort: Send + Sync {
+    async fn decide(
+        &self,
+        input: serde_json::Value,
+    ) -> Result<serde_json::Value, gateway_core::task::WorkerTaskError>;
+}

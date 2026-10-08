@@ -21,6 +21,7 @@ fn settings_with_margin(refresh_margin_seconds: u64) -> RuntimeSettingsUpdate {
         max_waiting_per_key: 0,
         max_waiting_per_account: 0,
         concurrency_wait_timeout_seconds: 30,
+        inference_limits: None,
         responses_max_decompressed_body_bytes: 64 * 1024 * 1024,
         rotation_strategy: "smart".to_owned(),
         model_mappings: BTreeMap::from([
@@ -46,6 +47,88 @@ fn settings_with_margin(refresh_margin_seconds: u64) -> RuntimeSettingsUpdate {
 fn runtime_settings_keep_account_rotation_global() {
     let settings = settings_with_margin(3_600);
     assert!(settings.validate().is_ok());
+}
+
+#[tokio::test]
+async fn inference_limits_persist_into_snapshot_and_omission_preserves_them() {
+    use gateway_store::postgres::{PgRuntimeSnapshotRepository, RuntimeSnapshotRepository};
+    let Some(database) = TestDatabase::create("inference_limits").await else {
+        return;
+    };
+    let repository = PgRuntimeSettingsRepository::new(database.pool.clone());
+    assert_eq!(
+        repository
+            .load_runtime_settings()
+            .await
+            .unwrap()
+            .inference_limits,
+        None
+    );
+    let limits = gateway_core::policy::InferenceLimits {
+        max_requests: 40,
+        max_body_bytes: 50 * 1024 * 1024,
+        max_in_flight_body_bytes: 512 * 1024 * 1024,
+    };
+    let mut update = settings_with_margin(3600);
+    update.inference_limits = Some(limits);
+    repository.update_runtime_settings(update).await.unwrap();
+    repository
+        .update_runtime_settings(settings_with_margin(1800))
+        .await
+        .unwrap();
+    assert_eq!(
+        repository
+            .load_runtime_settings()
+            .await
+            .unwrap()
+            .inference_limits,
+        Some(limits)
+    );
+    let snapshot = PgRuntimeSnapshotRepository::new(database.pool.clone())
+        .load_runtime_snapshot()
+        .await
+        .unwrap();
+    assert_eq!(snapshot.settings.inference_limits, Some(limits));
+    // 控制面保存后使用事务内的第二条 SELECT，覆盖同一行解析的全部调用方。
+    use gateway_store::postgres::{
+        AdminAuditActorKind, AdminAuditEvent, ControlPlaneReplacement, ControlPlaneRepository,
+        PgControlPlaneRepository,
+    };
+    let saved = PgControlPlaneRepository::new(database.pool.clone())
+        .replace_control_plane(ControlPlaneReplacement {
+            settings: settings_with_margin(1800),
+            audit: AdminAuditEvent {
+                id: "limits-audit".into(),
+                actor_kind: AdminAuditActorKind::System,
+                actor_admin_user_id: None,
+                actor_ref: "system".into(),
+                admin_request_id: None,
+                action: "settings.replace".into(),
+                entity_kind: "runtime_settings".into(),
+                entity_ref: "1".into(),
+                config_revision: None,
+                changed_fields: vec!["inference_limits_json".into()],
+                created_at: Utc::now(),
+            },
+        })
+        .await
+        .unwrap();
+    assert_eq!(saved.settings.inference_limits, Some(limits));
+    let mut invalid = settings_with_margin(3600);
+    invalid.inference_limits = Some(gateway_core::policy::InferenceLimits {
+        max_in_flight_body_bytes: 1,
+        ..limits
+    });
+    assert!(repository.update_runtime_settings(invalid).await.is_err());
+    assert_eq!(
+        repository
+            .load_runtime_settings()
+            .await
+            .unwrap()
+            .inference_limits,
+        Some(limits)
+    );
+    database.close().await;
 }
 
 #[tokio::test]

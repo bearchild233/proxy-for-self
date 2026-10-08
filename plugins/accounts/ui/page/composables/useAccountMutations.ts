@@ -1,0 +1,275 @@
+import type { Ref } from 'vue'
+import type { AccountImportTask, getAccounts } from '@/api'
+import type { RequestOptions } from '@/api/request'
+import { ref, watch } from 'vue'
+import {
+  deleteAccounts,
+  exportAccounts,
+  recoverAccount,
+  refreshAccount,
+  refreshAccountQuota,
+} from '@/api'
+import { toast } from '@/components/base/BaseToast'
+import { useAsyncAction } from '@/composables/useAsyncAction'
+import { useDownload } from '@/composables/useDownload'
+import { useIdSet } from '@/composables/useIdSet'
+import { errorMessage, withMinimumDuration } from '@/utils/async'
+import { chinaDate } from '@/utils/date'
+
+import { useAccountOnboarding } from './useAccountOnboarding'
+
+type AccountRow = Awaited<ReturnType<typeof getAccounts>>['items'][number]
+
+export function useAccountMutations(options: {
+  accounts: Ref<AccountRow[]>
+  selectedIds: Ref<Set<string>>
+  onImportTaskCreated: (task: AccountImportTask) => void
+  reload: () => Promise<unknown>
+  replaceAccount: (account: AccountRow) => Promise<boolean>
+}) {
+  const loadAccounts = options.reload
+  const { downloadJson } = useDownload()
+  const onboarding = useAccountOnboarding({
+    reload: loadAccounts,
+    onImportTaskCreated: options.onImportTaskCreated,
+  })
+  const selectedAccountsById = new Map<string, AccountRow>()
+  const showDeleteModal = ref(false)
+  const showSingleDeleteModal = ref(false)
+  const pendingDeleteAccount = ref<AccountRow | null>(null)
+  const recoveringAccounts = useIdSet<string>()
+  const refreshingAccounts = useIdSet<string>()
+  const refreshingQuotaAccounts = useIdSet<string>()
+  const deletingAccountAction = useAsyncAction()
+  const batchDeletingAction = useAsyncAction()
+  const exportingAccountsAction = useAsyncAction()
+  const recoveringAccountIds = recoveringAccounts.ids
+  const refreshingAccountIds = refreshingAccounts.ids
+  const refreshingQuotaAccountIds = refreshingQuotaAccounts.ids
+  const deletingAccount = deletingAccountAction.loading
+  const batchDeleting = batchDeletingAction.loading
+  const exportingAccounts = exportingAccountsAction.loading
+
+  watch(
+    [options.accounts, options.selectedIds],
+    ([accounts, selectedIds]) => {
+      for (const account of accounts) {
+        if (selectedIds.has(account.id))
+          selectedAccountsById.set(account.id, account)
+      }
+      for (const accountId of selectedAccountsById.keys()) {
+        if (!selectedIds.has(accountId))
+          selectedAccountsById.delete(accountId)
+      }
+    },
+    { immediate: true, flush: 'sync' },
+  )
+
+  function requestDeleteAccount(account: AccountRow) {
+    pendingDeleteAccount.value = account
+    showSingleDeleteModal.value = true
+  }
+
+  async function handleDelete() {
+    const account = pendingDeleteAccount.value
+    if (deletingAccount.value || !account)
+      return
+
+    await deletingAccountAction.run(
+      async () => {
+        await deleteAccountBatch([account])
+        const remaining = new Set(options.selectedIds.value)
+        remaining.delete(account.id)
+        options.selectedIds.value = remaining
+        showSingleDeleteModal.value = false
+        pendingDeleteAccount.value = null
+        await loadAccounts()
+        toast.success('账号已删除')
+      },
+    )
+  }
+
+  async function handleBatchDelete() {
+    if (batchDeleting.value || options.selectedIds.value.size === 0)
+      return
+
+    let deletedCount = 0
+    await batchDeletingAction.run(
+      async () => {
+        const selected = accountsById([...options.selectedIds.value])
+        for (const accounts of accountDeletionGroups(selected)) {
+          await deleteAccountBatch(accounts, { silent: true })
+          deletedCount += accounts.length
+          const deletedIds = new Set(accounts.map(account => account.id))
+          const remaining = new Set(options.selectedIds.value)
+          for (const accountId of deletedIds)
+            remaining.delete(accountId)
+          options.selectedIds.value = remaining
+        }
+        showDeleteModal.value = false
+        await loadAccounts()
+        toast.success(`已删除 ${deletedCount} 个账号`)
+      },
+      {
+        errorText: false,
+        onError: (error) => {
+          void loadAccounts().catch(() => undefined)
+          toast.error(
+            deletedCount > 0
+              ? `已删除 ${deletedCount} 个账号，其余未删除：${errorMessage(error, '操作失败')}`
+              : errorMessage(error, '批量删除失败'),
+          )
+        },
+      },
+    )
+  }
+
+  async function handleExportAccounts() {
+    if (exportingAccounts.value)
+      return
+    const selected = [...options.selectedIds.value]
+    if (selected.length === 0) {
+      toast.warning('请选择要导出的账号')
+      return
+    }
+
+    await exportingAccountsAction.run(
+      async () => {
+        const payload = await exportAccounts({
+          accountIds: selected.join(','),
+          confirm: 'export_sensitive_accounts',
+        })
+        const fileName = `cpr-accounts-selected-${selected.length}-${chinaDate().format('YYYY-MM-DD')}.json`
+        await downloadJson(payload, fileName)
+        toast.success(`已导出 ${selected.length} 个账号`)
+      },
+      { errorText: '导出失败' },
+    )
+  }
+
+  async function handleRefresh(accountId: string) {
+    await refreshingAccounts.run(accountId, async () => {
+      try {
+        const result = await withMinimumDuration(() =>
+          refreshAccount({
+            accountId,
+          }),
+        )
+        await loadAccounts()
+        if (result.result === 'skipped') {
+          toast.warning(result.error || 'Token 正在刷新中')
+          return
+        }
+        if (result.result === 'failed') {
+          toast.error(result.error || '刷新失败')
+          return
+        }
+        toast.success('Token 已刷新')
+      }
+      catch {}
+    })
+  }
+
+  async function handleRefreshQuota(accountId: string) {
+    await refreshingQuotaAccounts.run(accountId, async () => {
+      try {
+        const result = await withMinimumDuration(() => refreshAccountQuota({ accountId }))
+        const remainsVisible = await options.replaceAccount(result.account)
+        if (!remainsVisible) {
+          const selectedIds = new Set(options.selectedIds.value)
+          selectedIds.delete(accountId)
+          options.selectedIds.value = selectedIds
+        }
+        toast.success('额度已刷新')
+      }
+      catch {}
+    })
+  }
+
+  async function handleQuotaReset(accountId: string) {
+    try {
+      const result = await refreshAccountQuota({ accountId }, { silent: true })
+      await options.replaceAccount(result.account)
+    }
+    catch (error: unknown) {
+      toast.warning(
+        `额度已重置，但最新额度加载失败：${errorMessage(error, '请手动刷新额度')}`,
+        { duration: 5000 },
+      )
+    }
+  }
+
+  async function handleRecover(accountId: string) {
+    await recoveringAccounts.run(accountId, async () => {
+      try {
+        const result = await withMinimumDuration(() => recoverAccount({ accountId }))
+        const remainsVisible = await options.replaceAccount(result.account)
+        if (!remainsVisible) {
+          const selectedIds = new Set(options.selectedIds.value)
+          selectedIds.delete(accountId)
+          options.selectedIds.value = selectedIds
+        }
+        toast.success('账号状态已恢复')
+      }
+      catch {}
+    })
+  }
+
+  function accountsById(ids: string[]) {
+    const accounts = []
+    for (const id of ids) {
+      const account = selectedAccountsById.get(id)
+      if (!account)
+        throw new Error(`账号 ${id} 的页面数据已失效，请重新选择`)
+      accounts.push(account)
+    }
+    return accounts
+  }
+
+  async function deleteAccountBatch(accounts: AccountRow[], options?: RequestOptions) {
+    const account = accounts[0]
+    if (!account)
+      return
+    const payload = {
+      provider: account.provider,
+      accountIds: accounts.map(account => account.id),
+    }
+    const result = await deleteAccounts(payload, options)
+    if (!result)
+      throw new Error(`不支持的 Provider：${account.provider}`)
+  }
+
+  function accountDeletionGroups(accounts: AccountRow[]) {
+    const groups = new Map<string, AccountRow[]>()
+    for (const account of accounts) {
+      const key = account.provider
+      const group = groups.get(key)
+      if (group)
+        group.push(account)
+      else
+        groups.set(key, [account])
+    }
+    return groups.values()
+  }
+
+  return {
+    ...onboarding,
+    showDeleteModal,
+    showSingleDeleteModal,
+    pendingDeleteAccount,
+    recoveringAccountIds,
+    refreshingAccountIds,
+    refreshingQuotaAccountIds,
+    deletingAccount,
+    batchDeleting,
+    exportingAccounts,
+    requestDeleteAccount,
+    handleDelete,
+    handleBatchDelete,
+    handleExportAccounts,
+    handleRecover,
+    handleRefresh,
+    handleRefreshQuota,
+    handleQuotaReset,
+  }
+}

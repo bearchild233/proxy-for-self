@@ -43,3 +43,5 @@ jobs:
         run: python tools/test-excel-worker.py
       - name: Verify updater contracts
         run: python -m unittest discover -s services/updater -v
+      - name: Verify plugin platform contracts
+        run: python -m unittest discover -s services/plugin_host -p 'test_*.py' -v

@@ -391,6 +391,43 @@ impl ProviderAdmin for XaiAdminProvider {
         self.quota.invalidate_scheduling(account_ids);
     }
 
+    fn diagnostic_operation(
+        &self,
+        input: &gateway_admin::model::provider_credentials::ProviderDocument,
+    ) -> Result<Option<(UpstreamModelId, Operation)>, ProviderAdminError> {
+        let data = input.expose_to_provider().expose_to_provider();
+        if data.get("phase").and_then(Value::as_str) != Some("text") {
+            return Ok(None);
+        }
+        let invalid = || provider_error(ProviderAdminErrorKind::Invalid);
+        let model = UpstreamModelId::new(
+            data.get("model")
+                .and_then(Value::as_str)
+                .ok_or_else(invalid)?,
+        )
+        .map_err(|_| invalid())?;
+        let prompt = data
+            .get("prompt")
+            .and_then(Value::as_str)
+            .filter(|v| v.len() <= 32768)
+            .ok_or_else(invalid)?;
+        let effort = data.get("effort").and_then(Value::as_str).unwrap_or("low");
+        if !matches!(
+            effort,
+            "none" | "minimal" | "low" | "medium" | "high" | "xhigh"
+        ) {
+            return Err(invalid());
+        }
+        let body = serde_json::json!({"model":model.as_str(),"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":prompt}]}],"stream":true,"store":false,"tools":[],"tool_choice":"none","reasoning":{"effort":effort}});
+        let payload =
+            ProtocolPayload::json_object("openai", body.as_object().cloned().ok_or_else(invalid)?)
+                .map_err(|_| invalid())?;
+        Ok(Some((
+            model,
+            Operation::Generate(GenerateRequest::from_protocol_payload(payload)),
+        )))
+    }
+
     fn connection_test_operation(
         &self,
         upstream_model: &UpstreamModelId,
@@ -1136,6 +1173,7 @@ fn project_quota(
 ) -> ProviderQuota {
     let Some(snapshot) = snapshot else {
         return ProviderQuota {
+            credits: None,
             plan_type: None,
             observed_at: None,
             refresh_token_expires_at,
@@ -1208,6 +1246,7 @@ fn project_quota(
         }
     };
     ProviderQuota {
+        credits: None,
         plan_type: billing.plan_type().map(str::to_owned),
         observed_at: Some(snapshot.observed_at()),
         refresh_token_expires_at,

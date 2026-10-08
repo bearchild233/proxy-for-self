@@ -1,0 +1,10 @@
+{
+  "main": {
+    "source": "Diagnostics.vue",
+    "route": "/",
+    "title": "账号诊断",
+    "roles": [
+      "admin"
+    ]
+  }
+}

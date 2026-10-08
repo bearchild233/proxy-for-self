@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 // eslint-disable-next-line test/no-import-node-test -- 快捷筛选边界使用内置 runner
 import test from 'node:test'
-import { accountNeedsAttention } from '../src/views/accounts/utils/accountAttention.ts'
+import { accountNeedsAttention } from '../../plugins/accounts/ui/page/utils/accountAttention.ts'
 
 const account = { enabled: true, provider: 'openai', authenticationKind: 'oauth', status: 'normal', errorReason: null, quota: { limitReached: false, windows: [] } }
 test('A single low reported window is sufficient; unknown quota is not reported as low', () => {

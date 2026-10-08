@@ -65,7 +65,10 @@ fn unlimited_account_concurrency_preserves_overrides_intervals_and_finite_scores
         );
         let mut recent = candidate("acct_unlimited", u32::MAX, None);
         recent.signals.last_started_at = Some(context.now);
-        assert!(AccountSelector.select(&[recent], &context).is_none());
+        assert!(
+            AccountSelector.select(&[recent], &context).is_some(),
+            "interval is enforced by the atomic lease, not by lowering selection priority"
+        );
     }
 }
 

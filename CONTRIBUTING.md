@@ -19,6 +19,18 @@ git push -u origin feat/account-ui
 - Worker：Python 3.10+ 执行 `python tools/test-excel-worker.py`。与 CI 共用入口：每次创建临时隔离环境，安装锁定依赖及实际安装包，执行 `pip check` 和测试后清理。禁止以开发环境里直接运行 pytest 的结果替代此检查；新增依赖同步维护 `pyproject.toml` 与对应 lock。可追加 pytest 参数缩小检查范围。
 - 迁移：在 backend/migrations 执行 `sha256sum --check --strict .frozen-sha256`。已登记迁移的内容和哈希不得改变；新增迁移追加登记。
 
+## Windows 本地 Rust 编译
+
+已准备 `builder` 用户、Rust、rsync 和 cgroup v2 的 WSL 构建环境可使用：
+
+```powershell
+./scripts/build-local.ps1 -Task check -Package provider-openai
+./scripts/build-local.ps1 -Task test -Package provider-openai -CargoArgs @('--test', 'main', 'admin::openai_bundle_exposes_one_core_provider_and_drains_worker_contributions_once', '--', '--exact')
+./scripts/build-local.ps1 -Task release
+```
+
+默认使用 WSL 默认发行版，可通过 `-Distribution` 指定。入口自动同步 backend 到 `/work/proxy-for-self/backend`，复用该目录的 target；CPU 上限 4 核，依据 Windows 可用内存选择 1–3 个 Cargo 任务及 2–4 GiB 内存上限。开发编译启用增量缓存并关闭调试符号，默认只检查指定包。调试断言仍保留；需要源码级调试时使用普通 Cargo 命令及单独的 target。测试数据库需按上文单独准备。此入口只构建，不打包、推送或部署。
+
 ## CI 范围与速度
 
 push/PR 按改动选择 backend、frontend 或 Python 组件；文档改动保留工作流检查，发布/部署配置或未知路径改动执行全部检查。手动 CI 和正式发布保持全量校验。

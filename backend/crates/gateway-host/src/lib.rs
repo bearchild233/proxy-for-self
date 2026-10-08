@@ -3,6 +3,7 @@
 pub mod client_distribution;
 pub mod config;
 mod logging;
+pub mod plugin_policy;
 pub mod pricing;
 pub mod proxy_probe;
 pub mod serve;
@@ -44,7 +45,8 @@ pub async fn initialize(config: HostConfig) -> Result<HostBundle, HostError> {
     let log_guard = initialize_logging(&config.logging)?;
     let cancellation = CancellationToken::new();
     let connections = Arc::new(ConnectionTracker::new(cancellation.clone()));
-    let workers = WorkerSupervisor::new(cancellation.clone());
+    // HTTP 排空期间，计量和协调队列必须继续写入；Worker 仅在排空结束后取消。
+    let workers = WorkerSupervisor::new(CancellationToken::new());
     let system = Arc::new(ProcessSystemOperations::new(
         cancellation.clone(),
         config.system_update.clone(),

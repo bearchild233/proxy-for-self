@@ -134,6 +134,8 @@ impl SystemOperationAccepted {
 pub struct PluginStatus {
     pub id: String,
     pub name: String,
+    #[serde(default)]
+    pub description: String,
     pub protocol: u32,
     pub installed: bool,
     pub enabled: bool,
@@ -158,4 +160,58 @@ pub enum PluginAction {
     Disable,
     Uninstall,
     Update,
+}
+
+/// 登录防护仅支持预配置的两个入口，不接受主机命令或任意 jail 名称。
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoginSite {
+    Api,
+    Panel,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LoginProtectionPolicy {
+    pub site: LoginSite,
+    pub max_failures: u32,
+    pub window_seconds: u32,
+    pub ban_seconds: u32,
+    pub max_ban_seconds: u32,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LoginUnban {
+    pub site: LoginSite,
+    pub ip: std::net::IpAddr,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoginBan {
+    pub site: LoginSite,
+    pub ip: std::net::IpAddr,
+    pub expires_at: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoginProtectionStatus {
+    pub available: bool,
+    pub healthy: bool,
+    pub policies: Vec<LoginProtectionPolicy>,
+    pub bans: Vec<LoginBan>,
+    pub total_bans: u64,
+}
+
+/// 已验证会话到受信任插件的调用信封；不含 Cookie、API Key 或账号凭据。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginRequest {
+    pub kind: String,
+    pub plugin_id: Option<String>,
+    pub name: Option<String>,
+    pub principal: serde_json::Value,
+    pub input: serde_json::Value,
 }

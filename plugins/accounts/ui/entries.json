@@ -1,0 +1,10 @@
+{
+  "main": {
+    "source": "page/index.vue",
+    "route": "/accounts",
+    "title": "账号管理",
+    "roles": [
+      "admin"
+    ]
+  }
+}

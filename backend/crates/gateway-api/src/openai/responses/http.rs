@@ -42,6 +42,8 @@ const SSE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 /// `POST /v1/responses`。
 pub(crate) async fn responses(
     State(state): State<ApiState>,
+    body_budget: Option<Extension<crate::openai::resources::BodyBudgetLease>>,
+    ingress_limits: Option<Extension<crate::openai::resources::AdmittedBodyLimit>>,
     connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
     ingress_id: Option<Extension<tower_http::request_id::RequestId>>,
     headers: HeaderMap,
@@ -55,13 +57,27 @@ pub(crate) async fn responses(
     let decoded = match decode_request_with_headers(
         &body,
         &headers,
-        client.snapshot().responses_max_decompressed_body_bytes(),
+        ingress_limits.map_or_else(
+            || {
+                client
+                    .snapshot()
+                    .responses_max_decompressed_body_bytes()
+                    .min(service.default_inference_limits().body_limit())
+            },
+            |Extension(limit)| limit.0,
+        ),
     ) {
         Ok(decoded) => decoded,
         Err(error) => {
             return protocol_error_response(StatusCode::BAD_REQUEST, error.protocol_body());
         }
     };
+    if let Some(Extension(budget)) = body_budget
+        && let gateway_core::operation::Operation::Generate(request) = decoded.operation()
+        && let Some(original) = request.protocol_payload().original_json()
+    {
+        budget.shrink_to(original.len().max(body.len()));
+    }
     let (client_ip, user_agent) = request_client_context(
         &headers,
         connect_info.map(|Extension(ConnectInfo(address))| address),
@@ -110,16 +126,12 @@ pub(crate) async fn responses(
     crate::openai::with_model_request_id(response, &request_id)
 }
 
-/// 从 socket 与标准转发头提取旧 Usage 页面使用的诊断事实。
+/// 读取入口中间件校验后的来源；HTTP 与 WebSocket 共用。
 pub(in crate::openai) fn request_client_context(
     headers: &HeaderMap,
     peer_address: Option<SocketAddr>,
 ) -> (Option<IpAddr>, Option<String>) {
-    let client_ip = ["cf-connecting-ip", "x-real-ip"]
-        .into_iter()
-        .find_map(|name| header_ip(headers, name))
-        .or_else(|| forwarded_client_ip(headers))
-        .or_else(|| peer_address.map(|address| address.ip()));
+    let client_ip = peer_address.map(|address| address.ip());
     let user_agent = headers
         .get(USER_AGENT)
         .and_then(|value| value.to_str().ok())
@@ -127,36 +139,6 @@ pub(in crate::openai) fn request_client_context(
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
     (client_ip, user_agent)
-}
-
-fn header_ip(headers: &HeaderMap, name: &str) -> Option<IpAddr> {
-    headers
-        .get(name)
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .and_then(|value| value.parse().ok())
-}
-
-fn forwarded_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
-    let addresses = headers
-        .get("x-forwarded-for")?
-        .to_str()
-        .ok()?
-        .split(',')
-        .filter_map(|value| value.trim().parse::<IpAddr>().ok())
-        .collect::<Vec<_>>();
-    addresses
-        .iter()
-        .copied()
-        .find(|address| !is_private_or_loopback(*address))
-        .or_else(|| addresses.first().copied())
-}
-
-const fn is_private_or_loopback(address: IpAddr) -> bool {
-    match address {
-        IpAddr::V4(address) => address.is_private() || address.is_loopback(),
-        IpAddr::V6(address) => address.is_unique_local() || address.is_loopback(),
-    }
 }
 
 /// 编码完整 canonical event 集合，并在完整 JSON 成功后提交下游。

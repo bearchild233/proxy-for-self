@@ -10,8 +10,14 @@ def classify(paths):
     for path in paths:
         if path.startswith("backend/"):
             scopes.add("backend")
-        elif path.startswith("frontend/"):
+        elif path.startswith(("frontend/", "packages/ui-kit/", "packages/plugin-sdk/")) or path == "scripts/build-plugin.mjs":
             scopes.add("frontend")
+            if path.startswith("packages/plugin-sdk/"):
+                scopes.add("worker")
+        elif path.startswith("plugins/") and ("/ui/" in path or path.endswith("/plugin.json")):
+            scopes.add("frontend")
+        elif path.startswith("plugins/"):
+            scopes.add("worker")
         elif path.startswith(("plugins/", "services/", "tools/")):
             scopes.add("worker")
         elif path.startswith("docs/") or path in (

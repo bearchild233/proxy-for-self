@@ -23,6 +23,7 @@ pub(super) struct ModelsExecution {
     presentation: Option<ModelPresentation>,
     native: Option<Result<Vec<PublicModelDescriptor>, ProviderCatalogUnavailable>>,
     requested_versions: Mutex<Vec<String>>,
+    pub(super) limits: Mutex<Option<gateway_api::InferenceLimits>>,
 }
 
 impl ModelsExecution {
@@ -40,6 +41,7 @@ impl ModelsExecution {
             presentation: None,
             native: None,
             requested_versions: Mutex::default(),
+            limits: Mutex::default(),
         })
     }
 
@@ -76,6 +78,7 @@ impl ModelsExecution {
             presentation: Some(presentation),
             native: None,
             requested_versions: Mutex::default(),
+            limits: Mutex::default(),
         })
     }
 
@@ -85,6 +88,7 @@ impl ModelsExecution {
             presentation: None,
             native: None,
             requested_versions: Mutex::default(),
+            limits: Mutex::default(),
         })
     }
 
@@ -98,6 +102,7 @@ impl ModelsExecution {
             presentation: None,
             native: None,
             requested_versions: Mutex::default(),
+            limits: Mutex::default(),
         })
     }
 
@@ -116,6 +121,14 @@ impl ModelsExecution {
 }
 
 impl ExecutionService for ModelsExecution {
+    fn inference_limits(
+        &self,
+    ) -> Result<
+        Option<gateway_api::InferenceLimits>,
+        gateway_core::runtime::RuntimeSnapshotUnavailable,
+    > {
+        Ok(*self.limits.lock().unwrap())
+    }
     fn client_model_catalog<'a>(
         &'a self,
         _client: &'a AuthenticatedClient,
@@ -212,6 +225,7 @@ async fn native_catalog_preserves_complete_objects_and_only_rewrites_alias_slug(
         presentation: None,
         native: Some(Ok(vec![entry("gpt-native"), entry("my-alias")])),
         requested_versions: Mutex::default(),
+        limits: Mutex::default(),
     });
     let response = api_router(execution.clone())
         .await
@@ -244,6 +258,7 @@ async fn native_catalog_failure_does_not_publish_a_synthetic_or_empty_success() 
         presentation: None,
         native: Some(Err(ProviderCatalogUnavailable)),
         requested_versions: Mutex::default(),
+        limits: Mutex::default(),
     });
     let response = api_router(execution)
         .await

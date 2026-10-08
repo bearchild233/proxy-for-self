@@ -44,12 +44,22 @@ const PENDING_DELETION_BATCH: u32 = 20;
 
 /// 备份 Daemon 任务。
 pub struct BackupTask {
+    policy: Option<Arc<dyn crate::ports::backup::BackupPolicyPort>>,
     repository: Arc<dyn BackupRepository>,
     dump: Arc<dyn DatabaseDumpPort>,
     object_store: Arc<dyn BackupObjectStorePort>,
 }
 
 impl BackupTask {
+    #[must_use]
+    pub fn with_policy(
+        mut self,
+        policy: Option<Arc<dyn crate::ports::backup::BackupPolicyPort>>,
+    ) -> Self {
+        self.policy = policy;
+        self
+    }
+
     /// 组合仓储、导出器与对象存储适配器。
     #[must_use]
     pub fn new(
@@ -58,6 +68,7 @@ impl BackupTask {
         object_store: Arc<dyn BackupObjectStorePort>,
     ) -> Self {
         Self {
+            policy: None,
             repository,
             dump,
             object_store,
@@ -97,6 +108,15 @@ impl BackupTask {
         if cancellation.is_cancelled() {
             return Ok(());
         }
+        if let Some(policy) = &self.policy {
+            match policy
+                .decide(serde_json::json!({"action":"admission"}))
+                .await
+            {
+                Ok(value) if value["enabled"] == true => {}
+                _ => return Ok(()), // 插件不可用时关闭新计划，推理内核不受影响。
+            }
+        }
         self.advance_schedule(Utc::now()).await?;
         self.recover_intermediate(cancellation).await?;
         self.finish_pending_deletions().await?;
@@ -133,6 +153,15 @@ impl BackupTask {
                 }
                 return Ok(());
             }
+        };
+        let due = if let Some(policy) = &self.policy {
+            policy
+                .decide(serde_json::json!({"action":"schedule","due":due}))
+                .await?["schedule"]
+                == true
+                && due
+        } else {
+            due
         };
         if !due {
             return Ok(());
@@ -590,12 +619,25 @@ impl BackupTask {
             .list_scheduled_completed_desc(RETENTION_SCAN_LIMIT)
             .await
             .map_err(repo_error)?;
-        let decisions = decide_retention(
+        let mut decisions = decide_retention(
             settings.retention_days,
             settings.retention_count,
             now,
             &records,
         );
+        if let Some(policy) = &self.policy {
+            let decision = policy.decide(serde_json::json!({
+                "action":"retention", "now":now.timestamp(),
+                "retentionDays":settings.retention_days, "retentionCount":settings.retention_count,
+                "records":records.iter().map(|record|serde_json::json!({"id":record.id,"completedAt":record.completed_at.map(|v|v.timestamp())})).collect::<Vec<_>>()
+            })).await?;
+            let ids = decision["delete"].as_array().cloned().unwrap_or_default();
+            // 只执行宿主确认可删除的记录；插件不取得数据库或对象存储凭据。
+            decisions.retain(|item| {
+                ids.iter()
+                    .any(|id| id.as_str() == Some(item.record_id.as_str()))
+            });
+        }
         for decision in decisions.into_iter().take(RETENTION_BATCH_SIZE) {
             let Some(record) = self
                 .repository

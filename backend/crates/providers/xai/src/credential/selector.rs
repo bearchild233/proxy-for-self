@@ -98,7 +98,8 @@ impl GrokAccountSessionSelector {
             request.deadline(),
             request.concurrency_wait_budget(),
         );
-        loop {
+        let mut interval_account = None;
+        'capacity: loop {
             let diagnostic = request.eligibility() == AccountEligibilityPolicy::BypassForDiagnostic;
             // store 侧常规调度列表不包含停用账号；管理端诊断要对固定账号执行真实上游
             // 验证，这里把不在列表里的 required 账号显式补回候选。
@@ -220,11 +221,15 @@ impl GrokAccountSessionSelector {
                     .max_by_key(|candidate| affinity.score(candidate.account.id()))
                     .map(|candidate| candidate.account.id().clone())
             });
-            let mut context = AccountSelectionContext {
+            let context = AccountSelectionContext {
                 policy: request.account_selection_policy(),
                 now: SystemTime::now(),
                 excluded_accounts: request.excluded_accounts().clone(),
-                preferred_account: request.required_account().cloned().or(affinity_account),
+                preferred_account: request
+                    .required_account()
+                    .cloned()
+                    .or_else(|| interval_account.clone())
+                    .or(affinity_account),
                 preferred_account_overrides_weight: false,
                 round_robin_cursor: scheduling.round_robin_cursor(),
                 eligibility: request.eligibility(),
@@ -232,13 +237,6 @@ impl GrokAccountSessionSelector {
             };
             let wait_candidates = AccountSelector.wait_candidates(&candidates, &context);
             let capacity_context = context.clone();
-            for candidate in &candidates {
-                if !waiting.can_try(candidate.account.id()) {
-                    context
-                        .excluded_accounts
-                        .insert(candidate.account.id().clone());
-                }
-            }
             let mut capacity_denied = false;
             let mut retry_after = None;
             loop {
@@ -247,6 +245,13 @@ impl GrokAccountSessionSelector {
                     break;
                 };
                 let selected = selection.candidate();
+                if !diagnostic
+                    && queue_policy.max_waiting > 0
+                    && !waiting.can_try(selected.account.id())
+                {
+                    waiting.wait(&[selected.account.id().clone()]).await?;
+                    continue 'capacity;
+                }
                 let selected_id = selected.account.id().clone();
                 let selected_revision = selected.account.revision();
                 let allows_account_state_mutation = !diagnostic || selected.account.enabled();
@@ -270,9 +275,24 @@ impl GrokAccountSessionSelector {
                     .map_err(|_| GrokSessionSelectorError::Unavailable)?;
                 let guard = match lease {
                     ProviderLeaseAcquisition::Acquired(guard) => guard,
+                    ProviderLeaseAcquisition::IntervalPending { retry_after } => {
+                        interval_account = Some(selected_id);
+                        let remaining = request
+                            .deadline()
+                            .duration_since(SystemTime::now())
+                            .unwrap_or_default();
+                        if remaining <= retry_after {
+                            return Err(GrokSessionSelectorError::CapacityUnavailable {
+                                retry_after: Some(retry_after),
+                            });
+                        }
+                        tokio::time::sleep(retry_after).await;
+                        continue 'capacity;
+                    }
                     ProviderLeaseAcquisition::Busy {
                         retry_after: candidate_retry,
                     } => {
+                        interval_account = None;
                         capacity_denied = true;
                         retry_after = minimum_retry_after(retry_after, candidate_retry);
                         candidates.retain(|candidate| candidate.account.id() != &selected_id);

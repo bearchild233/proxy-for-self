@@ -54,12 +54,16 @@ impl HealthStatus {
     }
 }
 
-pub(crate) async fn healthz(State(state): State<ApiState>) -> StatusCode {
-    if state.health().healthy().await {
+pub(crate) async fn healthz(State(state): State<ApiState>) -> impl axum::response::IntoResponse {
+    let status = if state.health().healthy().await {
         StatusCode::NO_CONTENT
     } else {
         StatusCode::SERVICE_UNAVAILABLE
-    }
+    };
+    (
+        status,
+        [("x-proxy-process", std::process::id().to_string())],
+    )
 }
 
 fn worker_affects_healthz(worker: &WorkerHealthSnapshot) -> bool {

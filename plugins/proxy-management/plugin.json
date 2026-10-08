@@ -1,0 +1,47 @@
+{
+  "id": "proxy-management",
+  "version": "0.3.1",
+  "protocol": 2,
+  "kind": "ui",
+  "sdk": 1,
+  "pages": [
+    {
+      "id": "main",
+      "title": "出口代理",
+      "entry": "ui/module.js",
+      "roles": [
+        "admin"
+      ],
+      "route": "/proxies"
+    }
+  ],
+  "capabilities": [
+    "accounts.get.admin.accounts",
+    "accounts.get.admin.accounts.detail",
+    "accounts.get.admin.accounts.export",
+    "accounts.get.admin.accounts.import-tasks",
+    "accounts.get.admin.accounts.import-tasks.detail",
+    "accounts.get.admin.accounts.models",
+    "accounts.get.admin.accounts.personal-info",
+    "accounts.get.admin.accounts.quota-forecast",
+    "accounts.get.admin.accounts.reset-credits",
+    "auth.get.auth.status",
+    "auth.post.auth.logout",
+    "display-order.save",
+    "proxies.get.admin.proxies",
+    "proxies.get.admin.proxies.accounts",
+    "proxies.post.admin.proxies.accounts.remove",
+    "proxies.post.admin.proxies.create",
+    "proxies.post.admin.proxies.delete",
+    "proxies.post.admin.proxies.probe",
+    "proxies.post.admin.proxies.test",
+    "proxies.post.admin.proxies.update"
+  ],
+  "releasedAt": "2026-10-08T20:01:10.375124+00:00",
+  "releaseNotes": [
+    "可见页面每30秒静默同步数据，切回页面立即补刷，隐藏时暂停。",
+    "刷新保留分页与筛选；设置草稿不被后台读取覆盖。"
+  ],
+  "runtime": "vue-component",
+  "hostApi": 1
+}

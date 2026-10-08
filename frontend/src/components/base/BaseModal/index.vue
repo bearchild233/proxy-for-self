@@ -19,6 +19,7 @@ const props = withDefaults(
     tone?: ModalTone
     dismissible?: boolean
     draggable?: boolean
+    scrollable?: boolean
     role?: 'dialog' | 'alertdialog'
   }>(),
   {
@@ -27,6 +28,7 @@ const props = withDefaults(
     tone: 'neutral',
     dismissible: true,
     draggable: true,
+    scrollable: true,
     role: 'dialog',
   },
 )
@@ -275,12 +277,16 @@ onBeforeUnmount(() => {
           </header>
           <div v-if="$slots.default" class="min-h-0 overflow-hidden px-3.25 py-3.25 sm:px-5.25 sm:py-5.25">
             <BaseScrollbar
+              v-if="scrollable"
               class="h-full -mr-2 pr-2 sm:-mr-3 sm:pr-3"
             >
               <div class="p-0.75">
                 <slot />
               </div>
             </BaseScrollbar>
+            <div v-else class="h-full min-h-0 p-0.75">
+              <slot />
+            </div>
           </div>
           <footer
             v-if="$slots.footer"

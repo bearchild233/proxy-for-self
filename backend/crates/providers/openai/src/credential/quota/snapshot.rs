@@ -10,6 +10,7 @@ use gateway_core::account::{
     AccountQuotaSignals, CredentialRevision, ProviderAccountId, QuotaEvidence, QuotaObservation,
     QuotaState,
 };
+use gateway_core::metering::Decimal;
 use serde_json::{Map, Value};
 
 use super::document::{
@@ -109,6 +110,12 @@ impl CodexQuotaWindow {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CodexCreditBalance {
+    pub balance: Option<Decimal>,
+    pub unlimited: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct CodexAccountQuotaSnapshot {
     account_id: ProviderAccountId,
     credential_revision: CredentialRevision,
@@ -117,10 +124,15 @@ pub struct CodexAccountQuotaSnapshot {
     fact: CodexQuotaFact,
     quota: QuotaState,
     windows: Vec<CodexQuotaWindow>,
+    credits: Option<CodexCreditBalance>,
     pub(super) recovery: Option<QuotaRecovery>,
 }
 
 impl CodexAccountQuotaSnapshot {
+    pub(crate) fn credits(&self) -> Option<&CodexCreditBalance> {
+        self.credits.as_ref()
+    }
+
     #[must_use]
     pub const fn account_id(&self) -> &ProviderAccountId {
         &self.account_id
@@ -350,6 +362,21 @@ pub(crate) fn parse_account_quota_snapshot(
             .get("plan_type")
             .and_then(Value::as_str)
             .map(str::to_owned),
+        credits: object
+            .get("credits")
+            .and_then(Value::as_object)
+            .map(|credits| {
+                let unlimited = credits
+                    .get("unlimited")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let balance = credits.get("balance").and_then(|value| match value {
+                    Value::String(value) => value.parse::<Decimal>().ok(),
+                    Value::Number(value) => value.to_string().parse::<Decimal>().ok(),
+                    _ => None,
+                });
+                CodexCreditBalance { balance, unlimited }
+            }),
         fact,
         quota,
         windows,

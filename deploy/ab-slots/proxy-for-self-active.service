@@ -1,0 +1,15 @@
+[Unit]
+Description=Start the committed gateway slot
+After=proxy-for-self-slot-router.service api-hub-postgres.service api-hub-redis.service
+Requires=proxy-for-self-slot-router.service api-hub-postgres.service api-hub-redis.service
+OnFailure=proxy-for-self-slots-recover.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/python3 /opt/proxy-for-self-updater/slots.py --config /etc/proxy-for-self/slots.json boot
+TimeoutStartSec=900
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

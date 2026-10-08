@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body{font:14px/1.7 system-ui,sans-serif;color:#283344;margin:24px;background:#fff}
+  h2{font-size:20px;margin:0 0 8px}p{color:#64748b}dl{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  dl div{padding:16px;border:1px solid #e2e8f0;border-radius:12px}dt{color:#64748b}dd{margin:6px 0 0;font-size:24px;font-weight:600}
+  button{background:#f1f5f9;color:#283344;border:1px solid #e2e8f0;border-radius:8px;padding:8px 16px;cursor:pointer}
+</style>
+<h2>Excel Bridge</h2>
+<p>为绑定此插件的密钥提供 Excel 模型接口。账号授权、出口代理和使用记录由网关统一管理。</p>
+<dl><div><dt>正在处理</dt><dd id="active">—</dd></div><div><dt>并发上限</dt><dd id="capacity">—</dd></div></dl>
+<button id="refresh">刷新状态</button><p id="status" role="status"></p>
+<script>
+async function refresh(){const status=document.getElementById('status');status.textContent='正在读取…';try{const value=await proxyPlugin.call('status',{});document.getElementById('active').textContent=value.active;document.getElementById('capacity').textContent=value.maxConcurrency;status.textContent='已更新'}catch{status.textContent='服务暂不可用，请稍后重试'}}
+document.getElementById('refresh').addEventListener('click',refresh);refresh();
+</script></html>

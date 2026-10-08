@@ -176,6 +176,8 @@ impl AdminTestFixture {
             ClientConfig::default(),
             stores,
             gateway_admin::AdminRuntimePorts {
+                pricing_policy: None,
+                backup_policy: None,
                 pricing_source: Arc::new(StaticPricingSource),
                 providers,
                 snapshot: Arc::new(NoopSnapshot),
@@ -244,6 +246,7 @@ impl SessionState for AdminTestState {
 }
 
 pub(super) struct MemoryAuthStore {
+    pub login_sources: Mutex<Vec<std::net::IpAddr>>,
     pub(super) enabled: AtomicBool,
     pub(super) unavailable: AtomicBool,
     password_hash: Mutex<Option<String>>,
@@ -256,6 +259,7 @@ pub(super) struct MemoryAuthStore {
 impl MemoryAuthStore {
     fn new(api_key: Arc<Mutex<Option<AdminApiKey>>>) -> Self {
         Self {
+            login_sources: Mutex::new(Vec::new()),
             enabled: AtomicBool::new(false),
             unavailable: AtomicBool::new(false),
             password_hash: Mutex::new(None),
@@ -387,11 +391,12 @@ impl AuthStore for MemoryAuthStore {
 
     async fn consume_login_attempt(
         &self,
-        _: std::net::IpAddr,
+        source: std::net::IpAddr,
         _: u32,
         _: u32,
         _: std::time::Duration,
     ) -> AdminStoreResult<Option<std::time::Duration>> {
+        self.login_sources.lock().unwrap().push(source);
         Ok(None)
     }
 
@@ -533,6 +538,7 @@ impl SettingsStore for MemorySettingsStore {
             max_waiting_per_key: command.max_waiting_per_key,
             max_waiting_per_account: command.max_waiting_per_account,
             concurrency_wait_timeout_seconds: command.concurrency_wait_timeout_seconds,
+            inference_limits: command.inference_limits,
             responses_max_decompressed_body_bytes: command.responses_max_decompressed_body_bytes,
             rotation_strategy: command.rotation_strategy,
             min_codex_desktop_version: command.min_codex_desktop_version,
@@ -1478,6 +1484,7 @@ fn test_runtime_settings() -> RuntimeSettings {
         max_waiting_per_key: 0,
         max_waiting_per_account: 0,
         concurrency_wait_timeout_seconds: 30,
+        inference_limits: None,
         responses_max_decompressed_body_bytes: 64 * 1024 * 1024,
         rotation_strategy: RotationStrategy::Smart,
         min_codex_desktop_version: None,

@@ -5,6 +5,7 @@ mod endpoint;
 pub mod error;
 pub mod images;
 pub mod models;
+mod resources;
 pub mod responses;
 pub mod router;
 pub mod search;

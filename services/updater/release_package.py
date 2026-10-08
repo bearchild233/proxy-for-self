@@ -26,7 +26,7 @@ def main() -> None:
         parser.error("frontend/dist/index.html is required")
     manifest = {
         "format": 1, "application": "proxy-for-self", "version": args.version,
-        "platform": "linux-amd64", "plugin_protocols": {"excel": 1},
+        "platform": "linux-amd64", "plugin_protocols": {"excel": 1, "ui": 2},
         "migrations": {str(int(p.name.split("_", 1)[0])): hashlib.sha384(p.read_bytes()).hexdigest()
                        for p in sorted((root / "backend/migrations").glob("*.sql"))},
         "files": {name: hashlib.sha256(path.read_bytes()).hexdigest() for name, path in files.items()},

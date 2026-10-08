@@ -46,6 +46,7 @@ pub struct RuntimeSettingsView {
     pub max_waiting_per_key: u32,
     pub max_waiting_per_account: u32,
     pub concurrency_wait_timeout_seconds: u32,
+    pub inference_limits: Option<gateway_core::policy::InferenceLimits>,
     pub responses_max_decompressed_body_bytes: u64,
     pub rotation_strategy: String,
     pub min_codex_desktop_version: Option<String>,
@@ -81,6 +82,7 @@ pub struct UpdateRuntimeSettingsRequest {
     pub max_waiting_per_key: u32,
     pub max_waiting_per_account: u32,
     pub concurrency_wait_timeout_seconds: u32,
+    pub inference_limits: Option<gateway_core::policy::InferenceLimits>,
     pub responses_max_decompressed_body_bytes: u64,
     pub rotation_strategy: String,
     pub min_codex_desktop_version: Option<String>,
@@ -104,6 +106,12 @@ impl UpdateRuntimeSettingsRequest {
             .validate()
             .map_err(|_| WireValidationError::new("requestLocation"))?;
         validate_model_mappings(&self.model_mappings)?;
+        if self
+            .inference_limits
+            .is_some_and(|limits| !limits.is_valid())
+        {
+            return Err(WireValidationError::new("inferenceLimits"));
+        }
         for (value, field) in [
             (self.max_waiting_per_key, "maxWaitingPerKey"),
             (self.max_waiting_per_account, "maxWaitingPerAccount"),
@@ -201,6 +209,7 @@ impl UpdateRuntimeSettingsRequest {
             max_waiting_per_key: self.max_waiting_per_key,
             max_waiting_per_account: self.max_waiting_per_account,
             concurrency_wait_timeout_seconds: self.concurrency_wait_timeout_seconds,
+            inference_limits: self.inference_limits,
             responses_max_decompressed_body_bytes: self.responses_max_decompressed_body_bytes,
             rotation_strategy: RotationStrategy::parse(&self.rotation_strategy)
                 .ok_or_else(|| WireValidationError::new("rotationStrategy"))?,
@@ -243,6 +252,7 @@ impl From<RuntimeSettings> for RuntimeSettingsView {
             max_waiting_per_key: settings.max_waiting_per_key,
             max_waiting_per_account: settings.max_waiting_per_account,
             concurrency_wait_timeout_seconds: settings.concurrency_wait_timeout_seconds,
+            inference_limits: settings.inference_limits,
             responses_max_decompressed_body_bytes: settings.responses_max_decompressed_body_bytes,
             rotation_strategy: settings.rotation_strategy.as_str().to_owned(),
             min_codex_desktop_version: settings.min_codex_desktop_version,
@@ -556,7 +566,14 @@ where
         .map_err(map_service_error)?;
     Ok(AdminResponse::new(
         StatusCode::OK,
-        AdminEnvelope::ok(RuntimeSettingsView::from(result)),
+        AdminEnvelope::ok({
+            let mut view = RuntimeSettingsView::from(result);
+            view.inference_limits = Some(
+                view.inference_limits
+                    .unwrap_or_else(|| state.default_inference_limits()),
+            );
+            view
+        }),
     ))
 }
 
@@ -577,7 +594,14 @@ where
         .map_err(map_service_error)?;
     Ok(AdminResponse::new(
         StatusCode::OK,
-        AdminEnvelope::ok(RuntimeSettingsView::from(result)),
+        AdminEnvelope::ok({
+            let mut view = RuntimeSettingsView::from(result);
+            view.inference_limits = Some(
+                view.inference_limits
+                    .unwrap_or_else(|| state.default_inference_limits()),
+            );
+            view
+        }),
     ))
 }
 

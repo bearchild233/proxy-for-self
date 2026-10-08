@@ -60,6 +60,13 @@ client:
   session_ttl_minutes: 1440
 
 api:
+  # Only configured reverse-proxy peers may supply an overwritten X-Real-IP.
+  trusted_proxy_ips: []
+  # 低内存实例按容量设置；0 表示不启用此项限制。繁忙时返回 503 gateway_busy。
+  inference_limits:
+    max_requests: 0
+    max_body_bytes: 0
+    max_in_flight_body_bytes: 0
   # Docker 内由 CPR_WEB_DIST_DIR 覆盖。
   asset_directory: '../frontend/dist'
   cors_allowed_origins: []
@@ -67,6 +74,8 @@ api:
   request_id_header: 'x-request-id'
 
 openai:
+  # 配合 pinned_cli_profile：仅自动更新 CLI 稳定版本，保留统一身份。
+  pinned_cli_auto_update: false
   # 可选 Linux 私有 Worker，未启用时保持 null。
   excel_worker_socket: null
   # 数据驻留约束；省略或 null 不指定地域约束，与管理端客户端身份无关。

@@ -4,9 +4,15 @@
 具体 HTTP 字段见 [接口文档](api.md)，部署参数见 [部署文档](../deploy/README.md)；上游 URL、超时、
 重试间隔和 UI 布局属于源码或配置，不在架构文档重复维护。
 
+网关默认持有 PostgreSQL 会话级排他实例锁。显式配置 `store.deployment_slot: a|b` 后，使用每槽独立锁和共享存活锁；同一数据库最多一对 A/B 槽。加入存活槽时保留在途请求与 Redis 活动租约，两个槽都退出后的冷启动才执行中断恢复。槽模式只验证 schema，不运行迁移。生产接入状态和交接限制见 [A/B 发布](../deploy/ab-slots/README.md)。
+
+Core 运行快照的 `inference_limits` 覆盖 API 启动默认值，限制实例同时处理的推理请求数与正文大小。管理端保存到数据库后发布快照；API 在 HTTP 请求及 WS 每轮开始时读取最新值，共用进程内的在途计数，调整限制不重置占用。HTTP 在缓冲正文前获取许可，并持有至响应流结束或取消；WS 每轮生成共用许可，限制单帧与消息大小。管理、模型目录和健康检查不占推理许可。入口繁忙返回 `503 gateway_busy` 和重试提示，超大 HTTP 正文返回 `413 request_body_too_large`。
+
+可选在途正文总预算按请求大小分配，与请求数许可共同生效；HTTP压缩或未知长度请求先预留单请求上限，再按读取/解压结果归还余量。WS在收到完整消息后、解码前申请预算。它是正文准入预算，不等于进程内存上限；收帧缓冲、闲置会话状态及后台缓存需要另留空间。
+
 ## 1. 系统定位
 
-proxy-for-self 主网关是单进程、单副本运行的多 Provider AI 网关，同时提供：
+proxy-for-self 主网关以一个活动进程接收新连接；A/B 发布时允许旧槽短暂排空。同时提供：
 
 - 面向客户端的 OpenAI Responses、Images、standalone Search 和模型目录协议；
 - 面向管理员的 `/api/admin/*` 控制面和 Vue 管理端；
@@ -637,3 +643,13 @@ RUST_MIN_STACK=16777216 cargo +1.97.0 test --manifest-path backend/Cargo.toml --
 
 改动使现有说明失真或缺少必要信息时，修订所属文档：用户入口写入根 README，HTTP 合同写入 `docs/api.md`，
 部署操作写入 `deploy/README.md`，架构不变量保留在本文。
+
+登录及请求日志的来源由 API 入口统一解析：只信任显式 `trusted_proxy_ips` 对端提供的唯一合法 `X-Real-IP`，清除其他来源头，HTTP/WS 共用规范化 ConnectInfo。可信代理的 `/healthz` 允许本机无来源头检查。未配置可信代理时仅使用 TCP 对端。
+
+部署级登录封禁由现有 fail2ban 处理；Host 通过 updater 私有 socket 管理固定 jail，Admin/API 校验管理员权限与策略范围。Caddy 仅在登录入口调用 updater 的独立只读检查 socket；封禁镜像使用私有 SQLite，跨进程重启保留。该 socket 不暴露管理命令，失败时阻止登录，推理与已登录请求不经过它。详见 [登录防护部署](../deploy/login-security/README.md)。
+
+## 独立插件扩展
+
+功能页面由独立版本包加载，主壳通过隔离 iframe 与命名能力桥连接 Python 插件控制面；实际身份和数据范围由 Rust 管理接口校验。控制面负责包注册、版本、租约、任务和UI准入；Excel的原生Worker生命周期仍由独立更新器管理。推理请求直接进入Rust，插件服务故障不应停止网关。基础模块不可停用，可选入口随状态移除。详见 [插件平台](plugin-migration.md) 与 [原生 Worker 合同](plugins.md)。
+
+账号选择先处理资格和真实并发，再按亲和/权重/同权重策略决定账号。请求间隔只由原子租约裁决；间隔未到等待原账号，等待后重读资格与并发，不消费并发排队名额、不因间隔改变会话绑定。严格续接仍固定原状态拥有者。

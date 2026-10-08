@@ -218,17 +218,17 @@ impl CliReleaseService {
 }
 
 pub(super) fn seed_releases(state: &CodexWireProfileState) {
-    // 2026-09-30 核对官方 npm latest 及六个平台依赖；这里只提供离线启动资料。
+    // 2026-10-07 核对官方 npm latest 及六个平台依赖；这里只提供离线启动资料。
     for (platform, arch, _) in TARGETS {
         state.seed_client_release(
             ClientKind::Cli,
             platform,
             arch,
             ClientRelease {
-                codex_version: "0.159.2".to_owned(),
+                codex_version: "0.161.0".to_owned(),
                 desktop_version: None,
                 desktop_build: None,
-                verified_at: chrono::DateTime::parse_from_rfc3339("2026-09-29T23:57:16Z")
+                verified_at: chrono::DateTime::parse_from_rfc3339("2026-10-08T03:28:10Z")
                     .ok()
                     .map(|time| time.with_timezone(&Utc)),
             },

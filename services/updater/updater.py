@@ -27,7 +27,8 @@ import sys
 
 # -I 不自动加载脚本目录；这里只加载 root 管理的同目录模块。
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from plugins import PluginManager
+from plugin_registry import PluginRegistry
+from login_security import LoginSecurity, start_guard
 
 REPOSITORY = "ckcyian23/proxy-for-self"
 MAX_ARCHIVE = 512 * 1024 * 1024
@@ -114,7 +115,7 @@ def unpack(archive: Path, destination: Path, target_version: str) -> dict:
     manifest = json.loads((destination / "release-manifest.json").read_text())
     if (manifest.get("format") != 1 or manifest.get("application") != "proxy-for-self"
             or manifest.get("version") != target_version or manifest.get("platform") != "linux-amd64"
-            or manifest.get("plugin_protocols") != {"excel": 1}):
+            or manifest.get("plugin_protocols") not in ({"excel": 1}, {"excel": 1, "ui": 2})):
         raise ValueError("更新包版本、平台或插件协议不兼容")
     files = manifest.get("files", {})
     if set(files) != names - {"release-manifest.json"} or not {"bin/api-hub", "frontend/index.html"} <= set(files):
@@ -143,18 +144,19 @@ class Updater:
             self.state["recovery_required"] = True
             write_json(self.state_path, self.state)
 
-        self.plugins = PluginManager(config["plugins"], self.run) if config.get("plugins") else None
+        self.security = LoginSecurity(config["login_security"]) if config.get("login_security") else None
+        self.plugins = PluginRegistry(config["plugins"], self.run) if config.get("plugins") else None
 
     def plugin_status(self):
         with self.lock:
-            return [self.plugins.status()] if self.plugins else []
+            return self.plugins.status() if self.plugins else []
 
     def plugin_submit(self, plugin_id, action):
         with self.lock:
             if not self.plugins or self.state.get("recovery_required") or self.state["operation"]["status"] == "running":
                 raise ValueError("插件管理不可用或系统操作正在执行")
             operation_id = self.plugins.begin(plugin_id, action)
-        threading.Thread(target=self.plugins.execute, args=(action,), daemon=True).start()
+        threading.Thread(target=self.plugins.execute, args=(plugin_id, action), daemon=True).start()
         return {"operation_id": operation_id}
 
     def current(self) -> Path:
@@ -195,13 +197,18 @@ class Updater:
             self.state["operation"].update(changes)
             write_json(self.state_path, self.state)
 
+    def require_legacy_mode(self) -> None:
+        if self.config.get('slot_config'):
+            raise ValueError('已启用 A/B 发布，请通过独立槽位执行器操作；禁止原地替换或重启')
+
     def submit(self, action: str, target: str | None) -> dict:
+        self.require_legacy_mode()
         if action not in {"update", "rollback", "restart"}:
             raise ValueError("不支持的更新操作")
         with self.lock:
             if self.state.get("recovery_required"):
                 raise ValueError("上次更新中断，需要维护者检查后恢复")
-            if self.state["operation"]["status"] == "running" or (self.plugins and self.plugins.state.get("operation", {}).get("status") == "running"):
+            if self.state["operation"]["status"] == "running" or (self.plugins and self.plugins.running):
                 raise ValueError("已有系统操作正在执行")
             if action == "update":
                 current = version(self.state["current_version"])
@@ -251,6 +258,8 @@ class Updater:
         unpacked = temporary / "unpacked"
         unpacked.mkdir()
         manifest = unpack(temporary / filename, unpacked, target)
+        if manifest.get('plugin_protocols',{}).get('ui') == 2 and self.config.get('plugin_platform_protocol') != 2:
+            raise ValueError('请先安装并验证插件平台 v2，再更新网关与主壳')
         if manifest["migrations"] != self.schemas():
             raise ValueError("该版本包含数据库迁移，需要维护升级；当前服务未变更")
         destination = self.root / "releases" / ("release-" + target + "-" + checksums[0][:12])
@@ -287,6 +296,7 @@ class Updater:
             return False
 
     def restart(self) -> None:
+        self.require_legacy_mode()
         service = self.config["service"]
         self.ensure_restart_protection()
         # 独立 unit 持有操作，网关退出不会杀死执行者。systemd 负责原有请求的优雅排空。
@@ -309,6 +319,7 @@ class Updater:
         desired = None
         switched = False
         try:
+            self.require_legacy_mode()
             previous = self.current()
             self.ensure_restart_protection()
             if shutil.disk_usage(self.root).free < 1200 * 1024 * 1024 and action != "restart":
@@ -327,11 +338,14 @@ class Updater:
                 if action != "restart":
                     backup = self.backup()
                     self.persist(message="备份完成，等待正在执行的请求结束", backup=str(backup))
-                deadline = time.monotonic()+180
-                while int(self.sql("select count(*) from model_requests where outcome='running' and deadline_at>now()")):
-                    if time.monotonic() >= deadline:
-                        raise ValueError("请求持续繁忙，本次未切换版本，请稍后重试")
-                    time.sleep(2)
+                # 已明确请求重启时直接交给宿主停止接收新请求并优雅排空。
+                # 继续接收请求的同时等到全空闲，会让持续流量下的重启一直失败。
+                if action != "restart":
+                    deadline = time.monotonic()+180
+                    while int(self.sql("select count(*) from model_requests where outcome='running' and deadline_at>now()")):
+                        if time.monotonic() >= deadline:
+                            raise ValueError("请求持续繁忙，本次未切换版本，请稍后重试")
+                        time.sleep(2)
                 self.persist(message="正在优雅重启，请稍候恢复连接")
                 if action != "restart":
                     self.activate(desired)
@@ -367,6 +381,13 @@ class Handler(BaseHTTPRequestHandler):
         self.connection.settimeout(5)
 
     def do_GET(self):
+        if self.path == "/login-security":
+            try:
+                value = self.server.updater.security.status() if self.server.updater.security else {"available": False, "healthy": False, "policies": [], "bans": [], "totalBans": 0}
+                self.reply(200, value)
+            except Exception:
+                self.reply(503, {"error": "登录防护状态读取失败"})
+            return
         if self.path == "/plugins":
             self.reply(200, self.server.updater.plugin_status())
         elif self.path == "/status":
@@ -377,9 +398,22 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
             length = int(self.headers.get("Content-Length", "0"))
-            if self.path not in {"/operation", "/plugins/action"} or not 0 < length <= 1024:
+            if self.path not in {"/operation", "/plugins/action", "/plugins/request", "/login-security/policy", "/login-security/unban"} or not 0 < length <= (65536 if self.path == "/plugins/request" else 1024):
                 raise ValueError("无效请求")
             value = json.loads(self.rfile.read(length))
+            if self.path.startswith("/login-security/"):
+                with self.server.updater.lock:
+                    if not self.server.updater.security or self.server.updater.state.get("recovery_required") or self.server.updater.state["operation"]["status"] == "running":
+                        raise ValueError("系统维护中")
+                    method = self.server.updater.security.set_policy if self.path.endswith("/policy") else self.server.updater.security.unban
+                    self.reply(200, method(value))
+                return
+            if self.path == "/plugins/request":
+                if not self.server.updater.plugins:
+                    if value.get("kind") == "catalog":
+                        return self.reply(200, [])
+                    raise ValueError("插件管理未配置")
+                return self.reply(200, self.server.updater.plugins.request(value))
             if self.path == "/plugins/action":
                 if not isinstance(value, dict) or set(value) != {"id", "action"}:
                     raise ValueError("无效插件操作字段")
@@ -388,7 +422,7 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(value,dict) or set(value) - {"action","target_version"}:
                 raise ValueError("无效操作字段")
             self.reply(202, self.server.updater.submit(value.get("action"), value.get("target_version")))
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, OSError, subprocess.SubprocessError):
             self.reply(409, {"error":"操作无效、已有任务执行中，或需要维护者恢复状态"})
 
     def reply(self, code, value):
@@ -426,6 +460,7 @@ def main() -> None:
     with lock_path.open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         updater = Updater(config)
+        guard = start_guard(updater.security) if updater.security else None
         socket = Path(config["socket"])
         socket.parent.mkdir(parents=True, exist_ok=True)
         if socket.exists():

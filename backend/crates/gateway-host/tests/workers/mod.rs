@@ -17,7 +17,7 @@ use gateway_core::task::{
 use gateway_host::workers::{WorkerStartError, WorkerSupervisor};
 use tokio::sync::Notify;
 
-const ACTIVE_KINDS: [WorkerKind; 9] = [
+const ACTIVE_KINDS: [WorkerKind; 10] = [
     WorkerKind::OAuthRefresh,
     WorkerKind::QuotaCatalogHealth,
     WorkerKind::RuntimeSnapshotReconciliation,
@@ -27,7 +27,85 @@ const ACTIVE_KINDS: [WorkerKind; 9] = [
     WorkerKind::Backup,
     WorkerKind::AccountImport,
     WorkerKind::AccountFreezeRecovery,
+    WorkerKind::PricingSync,
 ];
+
+#[tokio::test]
+async fn host_keeps_workers_alive_until_stream_finishes_draining() {
+    use axum::{Router, body::Body, routing::get};
+    use futures::StreamExt as _;
+
+    let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = reserved.local_addr().unwrap().port();
+    drop(reserved);
+    let directory = tempfile::tempdir().unwrap();
+    let config = serde_json::from_value(serde_json::json!({
+        "listen": {"host":"127.0.0.1", "port":port},
+        "runtime_data_dir":directory.path(),
+        "logging":{"level":"error", "stdout":true, "file":{
+            "enabled":false,"directory":directory.path(),"max_file_size_mb":1
+        }},
+        "drain_timeout_seconds":5, "worker_shutdown_timeout_seconds":2
+    }))
+    .unwrap();
+    let host = gateway_host::initialize(config).await.unwrap();
+    let cancellation = host.cancellation();
+    let worker = CancellationTask {
+        entered: Arc::new(AtomicUsize::new(0)),
+        observed: Arc::new(AtomicUsize::new(0)),
+    };
+    host.start_workers(
+        target_plan(worker.clone(), long_interval_schedule()),
+        Arc::new(FakeLeasePort::default()),
+    )
+    .unwrap();
+    wait_until(|| worker.entered.load(Ordering::SeqCst) > 0).await;
+    let release = Arc::new(Notify::new());
+    let handler_release = Arc::clone(&release);
+    let router = Router::new().route(
+        "/",
+        get(move || {
+            let release = Arc::clone(&handler_release);
+            async move {
+                let first =
+                    futures::stream::once(async { Ok::<_, std::convert::Infallible>("start\n") });
+                let last = futures::stream::once(async move {
+                    release.notified().await;
+                    Ok::<_, std::convert::Infallible>("finished\n")
+                });
+                Body::from_stream(first.chain(last))
+            }
+        }),
+    );
+    let server = tokio::spawn(host.serve(router));
+    let client = reqwest::Client::new();
+    let response = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Ok(response) = client.get(format!("http://127.0.0.1:{port}/")).send().await {
+                break response;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    cancellation.cancel();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        worker.observed.load(Ordering::SeqCst),
+        0,
+        "worker cancelled during active stream"
+    );
+    assert!(!server.is_finished());
+    release.notify_one();
+    assert_eq!(response.text().await.unwrap(), "start\nfinished\n");
+    tokio::time::timeout(Duration::from_secs(3), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(worker.observed.load(Ordering::SeqCst), 1);
+}
 
 #[derive(Clone)]
 struct CountingTask {

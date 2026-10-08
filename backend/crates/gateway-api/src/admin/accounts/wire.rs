@@ -370,6 +370,7 @@ pub struct AccountGroupRefView {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountQuotaView {
+    pub credits: Option<AccountCreditBalanceView>,
     pub refreshed_at_display: String,
     pub limit_reached: bool,
     /// 冷却到期或可开始恢复探测的时间；非限流中为 `null`。
@@ -377,6 +378,15 @@ pub struct AccountQuotaView {
     pub rate_limit_reason: Option<String>,
     pub recovery_probe_required: bool,
     pub windows: Vec<AccountQuotaWindowView>,
+}
+
+/// Credits 与美元等值安全展示，不包含上游私有扩展。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountCreditBalanceView {
+    pub balance: Option<String>,
+    pub unlimited: bool,
+    pub usd_equivalent: Option<String>,
 }
 
 /// 一个 quota 时间窗口。
@@ -397,6 +407,7 @@ pub struct AccountQuotaWindowView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub local_usage: Option<serde_json::Value>,
     pub reset_at_display: String,
+    pub reset_at: Option<String>,
 }
 
 /// 账号观测用量。

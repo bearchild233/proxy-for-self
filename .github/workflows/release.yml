@@ -60,6 +60,7 @@ jobs:
         run: |
           pnpm --dir frontend install --frozen-lockfile
           pnpm --dir frontend build
+          node scripts/build-all-plugins.mjs
       - name: Verify updater contracts
         run: python3 -m unittest discover -s services/updater -v
       - name: Verify Worker in clean environment
@@ -76,9 +77,11 @@ jobs:
           cargo build --release --locked -p codex-proxy-rs
       - name: Package release
         run: python3 services/updater/release_package.py --version "$RELEASE_VERSION" --binary backend/target/release/codex-proxy-rs --output dist
+      - name: Package plugin platform
+        run: python3 scripts/package-plugin-platform.py --output dist
       - name: Publish immutable version
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "v$RELEASE_VERSION" dist/*.tar.gz dist/checksums.txt \
+          gh release create "v$RELEASE_VERSION" dist/*.tar.gz dist/checksums.txt dist/*.sha256 \
             --target "$GITHUB_SHA" --title "proxy-for-self v$RELEASE_VERSION" --generate-notes

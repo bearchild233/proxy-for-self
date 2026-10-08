@@ -781,6 +781,8 @@ pub(super) fn map_request_error(error: CodexRequestEncodeError) -> ProviderError
 
 pub(super) fn map_selection_error(error: CredentialSelectionError) -> ProviderError {
     match error {
+        CredentialSelectionError::Cancelled => provider_error(ProviderErrorKind::Cancelled, UpstreamSendState::NotSent),
+        CredentialSelectionError::IntervalDeadline => provider_error(ProviderErrorKind::Timeout, UpstreamSendState::NotSent),
         CredentialSelectionError::QueueRejected(error) => {
             provider_error(error.provider_kind(), UpstreamSendState::NotSent)
         }

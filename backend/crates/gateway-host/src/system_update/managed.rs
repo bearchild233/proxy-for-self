@@ -154,3 +154,43 @@ pub(super) async fn plugin_action(
         .map(str::to_owned)
         .ok_or_else(|| internal("plugin operation not confirmed"))
 }
+
+pub(super) async fn login_security(
+    config: &SystemUpdateConfig,
+    path: &str,
+    body: Option<Value>,
+) -> Result<gateway_admin::model::system::LoginProtectionStatus, OperationError> {
+    if config.managed_socket.is_none() {
+        return Ok(gateway_admin::model::system::LoginProtectionStatus {
+            available: false,
+            healthy: false,
+            policies: Vec::new(),
+            bans: Vec::new(),
+            total_bans: 0,
+        });
+    }
+    let client = client(config)?;
+    let url = format!("http://localhost{path}");
+    let request = if let Some(body) = body {
+        client.post(url).json(&body)
+    } else {
+        client.get(url)
+    };
+    let value = response(request.timeout(Duration::from_secs(20)).send().await).await?;
+    serde_json::from_value(value).map_err(|_| internal("invalid login protection status"))
+}
+
+pub(super) async fn plugin_request(
+    config: &SystemUpdateConfig,
+    request: gateway_admin::model::system::PluginRequest,
+) -> Result<Value, OperationError> {
+    response(
+        client(config)?
+            .post("http://localhost/plugins/request")
+            .json(&request)
+            .timeout(Duration::from_secs(20))
+            .send()
+            .await,
+    )
+    .await
+}

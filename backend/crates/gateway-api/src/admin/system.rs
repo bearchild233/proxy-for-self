@@ -221,6 +221,18 @@ where
     S: SessionState + Clone + Send + Sync + 'static,
 {
     Router::new()
+        .route(
+            "/api/admin/system/login-protection",
+            get(login_protection::<S>),
+        )
+        .route(
+            "/api/admin/system/login-protection/policy",
+            post(set_login_protection::<S>),
+        )
+        .route(
+            "/api/admin/system/login-protection/unban",
+            post(unban_login::<S>),
+        )
         .route("/api/admin/system/plugins", get(plugins::<S>))
         .route("/api/admin/system/plugins/action", post(plugin_action::<S>))
         .route("/api/admin/system/version", get(version::<S>))
@@ -527,5 +539,64 @@ where
     Ok(AdminResponse::new(
         StatusCode::ACCEPTED,
         AdminEnvelope::ok(serde_json::json!({"operationId": id})),
+    ))
+}
+
+async fn login_protection<S>(
+    _auth: AdminAuth,
+    State(state): State<S>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let status = state
+        .admin_services()
+        .system()
+        .login_protection()
+        .await
+        .map_err(map_system_error)?;
+    Ok(AdminResponse::new(
+        StatusCode::OK,
+        AdminEnvelope::ok(status),
+    ))
+}
+
+async fn set_login_protection<S>(
+    _auth: AdminAuth,
+    State(state): State<S>,
+    AdminJson(request): AdminJson<gateway_admin::model::system::LoginProtectionPolicy>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let status = state
+        .admin_services()
+        .system()
+        .set_login_protection(request)
+        .await
+        .map_err(map_system_error)?;
+    Ok(AdminResponse::new(
+        StatusCode::OK,
+        AdminEnvelope::ok(status),
+    ))
+}
+
+async fn unban_login<S>(
+    _auth: AdminAuth,
+    State(state): State<S>,
+    AdminJson(request): AdminJson<gateway_admin::model::system::LoginUnban>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let status = state
+        .admin_services()
+        .system()
+        .unban_login(request)
+        .await
+        .map_err(map_system_error)?;
+    Ok(AdminResponse::new(
+        StatusCode::OK,
+        AdminEnvelope::ok(status),
     ))
 }

@@ -12,6 +12,10 @@ where
     Router::new()
         .merge(super::import_tasks::router::<S>())
         .route("/api/admin/accounts", get(list_accounts::<S>))
+        .route(
+            "/api/admin/accounts/diagnostic",
+            post(account_diagnostic::<S>),
+        )
         .route("/api/admin/accounts/detail", get(account_detail::<S>))
         .route("/api/admin/accounts/export", get(export_accounts::<S>))
         .route("/api/admin/accounts/import", post(import_accounts::<S>))
@@ -605,4 +609,39 @@ where
             Ok(Event::default().data(data))
         });
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DiagnosticRequest {
+    account_id: String,
+    input: Map<String, Value>,
+}
+
+async fn account_diagnostic<S>(
+    _auth: AdminAuth,
+    State(state): State<S>,
+    AdminJson(request): AdminJson<DiagnosticRequest>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let account_id = ProviderAccountId::new(request.account_id)
+        .map_err(|_| map_wire_error(WireValidationError::new("accountId")))?;
+    if serde_json::to_vec(&request.input).map_or(true, |bytes| bytes.len() > 65536) {
+        return Err(map_wire_error(WireValidationError::new("input")));
+    }
+    let result = state
+        .admin_services()
+        .accounts()
+        .diagnostic(
+            account_id,
+            ProviderDocument::new(OpaqueProviderData::new(request.input)),
+        )
+        .await
+        .map_err(map_service_error)?;
+    Ok(AdminResponse::new(
+        StatusCode::OK,
+        AdminEnvelope::ok(Value::Object(result.into_provider_data().into_inner())),
+    ))
 }

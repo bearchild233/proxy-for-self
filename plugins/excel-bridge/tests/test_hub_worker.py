@@ -238,3 +238,14 @@ def test_idle_shutdown_waits_for_active_requests_and_a_fresh_idle_window(monkeyp
     asyncio.run(app._idle_shutdown())
     assert ticks == [10,20,30]
     assert calls == [(123,hub_worker.signal.SIGTERM)]
+
+
+def test_plugin_status_rpc_requires_admin_and_never_calls_upstream():
+    app, requests, _ = harness()
+    response = call(app, path="/plugins/rpc/status", payload={"principal": {"role": "admin", "id": "admin"}, "input": {}})
+    assert response.status_code == 200
+    assert response.json()["active"] == 0
+    assert response.json()["maxConcurrency"] > 0
+    for role in ["key", "device", None]:
+        assert call(app, path="/plugins/rpc/status", payload={"principal": {"role": role}}).status_code == 403
+    assert not requests

@@ -1,0 +1,10 @@
+{
+  "main": {
+    "source": "page/index.vue",
+    "route": "/keys",
+    "title": "API 密钥",
+    "roles": [
+      "admin"
+    ]
+  }
+}

@@ -152,10 +152,10 @@ onMounted(load)
     </p>
     <div v-else-if="lockedProfile" class="grid gap-3 rounded-cp-card bg-cp-fill-quaternary p-4">
       <div class="font-emphasis text-cp-text">
-        固定 Codex CLI {{ lockedProfile.codexVersion }}
+        Codex CLI {{ lockedProfile.codexVersion }}
       </div>
       <p class="m-0 text-cp-sm text-cp-text-secondary">
-        由服务器基线锁定，不跟随 Latest，不接受 Key 级身份覆盖
+        {{ lockedProfile.automaticUpdates ? '身份由服务器统一设置，每日自动跟随官方稳定版本' : '由服务器基线锁定，不跟随 Latest，不接受 Key 级身份覆盖' }}
       </p>
       <code class="wrap-break-word text-cp-xs text-cp-text-secondary">{{ lockedProfile.userAgent }}</code>
     </div>

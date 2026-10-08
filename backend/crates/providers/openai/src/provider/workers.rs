@@ -6,6 +6,7 @@ use crate::transport::profile::platform_release::PlatformDesktopReleaseService;
 
 pub(crate) struct ClientReleaseServices {
     pub enabled: bool,
+    pub cli_enabled: bool,
     pub desktop: Arc<CodexDesktopReleaseService>,
     pub cli: Arc<CliReleaseService>,
     pub platforms: Arc<PlatformDesktopReleaseService>,
@@ -50,25 +51,25 @@ pub(crate) fn worker_contributions(
         )?));
     }
     if releases.enabled {
-        contributions.extend([
-            WorkerContribution::Registration(scheduled_registration(
-                WorkerId::try_new(
-                    WorkerKind::QuotaCatalogHealth,
-                    "openai-platform-desktop-release",
-                )?,
-                APPCAST_POLL_INTERVAL,
-                Box::new(OpenAiPlatformDesktopReleaseTask {
-                    service: releases.platforms,
-                }),
-            )?),
-            WorkerContribution::Registration(scheduled_registration(
-                cli_release_id,
-                APPCAST_POLL_INTERVAL,
-                Box::new(OpenAiCliReleaseTask {
-                    service: releases.cli,
-                }),
-            )?),
-        ]);
+        contributions.push(WorkerContribution::Registration(scheduled_registration(
+            WorkerId::try_new(
+                WorkerKind::QuotaCatalogHealth,
+                "openai-platform-desktop-release",
+            )?,
+            APPCAST_POLL_INTERVAL,
+            Box::new(OpenAiPlatformDesktopReleaseTask {
+                service: releases.platforms,
+            }),
+        )?));
+    }
+    if releases.cli_enabled {
+        contributions.push(WorkerContribution::Registration(scheduled_registration(
+            cli_release_id,
+            APPCAST_POLL_INTERVAL,
+            Box::new(OpenAiCliReleaseTask {
+                service: releases.cli,
+            }),
+        )?));
     }
     contributions.extend([
         WorkerContribution::Registration(scheduled_registration(

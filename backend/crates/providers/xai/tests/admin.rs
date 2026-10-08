@@ -1264,3 +1264,28 @@ async fn client_profile_preview_and_dashboard_use_saved_configuration() {
     assert!(dashboard.release.is_none());
     assert!(dashboard.verified_at.is_none());
 }
+
+#[tokio::test]
+async fn diagnostic_template_preserves_prompt_and_effort_in_core_operation() {
+    let bundle = provider_xai::initialize(provider_ports()).await.unwrap();
+    let document = ProviderDocument::new(OpaqueProviderData::new(serde_json::json!({
+        "phase":"text", "model":"test-model", "prompt":"custom diagnostic input", "effort":"high"
+    }).as_object().unwrap().clone()));
+    let (model, operation) = bundle
+        .admin_provider()
+        .diagnostic_operation(&document)
+        .unwrap()
+        .unwrap();
+    assert_eq!(model.as_str(), "test-model");
+    let gateway_core::operation::Operation::Generate(request) = operation else {
+        panic!("generate expected")
+    };
+    assert_eq!(
+        request.protocol_payload().body()["reasoning"]["effort"],
+        "high"
+    );
+    assert_eq!(
+        request.protocol_payload().body()["input"][0]["content"][0]["text"],
+        "custom diagnostic input"
+    );
+}

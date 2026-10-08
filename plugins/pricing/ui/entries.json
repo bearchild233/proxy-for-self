@@ -1,0 +1,10 @@
+{
+  "main": {
+    "source": "page/index.vue",
+    "route": "/settings/pricing",
+    "title": "模型定价",
+    "roles": [
+      "admin"
+    ]
+  }
+}

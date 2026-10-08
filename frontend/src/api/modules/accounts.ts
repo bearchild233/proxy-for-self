@@ -26,9 +26,17 @@ export interface AccountQuotaWindow {
   limitReached: boolean
   localUsage?: unknown
   resetAtDisplay: string
+  resetAt?: string | null
+}
+
+export interface AccountCreditBalance {
+  balance: string | null
+  unlimited: boolean
+  usdEquivalent: string | null
 }
 
 export interface AccountQuota {
+  credits?: AccountCreditBalance | null
   refreshedAtDisplay: string
   limitReached: boolean
   // 429 临时限流（Redis 冷却）到期时间；非限流中为 null。

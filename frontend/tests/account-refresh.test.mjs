@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 // eslint-disable-next-line test/no-import-node-test -- 使用内置 runner 验证刷新失败与并发边界
 import test from 'node:test'
-import { refreshAccountPage } from '../src/views/accounts/utils/refreshAccountPage.ts'
+import { refreshAccountPage } from '../../plugins/accounts/ui/page/utils/refreshAccountPage.ts'
 
 function account(id, overrides = {}) {
   return { id, name: id, enabled: true, provider: 'openai', authenticationKind: 'oauth', ...overrides }

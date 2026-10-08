@@ -24,7 +24,19 @@ def package_plugin(runtime: Path, source: Path, output: Path, version: str):
     for path in source.rglob("*"):
         if path.is_file() and not path.is_symlink() and "__pycache__" not in path.parts and path.suffix != ".pyc":
             files[prefix + path.relative_to(source).as_posix()] = path
-    manifest = json.dumps({"id": "excel-bridge", "version": version, "protocol": 1, "platform": "linux-amd64-python3.10"}).encode()
+    ui = source.parent.parent / "ui"
+    license_file = source.parent.parent / "LICENSE"
+    if not (ui / "overview.html").is_file() or not license_file.is_file():
+        raise ValueError("插件 UI 或许可证缺失")
+    files["LICENSE"] = license_file
+    for path in ui.rglob("*"):
+        if path.is_file() and not path.is_symlink():
+            files["ui/" + path.relative_to(ui).as_posix()] = path
+    manifest = json.dumps({"id": "excel-bridge", "version": version, "protocol": 1,
+                           "platform": "linux-amd64-python3.10", "capabilities": ["excel-inference"],
+                           "pages": [{"id": "overview", "title": "插件详情", "slot": "settings",
+                                      "entry": "ui/overview.html", "roles": ["admin"]}],
+                           "operations": [{"id": "status", "roles": ["admin"]}]}).encode()
     with tarfile.open(output, "w:gz") as tar:
         for name, path in sorted(files.items()):
             info = tar.gettarinfo(str(path), arcname=name)

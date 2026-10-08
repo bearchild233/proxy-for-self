@@ -1,0 +1,36 @@
+{
+  "id": "pricing",
+  "version": "0.3.1",
+  "protocol": 2,
+  "kind": "ui",
+  "sdk": 1,
+  "pages": [
+    {
+      "id": "main",
+      "title": "模型定价",
+      "entry": "ui/module.js",
+      "roles": [
+        "admin"
+      ],
+      "route": "/settings/pricing",
+      "layout": "settings"
+    }
+  ],
+  "capabilities": [
+    "auth.get.auth.status",
+    "auth.post.auth.logout",
+    "pricing.get.admin.settings.pricing",
+    "pricing.post.admin.settings.pricing.sync",
+    "pricing.post.admin.settings.pricing.sync.preview",
+    "pricing.post.admin.settings.pricing.update",
+    "pricing.schedule.status"
+  ],
+  "releasedAt": "2026-10-08T20:01:10.384801+00:00",
+  "releaseNotes": [
+    "可见页面每30秒静默同步数据，切回页面立即补刷，隐藏时暂停。",
+    "刷新保留分页与筛选；设置草稿不被后台读取覆盖。"
+  ],
+  "policyWorker": "worker/policy.py",
+  "runtime": "vue-component",
+  "hostApi": 1
+}

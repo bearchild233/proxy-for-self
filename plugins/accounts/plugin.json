@@ -1,0 +1,62 @@
+{
+  "id": "accounts",
+  "version": "0.3.2",
+  "protocol": 2,
+  "kind": "ui",
+  "sdk": 1,
+  "pages": [
+    {
+      "id": "main",
+      "title": "账号管理",
+      "entry": "ui/module.js",
+      "roles": [
+        "admin"
+      ],
+      "route": "/accounts"
+    }
+  ],
+  "capabilities": [
+    "account-groups.get.admin.account-groups",
+    "accounts.get.admin.accounts",
+    "accounts.get.admin.accounts.detail",
+    "accounts.get.admin.accounts.export",
+    "accounts.get.admin.accounts.import-tasks",
+    "accounts.get.admin.accounts.import-tasks.detail",
+    "accounts.get.admin.accounts.models",
+    "accounts.get.admin.accounts.personal-info",
+    "accounts.get.admin.accounts.quota-forecast",
+    "accounts.get.admin.accounts.reset-credits",
+    "accounts.post.admin.accounts.batch-update",
+    "accounts.post.admin.accounts.delete",
+    "accounts.post.admin.accounts.import",
+    "accounts.post.admin.accounts.import-tasks",
+    "accounts.post.admin.accounts.import-tasks.stop",
+    "accounts.post.admin.accounts.models.refresh",
+    "accounts.post.admin.accounts.oauth.complete",
+    "accounts.post.admin.accounts.oauth.start",
+    "accounts.post.admin.accounts.quota.refresh",
+    "accounts.post.admin.accounts.recover",
+    "accounts.post.admin.accounts.refresh",
+    "accounts.post.admin.accounts.reset-credits",
+    "accounts.post.admin.accounts.rotate",
+    "accounts.post.admin.accounts.update",
+    "auth.get.auth.status",
+    "auth.post.auth.logout",
+    "client-profiles.get.admin.settings.client-profiles.openai",
+    "client-profiles.get.admin.settings.client-profiles.xai",
+    "display-order.save",
+    "proxies.get.admin.proxies",
+    "proxies.get.admin.proxies.accounts",
+    "settings.get.admin.settings",
+    "settings.get.admin.settings.admin-api-key",
+    "settings.get.admin.settings.client-downloads.codex-desktop.windows",
+    "accounts.avatar"
+  ],
+  "releasedAt": "2026-10-08T19:10:34.046514+00:00",
+  "releaseNotes": [
+    "后台同步保留列表、分页、选中及展开状态。",
+    "同步提示固定占位，加载图标原位替换，避免每 30 秒挤动页面。"
+  ],
+  "runtime": "vue-component",
+  "hostApi": 1
+}

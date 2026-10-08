@@ -20,6 +20,9 @@ pub(crate) const POSTGRES_HEALTH_RETRY_DELAY: Duration = Duration::from_millis(5
 /// Store 自己拥有并校验的启动配置。
 #[derive(Clone, Deserialize)]
 pub struct StoreConfig {
+    /// 固定 A/B 槽；省略时保持单实例启动与恢复行为。
+    #[serde(default)]
+    pub(crate) deployment_slot: Option<String>,
     /// root/服务用户独占的 32 字节十六进制主密钥文件，不从管理 API 返回。
     #[serde(default)]
     pub(crate) vault_key_file: Option<PathBuf>,
@@ -85,6 +88,16 @@ impl StoreConfig {
     }
 
     pub(crate) fn validate_resolved(&mut self) -> StoreResult<()> {
+        if self
+            .deployment_slot
+            .as_deref()
+            .is_some_and(|slot| !matches!(slot, "a" | "b"))
+        {
+            return Err(StoreError::InvalidData {
+                entity: "store config",
+                message: "deployment_slot must be a or b".to_owned(),
+            });
+        }
         if let Some(url) = optional_environment_value(DATABASE_URL_ENV)? {
             self.database.url = url;
         }

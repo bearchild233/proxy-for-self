@@ -19,6 +19,7 @@ export interface RuntimeSettings {
   maxWaitingPerKey: number
   maxWaitingPerAccount: number
   concurrencyWaitTimeoutSeconds: number
+  inferenceLimits: { maxRequests: number, maxBodyBytes: number, maxInFlightBodyBytes: number }
   responsesMaxDecompressedBodyBytes: number
   rotationStrategy: RotationStrategy
   minCodexDesktopVersion: string | null

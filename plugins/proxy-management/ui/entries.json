@@ -1,0 +1,10 @@
+{
+  "main": {
+    "source": "page/index.vue",
+    "route": "/proxies",
+    "title": "出口代理",
+    "roles": [
+      "admin"
+    ]
+  }
+}

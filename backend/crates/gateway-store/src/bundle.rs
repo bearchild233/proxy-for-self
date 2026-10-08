@@ -7,6 +7,8 @@ use super::*;
 
 /// 已完成连接、迁移与 hydration 的 Store 能力集合。
 pub struct StoreBundle {
+    _instance_lock: Option<sqlx::PgConnection>,
+    slot_guard: Option<postgres::PgSlotGuard>,
     admin_ports: AdminStorePorts,
     core_ports: CoreStorePorts,
     provider_ports: ProviderStorePorts,
@@ -16,6 +18,13 @@ pub struct StoreBundle {
 }
 
 impl StoreBundle {
+    /// 必须在 Core 已完成恢复后、监听端口前调用。
+    pub async fn complete_startup(&mut self) -> StoreResult<()> {
+        if let Some(guard) = &mut self.slot_guard {
+            guard.complete_startup().await?;
+        }
+        Ok(())
+    }
     #[must_use]
     pub fn admin_ports(&self) -> AdminStorePorts {
         self.admin_ports.clone()
@@ -51,10 +60,24 @@ pub async fn initialize(mut config: StoreConfig) -> StoreResult<StoreBundle> {
     const REDIS_NAMESPACE: &str = "codex-proxy-rs";
 
     config.validate_resolved()?;
-    let pool = postgres::connect_and_migrate(&config.database_url()?, config.pool).await?;
+    let pool = if config.deployment_slot.is_some() {
+        postgres::connect_for_slot(&config.database_url()?, config.pool).await?
+    } else {
+        postgres::connect_and_migrate(&config.database_url()?, config.pool).await?
+    };
+    let recovery = postgres::PgClientAdmissionRecoveryRepository::new(pool.clone());
+    let (instance_lock, slot_guard, recover_startup) = if let Some(slot) = &config.deployment_slot {
+        let guard = recovery.acquire_slot(slot).await?;
+        let recover = guard.needs_recovery();
+        (None, Some(guard), recover)
+    } else {
+        (Some(recovery.recover_after_restart().await?), None, true)
+    };
     if let Some(path) = &config.vault_key_file {
         crate::vault::initialize(path)?;
-        crate::vault::migrate_existing(&pool).await?;
+        if recover_startup {
+            crate::vault::migrate_existing(&pool).await?;
+        }
     }
     let observability_query_budget = postgres::ObservabilityQueryBudget::try_new(
         config.pool.observability_max_connections(),
@@ -76,6 +99,9 @@ pub async fn initialize(mut config: StoreConfig) -> StoreResult<StoreBundle> {
 
     let credential_leases =
         redis::RedisCredentialLeaseRepository::new(redis_connection.clone(), REDIS_NAMESPACE)?;
+    if recover_startup {
+        credential_leases.clear_interrupted_leases().await?;
+    }
     let admin_account_runtime = Arc::new(redis::RedisAdminAccountRuntimeStore::new(
         cooldowns.as_ref().clone(),
         credential_leases.clone(),
@@ -175,7 +201,8 @@ pub async fn initialize(mut config: StoreConfig) -> StoreResult<StoreBundle> {
         ),
         Arc::new(client_key_usage),
     )
-    .with_budget(Arc::new(postgres::PgClientBudgetStore::new(pool.clone())));
+    .with_budget(Arc::new(postgres::PgClientBudgetStore::new(pool.clone())))
+    .with_startup_recovery(recover_startup);
 
     let provider_ports = ProviderStorePorts::new(
         account_store,
@@ -213,6 +240,8 @@ pub async fn initialize(mut config: StoreConfig) -> StoreResult<StoreBundle> {
         retention,
     )?;
     Ok(StoreBundle {
+        _instance_lock: instance_lock,
+        slot_guard,
         admin_ports,
         core_ports,
         provider_ports,

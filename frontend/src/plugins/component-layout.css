@@ -1,0 +1,29 @@
+.component-plugin {
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+.component-plugin .component-page {
+  padding: 1rem;
+  min-height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+.component-plugin .component-page.component-settings {
+  padding-top: 0;
+}
+.component-plugin .component-popup {
+  padding: 0;
+}
+.component-plugin .settings-pricing {
+  height: var(--plugin-content-height) !important;
+  min-height: 0;
+}
+@media (min-width: 961px) {
+  .component-plugin .component-page {
+    padding: 1.5rem;
+  }
+  .component-plugin .component-page.component-settings {
+    padding-top: 0;
+  }
+}

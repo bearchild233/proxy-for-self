@@ -1,0 +1,18 @@
+{
+  "state_file": "/var/lib/proxy-for-self-updater/slots.json",
+  "release_root": "/opt/api-hub/releases",
+  "current_link": "/opt/api-hub/current",
+  "slots": {
+    "a": {"unit": "proxy-for-self-slot-a.service", "port": 8322, "directory": "/opt/api-hub/slots/a"},
+    "b": {"unit": "proxy-for-self-slot-b.service", "port": 8323, "directory": "/opt/api-hub/slots/b"}
+  },
+  "caddy_admin_port": 18341,
+  "caddy_dial_path": "/config/apps/http/servers/srv0/routes/0/handle/0/upstreams/0/dial",
+  "caddy_upstream_file": "/etc/caddy/slot-router/upstream.caddy",
+  "verify_host": "api.example.com",
+  "verify_port": 18340,
+  "ready_timeout": 60,
+  "drain_timeout": 700,
+  "minimum_available_mib": 512,
+  "maximum_draining_mib": 128
+}

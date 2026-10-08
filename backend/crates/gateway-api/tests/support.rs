@@ -86,6 +86,12 @@ struct VersionSystem;
 
 #[async_trait]
 impl SystemOperations for VersionSystem {
+    async fn plugin_request(
+        &self,
+        request: gateway_admin::model::system::PluginRequest,
+    ) -> Result<serde_json::Value, SystemOperationError> {
+        Ok(serde_json::to_value(request).expect("plugin request"))
+    }
     async fn version(&self) -> Result<SystemVersion, SystemOperationError> {
         Ok(SystemVersion {
             version: "3.7.0".to_owned(),

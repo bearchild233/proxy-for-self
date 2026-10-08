@@ -13,9 +13,12 @@ use crate::{StoreError, StoreResult, redis_unavailable, require_nonempty};
 const CONSUME_LOGIN_ATTEMPT_SCRIPT: &str = r#"
 local source_count = redis.call('INCR', KEYS[1])
 if source_count == 1 then redis.call('PEXPIRE', KEYS[1], ARGV[3]) end
+if source_count > tonumber(ARGV[1]) then
+  return math.max(redis.call('PTTL', KEYS[1]), 1)
+end
 local global_count = redis.call('INCR', KEYS[2])
 if global_count == 1 then redis.call('PEXPIRE', KEYS[2], ARGV[3]) end
-if source_count > tonumber(ARGV[1]) or global_count > tonumber(ARGV[2]) then
+if global_count > tonumber(ARGV[2]) then
   return math.max(redis.call('PTTL', KEYS[1]), redis.call('PTTL', KEYS[2]), 1)
 end
 return 0

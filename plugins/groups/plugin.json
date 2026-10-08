@@ -1,0 +1,38 @@
+{
+  "id": "groups",
+  "version": "0.3.1",
+  "protocol": 2,
+  "kind": "ui",
+  "sdk": 1,
+  "pages": [
+    {
+      "id": "main",
+      "title": "分组管理",
+      "entry": "ui/module.js",
+      "roles": [
+        "admin"
+      ],
+      "route": "/groups"
+    }
+  ],
+  "capabilities": [
+    "account-groups.get.admin.account-groups",
+    "account-groups.post.admin.account-groups.create",
+    "account-groups.post.admin.account-groups.delete",
+    "account-groups.post.admin.account-groups.disable",
+    "account-groups.post.admin.account-groups.enable",
+    "account-groups.post.admin.account-groups.update",
+    "api-keys.get.admin.client-keys",
+    "auth.get.auth.status",
+    "auth.post.auth.logout",
+    "display-order.save",
+    "api-keys.post.admin.client-keys.bindings"
+  ],
+  "releasedAt": "2026-10-08T20:01:10.365606+00:00",
+  "releaseNotes": [
+    "可见页面每30秒静默同步数据，切回页面立即补刷，隐藏时暂停。",
+    "刷新保留分页与筛选；设置草稿不被后台读取覆盖。"
+  ],
+  "runtime": "vue-component",
+  "hostApi": 1
+}

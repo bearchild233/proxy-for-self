@@ -284,7 +284,7 @@ impl CodexWireProfileState {
             &json!({ "presets": presets, "lockedProfile": self.identity_locked.then(|| json!({
             "codexVersion": locked.codex_version, "originator": locked.originator,
             "userAgent": locked.user_agent(), "osType": locked.os_type, "osVersion": locked.os_version,
-            "arch": locked.arch, "automaticUpdates": false,
+            "arch": locked.arch, "automaticUpdates": self.cli_auto_update,
         })) }),
         )
     }

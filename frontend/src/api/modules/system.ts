@@ -109,6 +109,7 @@ export function getSystemUpdateStatus(options: RequestOptions = {}) {
 
 export type PluginAction = 'install' | 'enable' | 'disable' | 'uninstall' | 'update'
 export interface PluginStatus {
+  description: string
   id: string
   name: string
   protocol: number
@@ -123,4 +124,28 @@ export function getPlugins(options: RequestOptions = {}) {
 }
 export function performPluginAction(id: string, action: PluginAction) {
   return request<{ operationId: string }>({ url: '/api/admin/system/plugins/action', method: 'POST', data: { id, action } })
+}
+
+export interface LoginProtectionPolicy {
+  site: 'api' | 'panel'
+  maxFailures: number
+  windowSeconds: number
+  banSeconds: number
+  maxBanSeconds: number
+}
+export interface LoginProtectionStatus {
+  available: boolean
+  healthy: boolean
+  policies: LoginProtectionPolicy[]
+  bans: { site: 'api' | 'panel', ip: string, expiresAt: number }[]
+  totalBans: number
+}
+export function getLoginProtection(options: RequestOptions = {}) {
+  return request<LoginProtectionStatus>({ url: '/api/admin/system/login-protection', method: 'GET', ...options })
+}
+export function saveLoginProtection(data: LoginProtectionPolicy) {
+  return request<LoginProtectionStatus>({ url: '/api/admin/system/login-protection/policy', method: 'POST', data })
+}
+export function unbanLogin(site: 'api' | 'panel', ip: string) {
+  return request<LoginProtectionStatus>({ url: '/api/admin/system/login-protection/unban', method: 'POST', data: { site, ip } })
 }

@@ -25,10 +25,12 @@ export function useStablePagedQuery<Result extends PageResult>(options: {
   const pageSize = shallowRef(options.initialPageSize)
   const total = shallowRef(0)
   const items = shallowRef<Result['items'][number][]>([])
+  const pending = shallowRef(0)
   const request = useRequestState(options.onError)
   const { loading, error, invalidate } = request
 
   async function execute(targetPage = currentPage.value, execution: { silent?: boolean } = {}) {
+    pending.value++
     const requestId = request.start(execution.silent)
 
     try {
@@ -51,6 +53,7 @@ export function useStablePagedQuery<Result extends PageResult>(options: {
       return false
     }
     finally {
+      pending.value--
       request.finish(requestId)
     }
   }
@@ -67,6 +70,7 @@ export function useStablePagedQuery<Result extends PageResult>(options: {
     total,
     items,
     loading,
+    pending,
     error,
     execute,
     reloadFromStart,

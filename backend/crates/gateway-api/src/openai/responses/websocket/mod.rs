@@ -21,7 +21,7 @@ use axum::{
 use gateway_core::{
     diagnostics::{TraceContext, diagnostic_json},
     engine::execution::{AuthenticatedClient, ClientTransport},
-    lifecycle::{ConnectionGuard, ConnectionLifecycle},
+    lifecycle::{CancellationToken, ConnectionGuard, ConnectionLifecycle},
 };
 
 use crate::{
@@ -109,7 +109,14 @@ impl ResponsesWebSocketAdapter {
                 .iter()
                 .map(|(name, value)| (name.as_str(), value.as_bytes())),
         );
-        let max_message_bytes = client.snapshot().responses_max_decompressed_body_bytes();
+        let limits = match self.service.inference_limits() {
+            Ok(limits) => limits,
+            Err(_) => return runtime_unavailable_response().into_response(),
+        };
+        let max_message_bytes = client
+            .snapshot()
+            .responses_max_decompressed_body_bytes()
+            .min(limits.body_limit());
         let session = ResponsesWebSocketSession {
             service: self.service.clone(),
             raw_headers,
@@ -164,12 +171,22 @@ async fn serve_responses_websocket(socket: WebSocket, session: ResponsesWebSocke
     let cancellation = lifecycle.cancellation();
     let request_headers =
         request_headers.with_downstream_websocket_connection_id(connection_id.clone());
-    let mut connection = ResponsesWebSocketConnection::new(socket, connection_id, cancellation);
+    // Host 排空只阻止下一轮；当前轮输出与结算继续，不能直接取消传输 pump。
+    let mut connection =
+        ResponsesWebSocketConnection::new(socket, connection_id, CancellationToken::new());
     let mut request_count = 0_u64;
     let mut replay = ConnectionReplaySnapshot::default();
 
     loop {
-        let Some(event) = connection.next_event().await else {
+        let event = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => {
+                connection.close_for_shutdown().await;
+                break;
+            }
+            event = connection.next_event() => event,
+        };
+        let Some(event) = event else {
             break;
         };
         let payload = match event {
@@ -190,6 +207,48 @@ async fn serve_responses_websocket(socket: WebSocket, session: ResponsesWebSocke
         }
         request_count = request_count.saturating_add(1);
         let correlation_id = Arc::<str>::from(service.next_request_id());
+        let limits = match service.inference_limits() {
+            Ok(limits) => limits,
+            Err(error) => {
+                let _ = send_gateway_error(&mut connection, &error, &correlation_id).await;
+                break;
+            }
+        };
+        if payload.len() > limits.body_limit() {
+            let error = gateway_core::error::GatewayError::new(
+                gateway_core::error::GatewayErrorKind::InvalidRequest,
+                "Request exceeds the configured gateway body limit.",
+            )
+            .with_client_code("request_body_too_large");
+            if send_gateway_error(&mut connection, &error, &correlation_id).await
+                == ForwardOutcome::Disconnect
+            {
+                break;
+            }
+            continue;
+        }
+        let _resource_permit = match service.resources.acquire(limits) {
+            Ok(permit) => permit,
+            Err(error) => {
+                if send_gateway_error(&mut connection, &error, &correlation_id).await
+                    == ForwardOutcome::Disconnect
+                {
+                    break;
+                }
+                continue;
+            }
+        };
+        let _body_permit = match service.resources.acquire_body(limits, payload.len()) {
+            Ok(permit) => permit,
+            Err(error) => {
+                if send_gateway_error(&mut connection, &error, &correlation_id).await
+                    == ForwardOutcome::Disconnect
+                {
+                    break;
+                }
+                continue;
+            }
+        };
         let decoded = match decode_response_create_with_context(&payload, &request_headers) {
             Ok(decoded) => decoded.with_client_context(client_ip, user_agent.clone()),
             Err(error) => {

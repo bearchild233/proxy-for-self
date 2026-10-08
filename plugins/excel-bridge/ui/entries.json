@@ -1,0 +1,11 @@
+{
+  "main": {
+    "source": "Excel.vue",
+    "route": "/",
+    "title": "Excel Bridge",
+    "roles": [
+      "admin",
+      "key"
+    ]
+  }
+}

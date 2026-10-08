@@ -235,3 +235,37 @@ async fn retention_cleans_expired_scheduled_backups() {
     assert!(object_store.object(&old_seed.object_key).is_none());
     assert!(object_store.object(&new_seed.object_key).is_some());
 }
+
+struct DisabledPluginPolicy;
+#[async_trait::async_trait]
+impl gateway_admin::ports::backup::BackupPolicyPort for DisabledPluginPolicy {
+    async fn decide(
+        &self,
+        _: serde_json::Value,
+    ) -> Result<serde_json::Value, gateway_core::task::WorkerTaskError> {
+        Ok(serde_json::json!({"enabled":false}))
+    }
+}
+
+#[tokio::test]
+async fn disabled_plugin_does_not_claim_queued_backups() {
+    let repository = Arc::new(FakeBackupRepository::new(configured_settings()));
+    repository
+        .insert_backup_record(BackupRecordSeed {
+            id: backup_id("paused"),
+            trigger_kind: BackupTriggerKind::Manual,
+            scheduled_at: None,
+            object_key: "paused.dump".to_owned(),
+            expires_at: None,
+        })
+        .await
+        .unwrap();
+    let task = BackupTask::new(
+        repository.clone(),
+        Arc::new(FakeDumpPort::new()),
+        Arc::new(FakeObjectStore::new()),
+    )
+    .with_policy(Some(Arc::new(DisabledPluginPolicy)));
+    task.run_cycle(&CancellationToken::new()).await.unwrap();
+    assert_eq!(repository.all_records()[0].status, BackupStatus::Queued);
+}

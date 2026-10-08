@@ -80,6 +80,8 @@ pub async fn run() -> Result<(), BootstrapError> {
         client,
         store.admin_ports(),
         gateway_admin::AdminRuntimePorts {
+            pricing_policy: gateway_host::plugin_policy::pricing_from_environment(),
+            backup_policy: gateway_host::plugin_policy::from_environment(),
             pricing_source: std::sync::Arc::new(gateway_host::pricing::ModelsDevPricing),
             providers: vec![openai.admin_provider(), xai.admin_provider()],
             snapshot: core.snapshot_control(),
@@ -113,6 +115,7 @@ pub async fn run() -> Result<(), BootstrapError> {
     plan.extend(admin.take_worker_contributions());
     host.start_workers(plan, store.worker_leader_lease())?;
     host.report_startup_ready("Workers");
+    store.complete_startup().await?;
     host.serve(api.router()).await?;
     Ok(())
 }

@@ -39,7 +39,7 @@ export interface ClientProfilePreset {
 }
 
 export function getClientProfileOptions() {
-  return request<{ presets: ClientProfilePreset[], globalConfiguration: ClientProfileSelection, lockedProfile?: { codexVersion: string, userAgent: string, originator: string } | null }>({
+  return request<{ presets: ClientProfilePreset[], globalConfiguration: ClientProfileSelection, lockedProfile?: { codexVersion: string, userAgent: string, originator: string, automaticUpdates?: boolean } | null }>({
     url: '/api/admin/settings/client-profiles/openai',
     method: 'GET',
     silent: true,

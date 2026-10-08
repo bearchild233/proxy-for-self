@@ -659,8 +659,11 @@ fn rebuild_account(current: &ProviderAccount, rebuild: AccountRebuild) -> Provid
 
 #[derive(Default)]
 pub(crate) struct TestLeaseCoordinator {
+    pub(crate) in_flight: Mutex<u32>,
+    pub(crate) last_started_at: Mutex<Option<SystemTime>>,
     pub(crate) requests: Mutex<Vec<ProviderSchedulingLeaseRequest>>,
     pub(crate) busy: Mutex<bool>,
+    pub(crate) interval_once: Mutex<Option<Duration>>,
     pub(crate) busy_accounts: Mutex<BTreeSet<ProviderAccountId>>,
     round_robin_cursor: Mutex<u64>,
 }
@@ -680,8 +683,11 @@ impl ProviderLeasePort for TestLeaseCoordinator {
                     (
                         account,
                         AccountRuntimeSignals {
-                            in_flight: 0,
-                            last_started_at: None,
+                            in_flight: *self.in_flight.lock().expect("in-flight signal"),
+                            last_started_at: *self
+                                .last_started_at
+                                .lock()
+                                .expect("last start signal"),
                             quota_reset_at: None,
                             quota_remaining_rank: None,
                             cooldown: None,
@@ -722,6 +728,10 @@ impl ProviderLeasePort for TestLeaseCoordinator {
                 Ok(ProviderLeaseAcquisition::Busy {
                     retry_after: Some(Duration::from_millis(25)),
                 })
+            } else if let Some(retry_after) =
+                self.interval_once.lock().expect("interval lock").take()
+            {
+                Ok(ProviderLeaseAcquisition::IntervalPending { retry_after })
             } else {
                 Ok(ProviderLeaseAcquisition::Acquired(Box::new(())))
             }

@@ -1,0 +1,13 @@
+/* 页面滚动留在插件视口内；边距只由插件这一层提供。 */
+html, body, #app { height: 100%; margin: 0; }
+body { overflow: hidden; }
+.plugin-viewport { height: 100dvh; min-width: 0; overflow: hidden; }
+.plugin-root { display: flex; flex-direction: column; min-height: 100dvh; min-width: 0; box-sizing: border-box; }
+.plugin-page { padding: 1rem; }
+.plugin-popup { padding: 0; }
+@media (min-width: 961px) { .plugin-page { padding: 1.5rem; } }
+
+/* 公共页头由宿主持有；iframe 只占下方内容区。 */
+.plugin-settings { padding-top: 0; }
+.settings-pricing { height: calc(100dvh - 1rem) !important; }
+@media (min-width: 961px) { .settings-pricing { height: calc(100dvh - 1.5rem) !important; } }

@@ -160,6 +160,15 @@ class HubWorker:
         path, method = scope["path"], scope["method"]
         if (path, method) == ("/healthz", "GET"):
             return await JSONResponse({"ok": True, "active": self.active})(scope, receive, send)
+        if (path, method) == ("/plugins/rpc/status", "POST"):
+            try:
+                envelope = await read_json(Request(scope, receive), 65536)
+                if envelope.get("principal", {}).get("role") != "admin":
+                    return await JSONResponse({"error": "Forbidden"}, status_code=403)(scope, receive, send)
+            except (ValueError, BodyTooLarge):
+                return await JSONResponse({"error": "Invalid request"}, status_code=400)(scope, receive, send)
+            return await JSONResponse({"active": self.active, "maxConcurrency": self.max_concurrency,
+                                       "models": len(codex_config.catalog_payload().get("models", []))})(scope, receive, send)
         if (path, method) == ("/internal/catalog", "GET"):
             return await JSONResponse(codex_config.catalog_payload())(scope, receive, send)
         if method != "POST" or path not in {

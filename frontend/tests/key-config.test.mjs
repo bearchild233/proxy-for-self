@@ -1,9 +1,23 @@
 import assert from 'node:assert/strict'
+import { Buffer } from 'node:buffer'
 // eslint-disable-next-line test/no-import-node-test -- 使用 Node 内置 runner，不新增测试框架依赖
 import test from 'node:test'
+import { buildCodexCcSwitchImportDeeplink } from '../src/utils/ccswitchImport.ts'
 import { buildCodexConfigFiles, CODEX_EXCEL_DEFAULT_MODEL } from '../src/utils/codexConfig.ts'
 
 const input = { apiKey: 'sk-test-only', baseUrl: 'https://proxy.example.invalid/v1/' }
+
+test('CC Switch import pins provider identity independently of the display name', () => {
+  const url = new URL(buildCodexCcSwitchImportDeeplink({ ...input, providerName: '我的 Key' }))
+  assert.equal(url.searchParams.get('codexModelProvider'), 'custom')
+  assert.equal(url.searchParams.get('codexProviderName'), 'custom')
+  assert.equal(url.searchParams.get('name'), '我的 Key')
+  const payload = JSON.parse(Buffer.from(url.searchParams.get('config'), 'base64').toString())
+  assert.ok(payload.config.includes('model_provider = "custom"'))
+  assert.ok(payload.config.includes('[model_providers.custom]'))
+  assert.ok(payload.config.includes('name = "custom"'))
+  assert.ok(payload.config.includes('model_reasoning_effort = "high"'))
+})
 
 test('Native export has no Excel catalog or alias', () => {
   const files = buildCodexConfigFiles(input)

@@ -76,6 +76,8 @@ function moveWithKeyboard(event: KeyboardEvent, index: number) {
 const sortable = useSortable(tableRef, shallowRef<Row[]>([]), {
   watchElement: true,
   animation: 150,
+  forceFallback: true,
+  fallbackTolerance: 3,
   handle: '[data-row-handle]',
   draggable: 'tbody[data-row-group]',
   ghostClass: 'opacity-40',

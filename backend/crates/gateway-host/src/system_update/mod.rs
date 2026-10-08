@@ -454,6 +454,52 @@ impl ProcessSystemOperations {
 
 #[async_trait]
 impl SystemOperations for ProcessSystemOperations {
+    async fn login_protection(
+        &self,
+    ) -> Result<gateway_admin::model::system::LoginProtectionStatus, OperationError> {
+        managed::login_security(&self.config, "/login-security", None).await
+    }
+
+    async fn set_login_protection(
+        &self,
+        request: gateway_admin::model::system::LoginProtectionPolicy,
+    ) -> Result<gateway_admin::model::system::LoginProtectionStatus, OperationError> {
+        managed::login_security(
+            &self.config,
+            "/login-security/policy",
+            Some(
+                serde_json::to_value(request)
+                    .map_err(|_| internal("invalid login protection request"))?,
+            ),
+        )
+        .await
+    }
+
+    async fn unban_login(
+        &self,
+        request: gateway_admin::model::system::LoginUnban,
+    ) -> Result<gateway_admin::model::system::LoginProtectionStatus, OperationError> {
+        managed::login_security(
+            &self.config,
+            "/login-security/unban",
+            Some(
+                serde_json::to_value(request)
+                    .map_err(|_| internal("invalid login protection request"))?,
+            ),
+        )
+        .await
+    }
+
+    async fn plugin_request(
+        &self,
+        request: gateway_admin::model::system::PluginRequest,
+    ) -> Result<serde_json::Value, OperationError> {
+        if self.config.managed_socket.is_none() && request.kind == "catalog" {
+            return Ok(serde_json::json!([]));
+        }
+        managed::plugin_request(&self.config, request).await
+    }
+
     async fn plugins(
         &self,
     ) -> Result<Vec<gateway_admin::model::system::PluginStatus>, OperationError> {

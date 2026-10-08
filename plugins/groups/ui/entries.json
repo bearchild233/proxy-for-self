@@ -1,0 +1,10 @@
+{
+  "main": {
+    "source": "page/index.vue",
+    "route": "/groups",
+    "title": "分组管理",
+    "roles": [
+      "admin"
+    ]
+  }
+}

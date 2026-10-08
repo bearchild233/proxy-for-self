@@ -8,6 +8,9 @@ export default defineConfig({
   plugins: [vue(), tailwindcss()],
   resolve: {
     alias: {
+      '@plugins': fileURLToPath(new URL('../plugins', import.meta.url)),
+      '@kit': fileURLToPath(new URL('../packages/ui-kit', import.meta.url)),
+      '@sdk': fileURLToPath(new URL('../packages/plugin-sdk', import.meta.url)),
       '@': fileURLToPath(new URL('./src', import.meta.url)),
     },
   },

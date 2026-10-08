@@ -742,9 +742,19 @@ pub struct ProviderQuotaRequest {
     pub rolling_usage: Option<AccountUsage>,
 }
 
+/// Provider 已规范化的 Credits 余额与标准用量美元等值；不是账单金额。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderCreditBalance {
+    pub balance: Option<String>,
+    pub unlimited: bool,
+    pub usd_equivalent: Option<String>,
+}
+
 /// Provider 已解析的 quota 结果及其不透明差异字段。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProviderQuota {
+    /// 展示用 Credits 余额；不参与账号额度访问结论。
+    pub credits: Option<ProviderCreditBalance>,
     /// 上游额度响应明确提供的套餐，可用于补全账号展示。
     pub plan_type: Option<String>,
     pub observed_at: Option<DateTime<Utc>>,

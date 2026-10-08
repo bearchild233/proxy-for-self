@@ -38,6 +38,7 @@ pub struct SnapshotSettingsFacts {
     max_waiting_per_key: u32,
     max_waiting_per_account: u32,
     concurrency_wait_timeout_seconds: u32,
+    inference_limits: Option<crate::policy::InferenceLimits>,
     responses_max_decompressed_body_bytes: u64,
     request_interval_ms: u64,
     rotation_strategy: String,
@@ -47,6 +48,15 @@ pub struct SnapshotSettingsFacts {
 }
 
 impl SnapshotSettingsFacts {
+    #[must_use]
+    pub const fn with_inference_limits(
+        mut self,
+        limits: Option<crate::policy::InferenceLimits>,
+    ) -> Self {
+        self.inference_limits = limits;
+        self
+    }
+
     #[must_use]
     pub fn with_pricing(mut self, pricing: crate::metering::PricingOverrides) -> Self {
         self.pricing = Arc::new(pricing);
@@ -110,6 +120,7 @@ impl SnapshotSettingsFacts {
             max_waiting_per_key: 0,
             max_waiting_per_account: 0,
             concurrency_wait_timeout_seconds: 30,
+            inference_limits: None,
             responses_max_decompressed_body_bytes: 64 * 1024 * 1024,
             request_interval_ms,
             rotation_strategy: rotation_strategy.into(),
@@ -487,7 +498,11 @@ async fn compile_runtime_snapshot(
     }
     let account_directory = Arc::new(RuntimeAccountDirectory::new(accounts));
 
-    if facts.settings.max_waiting_per_key > 1_000
+    if facts
+        .settings
+        .inference_limits
+        .is_some_and(|limits| !limits.is_valid())
+        || facts.settings.max_waiting_per_key > 1_000
         || facts.settings.max_waiting_per_account > 1_000
         || !(1..=120).contains(&facts.settings.concurrency_wait_timeout_seconds)
     {
@@ -684,6 +699,7 @@ async fn compile_runtime_snapshot(
             .with_pricing(facts.settings.pricing)
             .with_request_location(request_location)
             .with_responses_max_decompressed_body_bytes(decompressed_body_limit)
+            .with_inference_limits(facts.settings.inference_limits)
             .with_client_queue_policy(client_queue_policy)
             .with_model_mappings(model_mappings)
             .with_account_directory(account_directory)
@@ -696,6 +712,7 @@ async fn compile_runtime_snapshot(
 #[derive(Debug, Clone)]
 pub struct RuntimeSnapshot {
     pricing: Arc<crate::metering::PricingOverrides>,
+    inference_limits: Option<crate::policy::InferenceLimits>,
     responses_max_decompressed_body_bytes: std::num::NonZeroUsize,
     request_location: Option<crate::account::RequestLocation>,
     revision: ConfigRevision,
@@ -714,6 +731,19 @@ pub struct RuntimeSnapshot {
 }
 
 impl RuntimeSnapshot {
+    #[must_use]
+    pub const fn inference_limits(&self) -> Option<crate::policy::InferenceLimits> {
+        self.inference_limits
+    }
+    #[must_use]
+    pub const fn with_inference_limits(
+        mut self,
+        limits: Option<crate::policy::InferenceLimits>,
+    ) -> Self {
+        self.inference_limits = limits;
+        self
+    }
+
     #[must_use]
     pub fn with_pricing(mut self, pricing: Arc<crate::metering::PricingOverrides>) -> Self {
         self.pricing = pricing;
@@ -822,6 +852,7 @@ impl RuntimeSnapshot {
         client_policy_map.retain(|_, policy| policy.enabled());
 
         Ok(Self {
+            inference_limits: None,
             responses_max_decompressed_body_bytes: std::num::NonZeroUsize::new(64 * 1024 * 1024)
                 .expect("positive default limit"),
             pricing: Arc::default(),

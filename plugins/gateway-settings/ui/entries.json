@@ -1,0 +1,26 @@
+{
+  "main": {
+    "source": "page/index.vue",
+    "route": "/settings",
+    "title": "网关设置",
+    "roles": [
+      "admin"
+    ]
+  },
+  "upstream": {
+    "source": "page/index.vue",
+    "route": "/settings/upstream",
+    "title": "上游配置",
+    "roles": [
+      "admin"
+    ]
+  },
+  "access": {
+    "source": "page/index.vue",
+    "route": "/settings/access",
+    "title": "安全与访问",
+    "roles": [
+      "admin"
+    ]
+  }
+}

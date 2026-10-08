@@ -141,6 +141,7 @@ impl CodexWireProfile {
 #[derive(Debug, Clone)]
 pub struct CodexWireProfileState {
     identity_locked: bool,
+    cli_auto_update: bool,
     profile: Arc<RwLock<CodexWireProfile>>,
     releases: Arc<RwLock<ClientReleases>>,
 }
@@ -159,6 +160,7 @@ impl CodexWireProfileState {
     pub fn new(profile: CodexWireProfile) -> Self {
         let state = Self {
             identity_locked: false,
+            cli_auto_update: false,
             profile: Arc::new(RwLock::new(profile)),
             releases: Arc::default(),
         };
@@ -171,6 +173,43 @@ impl CodexWireProfileState {
     pub fn with_locked_identity(mut self, locked: bool) -> Self {
         self.identity_locked = locked;
         self
+    }
+
+    #[must_use]
+    pub fn with_cli_auto_update(mut self, enabled: bool) -> Self {
+        self.cli_auto_update = enabled;
+        self
+    }
+
+    /// 自动更新只改变版本字段，保留已配置的 CLI 身份；禁止版本倒退。
+    fn update_locked_cli_release(&self, release: &ClientRelease) {
+        if !self.identity_locked || !self.cli_auto_update {
+            return;
+        }
+        let Ok(next) = semver::Version::parse(&release.codex_version) else {
+            return;
+        };
+        if !next.pre.is_empty() || !next.build.is_empty() {
+            return;
+        }
+        let mut profile = self
+            .profile
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if profile.client_kind != ClientKind::Cli
+            || semver::Version::parse(&profile.codex_version).is_ok_and(|current| current > next)
+        {
+            return;
+        }
+        let terminal_marker = format!("(codex_exec; {})", profile.codex_version);
+        profile.terminal = profile.terminal.replace(
+            &terminal_marker,
+            &format!("(codex_exec; {})", release.codex_version),
+        );
+        profile.codex_version.clone_from(&release.codex_version);
+        if let Some(verified_at) = release.verified_at {
+            profile.verified_at = verified_at;
+        }
     }
 
     /// 返回当前画像的独立快照，避免持锁执行网络请求。
@@ -237,6 +276,9 @@ impl CodexWireProfileState {
         arch: &str,
         release: ClientRelease,
     ) {
+        if client == ClientKind::Cli {
+            self.update_locked_cli_release(&release);
+        }
         self.releases
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -252,6 +294,11 @@ impl CodexWireProfileState {
         arch: &str,
         result: Result<ClientRelease, String>,
     ) {
+        if client == ClientKind::Cli
+            && let Ok(release) = &result
+        {
+            self.update_locked_cli_release(release);
+        }
         let mut states = self
             .releases
             .write()

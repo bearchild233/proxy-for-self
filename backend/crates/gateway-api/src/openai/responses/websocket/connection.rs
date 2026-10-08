@@ -326,6 +326,18 @@ impl ResponsesWebSocketConnection {
         .await;
     }
 
+    pub(super) async fn close_for_shutdown(&mut self) {
+        self.close(
+            CloseFrame {
+                code: close_code::AWAY,
+                reason: "Gateway deployment; reconnect for the next turn".into(),
+            },
+            WriteContext::connection(FramePhase::Close),
+            PumpExitReason::LifecycleShutdown,
+        )
+        .await;
+    }
+
     async fn close(
         &mut self,
         frame: CloseFrame,

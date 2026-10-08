@@ -115,6 +115,22 @@ pub trait ProviderAdmin: Send + Sync {
         Default::default()
     }
 
+    /// 普通文本测试通过内核执行、计量；响应头观察仍由具体 Provider 负责。
+    fn diagnostic_operation(
+        &self,
+        _input: &ProviderDocument,
+    ) -> Result<Option<(UpstreamModelId, Operation)>, ProviderAdminError> {
+        Ok(None)
+    }
+
+    async fn diagnostic(
+        &self,
+        _account_id: &ProviderAccountId,
+        _input: ProviderDocument,
+    ) -> Result<ProviderDocument, ProviderAdminError> {
+        Err(ProviderAdminError::new(ProviderAdminErrorKind::Unsupported))
+    }
+
     fn provider_kind(&self) -> &ProviderKind;
 
     /// 提供该 Provider 的可选客户端身份；通用管理层不解释内部字段。

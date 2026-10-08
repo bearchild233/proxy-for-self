@@ -1,0 +1,40 @@
+{
+  "id": "client-access",
+  "version": "0.3.1",
+  "protocol": 2,
+  "kind": "ui",
+  "sdk": 1,
+  "pages": [
+    {
+      "id": "main",
+      "title": "导入客户端配置",
+      "entry": "ui/module.js",
+      "roles": [
+        "admin",
+        "key"
+      ],
+      "slot": "key-config"
+    }
+  ],
+  "capabilities": [
+    "api-keys.get.admin.client-keys",
+    "api-keys.get.admin.client-keys.reveal",
+    "auth.get.auth.status",
+    "auth.post.auth.logout",
+    "client.models",
+    "key-usage.get.key-usage.config",
+    "key-usage.get.key-usage.overview",
+    "key-usage.get.key-usage.records",
+    "key-usage.get.key-usage.version",
+    "settings.get.admin.settings",
+    "settings.get.admin.settings.admin-api-key",
+    "settings.get.admin.settings.client-downloads.codex-desktop.windows",
+    "api-keys.post.admin.client-keys.bindings"
+  ],
+  "releasedAt": "2026-10-08T19:47:20.445336+00:00",
+  "releaseNotes": [
+    "配置内容独立滚动，导入 CC Switch 和关闭按钮固定在弹窗右下角。"
+  ],
+  "runtime": "vue-component",
+  "hostApi": 1
+}

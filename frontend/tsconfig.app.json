@@ -7,7 +7,57 @@
     "module": "ESNext",
     "moduleResolution": "Bundler",
     "paths": {
-      "@/*": ["./src/*"]
+      "@/*": [
+        "./src/*"
+      ],
+      "@plugins/*": [
+        "../plugins/*"
+      ],
+      "@sdk/*": [
+        "../packages/plugin-sdk/*"
+      ],
+      "vue": [
+        "./node_modules/vue"
+      ],
+      "pinia": [
+        "./node_modules/pinia"
+      ],
+      "vue-router": [
+        "./node_modules/vue-router"
+      ],
+      "@lucide/vue": [
+        "./node_modules/@lucide/vue"
+      ],
+      "@vueuse/core": [
+        "./node_modules/@vueuse/core"
+      ],
+      "@vueuse/integrations/*": [
+        "./node_modules/@vueuse/integrations/dist/*"
+      ],
+      "echarts": [
+        "./node_modules/echarts"
+      ],
+      "echarts/*": [
+        "./node_modules/echarts/*"
+      ],
+      "dayjs": [
+        "./node_modules/dayjs"
+      ],
+      "gsap": [
+        "./node_modules/gsap"
+      ],
+      "pinia-plugin-persistedstate": [
+        "./node_modules/pinia-plugin-persistedstate"
+      ],
+      "@boxicons/vue": [
+        "./node_modules/@boxicons/vue"
+      ],
+      "es-toolkit": [
+        "./node_modules/es-toolkit"
+      ],
+      "@kit/*": [
+        "../packages/ui-kit/*"
+      ]
     },
     "strict": true,
     "noUnusedLocals": true,
@@ -15,5 +65,15 @@
     "noEmit": true,
     "verbatimModuleSyntax": true
   },
-  "include": ["env.d.ts", "src/**/*", "src/**/*.vue"]
+  "include": [
+    "env.d.ts",
+    "src/**/*",
+    "src/**/*.vue",
+    "../plugins/**/*.ts",
+    "../plugins/**/*.vue",
+    "../packages/plugin-sdk/**/*.ts",
+    "../packages/plugin-sdk/**/*.vue",
+    "../packages/ui-kit/**/*.ts",
+    "../packages/ui-kit/**/*.vue"
+  ]
 }

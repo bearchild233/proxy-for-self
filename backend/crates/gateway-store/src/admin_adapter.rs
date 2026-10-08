@@ -128,6 +128,7 @@ impl SettingsStore for AdminSettingsStoreAdapter {
                 max_waiting_per_key: command.max_waiting_per_key,
                 max_waiting_per_account: command.max_waiting_per_account,
                 concurrency_wait_timeout_seconds: command.concurrency_wait_timeout_seconds,
+                inference_limits: command.inference_limits,
                 responses_max_decompressed_body_bytes: command
                     .responses_max_decompressed_body_bytes,
                 rotation_strategy: command.rotation_strategy.as_str().to_owned(),
@@ -164,6 +165,7 @@ impl SettingsStore for AdminSettingsStoreAdapter {
                     "max_waiting_per_account".to_owned(),
                     "concurrency_wait_timeout_seconds".to_owned(),
                     "responses_max_decompressed_body_bytes".to_owned(),
+                    "inference_limits_json".to_owned(),
                     "rotation_strategy".to_owned(),
                     "min_codex_desktop_version".to_owned(),
                     "min_codex_cli_version".to_owned(),
@@ -275,6 +277,7 @@ pub(crate) fn admin_runtime_settings(
         max_waiting_per_key: settings.max_waiting_per_key,
         max_waiting_per_account: settings.max_waiting_per_account,
         concurrency_wait_timeout_seconds: settings.concurrency_wait_timeout_seconds,
+        inference_limits: settings.inference_limits,
         responses_max_decompressed_body_bytes: settings.responses_max_decompressed_body_bytes,
         rotation_strategy,
         min_codex_desktop_version: settings.min_codex_desktop_version,

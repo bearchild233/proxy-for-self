@@ -1,0 +1,11 @@
+{
+  "main": {
+    "source": "ClientAccess.vue",
+    "route": "/",
+    "title": "导入客户端配置",
+    "roles": [
+      "admin",
+      "key"
+    ]
+  }
+}

@@ -527,6 +527,7 @@ impl AccountSelector {
     }
 
     /// 从可调度账号中确定一个候选；这里只消费 Provider 已解析的额度投影。
+    /// 请求间隔由原子租约端口等待，不能成为降低权重或逃离亲和账号的依据。
     #[must_use]
     pub fn select<'a>(
         &self,
@@ -535,7 +536,12 @@ impl AccountSelector {
     ) -> Option<AccountSelection<'a>> {
         let mut eligible = candidates
             .iter()
-            .filter(|candidate| self.scheduling_blocker(candidate, context).is_none())
+            .filter(|candidate| {
+                matches!(
+                    self.scheduling_blocker(candidate, context),
+                    None | Some(AccountSchedulingBlocker::RequestInterval)
+                )
+            })
             .collect::<Vec<_>>();
         if eligible.is_empty() {
             return None;
@@ -550,13 +556,15 @@ impl AccountSelector {
                 .find(|candidate| candidate.account.id() == preferred)
             {
                 Some(candidate) => match self.scheduling_blocker(candidate, context) {
-                    Some(blocker) => PreferredAccountSelection::Blocked(blocker),
-                    None if !context.preferred_account_overrides_weight
+                    Some(blocker) if blocker != AccountSchedulingBlocker::RequestInterval => {
+                        PreferredAccountSelection::Blocked(blocker)
+                    }
+                    _ if !context.preferred_account_overrides_weight
                         && candidate.account.effective_weight(context.now) < highest_weight =>
                     {
                         PreferredAccountSelection::Blocked(AccountSchedulingBlocker::LowerWeight)
                     }
-                    None => {
+                    _ => {
                         return Some(AccountSelection {
                             candidate,
                             preferred: PreferredAccountSelection::Hit,

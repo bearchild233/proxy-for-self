@@ -1,0 +1,51 @@
+{
+  "id": "keys",
+  "version": "0.3.2",
+  "protocol": 2,
+  "kind": "ui",
+  "sdk": 1,
+  "pages": [
+    {
+      "id": "main",
+      "title": "API 密钥",
+      "entry": "ui/module.js",
+      "roles": [
+        "admin"
+      ],
+      "route": "/keys"
+    }
+  ],
+  "capabilities": [
+    "account-groups.get.admin.account-groups",
+    "accounts.get.admin.accounts",
+    "accounts.get.admin.accounts.detail",
+    "accounts.get.admin.accounts.export",
+    "accounts.get.admin.accounts.import-tasks",
+    "accounts.get.admin.accounts.import-tasks.detail",
+    "accounts.get.admin.accounts.models",
+    "accounts.get.admin.accounts.personal-info",
+    "accounts.get.admin.accounts.quota-forecast",
+    "accounts.get.admin.accounts.reset-credits",
+    "api-keys.get.admin.client-keys",
+    "api-keys.get.admin.client-keys.reveal",
+    "api-keys.post.admin.client-keys.bindings",
+    "api-keys.post.admin.client-keys.create",
+    "api-keys.post.admin.client-keys.create-bound",
+    "api-keys.post.admin.client-keys.delete",
+    "api-keys.post.admin.client-keys.disable",
+    "api-keys.post.admin.client-keys.enable",
+    "api-keys.post.admin.client-keys.reset-budget",
+    "api-keys.post.admin.client-keys.set-binding",
+    "api-keys.post.admin.client-keys.update",
+    "auth.get.auth.status",
+    "auth.post.auth.logout",
+    "display-order.save"
+  ],
+  "releasedAt": "2026-10-08T20:01:10.354854+00:00",
+  "releaseNotes": [
+    "可见页面每30秒静默同步数据，切回页面立即补刷，隐藏时暂停。",
+    "刷新保留分页与筛选；设置草稿不被后台读取覆盖。"
+  ],
+  "runtime": "vue-component",
+  "hostApi": 1
+}

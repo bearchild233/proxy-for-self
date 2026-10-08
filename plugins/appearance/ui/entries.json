@@ -1,0 +1,10 @@
+{
+  "main": {
+    "source": "page/index.vue",
+    "route": "/theme",
+    "title": "主题外观",
+    "roles": [
+      "admin"
+    ]
+  }
+}

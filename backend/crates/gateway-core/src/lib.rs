@@ -49,6 +49,7 @@ pub struct CoreStorePorts {
     execution: Arc<dyn ExecutionStore>,
     admissions: Arc<dyn ClientAdmissionPort>,
     admission_recovery: Arc<dyn ClientAdmissionRecoveryPort>,
+    recover_admission_on_startup: bool,
     circuits: Arc<dyn ProviderCircuitPort>,
     continuation: Arc<dyn NativeContinuationPort>,
     snapshots: Arc<dyn SnapshotStorePort>,
@@ -77,6 +78,7 @@ impl CoreStorePorts {
             execution,
             admissions,
             admission_recovery,
+            recover_admission_on_startup: true,
             circuits,
             continuation,
             snapshots,
@@ -89,6 +91,13 @@ impl CoreStorePorts {
     #[must_use]
     pub fn with_budget(mut self, budget: Arc<dyn engine::budget::ClientBudgetPort>) -> Self {
         self.budget = Some(budget);
+        self
+    }
+
+    /// Store 已持有 A/B 槽锁时，加入存活实例不能重建其准入热状态。
+    #[must_use]
+    pub fn with_startup_recovery(mut self, enabled: bool) -> Self {
+        self.recover_admission_on_startup = enabled;
         self
     }
 }
@@ -138,14 +147,16 @@ pub async fn initialize(
     ports: CoreStorePorts,
     providers: ProviderRegistry,
 ) -> Result<CoreBundle, CoreError> {
-    restore_client_admission_startup(
-        ports.execution.as_ref(),
-        ports.admission_recovery.as_ref(),
-        ports.admissions.as_ref(),
-        SystemTime::now(),
-    )
-    .await
-    .map_err(|_| CoreError::AdmissionRecoveryUnavailable)?;
+    if ports.recover_admission_on_startup {
+        restore_client_admission_startup(
+            ports.execution.as_ref(),
+            ports.admission_recovery.as_ref(),
+            ports.admissions.as_ref(),
+            SystemTime::now(),
+        )
+        .await
+        .map_err(|_| CoreError::AdmissionRecoveryUnavailable)?;
+    }
     let compiler = Arc::new(RuntimeSnapshotCompiler::new(
         Arc::clone(&ports.snapshots),
         Arc::new(providers.clone()),

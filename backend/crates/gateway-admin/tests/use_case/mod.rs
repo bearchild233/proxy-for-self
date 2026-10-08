@@ -243,6 +243,8 @@ impl AdminHarness {
                 self.backup,
             ),
             gateway_admin::AdminRuntimePorts {
+                pricing_policy: None,
+                backup_policy: None,
                 pricing_source: Arc::new(UnavailablePricingSource),
                 providers: self.providers,
                 snapshot: Arc::new(NoopSnapshot),

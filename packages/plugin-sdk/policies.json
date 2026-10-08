@@ -1,0 +1,459 @@
+{
+  "accounts": {
+    "name": "账号管理",
+    "required": true,
+    "category": "basic",
+    "capabilities": [
+      "account-groups.get.admin.account-groups",
+      "accounts.get.admin.accounts",
+      "accounts.get.admin.accounts.detail",
+      "accounts.get.admin.accounts.export",
+      "accounts.get.admin.accounts.import-tasks",
+      "accounts.get.admin.accounts.import-tasks.detail",
+      "accounts.get.admin.accounts.models",
+      "accounts.get.admin.accounts.personal-info",
+      "accounts.get.admin.accounts.quota-forecast",
+      "accounts.get.admin.accounts.reset-credits",
+      "accounts.post.admin.accounts.batch-update",
+      "accounts.post.admin.accounts.delete",
+      "accounts.post.admin.accounts.import",
+      "accounts.post.admin.accounts.import-tasks",
+      "accounts.post.admin.accounts.import-tasks.stop",
+      "accounts.post.admin.accounts.models.refresh",
+      "accounts.post.admin.accounts.oauth.complete",
+      "accounts.post.admin.accounts.oauth.start",
+      "accounts.post.admin.accounts.quota.refresh",
+      "accounts.post.admin.accounts.recover",
+      "accounts.post.admin.accounts.refresh",
+      "accounts.post.admin.accounts.reset-credits",
+      "accounts.post.admin.accounts.rotate",
+      "accounts.post.admin.accounts.update",
+      "auth.get.auth.status",
+      "auth.post.auth.logout",
+      "client-profiles.get.admin.settings.client-profiles.openai",
+      "client-profiles.get.admin.settings.client-profiles.xai",
+      "display-order.save",
+      "proxies.get.admin.proxies",
+      "proxies.get.admin.proxies.accounts",
+      "settings.get.admin.settings",
+      "settings.get.admin.settings.admin-api-key",
+      "settings.get.admin.settings.client-downloads.codex-desktop.windows",
+      "accounts.avatar"
+    ],
+    "description": "管理账号、订阅、额度和调度设置；诊断入口由诊断插件提供。",
+    "pages": [
+      {
+        "id": "main",
+        "title": "账号管理",
+        "entry": "ui/main.html",
+        "roles": [
+          "admin"
+        ],
+        "route": "/accounts"
+      }
+    ],
+    "trustedUi": true
+  },
+  "groups": {
+    "name": "分组管理",
+    "required": true,
+    "category": "basic",
+    "capabilities": [
+      "account-groups.get.admin.account-groups",
+      "account-groups.post.admin.account-groups.create",
+      "account-groups.post.admin.account-groups.delete",
+      "account-groups.post.admin.account-groups.disable",
+      "account-groups.post.admin.account-groups.enable",
+      "account-groups.post.admin.account-groups.update",
+      "api-keys.get.admin.client-keys",
+      "auth.get.auth.status",
+      "auth.post.auth.logout",
+      "display-order.save",
+      "api-keys.post.admin.client-keys.bindings"
+    ],
+    "description": "管理账号组、成员和分配方式，展示顺序独立于实际调度。",
+    "pages": [
+      {
+        "id": "main",
+        "title": "分组管理",
+        "entry": "ui/main.html",
+        "roles": [
+          "admin"
+        ],
+        "route": "/groups"
+      }
+    ],
+    "trustedUi": true
+  },
+  "keys": {
+    "name": "API 密钥",
+    "required": true,
+    "category": "basic",
+    "capabilities": [
+      "account-groups.get.admin.account-groups",
+      "accounts.get.admin.accounts",
+      "accounts.get.admin.accounts.detail",
+      "accounts.get.admin.accounts.export",
+      "accounts.get.admin.accounts.import-tasks",
+      "accounts.get.admin.accounts.import-tasks.detail",
+      "accounts.get.admin.accounts.models",
+      "accounts.get.admin.accounts.personal-info",
+      "accounts.get.admin.accounts.quota-forecast",
+      "accounts.get.admin.accounts.reset-credits",
+      "api-keys.get.admin.client-keys",
+      "api-keys.get.admin.client-keys.reveal",
+      "api-keys.post.admin.client-keys.bindings",
+      "api-keys.post.admin.client-keys.create",
+      "api-keys.post.admin.client-keys.create-bound",
+      "api-keys.post.admin.client-keys.delete",
+      "api-keys.post.admin.client-keys.disable",
+      "api-keys.post.admin.client-keys.enable",
+      "api-keys.post.admin.client-keys.reset-budget",
+      "api-keys.post.admin.client-keys.set-binding",
+      "api-keys.post.admin.client-keys.update",
+      "auth.get.auth.status",
+      "auth.post.auth.logout",
+      "display-order.save"
+    ],
+    "description": "创建和管理 API 密钥、额度、账号范围与权限。",
+    "pages": [
+      {
+        "id": "main",
+        "title": "API 密钥",
+        "entry": "ui/main.html",
+        "roles": [
+          "admin"
+        ],
+        "route": "/keys"
+      }
+    ],
+    "trustedUi": true
+  },
+  "usage-analytics": {
+    "name": "概览与使用统计",
+    "required": true,
+    "category": "basic",
+    "capabilities": [
+      "account-groups.get.admin.account-groups",
+      "accounts.get.admin.accounts",
+      "accounts.get.admin.accounts.detail",
+      "accounts.get.admin.accounts.export",
+      "accounts.get.admin.accounts.import-tasks",
+      "accounts.get.admin.accounts.import-tasks.detail",
+      "accounts.get.admin.accounts.models",
+      "accounts.get.admin.accounts.personal-info",
+      "accounts.get.admin.accounts.quota-forecast",
+      "accounts.get.admin.accounts.reset-credits",
+      "api-keys.get.admin.client-keys",
+      "api-keys.get.admin.client-keys.reveal",
+      "auth.get.auth.status",
+      "auth.post.auth.logout",
+      "dashboard.get.admin.dashboard.summary",
+      "dashboard.get.admin.dashboard.trend",
+      "key-usage.get.key-usage.config",
+      "key-usage.get.key-usage.overview",
+      "key-usage.get.key-usage.records",
+      "key-usage.get.key-usage.version",
+      "usage.get.admin.operations.errors",
+      "usage.get.admin.usage.insights.diagnostics",
+      "usage.get.admin.usage.insights.overview",
+      "usage.get.admin.usage.records",
+      "usage.get.admin.usage.records.detail",
+      "usage.get.admin.usage.records.summary",
+      "api-keys.post.admin.client-keys.bindings"
+    ],
+    "description": "查看概览、请求记录、费用、缓存和延迟；提供密钥用户用量页。",
+    "pages": [
+      {
+        "id": "dashboard",
+        "title": "概览",
+        "entry": "ui/dashboard.html",
+        "roles": [
+          "admin"
+        ],
+        "route": "/"
+      },
+      {
+        "id": "usage",
+        "title": "使用统计",
+        "entry": "ui/usage.html",
+        "roles": [
+          "admin"
+        ],
+        "route": "/usage"
+      },
+      {
+        "id": "key-usage",
+        "title": "我的用量",
+        "entry": "ui/key-usage.html",
+        "roles": [
+          "key"
+        ],
+        "route": "/key-usage"
+      }
+    ],
+    "trustedUi": true
+  },
+  "gateway-settings": {
+    "name": "网关配置",
+    "required": true,
+    "category": "basic",
+    "capabilities": [
+      "auth.get.auth.status",
+      "auth.post.auth.logout",
+      "client-profiles.get.admin.settings.client-profiles.openai",
+      "client-profiles.get.admin.settings.client-profiles.xai",
+      "client-profiles.post.admin.settings.client-profiles.openai.preview",
+      "client-profiles.post.admin.settings.client-profiles.xai.preview",
+      "settings.get.admin.settings",
+      "settings.get.admin.settings.admin-api-key",
+      "settings.get.admin.settings.client-downloads.codex-desktop.windows",
+      "settings.post.admin.settings.admin-api-key.delete",
+      "settings.post.admin.settings.admin-api-key.regenerate",
+      "settings.post.admin.settings.request-location",
+      "settings.post.admin.settings.update",
+      "system.get.admin.system.login-protection",
+      "system.post.admin.system.login-protection.policy",
+      "system.post.admin.system.login-protection.unban"
+    ],
+    "description": "配置网关运行限制、上游身份与访问安全。",
+    "pages": [
+      {
+        "id": "main",
+        "title": "网关设置",
+        "entry": "ui/main.html",
+        "roles": [
+          "admin"
+        ],
+        "route": "/settings"
+      },
+      {
+        "id": "upstream",
+        "title": "上游配置",
+        "entry": "ui/upstream.html",
+        "roles": [
+          "admin"
+        ],
+        "route": "/settings/upstream"
+      },
+      {
+        "id": "access",
+        "title": "安全与访问",
+        "entry": "ui/access.html",
+        "roles": [
+          "admin"
+        ],
+        "route": "/settings/access"
+      }
+    ],
+    "trustedUi": true
+  },
+  "appearance": {
+    "name": "主题外观",
+    "required": false,
+    "category": "extensions",
+    "capabilities": [
+      "auth.get.auth.status",
+      "auth.post.auth.logout"
+    ],
+    "description": "调整控制台配色、明暗模式与组件主题。",
+    "pages": [
+      {
+        "id": "main",
+        "title": "主题外观",
+        "entry": "ui/main.html",
+        "roles": [
+          "admin"
+        ],
+        "route": "/theme"
+      }
+    ],
+    "trustedUi": true
+  },
+  "proxy-management": {
+    "name": "出口代理管理",
+    "required": false,
+    "category": "operations",
+    "capabilities": [
+      "accounts.get.admin.accounts",
+      "accounts.get.admin.accounts.detail",
+      "accounts.get.admin.accounts.export",
+      "accounts.get.admin.accounts.import-tasks",
+      "accounts.get.admin.accounts.import-tasks.detail",
+      "accounts.get.admin.accounts.models",
+      "accounts.get.admin.accounts.personal-info",
+      "accounts.get.admin.accounts.quota-forecast",
+      "accounts.get.admin.accounts.reset-credits",
+      "auth.get.auth.status",
+      "auth.post.auth.logout",
+      "display-order.save",
+      "proxies.get.admin.proxies",
+      "proxies.get.admin.proxies.accounts",
+      "proxies.post.admin.proxies.accounts.remove",
+      "proxies.post.admin.proxies.create",
+      "proxies.post.admin.proxies.delete",
+      "proxies.post.admin.proxies.probe",
+      "proxies.post.admin.proxies.test",
+      "proxies.post.admin.proxies.update"
+    ],
+    "description": "管理账号出口代理及连接参数。账号上游请求始终遵守绑定出口。",
+    "pages": [
+      {
+        "id": "main",
+        "title": "出口代理",
+        "entry": "ui/main.html",
+        "roles": [
+          "admin"
+        ],
+        "route": "/proxies"
+      }
+    ],
+    "trustedUi": true
+  },
+  "pricing": {
+    "name": "模型定价管理",
+    "required": false,
+    "category": "operations",
+    "capabilities": [
+      "auth.get.auth.status",
+      "auth.post.auth.logout",
+      "pricing.get.admin.settings.pricing",
+      "pricing.post.admin.settings.pricing.sync",
+      "pricing.post.admin.settings.pricing.sync.preview",
+      "pricing.post.admin.settings.pricing.update",
+      "pricing.schedule.status"
+    ],
+    "description": "管理模型价格、Fast 计费倍率及价格源同步。",
+    "pages": [
+      {
+        "id": "main",
+        "title": "模型定价",
+        "entry": "ui/main.html",
+        "roles": [
+          "admin"
+        ],
+        "route": "/settings/pricing"
+      }
+    ],
+    "trustedUi": true
+  },
+  "backup": {
+    "name": "数据备份",
+    "required": false,
+    "category": "operations",
+    "capabilities": [
+      "auth.get.auth.status",
+      "auth.post.auth.logout",
+      "backups.get.admin.settings.backups",
+      "backups.get.admin.settings.backups.records",
+      "backups.post.admin.settings.backups.create",
+      "backups.post.admin.settings.backups.delete",
+      "backups.post.admin.settings.backups.download-url",
+      "backups.post.admin.settings.backups.schedule.update",
+      "backups.post.admin.settings.backups.storage.test",
+      "backups.post.admin.settings.backups.storage.update"
+    ],
+    "description": "管理备份计划、备份记录和恢复操作。",
+    "pages": [
+      {
+        "id": "main",
+        "title": "数据备份",
+        "entry": "ui/main.html",
+        "roles": [
+          "admin"
+        ],
+        "route": "/settings/backup"
+      }
+    ],
+    "trustedUi": true
+  },
+  "client-access": {
+    "name": "客户端接入",
+    "required": false,
+    "category": "clients",
+    "capabilities": [
+      "api-keys.get.admin.client-keys",
+      "api-keys.get.admin.client-keys.reveal",
+      "auth.get.auth.status",
+      "auth.post.auth.logout",
+      "key-usage.get.key-usage.config",
+      "key-usage.get.key-usage.overview",
+      "key-usage.get.key-usage.records",
+      "key-usage.get.key-usage.version",
+      "settings.get.admin.settings",
+      "settings.get.admin.settings.admin-api-key",
+      "settings.get.admin.settings.client-downloads.codex-desktop.windows",
+      "client.models",
+      "api-keys.post.admin.client-keys.bindings"
+    ],
+    "description": "生成 Codex 配置、下载导入脚本或通过 CC Switch 导入；管理员与密钥用户均可使用。",
+    "pages": [
+      {
+        "id": "main",
+        "title": "导入客户端配置",
+        "entry": "ui/main.html",
+        "roles": [
+          "admin",
+          "key"
+        ],
+        "slot": "key-config"
+      }
+    ],
+    "trustedUi": true
+  },
+  "account-diagnostics": {
+    "name": "账号诊断",
+    "required": false,
+    "category": "account-tools",
+    "capabilities": [
+      "accounts.get.admin.accounts.models",
+      "auth.get.auth.status",
+      "auth.post.auth.logout",
+      "diagnostic.observe",
+      "diagnostics.history",
+      "tasks.cancel",
+      "tasks.start",
+      "tasks.status",
+      "templates.read",
+      "templates.write"
+    ],
+    "description": "从账号菜单发起测试；支持模板、模型与推理强度，快速检测自动获取配套材料并重放一次。21／29 是实验信号，不是能力保证。",
+    "pages": [
+      {
+        "id": "main",
+        "title": "账号诊断",
+        "entry": "ui/main.html",
+        "roles": [
+          "admin"
+        ],
+        "slot": "account-menu"
+      }
+    ],
+    "worker": true,
+    "trustedUi": true
+  },
+  "excel-bridge": {
+    "name": "Excel Bridge",
+    "required": false,
+    "category": "extensions",
+    "capabilities": [
+      "auth.get.auth.status",
+      "auth.post.auth.logout",
+      "excel.status"
+    ],
+    "description": "提供 Excel 模型接入与独立 Worker 管理；停用后隐藏所有接入选项，已有任务排空后停止。",
+    "pages": [
+      {
+        "id": "main",
+        "title": "Excel Bridge",
+        "entry": "ui/main.html",
+        "roles": [
+          "admin",
+          "key"
+        ],
+        "slot": "settings"
+      }
+    ],
+    "trustedUi": true
+  }
+}

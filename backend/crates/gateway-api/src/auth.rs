@@ -24,6 +24,9 @@ use crate::{
 /// 控制面 HTTP adapter 消费同一组用例；权限由各入口服务端校验。
 pub trait SessionState {
     fn admin_services(&self) -> &AdminServices;
+    fn default_inference_limits(&self) -> crate::InferenceLimits {
+        crate::InferenceLimits::default()
+    }
 }
 
 #[derive(Deserialize)]
@@ -140,7 +143,13 @@ where
             session_cookie::value(&headers).as_deref(),
         )
         .await
-        .map_err(map_login_error)?;
+        .map_err(|error| {
+            if matches!(error, LoginError::InvalidCredentials) {
+                // 只记录已解析 IP，不记录用户名、密码或 Key，供 fail2ban 严格匹配。
+                tracing::warn!("login_failed source_ip={}", peer.ip());
+            }
+            map_login_error(error)
+        })?;
     let max_age = result
         .session
         .expires_at

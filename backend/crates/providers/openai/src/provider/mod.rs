@@ -226,9 +226,6 @@ impl CodexProvider {
         mut self,
         profile: Option<crate::transport::profile::CodexWireProfile>,
     ) -> Self {
-        if let Some(value) = &profile {
-            self.client = self.client.clone().with_request_profile(value.clone());
-        }
         self.pinned_cli_profile = profile;
         self
     }
@@ -250,8 +247,9 @@ impl Provider for CodexProvider {
         &self,
         configuration: &gateway_core::account::OpaqueProviderData,
     ) -> Result<gateway_core::account::OpaqueProviderData, ProviderError> {
-        if let Some(profile) = &self.pinned_cli_profile {
-            return crate::transport::profile::selection::object(profile).map_err(|_| {
+        if self.pinned_cli_profile.is_some() {
+            let profile = self.client.profile_state().snapshot();
+            return crate::transport::profile::selection::object(&profile).map_err(|_| {
                 provider_error(ProviderErrorKind::Protocol, UpstreamSendState::NotSent)
             });
         }
@@ -373,12 +371,15 @@ impl Provider for CodexProvider {
         if protocol != "codex" {
             return Ok(None);
         }
+        let profile = self.client.profile_state().snapshot();
         self.catalog
             .client_model_catalog(
                 scope,
-                self.pinned_cli_profile
-                    .as_ref()
-                    .map_or(client_version, |profile| profile.codex_version.as_str()),
+                if self.pinned_cli_profile.is_some() {
+                    &profile.codex_version
+                } else {
+                    client_version
+                },
             )
             .await
             .map(Some)
