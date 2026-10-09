@@ -270,6 +270,19 @@ impl ObservabilityRepository for PgObservabilityRepository {
             .await
     }
 
+    async fn usage_key_account_breakdown(
+        &self,
+        range: ObservabilityRange,
+        filter: UsageRecordFilter,
+    ) -> StoreResult<Vec<KeyAccountBreakdownObservation>> {
+        self.query_budget
+            .run(
+                "load usage key account breakdown",
+                usage_key_account_breakdown(&self.pool, range, &filter),
+            )
+            .await
+    }
+
     async fn list_ops_errors(&self, query: OpsErrorQuery) -> StoreResult<OpsErrorPage> {
         self.query_budget
             .run("list ops errors", list_ops_errors(&self.pool, query))
@@ -452,6 +465,20 @@ impl AdminObservabilityStore for PgAdminObservabilityStore {
             .map_err(observability_error)?
             .into_iter()
             .map(admin_diagnostic_observation)
+            .collect()
+    }
+
+    async fn usage_key_account_breakdown(
+        &self,
+        range: admin_observability::TimeRange,
+        filter: admin_observability::UsageFilter,
+    ) -> AdminStoreResult<Vec<admin_observability::KeyAccountBreakdownObservation>> {
+        self.repository
+            .usage_key_account_breakdown(store_range(range)?, store_usage_filter(filter))
+            .await
+            .map_err(observability_error)?
+            .into_iter()
+            .map(admin_key_account_breakdown)
             .collect()
     }
 

@@ -772,6 +772,29 @@ pub struct DiagnosticsView {
     pub items: Vec<DiagnosticItemView>,
 }
 
+/// 密钥 × 账号交叉聚合项目。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyAccountBreakdownItemView {
+    pub client_api_key_ref: String,
+    pub client_api_key_name: String,
+    pub provider_account_ref: String,
+    pub provider_account_name: String,
+    pub request_count: u64,
+    pub success_count: u64,
+    pub failure_count: u64,
+    pub total_tokens: u64,
+    pub cost_amount: Option<String>,
+    pub cost_currency: Option<String>,
+}
+
+/// 密钥 × 账号交叉聚合响应。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyAccountBreakdownView {
+    pub items: Vec<KeyAccountBreakdownItemView>,
+}
+
 /// 运维错误项目。
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]

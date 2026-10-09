@@ -1,6 +1,6 @@
 {
   "id": "usage-analytics",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "protocol": 2,
   "kind": "ui",
   "sdk": 1,
@@ -46,6 +46,7 @@
     "accounts.get.admin.accounts.reset-credits",
     "api-keys.get.admin.client-keys",
     "api-keys.get.admin.client-keys.reveal",
+    "api-keys.post.admin.client-keys.bindings",
     "auth.get.auth.status",
     "auth.post.auth.logout",
     "dashboard.get.admin.dashboard.summary",
@@ -56,16 +57,19 @@
     "key-usage.get.key-usage.version",
     "usage.get.admin.operations.errors",
     "usage.get.admin.usage.insights.diagnostics",
+    "usage.get.admin.usage.insights.key-account",
     "usage.get.admin.usage.insights.overview",
     "usage.get.admin.usage.records",
     "usage.get.admin.usage.records.detail",
-    "usage.get.admin.usage.records.summary",
-    "api-keys.post.admin.client-keys.bindings"
+    "usage.get.admin.usage.records.summary"
   ],
-  "releasedAt": "2026-10-08T20:01:10.355913+00:00",
+  "releasedAt": "2026-10-09T14:34:11+00:00",
   "releaseNotes": [
-    "可见页面每30秒静默同步数据，切回页面立即补刷，隐藏时暂停。",
-    "刷新保留分页与筛选；设置草稿不被后台读取覆盖。"
+    "配额消耗支持按账号或 API 密钥查询，历史用量中的身份也可筛选。",
+    "恢复完整消耗明细，固定表头并支持独立滚动；环图配套展示费用、请求数与占比。",
+    "修复图表提示气泡被裁切的问题，长名称自动换行并避开屏幕边缘。",
+    "筛选与后台刷新共用请求序列，避免旧查询结果覆盖新选择。",
+    "依赖宿主提供并授权 usage.get.admin.usage.insights.key-account 能力。"
   ],
   "runtime": "vue-component",
   "hostApi": 1

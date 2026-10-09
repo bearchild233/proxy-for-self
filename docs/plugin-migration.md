@@ -50,6 +50,14 @@ python scripts/package-ui-plugin.py groups
 
 在插件管理上传 `.build/plugin-releases/groups.tar.gz`，校验后切换；重新打开对应页面使用新版本。无需编译或重启 Rust。新包必须保持现有命名能力合同；需要新宿主能力时先升级平台。
 
+### 概览与使用统计 v0.3.2
+
+`usage-analytics` v0.3.2 增加密钥与账号的配额消耗交叉查询、可独立滚动的明细和双向费用环图，并修复筛选被旧响应覆盖、长气泡被卡片裁切的问题。历史用量中的身份快照可补充筛选选项，不要求保留账号认证资料。
+
+该版本依赖管理 API `GET /api/admin/usage/insights/key-account`，宿主 operations 必须映射 `usage.get.admin.usage.insights.key-account`，usage-analytics 策略必须授权该能力。原始 v0.3.1 平台未声明这项能力；首次升级需先补齐后端接口和宿主授权，再安装插件包。数据库迁移不变，账号、密钥与请求数据继续保留。
+
+插件显示版本不足以单独判定兼容。能力齐全的 protocol 2 / sdk 1 / hostApi 1 平台可直接热更新 UI 包；缺少能力时应拒绝安装，不能移除清单声明来绕过校验。安装后刷新或重新打开页面使用新包，已打开的旧页面继续持有原版本租约。
+
 发布包在 `plugin.json` 维护 `version`、带时区的 `releasedAt` 与 `releaseNotes` 字符串数组。管理页展示当前与可回退包的版本、构建标识、发布时间和更新说明；旧包缺失的信息直接标明。回退确认锁定所展示的两个构建，期间若发生更新则拒绝操作并要求刷新，防止回退到未确认的包。回退只切换插件包，不回退业务数据。
 
 仓库提供独立 `plugin-release.yml`，只检查、构建所选插件；Excel 另做干净依赖测试并发布运行包。版本读取该插件 `plugin.json`。工作流是手动触发，不自动部署。

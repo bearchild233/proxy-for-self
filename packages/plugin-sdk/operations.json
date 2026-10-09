@@ -687,5 +687,12 @@
       "admin",
       "key"
     ]
+  },
+  "usage.get.admin.usage.insights.key-account": {
+    "method": "GET",
+    "path": "/api/admin/usage/insights/key-account",
+    "roles": [
+      "admin"
+    ]
   }
 }

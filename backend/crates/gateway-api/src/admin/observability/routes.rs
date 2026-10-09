@@ -28,6 +28,10 @@ where
             "/api/admin/usage/insights/diagnostics",
             get(usage_insights_diagnostics::<S>),
         )
+        .route(
+            "/api/admin/usage/insights/key-account",
+            get(usage_insights_key_account::<S>),
+        )
         .route("/api/admin/operations/errors", get(ops_errors::<S>))
 }
 
@@ -191,6 +195,29 @@ where
     Ok(AdminResponse::new(
         StatusCode::OK,
         AdminEnvelope::ok(diagnostics_view(result, dimension)),
+    ))
+}
+
+pub(crate) async fn usage_insights_key_account<S>(
+    _auth: AdminAuth,
+    State(state): State<S>,
+    AdminQuery(query): AdminQuery<KeyAccountQuery>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let result = state
+        .admin_services()
+        .observability()
+        .key_account_breakdown(
+            query.range().map_err(map_wire_error)?,
+            query.usage_filter().map_err(map_wire_error)?,
+        )
+        .await
+        .map_err(map_service_error)?;
+    Ok(AdminResponse::new(
+        StatusCode::OK,
+        AdminEnvelope::ok(key_account_breakdown_view(result)),
     ))
 }
 

@@ -8,12 +8,13 @@ import BaseSelect from '@/components/base/BaseSelect.vue'
 
 type CatalogKind = 'accounts' | 'keys' | 'groups' | 'models'
 const props = defineProps<{
-  kind: 'accounts' | 'keys' | 'groups' | 'usage' | 'errors'
+  kind: 'accounts' | 'keys' | 'groups' | 'usage' | 'errors' | 'quota'
   label: string
+  supplementalOptions?: Partial<Record<CatalogKind, SelectOption[]>>
 }>()
 const model = defineModel<string>({ required: true })
-const categorized = computed(() => props.kind === 'usage' || props.kind === 'errors')
-const category = ref<CatalogKind | 'custom'>('accounts')
+const categorized = computed(() => ['usage', 'errors', 'quota'].includes(props.kind))
+const category = ref<CatalogKind | 'custom'>(props.kind === 'quota' ? 'keys' : 'accounts')
 const custom = ref(false)
 const activeKind = computed(() => categorized.value ? category.value : props.kind as CatalogKind)
 const manual = computed(() => categorized.value ? category.value === 'custom' : custom.value)
@@ -32,12 +33,17 @@ const categoryOptions = computed<SelectOption[]>(() => [
 const catalog = computed(() => activeKind.value === 'custom' ? undefined : catalogs[activeKind.value])
 const labels: Record<CatalogKind, string> = { accounts: '全部账号', keys: '全部 API 密钥', groups: '全部分组', models: '全部模型' }
 const selectionLabel = computed(() => activeKind.value === 'custom' ? props.label : labels[activeKind.value])
+// 历史用量可能只有账号快照；目录中的当前名称优先，但目录缺失不能使历史对象无法筛选。
+const choices = computed(() => [...new Map([
+  ...(activeKind.value === 'custom' ? [] : props.supplementalOptions?.[activeKind.value] ?? []),
+  ...(catalog.value?.choices ?? []),
+].map(option => [option.value, option])).values()])
 const options = computed<SelectOption[]>(() => [
   { label: catalog.value?.loading ? '正在加载选项…' : selectionLabel.value, value: '' },
-  ...(model.value && !catalog.value?.choices.some(option => option.value === model.value)
+  ...(model.value && !choices.value.some(option => option.value === model.value)
     ? [{ label: model.value, value: model.value }]
     : []),
-  ...(catalog.value?.choices ?? []),
+  ...choices.value,
 ])
 
 function changeCategory(value: string) {

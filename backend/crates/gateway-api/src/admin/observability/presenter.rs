@@ -1303,6 +1303,28 @@ pub(crate) fn diagnostics_view(
     }
 }
 
+pub(crate) fn key_account_breakdown_view(
+    items: Vec<domain::KeyAccountBreakdownObservation>,
+) -> KeyAccountBreakdownView {
+    KeyAccountBreakdownView {
+        items: items
+            .into_iter()
+            .map(|item| KeyAccountBreakdownItemView {
+                client_api_key_ref: item.client_api_key_ref,
+                client_api_key_name: item.client_api_key_name,
+                provider_account_ref: item.provider_account_ref,
+                provider_account_name: item.provider_account_name,
+                request_count: item.request_count,
+                success_count: item.success_count,
+                failure_count: item.failure_count,
+                total_tokens: item.total_tokens,
+                cost_amount: item.cost_amount.as_ref().map(ToString::to_string),
+                cost_currency: item.cost_currency,
+            })
+            .collect(),
+    }
+}
+
 pub(crate) fn map_wire_error(error: WireValidationError) -> AdminError {
     if error.field() == "timeRange" {
         return AdminError::invalid_time_range();

@@ -1,12 +1,14 @@
 import type { Ref } from 'vue'
 import type { UsageDisplayRecord } from '../utils/records'
 import type { UsageTimeRangeParams } from './useUsageTimeRange'
+import type { UsageKeyAccountBreakdownResponse } from '@/api'
 import { usePluginPolling } from '@sdk/polling'
 import { watchDebounced } from '@vueuse/core'
 
 import { computed, onMounted, onScopeDispose, shallowRef, watch } from 'vue'
 import {
   getUsageRecordInsightsDiagnostics,
+  getUsageRecordInsightsKeyAccount,
   getUsageRecordInsightsOverview,
   getUsageRecords,
   getUsageRecordSummary,
@@ -32,21 +34,28 @@ export function useUsageRecordsTable(options: UseUsageRecordsTableOptions) {
   const records = shallowRef<UsageDisplayRecord[]>([])
   const summary = shallowRef(emptySummary())
   const insights = shallowRef(emptyInsights())
+  const keyAccount = shallowRef(emptyKeyAccount())
   const currentPage = shallowRef(1)
   const pageSize = shallowRef(10)
   const totalRecords = shallowRef(0)
   const searchQuery = shallowRef('')
   const search = computed(() => searchQuery.value.trim() || undefined)
+  const quotaSearchQuery = shallowRef('')
+  const quotaSearch = computed(() => quotaSearchQuery.value.trim() || undefined)
   const providerQuery = shallowRef('')
   let tableParams = snapshot()
   const refreshingList = shallowRef(false)
+  const refreshingKeyAccount = shallowRef(false)
+  const keyAccountLoading = shallowRef(false)
   const diagnosticDimension = shallowRef('model')
   let tableRequestId = 0
   let analyticsRequestId = 0
   let diagnosticRequestId = 0
+  let keyAccountRequestId = 0
   let tableController: AbortController | undefined
   let analyticsController: AbortController | undefined
   let diagnosticController: AbortController | undefined
+  let keyAccountController: AbortController | undefined
   let disposed = false
   let pending = 0
   const scopedParams = () => ({
@@ -83,6 +92,7 @@ export function useUsageRecordsTable(options: UseUsageRecordsTableOptions) {
     await Promise.all([
       ...(options.active.value ? [loadUsagePage(background)] : []),
       ...(scope === 'all' ? [loadUsageAnalytics(globalParams, background)] : []),
+      ...(scope === 'all' ? [loadKeyAccount(background)] : []),
     ])
   }
 
@@ -175,6 +185,43 @@ export function useUsageRecordsTable(options: UseUsageRecordsTableOptions) {
     }
     catch {}
   }
+  async function loadKeyAccount(background = false) {
+    // 筛选、时间范围、手动刷新和轮询共用同一请求序列，旧筛选结果不能覆盖新选择。
+    pending++
+    const requestId = ++keyAccountRequestId
+    keyAccountController?.abort()
+    keyAccountController = new AbortController()
+    const params = {
+      ...scopedParams(),
+      ...(quotaSearch.value ? { search: quotaSearch.value } : {}),
+    }
+    keyAccountLoading.value = !background
+    try {
+      const result = await getUsageRecordInsightsKeyAccount(params, { signal: keyAccountController.signal, silent: background })
+      if (requestId !== keyAccountRequestId || params.search !== quotaSearch.value)
+        return
+      keyAccount.value = result
+    }
+    catch {}
+    finally {
+      pending--
+      if (requestId === keyAccountRequestId) {
+        keyAccountLoading.value = false
+      }
+    }
+  }
+
+  async function refreshKeyAccount() {
+    if (refreshingKeyAccount.value || keyAccountLoading.value)
+      return
+    refreshingKeyAccount.value = true
+    try {
+      await withMinimumDuration(() => loadKeyAccount(true))
+    }
+    finally {
+      refreshingKeyAccount.value = false
+    }
+  }
 
   async function refreshUsageRecords() {
     if (refreshingList.value || loading.value)
@@ -226,6 +273,7 @@ export function useUsageRecordsTable(options: UseUsageRecordsTableOptions) {
     await Promise.all([
       ...(options.active.value ? [loadUsagePage(true)] : []),
       loadUsageAnalytics(scopedParams(), true),
+      loadKeyAccount(true),
     ])
   }, shallowRef(30_000))
 
@@ -255,32 +303,48 @@ export function useUsageRecordsTable(options: UseUsageRecordsTableOptions) {
     },
     { debounce: 250 },
   )
+  watchDebounced(
+    quotaSearch,
+    () => {
+      if (!disposed)
+        void loadKeyAccount()
+    },
+    { debounce: 250 },
+  )
 
   onScopeDispose(() => {
     disposed = true
     tableRequestId += 1
     analyticsRequestId += 1
     diagnosticRequestId += 1
+    keyAccountRequestId += 1
     tableController?.abort()
     analyticsController?.abort()
     diagnosticController?.abort()
+    keyAccountController?.abort()
   })
 
   return {
     currentPage,
     pageSize,
     searchQuery,
+    quotaSearchQuery,
     providerQuery,
     usagePagination,
     loading,
     analyticsLoading,
+    keyAccountLoading,
     records,
     summary,
     insights,
+    keyAccount,
     refreshingList,
+    refreshingKeyAccount,
     diagnosticDimension,
     loadUsageRecords,
     refreshUsageRecords,
+    loadKeyAccount,
+    refreshKeyAccount,
     handlePageChange,
     handlePageSizeChange,
   }
@@ -373,4 +437,8 @@ function emptyDiagnostics() {
     items: [],
   }
   return diagnostics
+}
+
+function emptyKeyAccount(): UsageKeyAccountBreakdownResponse {
+  return { items: [] }
 }

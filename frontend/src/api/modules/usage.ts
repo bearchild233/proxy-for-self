@@ -459,6 +459,23 @@ export interface UsageDiagnosticsResponse {
   items: UsageDiagnosticItem[]
 }
 
+export interface UsageKeyAccountBreakdownItem {
+  clientApiKeyRef: string
+  clientApiKeyName: string
+  providerAccountRef: string
+  providerAccountName: string
+  requestCount: number
+  successCount: number
+  failureCount: number
+  totalTokens: number
+  costAmount: string | null
+  costCurrency: string | null
+}
+
+export interface UsageKeyAccountBreakdownResponse {
+  items: UsageKeyAccountBreakdownItem[]
+}
+
 // 请求参数类型：仅定义 API 边界的形状，调用方不依赖显式声明。
 interface UsageRangeQuery {
   startTime: string
@@ -532,6 +549,15 @@ export function getUsageRecordInsightsOverview(data: UsageRangeQuery, options: R
 export function getUsageRecordInsightsDiagnostics(data: UsageDiagnosticsQuery, options: RequestOptions = {}) {
   return request<UsageDiagnosticsResponse>({
     url: '/api/admin/usage/insights/diagnostics',
+    method: 'GET',
+    params: data,
+    ...options,
+  })
+}
+
+export function getUsageRecordInsightsKeyAccount(data: UsageRangeQuery, options: RequestOptions = {}) {
+  return request<UsageKeyAccountBreakdownResponse>({
+    url: '/api/admin/usage/insights/key-account',
     method: 'GET',
     params: data,
     ...options,

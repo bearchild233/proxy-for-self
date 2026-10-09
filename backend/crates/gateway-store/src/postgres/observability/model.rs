@@ -10,6 +10,8 @@ pub(crate) const MAX_ACCOUNT_IDS: usize = 200;
 /// 概览卡只展示最近使用的四个账号；完整账号用量由账号管理页单独查询。
 pub(crate) const DASHBOARD_ACCOUNT_LIMIT: u16 = 4;
 pub(crate) const DIAGNOSTIC_LIMIT: i64 = 100;
+/// 密钥 × 账号交叉视图的行数上限；单页表格无需分页。
+pub(crate) const KEY_ACCOUNT_BREAKDOWN_LIMIT: i64 = 200;
 pub(crate) const ACCOUNT_USAGE_TIMELINE_HOURS: i64 = 24;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -693,6 +695,24 @@ pub struct DiagnosticObservation {
     pub costs: Vec<CurrencyCostTotal>,
 }
 
+/// 单个 (客户端 API key, 上游账号) 组合的配额消耗聚合。
+///
+/// 显示名独立于 ref 解析：密钥名来自 `client_api_keys.name`（缺失回退 ref），账号名来自
+/// `model_requests` 快照（email 优先、name 其次、ref 兜底），不读取 `provider_accounts`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyAccountBreakdownObservation {
+    pub client_api_key_ref: String,
+    pub client_api_key_name: String,
+    pub provider_account_ref: String,
+    pub provider_account_name: String,
+    pub request_count: u64,
+    pub success_count: u64,
+    pub failure_count: u64,
+    pub total_tokens: u64,
+    pub cost_amount: Option<DecimalAmount>,
+    pub cost_currency: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpsErrorRecord {
     pub client_api_key_name: Option<String>,
@@ -794,5 +814,10 @@ pub trait ObservabilityRepository: Send + Sync {
         filter: UsageRecordFilter,
         dimension: DiagnosticDimension,
     ) -> StoreResult<Vec<DiagnosticObservation>>;
+    async fn usage_key_account_breakdown(
+        &self,
+        range: ObservabilityRange,
+        filter: UsageRecordFilter,
+    ) -> StoreResult<Vec<KeyAccountBreakdownObservation>>;
     async fn list_ops_errors(&self, query: OpsErrorQuery) -> StoreResult<OpsErrorPage>;
 }

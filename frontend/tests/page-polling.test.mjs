@@ -163,6 +163,7 @@ test('usage polling updates analytics to now, keeps later-page snapshot and does
     },
     async getUsageRecordInsightsOverview() { return {} },
     async getUsageRecordInsightsDiagnostics() { return {} },
+    async getUsageRecordInsightsKeyAccount() { return { items: [] } },
   })
   const scope = Vue.effectScope()
   const active = Vue.ref(true)
@@ -190,6 +191,52 @@ test('usage polling updates analytics to now, keeps later-page snapshot and does
   assert.equal(tables.length, count)
   assert.equal(q.summary.value.totalRequests, 't4')
   scope.stop()
+})
+
+test('switching quota filters rejects older analytics results and clearing reloads all rows', async () => {
+  const requests = []
+  const useUsage = load('../../plugins/usage-analytics/ui/usage/composables/useUsageRecordsTable.ts', 'useUsageRecordsTable', {
+    ...lifecycle,
+    withMinimumDuration: fn => fn(),
+    usePluginPolling() {},
+    async getUsageRecordSummary() { return { totalRequests: '8' } },
+    async getUsageRecordInsightsOverview() { return {} },
+    async getUsageRecordInsightsDiagnostics() { return {} },
+    getUsageRecordInsightsKeyAccount(params, options) {
+      const work = deferred()
+      requests.push({ ...work, params, options })
+      return work.promise
+    },
+  })
+  const scope = Vue.effectScope()
+  const range = { startTime: 'start', endTime: 'end' }
+  const q = scope.run(() => useUsage({ active: Vue.ref(false), timeRangeParams: Vue.ref(range), latestTimeRangeParams: () => range }))
+  try {
+    q.quotaSearchQuery.value = 'key_a'
+    const oldRefresh = q.loadUsageRecords({ background: true })
+    q.quotaSearchQuery.value = 'acct_a'
+    const accountQuery = q.loadKeyAccount()
+    assert.equal(requests[0].options.signal.aborted, true)
+    assert.equal(requests[0].options.silent, true)
+    assert.equal(requests[1].params.search, 'acct_a')
+    const accountRows = { items: [{ clientApiKeyRef: 'key_a' }, { clientApiKeyRef: 'key_b' }] }
+    requests[1].resolve(accountRows)
+    await accountQuery
+    requests[0].resolve({ items: [{ clientApiKeyRef: 'key_a' }] })
+    await oldRefresh
+    assert.deepEqual(q.keyAccount.value, accountRows)
+    assert.equal(q.summary.value.totalRequests, '8')
+
+    q.quotaSearchQuery.value = ''
+    const allQuery = q.loadKeyAccount()
+    assert.equal(requests[2].params.search, undefined)
+    assert.equal(requests[2].params.startTime, range.startTime)
+    requests[2].resolve({ items: [] })
+    await allQuery
+    assert.deepEqual(q.keyAccount.value.items, [])
+    assert.equal(q.keyAccountLoading.value, false)
+  }
+  finally { scope.stop() }
 })
 
 test('group polling updates metrics without overwriting open editor or selection', async () => {

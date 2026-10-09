@@ -1166,3 +1166,18 @@ pub struct DiagnosticsResult {
     pub dimension: DiagnosticDimension,
     pub items: Vec<DiagnosticsItem>,
 }
+
+/// 单个 (客户端 API key, 上游账号) 组合的配额消耗聚合。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyAccountBreakdownObservation {
+    pub client_api_key_ref: String,
+    pub client_api_key_name: String,
+    pub provider_account_ref: String,
+    pub provider_account_name: String,
+    pub request_count: u64,
+    pub success_count: u64,
+    pub failure_count: u64,
+    pub total_tokens: u64,
+    pub cost_amount: Option<DecimalAmount>,
+    pub cost_currency: Option<String>,
+}

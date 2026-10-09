@@ -709,6 +709,23 @@ pub(crate) fn admin_diagnostic_observation(
     })
 }
 
+pub(crate) fn admin_key_account_breakdown(
+    observation: KeyAccountBreakdownObservation,
+) -> AdminStoreResult<admin_observability::KeyAccountBreakdownObservation> {
+    Ok(admin_observability::KeyAccountBreakdownObservation {
+        client_api_key_ref: observation.client_api_key_ref,
+        client_api_key_name: observation.client_api_key_name,
+        provider_account_ref: observation.provider_account_ref,
+        provider_account_name: observation.provider_account_name,
+        request_count: observation.request_count,
+        success_count: observation.success_count,
+        failure_count: observation.failure_count,
+        total_tokens: observation.total_tokens,
+        cost_amount: admin_optional_decimal_amount(observation.cost_amount)?,
+        cost_currency: observation.cost_currency,
+    })
+}
+
 pub(crate) fn admin_ops_error_page(
     page: OpsErrorPage,
 ) -> AdminStoreResult<admin_observability::OpsErrorPage> {

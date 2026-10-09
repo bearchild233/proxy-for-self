@@ -19,12 +19,12 @@ use crate::{
             CostCoverage, CurrencyCost, DashboardAccountUsage, DashboardCapacity,
             DashboardPeriodMetrics, DashboardResult, DecimalAmount, DiagnosticDimension,
             DiagnosticsItem, DiagnosticsResult, HealthStatus, HealthTimeline, HealthTimelinePoint,
-            OpsErrorPage, OpsErrorQuery, ProviderBillingInput, RequestMetricPoint, RequestMetrics,
-            TimeRange, Trend, TrendKind, TrendPoint, TrendSummary, UsageBilling,
-            UsageCalculatedBillingFact, UsageDetail, UsageFilter, UsageInsights, UsageInsightsCost,
-            UsageInsightsCostPoint, UsageInsightsHealth, UsageInsightsHealthPoint,
-            UsageInsightsPerformance, UsageInsightsPerformancePoint, UsageOverview, UsagePage,
-            UsageQuery, UsageSummary, china_day_start,
+            KeyAccountBreakdownObservation, OpsErrorPage, OpsErrorQuery, ProviderBillingInput,
+            RequestMetricPoint, RequestMetrics, TimeRange, Trend, TrendKind, TrendPoint,
+            TrendSummary, UsageBilling, UsageCalculatedBillingFact, UsageDetail, UsageFilter,
+            UsageInsights, UsageInsightsCost, UsageInsightsCostPoint, UsageInsightsHealth,
+            UsageInsightsHealthPoint, UsageInsightsPerformance, UsageInsightsPerformancePoint,
+            UsageOverview, UsagePage, UsageQuery, UsageSummary, china_day_start,
         },
         provider_credentials::ProviderQuotaRequest,
     },
@@ -122,6 +122,11 @@ pub trait ObservabilityService: Send + Sync {
         filter: UsageFilter,
         dimension: DiagnosticDimension,
     ) -> Result<DiagnosticsResult, AdminError>;
+    async fn key_account_breakdown(
+        &self,
+        range: TimeRange,
+        filter: UsageFilter,
+    ) -> Result<Vec<KeyAccountBreakdownObservation>, AdminError>;
     async fn ops_errors(&self, query: OpsErrorQuery) -> Result<OpsErrorPage, AdminError>;
 }
 
@@ -397,6 +402,17 @@ impl ObservabilityService for DefaultObservabilityService {
                 .then_with(|| right.request_count.cmp(&left.request_count))
         });
         Ok(DiagnosticsResult { dimension, items })
+    }
+
+    async fn key_account_breakdown(
+        &self,
+        range: TimeRange,
+        filter: UsageFilter,
+    ) -> Result<Vec<KeyAccountBreakdownObservation>, AdminError> {
+        self.store
+            .usage_key_account_breakdown(range, filter)
+            .await
+            .map_err(|error| map_store_error(error, "usage key account breakdown"))
     }
 
     async fn ops_errors(&self, query: OpsErrorQuery) -> Result<OpsErrorPage, AdminError> {

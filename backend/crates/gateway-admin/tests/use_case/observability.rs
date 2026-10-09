@@ -17,10 +17,10 @@ use gateway_admin::{
         observability::{
             AccountPoolMetrics, AttemptMetrics, CostCoverage, CurrencyCost, DashboardObservation,
             DashboardRuntimeSlots, DiagnosticDimension, DiagnosticObservation, Granularity,
-            HealthStatus, LatencyPercentiles, OpsErrorPage, OpsErrorQuery, PercentileMilliseconds,
-            RequestMetricPoint, RequestMetrics, TimeRange, TrendKind, UsageBilling,
-            UsageCalculatedBillingFact, UsageDetail, UsageFilter, UsageListRecord, UsageOverview,
-            UsagePage, UsageQuery, china_day_start,
+            HealthStatus, KeyAccountBreakdownObservation, LatencyPercentiles, OpsErrorPage,
+            OpsErrorQuery, PercentileMilliseconds, RequestMetricPoint, RequestMetrics, TimeRange,
+            TrendKind, UsageBilling, UsageCalculatedBillingFact, UsageDetail, UsageFilter,
+            UsageListRecord, UsageOverview, UsagePage, UsageQuery, china_day_start,
         },
         settings::{
             AdminApiKey, AdminApiKeyMutation, ReplaceRuntimeSettings, RotationStrategy,
@@ -776,6 +776,14 @@ impl ObservabilityStore for FixtureObservabilityStore {
         _: DiagnosticDimension,
     ) -> AdminStoreResult<Vec<DiagnosticObservation>> {
         Ok(self.diagnostics.lock().expect("diagnostics").clone())
+    }
+
+    async fn usage_key_account_breakdown(
+        &self,
+        _: TimeRange,
+        _: UsageFilter,
+    ) -> AdminStoreResult<Vec<KeyAccountBreakdownObservation>> {
+        Ok(Vec::new())
     }
 
     async fn list_ops_errors(&self, _: OpsErrorQuery) -> AdminStoreResult<OpsErrorPage> {

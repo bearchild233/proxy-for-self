@@ -628,3 +628,114 @@ pub(crate) fn push_diagnostic_dimension_filter(
         | DiagnosticDimension::Transport => {}
     }
 }
+
+/// 按 (客户端 API key, 上游账号) 交叉聚合配额消耗。
+///
+/// 只依赖 `model_requests`（含账号快照）与 `client_api_keys`；账号显示名取最近快照
+/// （email 优先、name 其次、ref 兜底），密钥显示名取 `client_api_keys.name`，缺失回退 ref。
+/// 成本按币种分组合计后取该组合中金额最大的币种作为展示币种，避免跨币种相加失真。
+pub(crate) async fn usage_key_account_breakdown(
+    pool: &PgPool,
+    range: ObservabilityRange,
+    filter: &UsageRecordFilter,
+) -> StoreResult<Vec<KeyAccountBreakdownObservation>> {
+    filter.validate()?;
+    let completed_usage = completed_usage_fact_predicate("mr");
+    let mut statement = QueryBuilder::<Postgres>::new(
+        "with matched as (select coalesce(mr.client_api_key_ref, 'unrouted') as client_api_key_ref,
+                coalesce(mr.provider_account_ref, 'unrouted') as provider_account_ref,
+                mr.outcome, mr.total_tokens, mr.cost_amount, mr.cost_currency, (",
+    );
+    statement.push(completed_usage);
+    statement.push(
+        ") as is_completed_usage
+         from model_requests mr where mr.started_at >= ",
+    );
+    statement.push_bind(range.start);
+    statement.push(" and mr.started_at < ");
+    statement.push_bind(range.end);
+    push_unrecovered_request_filter(&mut statement, "mr");
+    push_usage_filter(&mut statement, filter, "mr");
+    statement.push(
+        "), per_currency as (
+           select client_api_key_ref, provider_account_ref, cost_currency,
+                  count(*)::bigint as request_count,
+                  count(*) filter (where outcome = 'succeeded')::bigint as success_count,
+                  count(*) filter (where outcome = 'failed')::bigint as failure_count,
+                  coalesce(sum(total_tokens) filter (where is_completed_usage), 0)::bigint
+                    as total_tokens,
+                  sum(cost_amount) filter (where is_completed_usage) as cost_amount
+             from matched
+            group by client_api_key_ref, provider_account_ref, cost_currency
+         ), ranked_currency as (
+           select client_api_key_ref, provider_account_ref, cost_currency,
+                  row_number() over (
+                    partition by client_api_key_ref, provider_account_ref
+                    order by cost_amount desc nulls last, request_count desc
+                  ) as currency_rank
+             from per_currency
+         ), totals as (
+           select client_api_key_ref, provider_account_ref,
+                  sum(request_count)::bigint as request_count,
+                  sum(success_count)::bigint as success_count,
+                  sum(failure_count)::bigint as failure_count,
+                  sum(total_tokens)::bigint as total_tokens,
+                  sum(cost_amount) as cost_amount
+             from per_currency
+            group by client_api_key_ref, provider_account_ref
+         )
+         select totals.client_api_key_ref, totals.provider_account_ref,
+                totals.request_count, totals.success_count, totals.failure_count,
+                totals.total_tokens, totals.cost_amount::text as cost_amount,
+                ranked_currency.cost_currency
+           from totals
+           join ranked_currency
+             on ranked_currency.client_api_key_ref = totals.client_api_key_ref
+            and ranked_currency.provider_account_ref = totals.provider_account_ref
+            and ranked_currency.currency_rank = 1
+          order by totals.request_count desc, totals.client_api_key_ref,
+                   totals.provider_account_ref
+          limit ",
+    );
+    statement.push_bind(KEY_ACCOUNT_BREAKDOWN_LIMIT);
+    let rows = statement
+        .build()
+        .fetch_all(pool)
+        .await
+        .map_err(|_| postgres_unavailable("load usage key account breakdown"))?;
+    let mut observations = Vec::with_capacity(rows.len());
+    let mut account_refs = Vec::with_capacity(rows.len());
+    let mut key_refs = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let client_api_key_ref = get::<String>(row, "client_api_key_ref")?;
+        let provider_account_ref = get::<String>(row, "provider_account_ref")?;
+        observations.push(KeyAccountBreakdownObservation {
+            client_api_key_ref: client_api_key_ref.clone(),
+            client_api_key_name: client_api_key_ref.clone(),
+            provider_account_ref: provider_account_ref.clone(),
+            provider_account_name: provider_account_ref.clone(),
+            request_count: unsigned(row, "request_count")?,
+            success_count: unsigned(row, "success_count")?,
+            failure_count: unsigned(row, "failure_count")?,
+            total_tokens: unsigned(row, "total_tokens")?,
+            cost_amount: match get::<Option<String>>(row, "cost_amount")? {
+                Some(amount) => Some(DecimalAmount::from_str(&amount)?),
+                None => None,
+            },
+            cost_currency: get(row, "cost_currency")?,
+        });
+        account_refs.push(provider_account_ref);
+        key_refs.push(client_api_key_ref);
+    }
+    let account_names = diagnostic_account_display_names(pool, &account_refs).await?;
+    let key_names = diagnostic_api_key_display_names(pool, &key_refs).await?;
+    for observation in &mut observations {
+        if let Some(name) = key_names.get(&observation.client_api_key_ref) {
+            observation.client_api_key_name = name.clone();
+        }
+        if let Some(name) = account_names.get(&observation.provider_account_ref) {
+            observation.provider_account_name = name.clone();
+        }
+    }
+    Ok(observations)
+}

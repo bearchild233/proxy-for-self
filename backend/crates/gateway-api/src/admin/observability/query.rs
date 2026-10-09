@@ -96,6 +96,36 @@ impl DiagnosticsQuery {
     }
 }
 
+/// 密钥 × 账号交叉聚合查询参数。
+#[derive(Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct KeyAccountQuery {
+    pub start_time: Option<String>,
+    pub end_time: Option<String>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub status_code: Option<i64>,
+    pub search: Option<String>,
+}
+
+impl KeyAccountQuery {
+    /// 解析查询时间范围。
+    pub fn range(&self) -> Result<domain::TimeRange, WireValidationError> {
+        usage_range(self.start_time.as_deref(), self.end_time.as_deref())
+    }
+
+    /// 将查询参数映射为领域过滤条件。
+    pub fn usage_filter(&self) -> Result<domain::UsageFilter, WireValidationError> {
+        Ok(domain::UsageFilter {
+            provider_kind: non_empty(self.provider.clone()),
+            model: non_empty(self.model.clone()),
+            status_code: parse_status(self.status_code)?,
+            search: non_empty(self.search.clone()),
+            ..domain::UsageFilter::default()
+        })
+    }
+}
+
 /// 运维错误查询参数。
 #[derive(Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

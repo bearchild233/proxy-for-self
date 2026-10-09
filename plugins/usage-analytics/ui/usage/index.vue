@@ -11,6 +11,7 @@ import BaseTableColumnSettings from '@/components/base/BaseTable/BaseTableColumn
 import BaseTablePagination from '@/components/base/BaseTable/BaseTablePagination.vue'
 import { useTableColumns } from '@/components/base/BaseTable/useTableColumns'
 import ProviderFilterSegmented from '@/components/ProviderFilterSegmented.vue'
+import KeyAccountBreakdownCard from './components/KeyAccountBreakdownCard.vue'
 import OpsErrorPanel from './components/OpsErrorPanel.vue'
 import UsageFilters from './components/UsageFilters.vue'
 import UsageInsightsGrid from './components/UsageInsightsGrid.vue'
@@ -23,10 +24,14 @@ import { useUsageTimeRange } from './composables/useUsageTimeRange'
 import { usageRecordColumns, usageTimeRangeOptions } from './constants'
 
 const recordView = shallowRef('success')
-const { visibleColumns, columnOptions, setColumnVisible, setColumnOrder, resetColumns } = useTableColumns(usageRecordColumns, 'usage-records')
+const { visibleColumns, columnOptions, setColumnVisible, setColumnOrder, resetColumns } = useTableColumns(
+  usageRecordColumns,
+  'usage-records',
+)
 const recordViewOptions = [
   { label: '成功记录', value: 'success' },
   { label: '错误排查', value: 'errors' },
+  { label: '配额消耗', value: 'quota' },
 ]
 const { timeRange, timeRangeParams, refreshTimeRangeEnd, latestTimeRangeParams }
   = useUsageTimeRange()
@@ -34,17 +39,22 @@ const { timeRange, timeRangeParams, refreshTimeRangeEnd, latestTimeRangeParams }
 const {
   currentPage,
   searchQuery,
+  quotaSearchQuery,
   providerQuery,
   usagePagination,
   loading,
   analyticsLoading,
+  keyAccountLoading,
   records,
   summary,
   insights,
+  keyAccount,
   refreshingList,
+  refreshingKeyAccount,
   diagnosticDimension,
   loadUsageRecords,
   refreshUsageRecords,
+  refreshKeyAccount,
   handlePageChange,
   handlePageSizeChange,
 } = useUsageRecordsTable({
@@ -95,10 +105,10 @@ watch(timeRange, () => {
             <p
               class="mt-1.75 mb-0 text-cp leading-[1.15] font-emphasis text-cp-text-secondary"
             >
-              成功请求与失败请求明细
+              成功记录、错误排查与配额消耗
             </p>
           </div>
-          <BaseSegmented v-model="recordView" label="请求明细类型" :options="recordViewOptions" class="w-52" />
+          <BaseSegmented v-model="recordView" label="请求明细类型" :options="recordViewOptions" class="w-72" />
         </div>
       </template>
 
@@ -159,6 +169,15 @@ watch(timeRange, () => {
             :latest-time-range-params="latestTimeRangeParams"
             :provider="providerQuery"
             :active="recordView === 'errors'"
+          />
+        </div>
+        <div v-show="recordView === 'quota'" class="min-w-0">
+          <KeyAccountBreakdownCard
+            v-model:search="quotaSearchQuery"
+            :breakdown="keyAccount"
+            :loading="analyticsLoading || keyAccountLoading"
+            :refreshing="refreshingKeyAccount"
+            @refresh="refreshKeyAccount"
           />
         </div>
       </template>

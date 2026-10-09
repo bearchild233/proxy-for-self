@@ -43,8 +43,9 @@ use gateway_admin::{
         observability::{
             DashboardDesktopRelease, DashboardObservation, DashboardWireAttribute,
             DashboardWireProfile, DashboardWireTarget, DesktopReleaseStatus, DiagnosticDimension,
-            DiagnosticObservation, OpsErrorPage, OpsErrorQuery, RequestMetricPoint, TimeRange,
-            UsageDetail, UsageFilter, UsageOverview, UsagePage, UsageQuery,
+            DiagnosticObservation, KeyAccountBreakdownObservation, OpsErrorPage, OpsErrorQuery,
+            RequestMetricPoint, TimeRange, UsageDetail, UsageFilter, UsageOverview, UsagePage,
+            UsageQuery,
         },
         provider_credentials::{
             AuthorizationCommit, AuthorizationStarted, CompleteAuthorization, CredentialDetails,
@@ -699,6 +700,14 @@ impl ObservabilityStore for UnavailableStore {
         _: DiagnosticDimension,
     ) -> AdminStoreResult<Vec<DiagnosticObservation>> {
         Err(unavailable("usage diagnostics"))
+    }
+
+    async fn usage_key_account_breakdown(
+        &self,
+        _: TimeRange,
+        _: UsageFilter,
+    ) -> AdminStoreResult<Vec<KeyAccountBreakdownObservation>> {
+        Err(unavailable("usage key account breakdown"))
     }
 
     async fn list_ops_errors(&self, _: OpsErrorQuery) -> AdminStoreResult<OpsErrorPage> {

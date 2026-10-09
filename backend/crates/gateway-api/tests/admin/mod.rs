@@ -35,8 +35,9 @@ use gateway_admin::{
         },
         observability::{
             DashboardObservation, DecimalAmount, DiagnosticDimension, DiagnosticObservation,
-            OpsError, OpsErrorPage, OpsErrorQuery, RequestMetricPoint, TimeRange, UsageDetail,
-            UsageFilter, UsageListRecord, UsageOverview, UsagePage, UsageQuery,
+            KeyAccountBreakdownObservation, OpsError, OpsErrorPage, OpsErrorQuery,
+            RequestMetricPoint, TimeRange, UsageDetail, UsageFilter, UsageListRecord,
+            UsageOverview, UsagePage, UsageQuery,
         },
         provider_credentials::{
             AuthorizationCommit, AuthorizationStarted, CompleteAuthorization, CredentialDetails,
@@ -1263,6 +1264,14 @@ impl ObservabilityStore for UnusedStore {
         _: DiagnosticDimension,
     ) -> AdminStoreResult<Vec<DiagnosticObservation>> {
         Ok(self.diagnostics.lock().expect("diagnostics").clone())
+    }
+
+    async fn usage_key_account_breakdown(
+        &self,
+        _: TimeRange,
+        _: UsageFilter,
+    ) -> AdminStoreResult<Vec<KeyAccountBreakdownObservation>> {
+        Ok(Vec::new())
     }
 
     async fn list_ops_errors(&self, query: OpsErrorQuery) -> AdminStoreResult<OpsErrorPage> {

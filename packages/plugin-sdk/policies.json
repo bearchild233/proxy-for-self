@@ -146,6 +146,7 @@
       "accounts.get.admin.accounts.reset-credits",
       "api-keys.get.admin.client-keys",
       "api-keys.get.admin.client-keys.reveal",
+      "api-keys.post.admin.client-keys.bindings",
       "auth.get.auth.status",
       "auth.post.auth.logout",
       "dashboard.get.admin.dashboard.summary",
@@ -156,11 +157,11 @@
       "key-usage.get.key-usage.version",
       "usage.get.admin.operations.errors",
       "usage.get.admin.usage.insights.diagnostics",
+      "usage.get.admin.usage.insights.key-account",
       "usage.get.admin.usage.insights.overview",
       "usage.get.admin.usage.records",
       "usage.get.admin.usage.records.detail",
-      "usage.get.admin.usage.records.summary",
-      "api-keys.post.admin.client-keys.bindings"
+      "usage.get.admin.usage.records.summary"
     ],
     "description": "查看概览、请求记录、费用、缓存和延迟；提供密钥用户用量页。",
     "pages": [
