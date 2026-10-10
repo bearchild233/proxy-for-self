@@ -27,10 +27,8 @@ export function accountOAuthExport(payload: unknown, account: OAuthAccountRef, f
     return payload
   if (account.provider !== 'openai')
     throw new Error('仅 OpenAI OAuth 账号支持 Codex 登录文件')
-  // OAuth provider 文档沿用 Rust credential 字段的 snake_case；公共账号字段使用 camelCase。
-  // Provider canonical documents use camelCase (the Rust wire contract), while
-  // older proxy exports used snake_case. Accept both so an export from the
-  // live gateway can be downloaded without making the UI depend on one schema.
+  // 网关 canonical 文档使用 camelCase，旧版代理导出使用 snake_case；两种都兼容，
+  // 避免 UI 绑定到单一导出版本。
   const idToken = stringField(entry, 'id_token', 'idToken')
   const accessToken = stringField(entry, 'access_token', 'accessToken')
   const refreshToken = stringField(entry, 'refresh_token', 'refreshToken')
