@@ -21,17 +21,20 @@ export function accountOAuthExport(payload: unknown, account: OAuthAccountRef, f
   if (!Array.isArray(accounts) || accounts.length !== 1 || !isRecord(accounts[0]))
     throw new Error('导出的账号文档不完整')
   const entry = accounts[0]
-  if (entry.id !== account.id || entry.authentication_kind === 'api_key')
+  if (entry.id !== account.id || stringField(entry, 'authentication_kind', 'authenticationKind') === 'api_key')
     throw new Error('导出的账号身份不匹配')
   if (format === 'proxy')
     return payload
   if (account.provider !== 'openai')
     throw new Error('仅 OpenAI OAuth 账号支持 Codex 登录文件')
   // OAuth provider 文档沿用 Rust credential 字段的 snake_case；公共账号字段使用 camelCase。
-  const idToken = entry.id_token
-  const accessToken = entry.access_token
-  const refreshToken = entry.refresh_token
-  const accountId = entry.accountId
+  // Provider canonical documents use camelCase (the Rust wire contract), while
+  // older proxy exports used snake_case. Accept both so an export from the
+  // live gateway can be downloaded without making the UI depend on one schema.
+  const idToken = stringField(entry, 'id_token', 'idToken')
+  const accessToken = stringField(entry, 'access_token', 'accessToken')
+  const refreshToken = stringField(entry, 'refresh_token', 'refreshToken')
+  const accountId = stringField(entry, 'accountId', 'account_id')
   if (![idToken, accessToken, refreshToken, accountId].every(value => typeof value === 'string' && value.trim()))
     throw new Error('缺少 ID Token、Refresh Token 或上游账号 ID，请重新授权后导出；当前凭据仍可导出为 OAuth JSON')
   // 文件只下载，不写入本机 auth.json，也不合并或替换现有 API Key。
@@ -41,6 +44,15 @@ export function accountOAuthExport(payload: unknown, account: OAuthAccountRef, f
     OPENAI_API_KEY: null,
     tokens: { id_token: idToken, access_token: accessToken, refresh_token: refreshToken, account_id: accountId },
   }
+}
+
+function stringField(value: Record<string, unknown>, ...keys: string[]) {
+  for (const key of keys) {
+    const candidate = value[key]
+    if (typeof candidate === 'string')
+      return candidate
+  }
+  return undefined
 }
 
 export function oauthExportFileName(account: OAuthAccountRef, format: OAuthExportFormat) {

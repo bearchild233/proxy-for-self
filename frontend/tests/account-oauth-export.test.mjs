@@ -48,3 +48,28 @@ test('OAuth export rejects API keys, another account and incomplete tokens', () 
   assert.throws(() => accountOAuthExport({ ...payload, documents: [{ ...document, document: { accounts: [{ ...document.document.accounts[0], refresh_token: null }] } }] }, account, 'codex'), /缺少 ID Token/)
   assert.throws(() => accountOAuthExport(payload, { ...account, provider: 'xai' }, 'codex'), /平台不匹配/)
 })
+
+test('OAuth export accepts the live gateway camelCase canonical document', () => {
+  const liveEntry = {
+    id: 'acct_fixture',
+    authenticationKind: 'oauth',
+    idToken: 'id-token-fixture',
+    accessToken: 'access-token-fixture',
+    refreshToken: 'refresh-token-fixture',
+    accountId: 'chatgpt-account-fixture',
+  }
+  const livePayload = {
+    exportedAt: '2026-10-10T00:00:00Z',
+    documents: [{ provider: 'openai', document: { sourceFormat: 'cpr', accounts: [liveEntry] } }],
+  }
+  assert.deepEqual(accountOAuthExport(livePayload, account, 'codex'), {
+    auth_mode: 'chatgpt',
+    OPENAI_API_KEY: null,
+    tokens: {
+      id_token: 'id-token-fixture',
+      access_token: 'access-token-fixture',
+      refresh_token: 'refresh-token-fixture',
+      account_id: 'chatgpt-account-fixture',
+    },
+  })
+})

@@ -1,6 +1,6 @@
 {
   "id": "accounts",
-  "version": "0.3.6",
+  "version": "0.3.7",
   "protocol": 2,
   "kind": "ui",
   "sdk": 1,
@@ -56,7 +56,8 @@
   "releaseNotes": [
     "账号导入时可直接填写名称和备注，支持 OAuth、Token、JSON 与 API Key。",
     "批量导入的名称应用于本次所有账号，留空保留原有名称。",
-    "OAuth 账号支持导出代理可重新导入的 JSON，以及 OpenAI 的 Codex auth.json。"
+    "OAuth 账号支持导出代理可重新导入的 JSON，以及 OpenAI 的 Codex auth.json。",
+    "兼容网关 canonical 导出的 camelCase 字段，修复 Codex auth.json 导出无响应。"
   ],
   "runtime": "vue-component",
   "hostApi": 1
