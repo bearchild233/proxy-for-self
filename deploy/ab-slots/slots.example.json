@@ -14,5 +14,5 @@
   "ready_timeout": 60,
   "drain_timeout": 700,
   "minimum_available_mib": 512,
-  "maximum_draining_mib": 128
+  "maximum_draining_mib": 160
 }
