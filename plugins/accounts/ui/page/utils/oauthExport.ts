@@ -6,6 +6,7 @@ interface OAuthAccountRef {
   id: string
   provider: string
   authenticationKind: string
+  email?: string | null
 }
 
 /** 精确校验导出的账号，避免下载其它账号或将 API Key 当作 OAuth。 */
@@ -21,8 +22,26 @@ export function accountOAuthExport(payload: unknown, account: OAuthAccountRef, f
   if (!Array.isArray(accounts) || accounts.length !== 1 || !isRecord(accounts[0]))
     throw new Error('导出的账号文档不完整')
   const entry = accounts[0]
-  if (entry.id !== account.id || stringField(entry, 'authentication_kind', 'authenticationKind') === 'api_key')
+  if (stringField(entry, 'authentication_kind', 'authenticationKind') === 'api_key')
     throw new Error('导出的账号身份不匹配')
+  if (account.provider === 'openai') {
+    if (entry.id !== account.id || !stringField(entry, 'access_token', 'accessToken')?.trim())
+      throw new Error('导出的账号身份不匹配')
+  }
+  else if (account.provider === 'xai') {
+    // xAI 的规范 OAuth bundle 没有网关内部 id。账号范围由导出请求的单一
+    // accountIds 和后端校验保证；仍校验平台、OAuth 类型和已有邮箱。
+    const credentials = entry.credentials
+    if (document.document.type !== 'oauth-account-bundle' || entry.platform !== 'grok'
+      || entry.type !== 'oauth' || !isRecord(credentials) || !stringField(credentials, 'accessToken')?.trim())
+      throw new Error('导出的账号文档不完整')
+    const email = stringField(credentials, 'email')
+    if (account.email && email && account.email !== email)
+      throw new Error('导出的账号身份不匹配')
+  }
+  else {
+    throw new Error('该平台暂不支持 OAuth 导出')
+  }
   if (format === 'proxy')
     return payload
   if (account.provider !== 'openai')

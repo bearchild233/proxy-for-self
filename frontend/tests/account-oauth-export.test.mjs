@@ -52,7 +52,8 @@ test('OAuth export rejects API keys, another account and incomplete tokens', () 
 test('OAuth export accepts the live gateway camelCase canonical document', () => {
   const liveEntry = {
     id: 'acct_fixture',
-    authenticationKind: 'oauth',
+    modelAccess: { mode: 'all', models: [] },
+    label: 'Fixture account',
     idToken: 'id-token-fixture',
     accessToken: 'access-token-fixture',
     refreshToken: 'refresh-token-fixture',
@@ -72,4 +73,19 @@ test('OAuth export accepts the live gateway camelCase canonical document', () =>
       account_id: 'chatgpt-account-fixture',
     },
   })
+})
+
+test('xAI exports its real OAuth bundle without a gateway id', () => {
+  const xaiAccount = { id: 'acct_grok', provider: 'xai', authenticationKind: 'oauth', email: 'fixture@example.test' }
+  const entry = {
+    platform: 'grok',
+    type: 'oauth',
+    name: 'Grok fixture',
+    credentials: { accessToken: 'fixture-access', refreshToken: 'fixture-refresh', email: xaiAccount.email },
+  }
+  const xaiPayload = { documents: [{ provider: 'xai', document: { version: 1, type: 'oauth-account-bundle', accounts: [entry] } }] }
+  assert.deepEqual(accountOAuthExport(xaiPayload, xaiAccount, 'proxy'), xaiPayload)
+  assert.throws(() => accountOAuthExport(xaiPayload, xaiAccount, 'codex'), /仅 OpenAI/)
+  assert.throws(() => accountOAuthExport(xaiPayload, { ...xaiAccount, email: 'other@example.test' }, 'proxy'), /身份不匹配/)
+  assert.throws(() => accountOAuthExport({ documents: [{ provider: 'xai', document: { type: 'oauth-account-bundle', accounts: [{ ...entry, type: 'api_key' }] } }] }, xaiAccount, 'proxy'), /文档不完整/)
 })

@@ -14,7 +14,7 @@ defineProps<{
   refreshing: boolean
   testing: boolean
   diagnosticsEnabled: boolean
-  exportingOAuth: boolean
+  exportingOauth: boolean
 }>()
 
 const emit = defineEmits<{
@@ -24,7 +24,7 @@ const emit = defineEmits<{
   test: [account: AccountRow]
   refresh: [accountId: string]
   reauthorize: [account: AccountRow]
-  exportOAuth: [account: AccountRow, format: OAuthExportFormat]
+  exportOauth: [account: AccountRow, format: OAuthExportFormat]
 }>()
 </script>
 
@@ -91,9 +91,9 @@ const emit = defineEmits<{
           </BaseMenuItem>
           <BaseMenuItem
             v-if="account.authenticationKind === 'oauth'"
-            :loading="exportingOAuth"
-            :disabled="exportingOAuth"
-            @click.stop="(close(), emit('exportOAuth', account, 'proxy'))"
+            :loading="exportingOauth"
+            :disabled="exportingOauth"
+            @click.stop="(close(), emit('exportOauth', account, 'proxy'))"
           >
             <template #icon>
               <Download class="size-3.5 text-cp-text-quaternary" />
@@ -102,8 +102,8 @@ const emit = defineEmits<{
           </BaseMenuItem>
           <BaseMenuItem
             v-if="account.authenticationKind === 'oauth' && account.provider === 'openai'"
-            :disabled="exportingOAuth"
-            @click.stop="(close(), emit('exportOAuth', account, 'codex'))"
+            :disabled="exportingOauth"
+            @click.stop="(close(), emit('exportOauth', account, 'codex'))"
           >
             <template #icon>
               <Download class="size-3.5 text-cp-text-quaternary" />
