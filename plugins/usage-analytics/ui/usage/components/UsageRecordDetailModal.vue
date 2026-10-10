@@ -2,6 +2,7 @@
 import type { EChartsOption } from 'echarts'
 import type { UsageViewModel } from '../utils/records'
 
+import { formatDuration } from '@kit/format'
 import { computed } from 'vue'
 import BaseButton from '@/components/base/BaseButton.vue'
 import BaseModal from '@/components/base/BaseModal/index.vue'
@@ -12,8 +13,8 @@ import { chartTooltipStyle } from '@/components/charts/tooltip'
 import { useChartPalette } from '@/composables/useChartPalette'
 import { isRecord } from '@/utils/object'
 import { displayValue, fieldLabelClass, fieldValueBaseClass, fieldValueClass } from '../utils/detail'
-import { formatDuration } from '@kit/format'
 import {
+  usageAccountEmail,
   usageAccountText,
   usageBilling,
   usageBillingText,
@@ -53,6 +54,7 @@ const panelClass = 'min-w-0 rounded-cp-card bg-cp-fill-quaternary px-4 py-3.5'
 const panelTitleClass = 'm-0 text-cp-sm leading-none font-heavy text-cp-text-secondary'
 
 const accountDisplay = computed(() => props.record ? usageAccountText(props.record) : '—')
+const accountEmailDisplay = computed(() => props.record ? usageAccountEmail(props.record) : '')
 const finalAttemptIndex = computed(() => {
   const attempts = props.record?.attempts ?? []
   const last = attempts[attempts.length - 1]
@@ -124,7 +126,7 @@ interface AttemptRow {
   transport: string
   statusCode: number | null
   accountLabel: string
-  accountId: string | null
+  accountEmail: string
   latencyMs: number | null
 }
 
@@ -148,8 +150,8 @@ const attemptRows = computed<AttemptRow[]>(() =>
     model: attempt.model,
     transport: attempt.transport,
     statusCode: attempt.statusCode,
-    accountLabel: attempt.accountEmail || attempt.accountName || attempt.accountId || '—',
-    accountId: attempt.accountId,
+    accountLabel: usageAccountText(attempt),
+    accountEmail: usageAccountEmail(attempt),
     latencyMs: attempt.latencyMs,
   })),
 )
@@ -311,6 +313,7 @@ const tokenDonutOption = computed<EChartsOption>(() => {
               :title="displayValue(accountDisplay)"
             >
               {{ displayValue(accountDisplay) }}
+              <span v-if="accountEmailDisplay" class="mt-1 block text-cp-xs font-normal text-cp-text-quaternary">{{ accountEmailDisplay }}</span>
             </dd>
           </div>
 
@@ -455,10 +458,11 @@ const tokenDonutOption = computed<EChartsOption>(() => {
           <template #accountLabel="{ row }">
             <span
               class="block max-w-full truncate font-mono text-cp-sm font-bold text-cp-text"
-              :title="row.accountId || ''"
+              :title="row.accountLabel"
             >
               {{ row.accountLabel }}
             </span>
+            <span v-if="row.accountEmail" class="mt-1 block truncate font-mono text-cp-xs text-cp-text-quaternary">{{ row.accountEmail }}</span>
           </template>
           <template #latencyMs="{ row }">
             <span class="font-mono font-bold tabular-nums text-cp-text">

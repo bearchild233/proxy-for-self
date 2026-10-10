@@ -11,8 +11,9 @@ import type {
   UsageTokenDetails,
 } from '@/api'
 
-import { isRecord } from '@/utils/object'
 import { formatDuration } from '@kit/format'
+import { isRecord } from '@/utils/object'
+import { accountIdentity } from './accountIdentity'
 
 // Usage 记录的规范化 view model：组件只消费这个形状。
 export interface UsageViewModel {
@@ -173,7 +174,11 @@ export function usageTransportTypeClass(transport?: string | null) {
 }
 
 export function usageAccountText(record: UsageCommonRecord) {
-  return record.accountEmail || record.accountName || record.accountId || '—'
+  return accountIdentity({ name: record.accountName, email: record.accountEmail, reference: record.accountId }).primary
+}
+
+export function usageAccountEmail(record: UsageCommonRecord) {
+  return accountIdentity({ name: record.accountName, email: record.accountEmail, reference: record.accountId }).secondary
 }
 
 export function usageAuthenticationKind(record: UsageCommonRecord) {

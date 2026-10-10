@@ -1,6 +1,6 @@
 {
   "id": "usage-analytics",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "protocol": 2,
   "kind": "ui",
   "sdk": 1,
@@ -63,13 +63,11 @@
     "usage.get.admin.usage.records.detail",
     "usage.get.admin.usage.records.summary"
   ],
-  "releasedAt": "2026-10-10T02:45:35.028671+00:00",
+  "releasedAt": "2026-10-10T03:36:16Z",
   "releaseNotes": [
-    "配额消耗支持按账号或 API 密钥查询，历史身份也可筛选。",
-    "费用按币种分别统计；环图只比较所选币种，明细展示所有币种。",
-    "查询返回当前时间范围内的全部密钥与账号组合。",
-    "筛选与后台刷新避免旧结果覆盖新选择，明细独立滚动。",
-    "依赖宿主提供并授权 usage.get.admin.usage.insights.key-account 能力。"
+    "消耗明细优先显示当前账号名称，邮箱作为次级信息，不展示账号引用 ID。",
+    "图表、使用记录及请求详情统一按名称和邮箱展示账号。",
+    "归档账号保留名称；目录读取失败时保留现有展示，避免触发上游刷新。"
   ],
   "runtime": "vue-component",
   "hostApi": 1

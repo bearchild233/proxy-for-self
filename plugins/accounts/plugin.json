@@ -1,6 +1,6 @@
 {
   "id": "accounts",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "protocol": 2,
   "kind": "ui",
   "sdk": 1,
@@ -52,9 +52,10 @@
     "settings.get.admin.settings.client-downloads.codex-desktop.windows",
     "accounts.avatar"
   ],
-  "releasedAt": "2026-10-10T03:13:38.720307+00:00",
+  "releasedAt": "2026-10-10T03:36:16Z",
   "releaseNotes": [
-    "Plus 额度摘要只显示重置倒计时，窗口说明保留在悬停详情中。"
+    "账号导入时可直接填写名称和备注，支持 OAuth、Token、JSON 与 API Key。",
+    "批量导入的名称应用于本次所有账号，留空保留原有名称。"
   ],
   "runtime": "vue-component",
   "hostApi": 1

@@ -464,6 +464,7 @@ export interface UsageKeyAccountBreakdownItem {
   clientApiKeyName: string
   providerAccountRef: string
   providerAccountName: string
+  providerAccountEmail?: string | null
   requestCount: number
   successCount: number
   failureCount: number

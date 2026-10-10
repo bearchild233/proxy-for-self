@@ -11,6 +11,8 @@ import { defineTableColumns } from '@/components/base/BaseTable/columns'
 import BaseTable from '@/components/base/BaseTable/index.vue'
 import CatalogFilter from '@/components/CatalogFilter.vue'
 import { formatLocalizedCompactNumber as formatCompactNumber } from '@/utils/number'
+import { useAccountIdentityDirectory } from '../composables/useAccountIdentityDirectory'
+import { accountIdentity } from '../utils/accountIdentity'
 import { quotaCosts } from '../utils/quota'
 import KeyAccountQuotaCharts from './KeyAccountQuotaCharts.vue'
 
@@ -32,16 +34,23 @@ const emit = defineEmits<{
 
 const search = defineModel<string>('search', { default: '' })
 const catalogOptions = shallowRef<{ accounts: SelectOption[], keys: SelectOption[] }>({ accounts: [], keys: [] })
+const accountDirectory = useAccountIdentityDirectory()
+const resolvedItems = computed(() => props.breakdown.items.map((item) => {
+  const current = accountDirectory.value.get(item.providerAccountRef)
+  const email = current?.email || item.providerAccountEmail || (item.providerAccountName.includes('@') ? item.providerAccountName : null)
+  const identity = accountIdentity({ name: current?.name || item.providerAccountName, email, reference: item.providerAccountRef })
+  return { ...item, providerAccountName: identity.primary, providerAccountEmail: email }
+}))
 
-watch(() => props.breakdown.items, (items) => {
+watch(resolvedItems, (items) => {
   // 保留本页已见过的身份选项，筛选后的子集不能让其它账号或密钥从下拉框消失。
   const accounts = new Map(catalogOptions.value.accounts.map(option => [option.value, option]))
   const keys = new Map(catalogOptions.value.keys.map(option => [option.value, option]))
   for (const item of items) {
     accounts.set(item.providerAccountRef, {
       value: item.providerAccountRef,
-      label: item.providerAccountName || item.providerAccountRef,
-      description: item.providerAccountRef,
+      label: item.providerAccountName,
+      description: item.providerAccountEmail || undefined,
     })
     keys.set(item.clientApiKeyRef, {
       value: item.clientApiKeyRef,
@@ -100,11 +109,11 @@ type KeyAccountDisplayItem = UsageKeyAccountBreakdownItem & {
 }
 
 const displayItems = computed<KeyAccountDisplayItem[]>(() =>
-  props.breakdown.items.map(item => ({
+  resolvedItems.value.map(item => ({
     ...item,
     rowKey: `${item.clientApiKeyRef}::${item.providerAccountRef}`,
     keyNameDisplay: pairName(item.clientApiKeyName, item.clientApiKeyRef),
-    accountNameDisplay: pairName(item.providerAccountName, item.providerAccountRef),
+    accountNameDisplay: accountIdentity({ name: item.providerAccountName, email: item.providerAccountEmail, reference: item.providerAccountRef }),
     successRate: item.requestCount > 0 ? item.successCount / item.requestCount : null,
     costDisplay: quotaCosts(item).map(cost => costText(cost.amount, cost.currency)).join(' + ') || '—',
   })),
@@ -169,7 +178,7 @@ function costText(amount: string | null, currency: string | null) {
       </div>
     </div>
     <KeyAccountQuotaCharts
-      :items="breakdown.items"
+      :items="resolvedItems"
       :loading="loading"
     />
 

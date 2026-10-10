@@ -151,7 +151,8 @@ const accountOptions = computed<SelectOption[]>(() =>
     const trimmedName = meta.name.trim()
     const trimmedRef = meta.ref.trim()
     const primary = trimmedName || trimmedRef || '未知'
-    const secondary = primary !== trimmedRef && trimmedRef ? trimmedRef : undefined
+    const email = props.items.find(item => item.providerAccountRef === meta.ref)?.providerAccountEmail
+    const secondary = email && email !== primary ? email : undefined
     return {
       label: primary,
       value: meta.ref,

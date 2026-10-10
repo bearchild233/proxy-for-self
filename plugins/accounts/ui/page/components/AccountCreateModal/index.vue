@@ -3,6 +3,7 @@ import type { AccountRow } from '../../constants'
 import type { AccountCreateForm, AccountImportMode } from './model'
 import type { AccountGroup } from '@/api'
 import { Openai, Xai } from '@boxicons/vue'
+import AccountPlanBadge from '@kit/accounts/AccountPlanBadge.vue'
 import { Copy, LayoutGrid, Settings2 } from '@lucide/vue'
 import { computed } from 'vue'
 import BaseButton from '@/components/base/BaseButton.vue'
@@ -15,8 +16,8 @@ import { accountModelAccessError } from '../../utils/modelAccess'
 import { parseAccountSchedulingForm } from '../../utils/schedulingForm'
 import AccountApiKeyFields from '../AccountApiKeyFields.vue'
 import AccountIdentityCell from '../AccountIdentityCell.vue'
-import AccountPlanBadge from '@kit/accounts/AccountPlanBadge.vue'
 import AccountImportFields from './AccountImportFields.vue'
+import AccountMetadataFields from './AccountMetadataFields.vue'
 import AccountOAuthFields from './AccountOAuthFields.vue'
 import AccountSetupFields from './AccountSetupFields.vue'
 import { accountProxyError } from './model'
@@ -55,8 +56,11 @@ const view = computed(() => resolveAccountCreatePresentation({
 const mode = computed({
   get: () => form.value.mode,
   set: (value: string) => {
-    if (!props.reauthorizing && view.value.modeOptions.some(option => option.value === value))
+    if (!props.reauthorizing && view.value.modeOptions.some(option => option.value === value)) {
       form.value.mode = value as AccountImportMode
+      if (value === 'api_key' && !form.value.apiKey.name.trim())
+        form.value.apiKey.name = form.value.name.trim()
+    }
   },
 })
 const importText = computed({
@@ -163,6 +167,7 @@ function continueToImport() {
           :uploadable="view.importInput.uploadable"
           :disabled="busy"
         />
+        <AccountMetadataFields v-if="!reauthorizing" v-model="form" :disabled="busy" :show-name="mode !== 'api_key'" />
       </template>
     </div>
 

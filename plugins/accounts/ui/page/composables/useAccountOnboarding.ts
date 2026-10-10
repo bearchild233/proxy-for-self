@@ -13,6 +13,7 @@ import { isRecord } from '@/utils/object'
 import { formatProviderLabel, isSupportedProvider } from '@/utils/providers'
 import { generateRequestId } from '@/utils/uuid'
 import { accountImportSettings, accountProxyError, emptyAccountCreateForm } from '../components/AccountCreateModal/model'
+import { applyAccountImportName } from '../utils/importName'
 import { apiKeyAccountError, emptyApiKeyAccountForm } from '../utils/upstreamApiKey'
 
 type AccountRow = Awaited<ReturnType<typeof getAccounts>>['items'][number]
@@ -97,7 +98,7 @@ export function useAccountOnboarding(options: {
           submissionId,
           items: documents.map(entry => ({
             provider: entry.provider,
-            data: entry.document,
+            data: applyAccountImportName(entry.document, createForm.value.name),
             settings: accountImportSettings(createForm.value),
             outboundProxyId: createForm.value.proxyMode === 'proxy' ? createForm.value.proxyId.trim() : undefined,
           })),
@@ -197,7 +198,7 @@ export function useAccountOnboarding(options: {
     const account = reauthorizingAccount.value
     return {
       provider: createForm.value.provider,
-      name: account?.name || account?.email || `${createForm.value.provider} OAuth`,
+      name: account?.name || account?.email || createForm.value.name.trim() || `${createForm.value.provider} OAuth`,
     }
   }
 
@@ -227,6 +228,7 @@ export function useAccountOnboarding(options: {
     [
       () => createForm.value.proxyMode,
       () => createForm.value.proxyMode === 'proxy' ? createForm.value.proxyId.trim() : '',
+      () => reauthorizingAccount.value ? '' : createForm.value.name.trim(),
     ],
     () => {
       createForm.value.oauthFlowId = ''
@@ -296,6 +298,8 @@ function isOpenAiTokenImportMode(value: string): value is OpenAiTokenImportMode 
 }
 
 function providerImportDocuments(value: unknown, provider: ImportProvider): MixedImportDocument[] {
+  if (Array.isArray(value))
+    return [{ provider, document: { accounts: value } }]
   if (isRecord(value) && Array.isArray(value.documents)) {
     const documents = parseMixedImportDocuments(value)
       .filter(entry => entry.provider === provider)

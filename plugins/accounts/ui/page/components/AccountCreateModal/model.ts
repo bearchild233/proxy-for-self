@@ -11,6 +11,7 @@ export type AccountImportInputMode = Exclude<AccountImportMode, 'oauth' | 'api_k
 export interface AccountCreateForm {
   provider: AccountCreateProvider | ''
   apiKey: ApiKeyAccountForm
+  name: string
   notes: string
   enabled: boolean
   concurrencyLimit: string
@@ -31,6 +32,7 @@ export function emptyAccountCreateForm(): AccountCreateForm {
   return {
     provider: '',
     apiKey: emptyApiKeyAccountForm(),
+    name: '',
     notes: '',
     enabled: true,
     concurrencyLimit: '',

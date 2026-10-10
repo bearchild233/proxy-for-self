@@ -5,6 +5,7 @@ import { Minimize2 } from '@lucide/vue'
 import BaseTable from '@/components/base/BaseTable/index.vue'
 import ProviderIconGroup from '@/components/ProviderIconGroup.vue'
 import {
+  usageAccountEmail,
   usageAccountText,
   usageAuthenticationKind,
   usageIsCompact,
@@ -62,6 +63,9 @@ withDefaults(
         :title="usageAccountText(row)"
       >
         {{ usageAccountText(row) }}
+      </span>
+      <span v-if="usageAccountEmail(row)" class="mt-1 block max-w-full truncate font-mono text-cp-xs text-cp-text-quaternary" :title="usageAccountEmail(row)">
+        {{ usageAccountEmail(row) }}
       </span>
       <span
         v-if="row.accountNotes?.trim()"
