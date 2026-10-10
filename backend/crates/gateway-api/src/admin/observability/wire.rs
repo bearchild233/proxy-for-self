@@ -784,8 +784,16 @@ pub struct KeyAccountBreakdownItemView {
     pub success_count: u64,
     pub failure_count: u64,
     pub total_tokens: u64,
+    pub costs: Vec<KeyAccountCostView>,
     pub cost_amount: Option<String>,
     pub cost_currency: Option<String>,
+}
+
+/// 按币种独立计量，金额不跨币种相加。
+#[derive(Debug, Serialize)]
+pub struct KeyAccountCostView {
+    pub currency: String,
+    pub amount: String,
 }
 
 /// 密钥 × 账号交叉聚合响应。

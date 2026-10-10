@@ -31,7 +31,6 @@ import AccountQuotaPanel from './components/AccountQuotaPanel/index.vue'
 import AccountQuotaSummaryCell from './components/AccountQuotaSummaryCell/index.vue'
 import AccountStatusBadge from './components/AccountStatusBadge/index.vue'
 import AccountSubscriptionCell from './components/AccountSubscriptionCell.vue'
-import AccountSyncStatus from './components/AccountSyncStatus.vue'
 import AccountTableActions from './components/AccountTableActions.vue'
 import AccountUsagePanel from './components/AccountUsagePanel.vue'
 import { useAccountBatchEditor } from './composables/useAccountBatchEditor'
@@ -48,8 +47,6 @@ const selectedIds = ref<Set<string>>(new Set())
 const { visibleColumns, columnOptions, setColumnVisible, setColumnOrder, resetColumns } = useTableColumns(accountColumns, 'accounts')
 const {
   refreshing,
-  lastRefreshedAt,
-  refreshMessage,
   refreshAccounts,
   loading,
   accounts,
@@ -205,12 +202,10 @@ async function updateLifecycle(account: Account, changes: { expiryPriority?: boo
 <template>
   <div class="flex min-h-0 w-full flex-col xl:h-full xl:overflow-hidden">
     <BasePageHeader
-      class="h-17"
       title="账号管理"
       description="维护账号池，查看可用性、配额与使用状态"
     >
       <template #actions>
-        <AccountSyncStatus :last-refreshed-at="lastRefreshedAt" :message="refreshMessage" />
         <BaseButton variant="secondary" :loading="refreshing || subscriptionsRefreshing" :disabled="loading || refreshing || subscriptionsRefreshing" @click="refreshPage">
           <template #icon>
             <RefreshCw class="size-4" />

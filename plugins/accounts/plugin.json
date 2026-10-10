@@ -1,6 +1,6 @@
 {
   "id": "accounts",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "protocol": 2,
   "kind": "ui",
   "sdk": 1,
@@ -52,10 +52,11 @@
     "settings.get.admin.settings.client-downloads.codex-desktop.windows",
     "accounts.avatar"
   ],
-  "releasedAt": "2026-10-08T19:10:34.046514+00:00",
+  "releasedAt": "2026-10-10T02:45:35.028671+00:00",
   "releaseNotes": [
     "后台同步保留列表、分页、选中及展开状态。",
-    "同步提示固定占位，加载图标原位替换，避免每 30 秒挤动页面。"
+    "删除常驻同步提示；窄窗口下标题与按钮自然排布，不与卡片重叠。",
+    "额度倒计时使用 d/h/m 缩写，完整重置时间保留在提示中。"
   ],
   "runtime": "vue-component",
   "hostApi": 1

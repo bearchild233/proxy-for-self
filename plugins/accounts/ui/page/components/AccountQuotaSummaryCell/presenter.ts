@@ -77,16 +77,30 @@ function quotaIdentity(value: string | null) {
 export function quotaResetCountdown(resetAt: string | null | undefined, now: number): string {
   const reset = resetAt ? Date.parse(resetAt) : Number.NaN
   if (!Number.isFinite(reset))
-    return '重置时间未提供'
+    return '—'
   const minutes = Math.ceil((reset - now) / 60_000)
   if (minutes <= 0)
-    return '已到重置时间，待刷新'
+    return '待同步'
   const days = Math.floor(minutes / 1440)
   const hours = Math.floor(minutes % 1440 / 60)
   const rest = minutes % 60
   if (days > 0)
-    return `${days}天${hours}小时后重置`
+    return hours ? `${days}d ${hours}h` : `${days}d`
   if (hours > 0)
-    return `${hours}小时${rest}分后重置`
-  return `${rest}分后重置`
+    return rest ? `${hours}h ${rest}m` : `${hours}h`
+  return `${rest}m`
+}
+
+export function quotaWindowAbbreviation(seconds: number | null, label: string): string {
+  if (seconds === 604800)
+    return 'Week'
+  if (seconds != null && seconds > 0) {
+    if (seconds % 86400 === 0)
+      return `${seconds / 86400}d`
+    if (seconds % 3600 === 0)
+      return `${seconds / 3600}h`
+    if (seconds % 60 === 0)
+      return `${seconds / 60}m`
+  }
+  return label
 }

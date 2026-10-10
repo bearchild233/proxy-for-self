@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import tarfile
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -11,6 +12,17 @@ from static_plugins import StaticPluginStore
 
 
 class StaticPluginTests(unittest.TestCase):
+    def test_sleeping_page_keeps_its_version_during_daily_lease_grace(self):
+        first = self.install()['current']
+        self.store.lease('groups', first)
+        self.install('2')
+        self.install('3')
+        with patch('static_plugins.time.time', return_value=time.time() + 600):
+            self.assertIn('version 1', self.store.page('groups', first, 'main', 'admin'))
+        with patch('static_plugins.time.time', return_value=time.time() + 86401):
+            self.store.cleanup('groups', self.store.state('groups'))
+            self.assertFalse((self.store.directory('groups') / 'releases' / first).exists())
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

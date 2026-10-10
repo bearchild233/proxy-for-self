@@ -721,6 +721,7 @@ pub(crate) fn admin_key_account_breakdown(
         success_count: observation.success_count,
         failure_count: observation.failure_count,
         total_tokens: observation.total_tokens,
+        costs: admin_currency_costs(observation.costs)?,
         cost_amount: admin_optional_decimal_amount(observation.cost_amount)?,
         cost_currency: observation.cost_currency,
     })

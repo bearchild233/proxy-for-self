@@ -10,8 +10,6 @@ pub(crate) const MAX_ACCOUNT_IDS: usize = 200;
 /// 概览卡只展示最近使用的四个账号；完整账号用量由账号管理页单独查询。
 pub(crate) const DASHBOARD_ACCOUNT_LIMIT: u16 = 4;
 pub(crate) const DIAGNOSTIC_LIMIT: i64 = 100;
-/// 密钥 × 账号交叉视图的行数上限；单页表格无需分页。
-pub(crate) const KEY_ACCOUNT_BREAKDOWN_LIMIT: i64 = 200;
 pub(crate) const ACCOUNT_USAGE_TIMELINE_HOURS: i64 = 24;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -709,6 +707,7 @@ pub struct KeyAccountBreakdownObservation {
     pub success_count: u64,
     pub failure_count: u64,
     pub total_tokens: u64,
+    pub costs: Vec<CurrencyCostTotal>,
     pub cost_amount: Option<DecimalAmount>,
     pub cost_currency: Option<String>,
 }

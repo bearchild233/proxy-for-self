@@ -4,7 +4,6 @@ import type { UsageKeyAccountBreakdownItem } from '@/api'
 import type { SelectOption } from '@/components/base/BaseSelect.vue'
 
 import {
-  decimalDisplayNumber,
   formatPercent,
   formatUsd,
 } from '@kit/format'
@@ -21,6 +20,7 @@ import {
   usageTooltipContent,
   usageTooltipItem,
 } from '../utils/chart'
+import { quotaAmount, quotaCosts } from '../utils/quota'
 
 const props = withDefaults(
   defineProps<{
@@ -55,6 +55,15 @@ interface MetaEntry {
   totalRequests: number
 }
 
+const selectedCurrency = ref('USD')
+const currencyOptions = computed<SelectOption[]>(() =>
+  [...new Set(props.items.flatMap(item => quotaCosts(item).map(cost => cost.currency)))].sort().map(currency => ({ label: currency, value: currency })),
+)
+watch(currencyOptions, (options) => {
+  if (!options.some(option => option.value === selectedCurrency.value))
+    selectedCurrency.value = options.find(option => option.value === 'USD')?.value ?? options[0]?.value ?? 'USD'
+}, { immediate: true })
+
 // Group all items by key to generate key options
 const keyMetas = computed<MetaEntry[]>(() => {
   const map = new Map<string, MetaEntry>()
@@ -70,7 +79,7 @@ const keyMetas = computed<MetaEntry[]>(() => {
       }
       map.set(ref, meta)
     }
-    const cost = decimalDisplayNumber(item.costAmount)
+    const cost = quotaAmount(item, selectedCurrency.value)
     if (cost != null && cost > 0) {
       meta.totalCost += cost
     }
@@ -118,7 +127,7 @@ const accountMetas = computed<MetaEntry[]>(() => {
       }
       map.set(ref, meta)
     }
-    const cost = decimalDisplayNumber(item.costAmount)
+    const cost = quotaAmount(item, selectedCurrency.value)
     if (cost != null && cost > 0) {
       meta.totalCost += cost
     }
@@ -220,7 +229,7 @@ const keyAccountSlices = computed<SliceItem[]>(() => {
     if (item.clientApiKeyRef !== selectedKey.value)
       continue
 
-    const costNum = decimalDisplayNumber(item.costAmount)
+    const costNum = quotaAmount(item, selectedCurrency.value)
     if (costNum == null || costNum <= 0)
       continue
 
@@ -232,7 +241,7 @@ const keyAccountSlices = computed<SliceItem[]>(() => {
         name: item.providerAccountName || '',
         cost: 0,
         requests: 0,
-        currency: item.costCurrency || 'USD',
+        currency: selectedCurrency.value,
       }
       groupMap.set(ref, entry)
     }
@@ -293,7 +302,7 @@ const accountKeySlices = computed<SliceItem[]>(() => {
     if (item.providerAccountRef !== selectedAccount.value)
       continue
 
-    const costNum = decimalDisplayNumber(item.costAmount)
+    const costNum = quotaAmount(item, selectedCurrency.value)
     if (costNum == null || costNum <= 0)
       continue
 
@@ -305,7 +314,7 @@ const accountKeySlices = computed<SliceItem[]>(() => {
         name: item.clientApiKeyName || '',
         cost: 0,
         requests: 0,
-        currency: item.costCurrency || 'USD',
+        currency: selectedCurrency.value,
       }
       groupMap.set(ref, entry)
     }
@@ -441,7 +450,7 @@ const emptyKeyText = computed(() => {
     return '当前范围暂无配额消耗记录'
   if (!selectedKey.value)
     return '请选择 API 密钥'
-  return '该 API 密钥在此时间段内无产生费用的账号消耗'
+  return `该 API 密钥在此时间段内没有 ${selectedCurrency.value} 费用`
 })
 
 const emptyAccountText = computed(() => {
@@ -449,7 +458,7 @@ const emptyAccountText = computed(() => {
     return '当前范围暂无配额消耗记录'
   if (!selectedAccount.value)
     return '请选择账号'
-  return '该账号在此时间段内无产生费用的密钥消耗'
+  return `该账号在此时间段内没有 ${selectedCurrency.value} 费用`
 })
 
 function legendItems(slices: SliceItem[]) {
@@ -501,6 +510,10 @@ function selectSource(panel: string, value: string) {
 
 <template>
   <div class="quota-charts">
+    <div v-if="currencyOptions.length > 1" class="col-span-full flex items-center justify-end gap-2">
+      <span class="text-cp-xs text-cp-text-secondary">费用币种</span>
+      <BaseSelect v-model="selectedCurrency" :options="currencyOptions" aria-label="费用币种" size="sm" class="w-28" />
+    </div>
     <section v-for="panel in panels" :key="panel.id" class="quota-chart-card rounded-cp-card" :aria-label="panel.title">
       <div class="flex items-start justify-between gap-3">
         <div class="min-w-0">
@@ -511,7 +524,7 @@ function selectSource(panel: string, value: string) {
             {{ panel.description }}
           </p>
         </div>
-        <span class="shrink-0 rounded-full bg-cp-fill-tertiary px-2 py-1 text-cp-xs text-cp-text-secondary">费用占比</span>
+        <span class="shrink-0 rounded-full bg-cp-fill-tertiary px-2 py-1 text-cp-xs text-cp-text-secondary">{{ selectedCurrency }} 费用占比</span>
       </div>
 
       <BaseSelect

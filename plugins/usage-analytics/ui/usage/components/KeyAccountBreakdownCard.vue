@@ -11,6 +11,7 @@ import { defineTableColumns } from '@/components/base/BaseTable/columns'
 import BaseTable from '@/components/base/BaseTable/index.vue'
 import CatalogFilter from '@/components/CatalogFilter.vue'
 import { formatLocalizedCompactNumber as formatCompactNumber } from '@/utils/number'
+import { quotaCosts } from '../utils/quota'
 import KeyAccountQuotaCharts from './KeyAccountQuotaCharts.vue'
 
 const props = withDefaults(
@@ -105,7 +106,7 @@ const displayItems = computed<KeyAccountDisplayItem[]>(() =>
     keyNameDisplay: pairName(item.clientApiKeyName, item.clientApiKeyRef),
     accountNameDisplay: pairName(item.providerAccountName, item.providerAccountRef),
     successRate: item.requestCount > 0 ? item.successCount / item.requestCount : null,
-    costDisplay: costText(item.costAmount, item.costCurrency),
+    costDisplay: quotaCosts(item).map(cost => costText(cost.amount, cost.currency)).join(' + ') || '—',
   })),
 )
 

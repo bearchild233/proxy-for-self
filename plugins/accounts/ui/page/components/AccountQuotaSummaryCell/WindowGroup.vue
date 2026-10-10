@@ -1,10 +1,10 @@
 <script setup lang="ts">
 import type { AccountQuotaWindow } from '../../constants'
 
+import { quotaWindowPresentation } from '@kit/accounts/AccountUsageWindow/presenter'
 import { computed } from 'vue'
 import { useUiClock } from '@/composables/useUiClock'
-import { quotaWindowPresentation } from '@kit/accounts/AccountUsageWindow/presenter'
-import { quotaResetCountdown } from './presenter'
+import { quotaResetCountdown, quotaWindowAbbreviation } from './presenter'
 
 const props = withDefaults(defineProps<{
   label: string
@@ -17,8 +17,8 @@ const props = withDefaults(defineProps<{
 const now = useUiClock()
 const windowItems = computed(() => props.windows.map(window => ({
   key: window.key,
-  reset: `${props.windows.length > 1 ? `${window.windowSeconds === 604800 ? '周' : window.windowLabelDisplay} · ` : ''}${quotaResetCountdown(window.resetAt, now.value.getTime())}`,
-  resetTitle: `${window.windowLabelDisplay} · ${window.resetAtDisplay}`,
+  reset: `${props.windows.length > 1 ? `${quotaWindowAbbreviation(window.windowSeconds, window.windowLabelDisplay)} · ` : ''}${quotaResetCountdown(window.resetAt, now.value.getTime())}`,
+  resetTitle: `${window.windowLabelDisplay} · 重置 ${window.resetAtDisplay}`,
   labelTooltip: window.labelDisplay,
   usedPercent: window.usedPercent,
   usedPercentDisplay: window.usedPercentDisplay,
@@ -73,7 +73,7 @@ const trackGridStyle = computed(() => ({
             :style="item.presentation.barStyle"
           />
         </div>
-        <span class="text-[10px] leading-normal text-cp-text-quaternary" :title="item.resetTitle">{{ item.reset }}</span>
+        <span class="min-w-0 truncate text-[10px] leading-normal whitespace-nowrap text-cp-text-quaternary" :title="item.resetTitle">{{ item.reset }}</span>
       </div>
     </div>
   </div>

@@ -254,7 +254,8 @@ class StaticPluginStore:
                 raise ValueError('插件未启用')
             self.manifest(plugin_id, version)
             temporary = directory / (lease_id + '.tmp')
-            temporary.write_text(json.dumps({'version':version,'expires':time.time()+120}))
+            # 挂载页允许浏览器休眠一天；旧包只有磁盘文件，不启动额外进程。
+            temporary.write_text(json.dumps({'version':version,'expires':time.time()+86400}))
             temporary.replace(path)
             return lease_id
 

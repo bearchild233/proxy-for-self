@@ -14,6 +14,7 @@ import { useAuthStore } from '@/stores/modules/auth'
 import { useThemeStore } from '@/stores/modules/theme'
 import { pinComponent, prepareComponent } from './componentResources'
 import { componentRuntime } from './componentRuntime'
+import { maintainPluginLease } from './leaseHeartbeat'
 import { loadPluginPage } from './pageResources'
 import { openPlugin, platformPlugins, refreshPlatform } from './platform'
 import { settingsActions } from './settingsActions'
@@ -53,15 +54,15 @@ let token = ''
 let generation = 0
 let pending = 0
 let bound: { id: string, version: string } | undefined
-let lease: string | undefined, leaseTimer: ReturnType<typeof setInterval> | undefined
+let stopLeaseHeartbeat: (() => void) | undefined
 let releasePage: (() => void) | undefined
 function releaseLease() {
   unpin?.()
   unpin = undefined
-  clearInterval(leaseTimer)
+  stopLeaseHeartbeat?.()
+  stopLeaseHeartbeat = undefined
   releasePage?.()
   releasePage = undefined
-  lease = undefined
 }
 function themeConfiguration() {
   return { mode: themeStore.themeMode, color: themeStore.themeColor, customColor: themeStore.customThemeColor, customization: themeStore.themeCustomization }
@@ -75,7 +76,7 @@ function sendContext() {
   })), '*')
 }
 let readyTimer: ReturnType<typeof setTimeout> | undefined
-async function load() {
+async function load(version = props.plugin.contentVersion) {
   releaseLease()
   const run = ++generation
   error.value = ''
@@ -84,9 +85,9 @@ async function load() {
   componentBridge = undefined
   token = crypto.randomUUID()
   clearTimeout(readyTimer)
-  if (!props.plugin.contentVersion)
+  if (!version)
     return
-  bound = { id: props.plugin.id, version: props.plugin.contentVersion }
+  bound = { id: props.plugin.id, version }
   const current = bound
   try {
     const result = await loadPluginPage(bound.id, bound.version, props.page.id)
@@ -94,19 +95,21 @@ async function load() {
       result.release()
       return
     }
-    lease = result.lease
     releasePage = result.release
-    leaseTimer = setInterval(() => {
-      if (bound && lease) {
-        void request({ url: '/api/plugin-platform/lease', method: 'POST', data: { ...bound, lease }, silent: true,
-        }).catch(() => {
-          error.value = '插件已停用或版本已失效，请重新打开'
-          html.value = ''
-          componentRoot.value = undefined
-          releaseLease()
-        })
-      }
-    }, 30000)
+    stopLeaseHeartbeat = maintainPluginLease({
+      renew: () => request({ url: '/api/plugin-platform/lease', method: 'POST', data: { ...current, lease: result.lease }, silent: true }),
+      async unavailable() {
+        if (run !== generation)
+          return
+        await refreshPlatform(true)
+        if (run !== generation)
+          return
+        const latest = platformPlugins.value.find(plugin => plugin.id === current.id)
+        // 同版本租约可直接续接；旧版本已回收时才自动加载当前版本。
+        if (latest?.contentVersion && latest.contentVersion !== current.version)
+          await load(latest.contentVersion)
+      },
+    })
     const styles = document.documentElement.style
     const theme = Object.fromEntries(Array.from(styles).filter(key => key.startsWith('--cp-')).map(key => [key, styles.getPropertyValue(key)]))
     const context = { ...props.context, active: props.active !== false, settingsShell: props.page.layout === 'settings', presentation: props.page.route ? 'page' : 'popup', route: props.page.route || '/', role: auth.session?.role, apiBaseUrl: `${location.origin}/v1`, theme, themeConfiguration: themeConfiguration(), plugins: platformPlugins.value }
@@ -325,7 +328,7 @@ onScopeDispose(() => {
 <template>
   <div ref="container" class="component-plugin flex min-h-0 flex-1 flex-col" :style="{ '--plugin-content-height': contentHeight }">
     <div v-if="error" role="alert" class="rounded-cp bg-cp-error-container p-4 text-cp-error-text">
-      {{ error }} <button type="button" class="ml-3 underline" @click="load">
+      {{ error }} <button type="button" class="ml-3 underline" @click="load()">
         重新打开
       </button>
     </div>

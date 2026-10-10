@@ -13,9 +13,9 @@ export function resetPlatform() {
   platformPlugins.value = []
   resetPageResources()
 }
-export async function refreshPlatform() {
+export async function refreshPlatform(silent = false) {
   const epoch = sessionEpoch
-  const plugins = await request<PlatformPlugin[]>({ url: '/api/plugin-platform/catalog' })
+  const plugins = await request<PlatformPlugin[]>({ url: '/api/plugin-platform/catalog', silent })
   if (epoch !== sessionEpoch)
     return
   // 目录内容未变化时不触发所有驻留页面的响应式更新。

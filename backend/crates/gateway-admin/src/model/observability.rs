@@ -1178,6 +1178,7 @@ pub struct KeyAccountBreakdownObservation {
     pub success_count: u64,
     pub failure_count: u64,
     pub total_tokens: u64,
+    pub costs: Vec<CurrencyCost>,
     pub cost_amount: Option<DecimalAmount>,
     pub cost_currency: Option<String>,
 }

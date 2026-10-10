@@ -633,7 +633,7 @@ pub(crate) fn push_diagnostic_dimension_filter(
 ///
 /// 只依赖 `model_requests`（含账号快照）与 `client_api_keys`；账号显示名取最近快照
 /// （email 优先、name 其次、ref 兜底），密钥显示名取 `client_api_keys.name`，缺失回退 ref。
-/// 成本按币种分组合计后取该组合中金额最大的币种作为展示币种，避免跨币种相加失真。
+/// 返回范围内所有组合；总请求与 Token 只计一次，费用按币种独立合计。
 pub(crate) async fn usage_key_account_breakdown(
     pool: &PgPool,
     range: ObservabilityRange,
@@ -657,47 +657,23 @@ pub(crate) async fn usage_key_account_breakdown(
     push_unrecovered_request_filter(&mut statement, "mr");
     push_usage_filter(&mut statement, filter, "mr");
     statement.push(
-        "), per_currency as (
+        "), aggregated as (
            select client_api_key_ref, provider_account_ref, cost_currency,
+                  grouping(cost_currency)::integer as currency_grouping,
                   count(*)::bigint as request_count,
                   count(*) filter (where outcome = 'succeeded')::bigint as success_count,
                   count(*) filter (where outcome = 'failed')::bigint as failure_count,
                   coalesce(sum(total_tokens) filter (where is_completed_usage), 0)::bigint
                     as total_tokens,
-                  sum(cost_amount) filter (where is_completed_usage) as cost_amount
+                  sum(cost_amount) filter (where is_completed_usage)::text as amount
              from matched
-            group by client_api_key_ref, provider_account_ref, cost_currency
-         ), ranked_currency as (
-           select client_api_key_ref, provider_account_ref, cost_currency,
-                  row_number() over (
-                    partition by client_api_key_ref, provider_account_ref
-                    order by cost_amount desc nulls last, request_count desc
-                  ) as currency_rank
-             from per_currency
-         ), totals as (
-           select client_api_key_ref, provider_account_ref,
-                  sum(request_count)::bigint as request_count,
-                  sum(success_count)::bigint as success_count,
-                  sum(failure_count)::bigint as failure_count,
-                  sum(total_tokens)::bigint as total_tokens,
-                  sum(cost_amount) as cost_amount
-             from per_currency
-            group by client_api_key_ref, provider_account_ref
+            group by client_api_key_ref, provider_account_ref,
+                     grouping sets ((), (cost_currency))
          )
-         select totals.client_api_key_ref, totals.provider_account_ref,
-                totals.request_count, totals.success_count, totals.failure_count,
-                totals.total_tokens, totals.cost_amount::text as cost_amount,
-                ranked_currency.cost_currency
-           from totals
-           join ranked_currency
-             on ranked_currency.client_api_key_ref = totals.client_api_key_ref
-            and ranked_currency.provider_account_ref = totals.provider_account_ref
-            and ranked_currency.currency_rank = 1
-          order by totals.request_count desc, totals.client_api_key_ref,
-                   totals.provider_account_ref
-          limit ",
+         select * from aggregated
+          order by client_api_key_ref, provider_account_ref,
+                   currency_grouping desc, cost_currency nulls last",
     );
-    statement.push_bind(KEY_ACCOUNT_BREAKDOWN_LIMIT);
     let rows = statement
         .build()
         .fetch_all(pool)
@@ -706,9 +682,25 @@ pub(crate) async fn usage_key_account_breakdown(
     let mut observations = Vec::with_capacity(rows.len());
     let mut account_refs = Vec::with_capacity(rows.len());
     let mut key_refs = Vec::with_capacity(rows.len());
+    let mut costs = HashMap::<(String, String), Vec<CurrencyCostTotal>>::new();
     for row in &rows {
         let client_api_key_ref = get::<String>(row, "client_api_key_ref")?;
         let provider_account_ref = get::<String>(row, "provider_account_ref")?;
+        if get::<i32>(row, "currency_grouping")? == 0 {
+            if let (Some(currency), Some(amount)) = (
+                get::<Option<String>>(row, "cost_currency")?,
+                get::<Option<String>>(row, "amount")?,
+            ) {
+                costs
+                    .entry((client_api_key_ref, provider_account_ref))
+                    .or_default()
+                    .push(CurrencyCostTotal {
+                        currency,
+                        amount: DecimalAmount::from_str(&amount)?,
+                    });
+            }
+            continue;
+        }
         observations.push(KeyAccountBreakdownObservation {
             client_api_key_ref: client_api_key_ref.clone(),
             client_api_key_name: client_api_key_ref.clone(),
@@ -718,11 +710,9 @@ pub(crate) async fn usage_key_account_breakdown(
             success_count: unsigned(row, "success_count")?,
             failure_count: unsigned(row, "failure_count")?,
             total_tokens: unsigned(row, "total_tokens")?,
-            cost_amount: match get::<Option<String>>(row, "cost_amount")? {
-                Some(amount) => Some(DecimalAmount::from_str(&amount)?),
-                None => None,
-            },
-            cost_currency: get(row, "cost_currency")?,
+            costs: Vec::new(),
+            cost_amount: None,
+            cost_currency: None,
         });
         account_refs.push(provider_account_ref);
         key_refs.push(client_api_key_ref);
@@ -730,6 +720,17 @@ pub(crate) async fn usage_key_account_breakdown(
     let account_names = diagnostic_account_display_names(pool, &account_refs).await?;
     let key_names = diagnostic_api_key_display_names(pool, &key_refs).await?;
     for observation in &mut observations {
+        observation.costs = costs
+            .remove(&(
+                observation.client_api_key_ref.clone(),
+                observation.provider_account_ref.clone(),
+            ))
+            .unwrap_or_default();
+        // 旧版单币种字段只在恰有一种费用时提供，混合币种不能伪造合计。
+        if let [cost] = observation.costs.as_slice() {
+            observation.cost_amount = Some(cost.amount.clone());
+            observation.cost_currency = Some(cost.currency.clone());
+        }
         if let Some(name) = key_names.get(&observation.client_api_key_ref) {
             observation.client_api_key_name = name.clone();
         }
@@ -737,5 +738,11 @@ pub(crate) async fn usage_key_account_breakdown(
             observation.provider_account_name = name.clone();
         }
     }
+    observations.sort_by(|a, b| {
+        b.request_count
+            .cmp(&a.request_count)
+            .then_with(|| a.client_api_key_ref.cmp(&b.client_api_key_ref))
+            .then_with(|| a.provider_account_ref.cmp(&b.provider_account_ref))
+    });
     Ok(observations)
 }

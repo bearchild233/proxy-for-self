@@ -1,6 +1,6 @@
 {
   "id": "usage-analytics",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "protocol": 2,
   "kind": "ui",
   "sdk": 1,
@@ -63,12 +63,12 @@
     "usage.get.admin.usage.records.detail",
     "usage.get.admin.usage.records.summary"
   ],
-  "releasedAt": "2026-10-09T14:34:11+00:00",
+  "releasedAt": "2026-10-10T02:45:35.028671+00:00",
   "releaseNotes": [
-    "配额消耗支持按账号或 API 密钥查询，历史用量中的身份也可筛选。",
-    "恢复完整消耗明细，固定表头并支持独立滚动；环图配套展示费用、请求数与占比。",
-    "修复图表提示气泡被裁切的问题，长名称自动换行并避开屏幕边缘。",
-    "筛选与后台刷新共用请求序列，避免旧查询结果覆盖新选择。",
+    "配额消耗支持按账号或 API 密钥查询，历史身份也可筛选。",
+    "费用按币种分别统计；环图只比较所选币种，明细展示所有币种。",
+    "查询返回当前时间范围内的全部密钥与账号组合。",
+    "筛选与后台刷新避免旧结果覆盖新选择，明细独立滚动。",
     "依赖宿主提供并授权 usage.get.admin.usage.insights.key-account 能力。"
   ],
   "runtime": "vue-component",

@@ -468,6 +468,7 @@ export interface UsageKeyAccountBreakdownItem {
   successCount: number
   failureCount: number
   totalTokens: number
+  costs?: { currency: string, amount: string }[]
   costAmount: string | null
   costCurrency: string | null
 }

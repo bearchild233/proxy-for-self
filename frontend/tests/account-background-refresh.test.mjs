@@ -5,8 +5,6 @@ import { stripTypeScriptTypes } from 'node:module'
 // eslint-disable-next-line test/no-import-node-test -- 与仓库现有逻辑测试共用内置 runner
 import test from 'node:test'
 import * as Vue from 'vue'
-import { compileScript, parse } from 'vue/compiler-sfc'
-import { renderToString } from 'vue/server-renderer'
 import { refreshAccountPage } from '../../plugins/accounts/ui/page/utils/refreshAccountPage.ts'
 
 function load(path, name, deps) {
@@ -108,24 +106,4 @@ test('repeated failed synchronization does not clear then reinsert the same stat
     assert.deepEqual(messages, [])
   }
   finally { f.stop() }
-})
-
-test('sync status has identical fixed layout for initial, success and long error states', async () => {
-  const filename = '../../plugins/accounts/ui/page/components/AccountSyncStatus.vue'
-  const descriptor = parse(readFileSync(new URL(filename, import.meta.url), 'utf8'), { filename }).descriptor
-  const script = compileScript(descriptor, { id: 'sync-status', inlineTemplate: true })
-  const code = stripTypeScriptTypes(script.content, { mode: 'strip' })
-    .replace(/import \{([^}]+)\} from ["']vue["']/g, (_, names) => `const {${names.replace(/\bas\b/g, ':')}} = Vue`)
-    .replace('export default', 'return')
-  const component = new Function('Vue', code)(Vue)
-  const layouts = []
-  for (const message of ['', '已同步', '上游请求失败；'.repeat(40)]) {
-    const html = await renderToString(Vue.createSSRApp(component, { lastRefreshedAt: message ? '2026-10-08 12:00:00' : '', message }))
-    layouts.push([...html.matchAll(/class="([^"]+)"/g)].map(m => m[1]))
-    assert.equal((html.match(/<span/g) || []).length, 2)
-    assert.match(html, /h-10 w-80/)
-    assert.match(html, /h-5 truncate/)
-  }
-  assert.deepEqual(layouts[0], layouts[1])
-  assert.deepEqual(layouts[1], layouts[2])
 })

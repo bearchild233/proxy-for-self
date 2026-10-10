@@ -1318,6 +1318,14 @@ pub(crate) fn key_account_breakdown_view(
                 success_count: item.success_count,
                 failure_count: item.failure_count,
                 total_tokens: item.total_tokens,
+                costs: item
+                    .costs
+                    .iter()
+                    .map(|cost| KeyAccountCostView {
+                        currency: cost.currency.clone(),
+                        amount: cost.amount.to_string(),
+                    })
+                    .collect(),
                 cost_amount: item.cost_amount.as_ref().map(ToString::to_string),
                 cost_currency: item.cost_currency,
             })

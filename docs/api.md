@@ -1374,7 +1374,12 @@ errorCode, errorMessage, startedAt, completedAt, expiresAt, createdAt, updatedAt
 | `GET` | `/api/admin/usage/records/summary` | 当前筛选条件的请求汇总 |
 | `GET` | `/api/admin/usage/insights/overview` | 用量、成本与成功率洞察 |
 | `GET` | `/api/admin/usage/insights/diagnostics` | 按维度聚合诊断 |
+| `GET` | `/api/admin/usage/insights/key-account` | 密钥与账号双向费用归因，返回范围内全部组合 |
 | `GET` | `/api/admin/operations/errors` | 运维错误分页列表 |
+
+`key-account` 复用时间范围、provider、model、statusCode、search 筛选，返回完整 `items`。
+每个密钥与账号组合的 `costs` 为 `{currency, amount}` 数组，按币种独立合计。
+兼容字段 `costAmount`、`costCurrency` 只在单币种时有值，多币种或未知费用为 `null`；请求数与 Token 不重复累计。
 
 Dashboard 的 `capacityInfo.maxConcurrentPerAccount` 为默认账号并发上限，`0` 表示不限制。
 `capacityInfo.totalSlots` 为 `number | null`；可用账号池含无限并发账号时为 `null`，此时 `availableSlots` 也为 `null`。
