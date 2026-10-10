@@ -100,6 +100,7 @@ pub(super) struct AdminHarness {
     settings: Arc<dyn SettingsStore>,
     backup: BackupStorePorts,
     providers: Vec<Arc<dyn ProviderAdmin>>,
+    snapshot: Arc<dyn SnapshotControl>,
     probe: Arc<dyn AccountProbe>,
     system: Arc<dyn SystemOperations>,
     client_key_verifier: Arc<dyn ClientKeyVerifier>,
@@ -126,6 +127,7 @@ impl AdminHarness {
                 Arc::new(UnavailableProvider::new("xai")),
             ],
             probe: Arc::new(UnavailableProbe),
+            snapshot: Arc::new(NoopSnapshot),
             system: Arc::new(UnavailableSystem),
             client_key_verifier: Arc::new(UnavailableClientKeyVerifier),
         }
@@ -203,6 +205,11 @@ impl AdminHarness {
         self
     }
 
+    pub(super) fn snapshot(mut self, snapshot: Arc<dyn SnapshotControl>) -> Self {
+        self.snapshot = snapshot;
+        self
+    }
+
     pub(super) fn proxies(
         mut self,
         proxies: Arc<dyn gateway_admin::ports::proxy::ProxyStore>,
@@ -248,7 +255,7 @@ impl AdminHarness {
                 backup_policy: None,
                 pricing_source: Arc::new(UnavailablePricingSource),
                 providers: self.providers,
-                snapshot: Arc::new(NoopSnapshot),
+                snapshot: self.snapshot,
                 account_probe: self.probe,
                 proxy_probe: Arc::new(proxies::TestProxies::default()),
                 client_distribution: Arc::new(NoopClientDistribution),

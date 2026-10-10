@@ -608,19 +608,30 @@ impl AccountsService for DefaultAccountsService {
     ) -> Result<AccountUpdateResult, AdminError> {
         let account_id = ProviderAccountId::new(command.account_id.clone())
             .map_err(|_| AdminError::invalid("Provider 账号 ID 不合法"))?;
-        let (_, provider) = self.provider_for_account(&account_id).await?;
-        let enabled = command.enabled;
+        let (stored, provider) = self.provider_for_account(&account_id).await?;
+        // 名称、备注、分组不改变 Provider 模型目录；不要让这类保存等待上游目录。
+        let provider_facts_changed = command.enabled != stored.account.enabled
+            || command.concurrency_limit != stored.account.concurrency_limit
+            || command.weight != stored.account.weight
+            || command
+                .model_access
+                .as_ref()
+                .is_some_and(|access| access != &stored.account.model_access)
+            || command.outbound_proxy.is_some();
+        let became_disabled = stored.account.enabled && !command.enabled;
         let result = self
             .accounts
             .update_account(command, context)
             .await
             .map_err(|error| map_store_error(error, "provider account"))?;
-        if !enabled {
+        if became_disabled {
             provider.account_unavailable(&account_id).await;
         }
-        provider
-            .account_facts_changed(std::slice::from_ref(&account_id))
-            .await;
+        if provider_facts_changed {
+            provider
+                .account_facts_changed(std::slice::from_ref(&account_id))
+                .await;
+        }
         publish_committed(self.snapshot.as_ref(), result.config_revision).await?;
         Ok(result)
     }
@@ -674,6 +685,14 @@ impl AccountsService for DefaultAccountsService {
                 .1
                 .push(account_id.clone());
         }
+        // 仅分组更新仍需发布新的路由快照，复用现有 Provider 目录。
+        let provider_facts_changed = command.enabled.is_some()
+            || command.concurrency_limit.is_some()
+            || command.weight.is_some()
+            || command.model_access.is_some()
+            || command.outbound_proxy.is_some()
+            || command.expiry_priority.is_some()
+            || command.restore_archived;
         let enabled = command.enabled;
         let result = self
             .accounts
@@ -686,7 +705,9 @@ impl AccountsService for DefaultAccountsService {
                     provider.account_unavailable(account_id).await;
                 }
             }
-            provider.account_facts_changed(provider_ids).await;
+            if provider_facts_changed {
+                provider.account_facts_changed(provider_ids).await;
+            }
         }
         publish_committed(self.snapshot.as_ref(), result.config_revision).await?;
         Ok(result)

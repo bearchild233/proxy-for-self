@@ -1591,6 +1591,115 @@ async fn accounts_update_should_not_notify_provider_when_store_commit_fails() {
 }
 
 #[tokio::test]
+async fn accounts_metadata_update_keeps_provider_catalog_and_publishes_committed_revision() {
+    let events = events();
+    let provider = FakeProviderAdmin::new("openai", events.clone());
+    let store = FakeAccountStore::new("openai", events.clone());
+    let snapshot = Arc::new(RecordedSnapshot::default());
+    let services = super::AdminHarness::new()
+        .accounts(store.clone())
+        .provider(provider)
+        .snapshot(snapshot.clone())
+        .build()
+        .await;
+    let result = services
+        .accounts()
+        .update(
+            &context("metadata-update"),
+            UpdateAccount {
+                name: Some("renamed account".to_owned()),
+                notes: Some("notes".to_owned()),
+                account_id: "acct_test".to_owned(),
+                enabled: true,
+                concurrency_limit: None,
+                weight: gateway_core::account::AccountWeight::DEFAULT,
+                model_access: Some(Default::default()),
+                group_ids: vec![
+                    gateway_core::routing::AccountGroupId::new(
+                        "grp_00000000000000000000000000000091",
+                    )
+                    .expect("group"),
+                ],
+                outbound_proxy: None,
+            },
+        )
+        .await
+        .expect("metadata update");
+    assert_eq!(result.config_revision, revision(2));
+    assert_eq!(
+        recorded(&events),
+        ["store.load_account", "store.update_account"]
+    );
+    assert_eq!(store.audit_requests(), ["metadata-update"]);
+    assert_eq!(
+        *snapshot.0.lock().expect("revisions"),
+        [gateway_core::routing::ConfigRevision::new(2).expect("revision")]
+    );
+}
+
+#[tokio::test]
+async fn accounts_group_only_batch_update_keeps_provider_catalog_and_publishes_committed_revision()
+{
+    let events = events();
+    let provider = FakeProviderAdmin::new("openai", events.clone());
+    let store = FakeAccountStore::new("openai", events.clone());
+    let snapshot = Arc::new(RecordedSnapshot::default());
+    let services = super::AdminHarness::new()
+        .accounts(store.clone())
+        .provider(provider)
+        .snapshot(snapshot.clone())
+        .build()
+        .await;
+    let result = services
+        .accounts()
+        .batch_update(
+            &context("group-only-update"),
+            BatchUpdateAccounts {
+                expiry_priority: None,
+                restore_archived: false,
+                account_ids: vec!["acct_test".to_owned()],
+                enabled: None,
+                concurrency_limit: None,
+                weight: None,
+                model_access: None,
+                group_ids: Some(vec![
+                    gateway_core::routing::AccountGroupId::new(
+                        "grp_00000000000000000000000000000091",
+                    )
+                    .expect("group"),
+                ]),
+                outbound_proxy: None,
+            },
+        )
+        .await
+        .expect("group update");
+    assert_eq!(result.config_revision, revision(2));
+    assert_eq!(
+        recorded(&events),
+        ["store.load_account", "store.batch_update_accounts"]
+    );
+    assert_eq!(store.audit_requests(), ["group-only-update"]);
+    assert_eq!(
+        *snapshot.0.lock().expect("revisions"),
+        [gateway_core::routing::ConfigRevision::new(2).expect("revision")]
+    );
+}
+
+#[derive(Default)]
+struct RecordedSnapshot(Mutex<Vec<gateway_core::routing::ConfigRevision>>);
+
+impl gateway_core::runtime::SnapshotControl for RecordedSnapshot {
+    fn publish_committed(
+        &self,
+        revision: gateway_core::routing::ConfigRevision,
+    ) -> BoxFuture<'_, ()> {
+        Box::pin(async move {
+            self.0.lock().expect("revisions").push(revision);
+        })
+    }
+}
+
+#[tokio::test]
 async fn accounts_batch_update_should_commit_once_and_notify_each_provider() {
     let events = events();
     let openai = FakeProviderAdmin::new("openai", events.clone());
