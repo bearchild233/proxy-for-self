@@ -1,10 +1,10 @@
 <script setup lang="ts">
 import type { AccountRow } from '../../constants'
 
-import { computed } from 'vue'
-import { groupedAccountQuotaWindows, visibleSummaryQuotaWindows } from '../../constants'
 import AccountUsageWindow from '@kit/accounts/AccountUsageWindow/index.vue'
 import { quotaWindowPresentation } from '@kit/accounts/AccountUsageWindow/presenter'
+import { computed } from 'vue'
+import { groupedAccountQuotaWindows, visibleSummaryQuotaWindows } from '../../constants'
 import AccountQuotaSummaryEntry from './Entry.vue'
 import { recentlyUsedQuotaEntry, representativeQuotaWindow } from './presenter'
 
@@ -76,6 +76,7 @@ const additionalEntryCount = computed(() => Math.max(summaryEntries.value.length
             :label="recentUsageEntry.label"
             :windows="recentUsageEntry.windows"
             :show-percentage="false"
+            :show-window-labels="account.planType?.toLowerCase() !== 'plus'"
           />
         </div>
         <span

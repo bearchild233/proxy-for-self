@@ -1,21 +1,23 @@
 <script setup lang="ts">
 import type { AccountQuotaWindow } from '../../constants'
 
-import { computed } from 'vue'
-
-import BasePopover from '@/components/base/BasePopover.vue'
-import { useUiClock } from '@/composables/useUiClock'
 import AccountRequestTimeline from '@kit/accounts/AccountUsageWindow/AccountRequestTimeline.vue'
+
 import AccountUsageWindow from '@kit/accounts/AccountUsageWindow/index.vue'
 import { resolveAccountUsageWindowPresentation } from '@kit/accounts/AccountUsageWindow/presenter'
+import { computed } from 'vue'
+import BasePopover from '@/components/base/BasePopover.vue'
+import { useUiClock } from '@/composables/useUiClock'
 import AccountQuotaWindowGroup from './WindowGroup.vue'
 
 const props = withDefaults(defineProps<{
   label: string | null
   windows: AccountQuotaWindow[]
   showPercentage?: boolean
+  showWindowLabels?: boolean
 }>(), {
   showPercentage: true,
+  showWindowLabels: true,
 })
 
 const now = useUiClock()
@@ -91,6 +93,7 @@ function quotaWindowCode(windowSeconds: number | null, role: AccountQuotaWindow[
           :label="summaryLabel"
           :windows="windows"
           :show-percentage="showPercentage"
+          :show-window-labels="showWindowLabels"
         />
         <AccountUsageWindow
           v-else

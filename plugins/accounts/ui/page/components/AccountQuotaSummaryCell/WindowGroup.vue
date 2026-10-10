@@ -10,14 +10,16 @@ const props = withDefaults(defineProps<{
   label: string
   windows: AccountQuotaWindow[]
   showPercentage?: boolean
+  showWindowLabels?: boolean
 }>(), {
   showPercentage: true,
+  showWindowLabels: true,
 })
 
 const now = useUiClock()
 const windowItems = computed(() => props.windows.map(window => ({
   key: window.key,
-  reset: `${props.windows.length > 1 ? `${quotaWindowAbbreviation(window.windowSeconds, window.windowLabelDisplay)} · ` : ''}${quotaResetCountdown(window.resetAt, now.value.getTime())}`,
+  reset: `${props.showWindowLabels && props.windows.length > 1 ? `${quotaWindowAbbreviation(window.windowSeconds, window.windowLabelDisplay)} · ` : ''}${quotaResetCountdown(window.resetAt, now.value.getTime())}`,
   resetTitle: `${window.windowLabelDisplay} · 重置 ${window.resetAtDisplay}`,
   labelTooltip: window.labelDisplay,
   usedPercent: window.usedPercent,
