@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import type { AccountRow } from '../constants'
-import { KeyRound, MoreHorizontal, Pencil, RefreshCw, RotateCcw, Trash2, Wifi } from '@lucide/vue'
+import type { OAuthExportFormat } from '../utils/oauthExport'
+import { Download, KeyRound, MoreHorizontal, Pencil, RefreshCw, RotateCcw, Trash2, Wifi } from '@lucide/vue'
 
 import BaseIconButton from '@/components/base/BaseIconButton.vue'
 import BaseMenuItem from '@/components/base/BaseMenuItem.vue'
@@ -13,6 +14,7 @@ defineProps<{
   refreshing: boolean
   testing: boolean
   diagnosticsEnabled: boolean
+  exportingOAuth: boolean
 }>()
 
 const emit = defineEmits<{
@@ -22,6 +24,7 @@ const emit = defineEmits<{
   test: [account: AccountRow]
   refresh: [accountId: string]
   reauthorize: [account: AccountRow]
+  exportOAuth: [account: AccountRow, format: OAuthExportFormat]
 }>()
 </script>
 
@@ -54,7 +57,7 @@ const emit = defineEmits<{
       </template>
 
       <template #default="{ close }">
-        <div class="w-40 p-1.5">
+        <div class="w-48 p-1.5">
           <BaseMenuItem
             v-if="diagnosticsEnabled"
             :loading="testing"
@@ -85,6 +88,27 @@ const emit = defineEmits<{
               <KeyRound class="size-3.5 text-cp-text-quaternary" />
             </template>
             重新授权
+          </BaseMenuItem>
+          <BaseMenuItem
+            v-if="account.authenticationKind === 'oauth'"
+            :loading="exportingOAuth"
+            :disabled="exportingOAuth"
+            @click.stop="(close(), emit('exportOAuth', account, 'proxy'))"
+          >
+            <template #icon>
+              <Download class="size-3.5 text-cp-text-quaternary" />
+            </template>
+            导出 OAuth JSON
+          </BaseMenuItem>
+          <BaseMenuItem
+            v-if="account.authenticationKind === 'oauth' && account.provider === 'openai'"
+            :disabled="exportingOAuth"
+            @click.stop="(close(), emit('exportOAuth', account, 'codex'))"
+          >
+            <template #icon>
+              <Download class="size-3.5 text-cp-text-quaternary" />
+            </template>
+            导出 Codex auth.json
           </BaseMenuItem>
           <BaseMenuItem
             :loading="recovering"

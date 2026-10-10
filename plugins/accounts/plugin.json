@@ -1,6 +1,6 @@
 {
   "id": "accounts",
-  "version": "0.3.5",
+  "version": "0.3.6",
   "protocol": 2,
   "kind": "ui",
   "sdk": 1,
@@ -55,7 +55,8 @@
   "releasedAt": "2026-10-10T03:36:16Z",
   "releaseNotes": [
     "账号导入时可直接填写名称和备注，支持 OAuth、Token、JSON 与 API Key。",
-    "批量导入的名称应用于本次所有账号，留空保留原有名称。"
+    "批量导入的名称应用于本次所有账号，留空保留原有名称。",
+    "OAuth 账号支持导出代理可重新导入的 JSON，以及 OpenAI 的 Codex auth.json。"
   ],
   "runtime": "vue-component",
   "hostApi": 1

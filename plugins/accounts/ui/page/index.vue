@@ -38,12 +38,14 @@ import { useAccountBatchEditor } from './composables/useAccountBatchEditor'
 import { useAccountEditor } from './composables/useAccountEditor'
 import { useAccountImportTasks } from './composables/useAccountImportTasks'
 import { useAccountMutations } from './composables/useAccountMutations'
+import { useAccountOAuthExport } from './composables/useAccountOAuthExport'
 import { useAccountsQuery } from './composables/useAccountsQuery'
 import { useAccountsTable } from './composables/useAccountsTable'
 import { useAccountSubscriptions } from './composables/useAccountSubscriptions'
 import { accountColumns, derivedAccountStatus } from './constants'
 
 const selectedIds = ref<Set<string>>(new Set())
+const { exportingOAuthIds, exportOAuth } = useAccountOAuthExport()
 const { visibleColumns, columnOptions, setColumnVisible, setColumnOrder, resetColumns } = useTableColumns(accountColumns, 'accounts')
 const {
   refreshing,
@@ -363,12 +365,14 @@ async function updateLifecycle(account: Account, changes: { expiryPriority?: boo
                 :deleting="deletingAccount"
                 :recovering="recoveringAccountIds.has(row.id)"
                 :refreshing="refreshingAccountIds.has(row.id)"
+                :exporting-oauth="exportingOAuthIds.has(row.id)"
                 :testing="false" :diagnostics-enabled="enabled('account-diagnostics')"
                 @edit="openAccountEdit"
                 @delete="requestDeleteAccount"
                 @recover="handleRecover"
                 @refresh="handleRefresh"
                 @reauthorize="openReauthorizeAccount"
+                @export-oauth="exportOAuth"
                 @test="openConnectionTest"
               />
             </template>
