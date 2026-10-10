@@ -4,7 +4,13 @@ interface LeaseHeartbeatOptions {
 }
 
 /** 临时网络失败不卸载页面；唤醒或恢复网络时立即续期，慢请求不重叠。 */
-export function maintainPluginLease(options: LeaseHeartbeatOptions, browser = { document, window, setTimeout, clearTimeout }) {
+export function maintainPluginLease(options: LeaseHeartbeatOptions, browser = {
+  document,
+  window,
+  // 浏览器原生定时器要求 Window 接收者，不能以包装对象作为 this 调用。
+  setTimeout: window.setTimeout.bind(window),
+  clearTimeout: window.clearTimeout.bind(window),
+}) {
   let stopped = false
   let pending = false
   let timer: ReturnType<typeof setTimeout> | undefined

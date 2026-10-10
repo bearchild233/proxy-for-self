@@ -3,6 +3,39 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { maintainPluginLease } from '../src/plugins/leaseHeartbeat.ts'
 
+test('default browser timers retain their required Window receiver', () => {
+  const document = new EventTarget()
+  document.hidden = false
+  const window = new EventTarget()
+  const tasks = new Map()
+  window.setTimeout = function (callback, delay) {
+    assert.equal(this, window, 'native timer receiver')
+    tasks.set(1, { callback, delay })
+    return 1
+  }
+  window.clearTimeout = function (id) {
+    assert.equal(this, window, 'native timer receiver')
+    tasks.delete(id)
+  }
+  const originals = new Map(['document', 'window', 'setTimeout', 'clearTimeout'].map(key => [key, Object.getOwnPropertyDescriptor(globalThis, key)]))
+  try {
+    for (const [key, value] of Object.entries({ document, window, setTimeout: window.setTimeout, clearTimeout: window.clearTimeout }))
+      Object.defineProperty(globalThis, key, { configurable: true, writable: true, value })
+    const stop = maintainPluginLease({ renew: async () => {}, unavailable: async () => {} })
+    assert.equal(tasks.get(1).delay, 30_000)
+    stop()
+    assert.equal(tasks.size, 0)
+  }
+  finally {
+    for (const [key, descriptor] of originals) {
+      if (descriptor)
+        Object.defineProperty(globalThis, key, descriptor)
+      else
+        delete globalThis[key]
+    }
+  }
+})
+
 function fixture(renew, unavailable = async () => {}) {
   const tasks = new Map()
   const document = new EventTarget()
