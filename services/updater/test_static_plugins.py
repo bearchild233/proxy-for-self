@@ -12,6 +12,15 @@ from static_plugins import StaticPluginStore
 
 
 class StaticPluginTests(unittest.TestCase):
+    def test_wrong_owner_cannot_change_active_release(self):
+        original = self.install()['current']
+        archive, digest = self.bundle('2')
+        with patch('static_plugins.os.geteuid', return_value=self.store.root.stat().st_uid + 1, create=True):
+            with self.assertRaisesRegex(PermissionError, '所有者'):
+                self.store.install('groups', archive, digest)
+        self.assertEqual(self.store.state('groups')['current'], original)
+        self.assertFalse((self.store.directory('groups') / 'releases' / digest).exists())
+
     def test_sleeping_page_keeps_its_version_during_daily_lease_grace(self):
         first = self.install()['current']
         self.store.lease('groups', first)

@@ -44,6 +44,10 @@ class StaticPluginStore:
     @contextmanager
     def mutation(self):
         # CLI 安装与 HTTP 管理可能处于不同进程，必须共用同一写锁。
+        # 发布目录的组权限只读；root 创建的 0750/0640 包会让服务用户失去
+        # 读取权限。写操作必须始终以插件存储所有者身份运行。
+        if hasattr(os, 'geteuid') and self.root.stat().st_uid != os.geteuid():
+            raise PermissionError('插件存储写操作必须使用目录所有者身份执行')
         with self.lock, (self.root / '.mutation.lock').open('a+b') as handle:
             if os.name == 'nt':
                 import msvcrt
