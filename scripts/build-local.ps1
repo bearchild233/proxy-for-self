@@ -21,5 +21,12 @@ $linuxRepo = & wsl.exe @wslArgs --exec wslpath -a -u $repo.Replace('\', '/')
 if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve the repository in WSL.' }
 $linuxRepo = $linuxRepo.Trim()
 Write-Host "Local Rust: CPU limit 4 cores, memory ${memoryMiB} MiB, $jobs Cargo job(s), incremental dev build."
-& wsl.exe @wslArgs --exec bash "$linuxRepo/scripts/build-local.sh" $linuxRepo $memoryMiB $jobs $Task $Package @CargoArgs
+$buildCommand = @('bash', "$linuxRepo/scripts/build-local.sh", $linuxRepo, $memoryMiB, $jobs, $Task, $Package) + $CargoArgs
+if ($Task -eq 'release') {
+    # Windows worktree 的 .git 指针不能由 Linux Git 解析，宿主先读取实际提交。
+    $buildSha = & git -C $repo rev-parse HEAD
+    if ($LASTEXITCODE -ne 0 -or $buildSha -notmatch '^[0-9a-f]{40}$') { throw 'Cannot resolve build commit.' }
+    $buildCommand = @('env', "CPR_GIT_SHA=$buildSha") + $buildCommand
+}
+& wsl.exe @wslArgs --exec @buildCommand
 if ($LASTEXITCODE -ne 0) { throw "Local Rust build failed (exit $LASTEXITCODE)." }

@@ -37,7 +37,8 @@ export RUST_MIN_STACK=16777216
 if [[ $task == release ]]; then
     # 本地发布构建使用较快的代码生成；正式发布仍由标准发布流程完成。
     export CARGO_INCREMENTAL=0 CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_CODEGEN_UNITS=8
-    CPR_GIT_SHA=$(git -C "$src" rev-parse HEAD)
+    CPR_GIT_SHA=${CPR_GIT_SHA:-$(git -C "$src" rev-parse HEAD)}
+    [[ $CPR_GIT_SHA =~ ^[0-9a-f]{40}$ ]] || exit 2
     CPR_BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     export CPR_GIT_SHA CPR_BUILD_TIME CPR_BUILD_TYPE=source-local
     command=(cargo build --release --locked -p "$package")
