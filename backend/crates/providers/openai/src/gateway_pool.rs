@@ -21,24 +21,31 @@ use std::{
 use tokio::sync::{Mutex, Semaphore};
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 pub struct GatewayPoolConfig {
     pub runtime_url: String,
     pub key_file: PathBuf,
+    /// 另一个控制面槽的私有入口；控制面 A/B 轮换后无需改网关配置。
+    #[serde(default)]
+    pub fallback_url: Option<String>,
 }
 impl GatewayPoolConfig {
     pub(crate) fn validate(&self) -> Result<(), ()> {
-        let url = url::Url::parse(&self.runtime_url).map_err(|_| ())?;
-        if url.scheme() != "http"
-            || url
-                .host_str()
-                .is_none_or(|host| host != "127.0.0.1" && host != "[::1]")
-            || url.username() != ""
-            || url.password().is_some()
-            || url.query().is_some()
-            || url.fragment().is_some()
-            || !self.key_file.is_absolute()
-        {
+        for value in std::iter::once(&self.runtime_url).chain(self.fallback_url.as_ref()) {
+            let url = url::Url::parse(value).map_err(|_| ())?;
+            if url.scheme() != "http"
+                || url
+                    .host_str()
+                    .is_none_or(|host| host != "127.0.0.1" && host != "[::1]")
+                || url.username() != ""
+                || url.password().is_some()
+                || url.query().is_some()
+                || url.fragment().is_some()
+            {
+                return Err(());
+            }
+        }
+        if !self.key_file.is_absolute() {
             return Err(());
         }
         Ok(())
@@ -96,6 +103,9 @@ struct Material {
 pub(crate) struct GatewayPoolService {
     http: Client,
     url: String,
+    fallback_url: Option<String>,
+    /// 最近一次可用的是备用入口。
+    prefer_fallback: std::sync::atomic::AtomicBool,
     key: SecretString,
     repository: CodexCredentialRepository,
     quota: Arc<CodexCredentialQuotaService>,
@@ -135,6 +145,8 @@ impl GatewayPoolService {
                 .build()
                 .map_err(|_| ())?,
             url: config.runtime_url.clone(),
+            fallback_url: config.fallback_url.clone(),
+            prefer_fallback: std::sync::atomic::AtomicBool::new(false),
             key: SecretString::from(key.trim().to_owned()),
             repository,
             quota,
@@ -151,14 +163,31 @@ impl GatewayPoolService {
         }))
     }
     async fn call(&self, value: Value) -> Result<Value, ()> {
-        let response = self
-            .http
-            .post(&self.url)
-            .bearer_auth(self.key.expose_secret())
-            .json(&value)
-            .send()
-            .await
-            .map_err(|_| ())?;
+        use std::sync::atomic::Ordering;
+        // 先用最近可用的入口；连接失败（控制面已轮换到另一槽）时改用另一个并记住。
+        let fallback = self.fallback_url.as_deref();
+        let use_fallback = fallback.is_some() && self.prefer_fallback.load(Ordering::Relaxed);
+        let (first, second) = if use_fallback {
+            (fallback.unwrap_or(&self.url), Some(self.url.as_str()))
+        } else {
+            (self.url.as_str(), fallback)
+        };
+        let send = |url: &str| {
+            self.http
+                .post(url)
+                .bearer_auth(self.key.expose_secret())
+                .json(&value)
+                .send()
+        };
+        let response = match send(first).await {
+            Ok(response) => response,
+            Err(error) if error.is_connect() && second.is_some() => {
+                let response = send(second.unwrap_or_default()).await.map_err(|_| ())?;
+                self.prefer_fallback.store(!use_fallback, Ordering::Relaxed);
+                response
+            }
+            Err(_) => return Err(()),
+        };
         if response.status() != 200 {
             return Err(());
         }

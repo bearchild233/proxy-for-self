@@ -89,6 +89,7 @@ async fn authorized_real_gateway_cache_experiment() {
         config.config.gateway_pool = Some(provider_openai::gateway_pool::GatewayPoolConfig {
             runtime_url: format!("{}/{lane}", input["runtimeUrl"].as_str().unwrap()),
             key_file: root.join("runtime.key"),
+            fallback_url: None,
         });
         let bundle = provider_openai::initialize(
             config.config.clone(),
@@ -318,6 +319,7 @@ async fn experiment_runner(
     config.config.gateway_pool = Some(provider_openai::gateway_pool::GatewayPoolConfig {
         runtime_url: format!("{}/{lane}", input["runtimeUrl"].as_str().unwrap()),
         key_file: root.join("runtime.key"),
+        fallback_url: None,
     });
     let bundle = provider_openai::initialize(
         config.config.clone(),
@@ -577,6 +579,7 @@ async fn authorized_real_header_only_experiment() {
     config.config.gateway_pool = Some(provider_openai::gateway_pool::GatewayPoolConfig {
         runtime_url: input["runtimeUrl"].as_str().unwrap().into(),
         key_file: root.join("runtime.key"),
+        fallback_url: None,
     });
     let bundle = provider_openai::initialize(
         config.config.clone(),
@@ -764,6 +767,7 @@ async fn run(exhausted: bool, tools: Value) -> (Vec<String>, usize) {
     config.config.gateway_pool = Some(provider_openai::gateway_pool::GatewayPoolConfig {
         runtime_url: runtime.uri(),
         key_file: key,
+        fallback_url: None,
     });
     let bundle = provider_openai::initialize(
         config.config.clone(),
@@ -902,6 +906,7 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_pool\",\"stat
     config.config.gateway_pool = Some(provider_openai::gateway_pool::GatewayPoolConfig {
         runtime_url: runtime.uri(),
         key_file: key,
+        fallback_url: None,
     });
     let bundle = provider_openai::initialize(
         config.config.clone(),
@@ -990,8 +995,10 @@ async fn pool_pinned_continuation_yields_to_active_window_account() {
     std::fs::write(&key, "a".repeat(64)).unwrap();
     config.config.api.base_url = upstream.uri();
     config.config.gateway_pool = Some(provider_openai::gateway_pool::GatewayPoolConfig {
-        runtime_url: runtime.uri(),
+        // 主入口是已关闭的控制面槽，必须自动改用备用入口。
+        runtime_url: "http://127.0.0.1:9/".into(),
         key_file: key,
+        fallback_url: Some(runtime.uri()),
     });
     let bundle = provider_openai::initialize(
         config.config.clone(),
@@ -1101,6 +1108,7 @@ async fn probe_retries(status: u16, phase: &'static str, recovers: bool) {
     config.config.gateway_pool = Some(provider_openai::gateway_pool::GatewayPoolConfig {
         runtime_url: runtime.uri(),
         key_file: key,
+        fallback_url: None,
     });
     let bundle = provider_openai::initialize(
         config.config.clone(),
@@ -1227,6 +1235,7 @@ async fn cache_experiment_reloads_account_projection_after_route_preparation() {
     config.config.gateway_pool = Some(provider_openai::gateway_pool::GatewayPoolConfig {
         runtime_url: runtime.uri(),
         key_file: key,
+        fallback_url: None,
     });
     let bundle = provider_openai::initialize(
         config.config.clone(),

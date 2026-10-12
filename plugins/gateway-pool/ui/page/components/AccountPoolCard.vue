@@ -10,6 +10,7 @@ const props = defineProps<{
   pairs: Pair[]
   windowSeconds: number
   probeModel: string
+  mode: 'lazy' | 'continuous'
   now: number
   catalog?: { at: number, gateways: CatalogEntry[] }
 }>()
@@ -22,7 +23,20 @@ const available = computed(() => props.pairs.filter(pair => pair.state === 'unkn
 const nextRecovery = computed(() => Math.min(...cooling.value.map(pair => pair.restUntil ?? Infinity)))
 const elapsed = computed(() => current.value?.firstContactAt ? props.now - current.value.firstContactAt : 0)
 const progress = computed(() => Math.min(1, elapsed.value / Math.max(1, props.windowSeconds)))
-const overdue = computed(() => elapsed.value >= props.windowSeconds)
+const cookieEnding = computed(() => current.value?.cookieExpiresAt != null && current.value.cookieExpiresAt - props.now <= 60)
+const overdue = computed(() => elapsed.value >= props.windowSeconds || cookieEnding.value)
+const idle = computed(() => current.value?.lastContactAt ? props.now - current.value.lastContactAt : 0)
+// 窗口用完后的三种情形：正在准备、懒模式等待下个请求、持续模式等待准备。
+const phase = computed(() => {
+  if (!overdue.value)
+    return { text: '满血窗口', tone: 'text-cp-text-secondary', bar: 'bg-cp-success' }
+  const reason = cookieEnding.value && elapsed.value < props.windowSeconds ? 'Cookie 即将到期' : '窗口已用完'
+  if (preparing.value)
+    return { text: `${reason}，正在准备下一个网关`, tone: 'text-cp-info-text', bar: 'bg-cp-info' }
+  if (props.mode === 'lazy')
+    return { text: `${reason} · 下个请求到来时切换`, tone: 'text-cp-text-tertiary', bar: 'bg-cp-text-quaternary' }
+  return { text: `${reason}，等待准备下一个`, tone: 'text-cp-warning-text', bar: 'bg-cp-warning' }
+})
 // 当前组合的票：打票模型自带，其余是窗口内按需拿到的。
 const tickets = computed(() => current.value ? [props.probeModel, ...(current.value.ticketModels ?? []).filter(model => model !== props.probeModel)] : [])
 const entries = computed(() => new Map((props.catalog?.gateways ?? []).map(entry => [entry.gateway, entry])))
@@ -97,15 +111,14 @@ function chipTitle(pair: Pair) {
 
         <div v-if="current" class="min-w-0">
           <div class="flex items-center justify-between text-cp-xs">
-            <span :class="overdue ? 'text-cp-warning' : 'text-cp-text-secondary'">
-              {{ overdue ? (preparing ? '窗口已到，正在准备下一个' : '窗口已到，继续服务至下一个就绪') : '满血窗口' }}
-            </span>
-            <span class="font-mono tabular-nums text-cp-text-secondary">{{ clock(elapsed) }} / {{ clock(windowSeconds) }}</span>
+            <span :class="phase.tone">{{ phase.text }}</span>
+            <span v-if="!overdue" class="font-mono tabular-nums text-cp-text-secondary">{{ clock(elapsed) }} / {{ clock(windowSeconds) }}</span>
+            <span v-else-if="!preparing && idle >= 5" class="tabular-nums text-cp-text-tertiary">已空闲 {{ duration(idle) }}</span>
           </div>
           <div class="mt-1.5 h-1.5 overflow-hidden rounded-full bg-cp-fill-tertiary">
             <div
               class="h-full rounded-full transition-[width] duration-1000 ease-linear"
-              :class="overdue ? 'bg-cp-warning' : 'bg-cp-success'"
+              :class="phase.bar"
               :style="{ width: `${progress * 100}%` }"
             />
           </div>

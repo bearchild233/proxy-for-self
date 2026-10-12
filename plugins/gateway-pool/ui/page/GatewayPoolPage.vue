@@ -222,6 +222,7 @@ usePluginPolling(refresh, shallowRef(10_000))
             :pairs="card.pairs"
             :window-seconds="settings?.windowSeconds ?? 180"
             :probe-model="settings?.probeModel ?? 'gpt-6.1-sol'"
+            :mode="settings?.mode ?? 'lazy'"
             :catalog="view?.catalogs?.[card.id]"
             :now="now"
           />
