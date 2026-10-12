@@ -1,5 +1,6 @@
 # proxy-for-self 维护约定
 
+- 从仓库根目录工作。开始修改前核对分支、工作区、worktree 和正在运行的维护任务。
 - 本目录是独立主仓库；不要依赖旧 excel-bridge/research 布局或开发者绝对路径。
 - 保持 API → Admin/Core → Store 分层；先读 docs/architecture.md 和 CONTRIBUTING.md。
 - Rust/Vue/Python 各组件有独立职责。保留现有修改，不回退其他人的工作。
@@ -19,3 +20,24 @@
 - 小幅界面文案及已有布局的显示细节修正，完成轻量验证后可直接热更新上线。较大布局或交互修改先展示具体预览并取得确认；后端实现和轻量验证可继续推进。部署或预览确认不代表 GitHub push 授权。
 - 全面插件化迁移先在独立端口、独立数据的测试环境部署验证，再供用户查看；只有用户确认测试结果后才能上线生产。不得把方案或外观确认当成生产部署授权。
 - 发布按 A/B 阶段执行：A 持续服务，B 在独立端口完成真实启动和接口验收，通过后才进入入口切换阶段。准备失败不得停止或重启 A；恢复按已完成阶段执行，一次恢复失败后禁止循环重启。主网关的单实例锁与在途会话必须有明确交接方案，不能以绕过锁或先停线上服务来验证新程序。
+
+## 按改动读取的文档
+
+| 文档 | 内容 |
+| --- | --- |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | 工具链、本地构建与检查入口 |
+| [docs/architecture.md](docs/architecture.md) | Rust 分层、冷流执行、调度与数据约束 |
+| [docs/api.md](docs/api.md) | 管理接口、字段、权限与账号生命周期 |
+| [docs/plugin-migration.md](docs/plugin-migration.md) | 插件 UI 包、能力授权、租约和热更新 |
+| [docs/plugins.md](docs/plugins.md) | Worker 与 Excel 生命周期 |
+| [docs/plugin-stage.md](docs/plugin-stage.md) | 本机隔离测试环境与接口验收 |
+| [docs/hermes-fast.md](docs/hermes-fast.md) | VPS 客户端补丁与升级核查 |
+| [deploy/ab-slots/README.md](deploy/ab-slots/README.md) | 主网关 A/B 发布、排空与恢复 |
+| [deploy/plugin-platform/README.md](deploy/plugin-platform/README.md) | 插件控制面身份、目录权限与发布 |
+| [deploy/login-security/README.md](deploy/login-security/README.md) | 可信来源、封禁和管理入口 |
+
+`docs/validation.md` 是历史验证记录，不能替代当前代码检查或现场验收。文档与源码冲突时，以当前源码、用户最新要求和实际服务状态为准，并修正过时文档。
+
+## 生产状态
+
+线上活动槽、二进制、插件版本和运行配置以 VPS 实际状态与 `/root/维护手册/` 为准，不以仓库版本字段或文档中的端口推断。
