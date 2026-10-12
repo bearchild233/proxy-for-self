@@ -91,6 +91,8 @@ class GatewayPool:
                 values = settings[field]
                 if not isinstance(values, list) or len(values) > 512 or any(not isinstance(v, str) or not re.fullmatch(pattern, v) for v in values) or len(set(values)) != len(values):
                     raise ValueError(field + '无效')
+            if not isinstance(settings['poolDirect'], bool):
+                raise ValueError('池服务直连设置无效')
             # 打票模型只接受官方模型标识格式；默认 6.1 Sol。
             if not isinstance(settings['probeModel'], str) or not re.fullmatch(r'gpt-[0-9a-z.-]{1,60}', settings['probeModel']):
                 raise ValueError('打票模型无效')

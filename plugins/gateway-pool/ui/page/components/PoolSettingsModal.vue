@@ -8,6 +8,7 @@ import BaseInput from '@/components/base/BaseInput.vue'
 import BaseModal from '@/components/base/BaseModal/index.vue'
 import BaseNumberInput from '@/components/base/BaseNumberInput.vue'
 import BaseSegmented from '@/components/base/BaseSegmented.vue'
+import BaseSwitch from '@/components/base/BaseSwitch.vue'
 import BaseTextarea from '@/components/base/BaseTextarea.vue'
 
 const props = defineProps<{
@@ -72,6 +73,7 @@ function submit() {
     windowSeconds: draft.value.windowSeconds,
     probeIntervalMs: draft.value.probeIntervalMs,
     probeModel: draft.value.probeModel.trim(),
+    poolDirect: draft.value.poolDirect,
     groupIds: draft.value.groupIds,
     gateways: gateways.value,
     poolUrl: draft.value.poolUrl.trim(),
@@ -162,6 +164,13 @@ function submit() {
           <BaseFormItem label="服务凭证">
             <BaseInput v-model="token" type="password" autocomplete="new-password" :placeholder="settings.poolTokenConfigured ? '已设置，留空保持不变' : '填写池服务 Bearer'" />
           </BaseFormItem>
+        </div>
+        <div class="flex items-start justify-between gap-4 rounded-cp border border-cp-border px-3 py-2.5">
+          <div class="grid gap-0.5">
+            <span class="text-cp-sm text-cp-text">池服务直连</span>
+            <span class="text-cp-xs text-cp-text-tertiary">取网关目录和 Cookie 时走服务器直连，避免账号代理无法访问池服务；打票与业务请求仍走账号出口。</span>
+          </div>
+          <BaseSwitch v-model="draft.poolDirect" label="池服务直连" />
         </div>
         <BaseFormItem label="限定网关（可选）" :description="gateways.length ? `只在这 ${gateways.length} 个网关中挑选，且须在池服务目录中` : '留空：跟随池服务当前可配对的网关，池中消失的网关自动不再作为候选'">
           <BaseTextarea v-model="gatewayText" :rows="4" placeholder="unified-142&#10;unified-143" class="font-mono" />

@@ -6,6 +6,7 @@ export interface Settings {
   maximumRestSeconds: number
   probeIntervalMs: number
   probeModel: string
+  poolDirect: boolean
   groupIds: string[]
   gateways: string[]
   poolAccountIds: Record<string, string>

@@ -72,6 +72,12 @@ struct Settings {
     /// 打票用模型；业务请求固定使用由它取得并验证的 S0。
     #[serde(default = "default_probe_model")]
     probe_model: String,
+    /// 取网关目录与 Cookie 时走 VPS 直连；打票、业务与额度请求仍走账号出口。
+    #[serde(default = "default_pool_direct")]
+    pool_direct: bool,
+}
+fn default_pool_direct() -> bool {
+    true
 }
 fn default_probe_model() -> String {
     "gpt-6.1-sol".into()
@@ -280,7 +286,11 @@ impl GatewayPoolService {
         }
         Ok(())
     }
-    fn pool_client<'a>(&'a self, account_client: &'a CodexBackendClient) -> &'a CodexBackendClient {
+    fn pool_client<'a>(
+        &'a self,
+        account_client: &'a CodexBackendClient,
+        settings: &Settings,
+    ) -> &'a CodexBackendClient {
         #[cfg(feature = "gateway-pool-experiment")]
         if self
             .direct_pool_experiment
@@ -288,7 +298,11 @@ impl GatewayPoolService {
         {
             return &self.client;
         }
-        account_client
+        if settings.pool_direct {
+            &self.client
+        } else {
+            account_client
+        }
     }
     /// 读取池服务目录，只保留可配对的网关；失败返回空值，控制面退回限定列表或上一份目录。
     async fn catalog(&self, account: &ProviderAccount, settings: &Settings) -> Value {
@@ -304,7 +318,7 @@ impl GatewayPoolService {
             return Value::Null;
         };
         let Ok(response) = self
-            .pool_client(&client)
+            .pool_client(&client, settings)
             .gateway_pool_catalog(&settings.pool_url, &settings.pool_token, &identity)
             .await
         else {
@@ -560,7 +574,7 @@ impl GatewayPoolService {
         let pool_id = pool_member_id(settings, account).ok_or(())?;
         let pool_id = &pool_id;
         let value = self
-            .pool_client(&client)
+            .pool_client(&client, settings)
             .gateway_pool_cookie(
                 &settings.pool_url,
                 &settings.pool_token,
