@@ -951,6 +951,85 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_pool\",\"stat
     );
 }
 
+/// 单窗口：续接请求的原账号没有窗口而窗口在别的账号上时，不另开窗口，
+/// 报告原账号不可调度，交给核心排除原账号后在持窗账号上重放。
+#[tokio::test]
+async fn pool_pinned_continuation_yields_to_active_window_account() {
+    use gateway_core::engine::ContinuationAttempt;
+    use gateway_core::engine::continuation::{
+        ContinuationBinding, NativeContinuationPin, PreviousResponseId,
+    };
+    use gateway_core::error::ProviderErrorKind;
+    let upstream = MockServer::start().await;
+    let runtime = MockServer::start().await;
+    let store = Arc::new(MemoryAccountStore::default());
+    store
+        .seed_oauth_credential(ImportCodexOAuthCredential {
+            account_id: ACCOUNT.into(),
+            name: "Demo".into(),
+            secret: secret("demo-token"),
+            verified_account: profile("demo-upstream"),
+            next_refresh_at: None,
+            enabled: true,
+        })
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(|input: &wiremock::Request| {
+            let data: Value = input.body_json().unwrap();
+            let value = match data["action"].as_str().unwrap() {
+                "config" => json!({"enabled":true,"groupIds":[GROUP],"probeIntervalMs":50}),
+                "active" => json!({"accounts":["acct_window_holder"]}),
+                other => panic!("unexpected runtime action {other}"),
+            };
+            ResponseTemplate::new(200).set_body_json(value)
+        })
+        .mount(&runtime)
+        .await;
+    let mut config = valid_config();
+    let key = config._runtime.path().join("pool.key");
+    std::fs::write(&key, "a".repeat(64)).unwrap();
+    config.config.api.base_url = upstream.uri();
+    config.config.gateway_pool = Some(provider_openai::gateway_pool::GatewayPoolConfig {
+        runtime_url: runtime.uri(),
+        key_file: key,
+    });
+    let bundle = provider_openai::initialize(
+        config.config.clone(),
+        provider_ports_with(store, Arc::new(TestOAuthPending::default())),
+    )
+    .await
+    .unwrap();
+    let pin = NativeContinuationPin::new(
+        PreviousResponseId::new("resp_previous"),
+        PreviousResponseId::new("resp_upstream"),
+        ClientApiKeyId::new("key_gateway_pool").unwrap(),
+        ProviderKind::new("openai").unwrap(),
+        ProviderAccountId::new(ACCOUNT).unwrap(),
+    );
+    let context = AttemptContext::new(
+        RequestAttemptContext::new(
+            ModelRequestId::new("req_gateway_pool_pinned").unwrap(),
+            ClientApiKeyId::new("key_gateway_pool").unwrap(),
+        ),
+        NonZeroU32::new(1).unwrap(),
+        SystemTime::now() + Duration::from_secs(10),
+        account_policy(),
+        AccountAttemptContext::new(BTreeSet::new(), None, None).with_account_scope(scope()),
+        Some(ContinuationBinding::Pinned(pin)),
+        CancellationToken::new(),
+    )
+    .with_continuation_attempt(ContinuationAttempt::Native);
+    let Err(error) = bundle
+        .core_provider()
+        .execute(request(json!([])), context)
+        .await
+    else {
+        panic!("pinned account without the window must yield");
+    };
+    assert_eq!(error.kind(), ProviderErrorKind::NoEligibleAccount);
+    assert!(upstream.received_requests().await.unwrap().is_empty());
+}
+
 // 走完整找票流程，响应体故意不是 SSE：探测只读头，错误最多重试一次。
 async fn probe_retries(status: u16, phase: &'static str, recovers: bool) {
     use std::sync::atomic::AtomicUsize;

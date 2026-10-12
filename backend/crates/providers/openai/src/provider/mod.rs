@@ -515,6 +515,19 @@ impl Provider for CodexProvider {
             Some(service) if pool_enabled => service.active_accounts().await,
             _ => Vec::new(),
         };
+        // 单窗口：续接请求的原账号没有窗口而窗口在别的账号上时，不为它另开窗口；
+        // 报告原账号不可调度，由核心排除原账号并用保存的历史在持窗账号上重放。
+        if context.continuation_attempt() == ContinuationAttempt::Native
+            && let Some(ContinuationBinding::Pinned(binding)) = context.continuation()
+            && pool_preferred
+                .first()
+                .is_some_and(|active| active != binding.account())
+        {
+            return Err(provider_error(
+                ProviderErrorKind::NoEligibleAccount,
+                UpstreamSendState::NotSent,
+            ));
+        }
         let selection_started_at = Instant::now();
         let lease = self
             .selector
