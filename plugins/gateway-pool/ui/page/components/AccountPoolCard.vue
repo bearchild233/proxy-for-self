@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import type { Pair } from '../model'
+import type { CatalogEntry, Pair } from '../model'
 import { ChevronDown, Clock, Radio, Ticket } from '@lucide/vue'
 import { computed, shallowRef } from 'vue'
 import BaseTag from '@/components/base/BaseTag.vue'
@@ -11,6 +11,7 @@ const props = defineProps<{
   windowSeconds: number
   probeModel: string
   now: number
+  catalog?: { at: number, gateways: CatalogEntry[] }
 }>()
 
 const expanded = shallowRef(false)
@@ -24,8 +25,15 @@ const progress = computed(() => Math.min(1, elapsed.value / Math.max(1, props.wi
 const overdue = computed(() => elapsed.value >= props.windowSeconds)
 // 当前组合的票：打票模型自带，其余是窗口内按需拿到的。
 const tickets = computed(() => current.value ? [props.probeModel, ...(current.value.ticketModels ?? []).filter(model => model !== props.probeModel)] : [])
+const entries = computed(() => new Map((props.catalog?.gateways ?? []).map(entry => [entry.gateway, entry])))
+// Cookie 剩余以组合记录的到期时间为准（Cookie 自身与池服务有效期取较早者）。
+const cookieLeft = computed(() => current.value?.cookieExpiresAt ? current.value.cookieExpiresAt - props.now : null)
+// 池服务目录里还没有访问过的网关同样是候选，按“可检测”展示。
+const fresh = computed(() => (props.catalog?.gateways ?? [])
+  .filter(entry => !props.pairs.some(pair => pair.gateway === entry.gateway))
+  .map(entry => ({ accountId: '', gateway: entry.gateway, state: 'unknown', inFlight: 0 }) as Pair))
 const order: Record<string, number> = { ready: 0, preparing: 1, draining: 2, cooling: 3, unknown: 4 }
-const sorted = computed(() => [...props.pairs].sort((a, b) =>
+const sorted = computed(() => [...props.pairs, ...fresh.value].sort((a, b) =>
   order[a.state] - order[b.state] || (a.restUntil ?? 0) - (b.restUntil ?? 0) || a.gateway.localeCompare(b.gateway, undefined, { numeric: true })))
 
 function chipClass(pair: Pair) {
@@ -40,7 +48,12 @@ function chipClass(pair: Pair) {
   return 'border-dashed border-cp-border text-cp-text-secondary'
 }
 function chipTitle(pair: Pair) {
-  const parts = [`${pair.gateway} · ${stateLabels[pair.state]}`]
+  const entry = entries.value.get(pair.gateway)
+  const parts = [`${pair.gateway}${entry?.country ? ` · ${entry.country}` : ''} · ${stateLabels[pair.state]}`]
+  if (entry)
+    parts.push(`池中 Cookie 剩余 ${duration(entry.validForS - (props.now - (props.catalog?.at ?? props.now)))}`)
+  else if (props.catalog)
+    parts.push('当前不在池服务目录中')
   if (pair.state === 'cooling' && pair.restUntil)
     parts.push(pair.restUntil > props.now ? `还需静置 ${duration(pair.restUntil - props.now)}` : '静置已结束，可重新检测')
   if (pair.restSeconds)
@@ -105,13 +118,16 @@ function chipTitle(pair: Pair) {
           <BaseTag v-for="model in tickets" :key="model" size="sm" :type="model === probeModel ? 'primary' : 'info'">
             <span class="flex items-center gap-1 whitespace-nowrap"><Ticket class="size-3" aria-hidden="true" />{{ model }}</span>
           </BaseTag>
+          <BaseTag v-if="cookieLeft != null" size="sm" :type="cookieLeft < 120 ? 'warning' : 'neutral'" title="Cookie 到期前 60 秒开始准备下一个组合">
+            <span class="whitespace-nowrap">Cookie {{ duration(cookieLeft) }}</span>
+          </BaseTag>
           <BaseTag v-if="current?.inFlight" size="sm" type="neutral">
             在途 {{ current.inFlight }}
           </BaseTag>
         </div>
       </div>
       <div class="hidden shrink-0 items-center gap-3 text-cp-xs text-cp-text-secondary lg:flex">
-        <span title="可检测 / 静置中">{{ available.length }} / {{ cooling.length }}</span>
+        <span title="可检测 / 静置中">{{ available.length + fresh.length }} / {{ cooling.length }}</span>
         <ChevronDown class="size-4 transition-transform" :class="{ 'rotate-180': expanded }" aria-hidden="true" />
       </div>
     </button>

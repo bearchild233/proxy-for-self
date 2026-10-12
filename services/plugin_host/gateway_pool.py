@@ -27,6 +27,7 @@ class GatewayPool:
                 CREATE TABLE IF NOT EXISTS observations (id INTEGER PRIMARY KEY, at REAL NOT NULL, account TEXT NOT NULL, gateway TEXT NOT NULL, data TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS switches (id INTEGER PRIMARY KEY, at REAL NOT NULL, account TEXT NOT NULL, data TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS materials (account TEXT NOT NULL, generation TEXT NOT NULL, expires REAL NOT NULL, data TEXT NOT NULL, PRIMARY KEY(account,generation));
+                CREATE TABLE IF NOT EXISTS catalogs (account TEXT PRIMARY KEY, at REAL NOT NULL, data TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS model_tickets (account TEXT NOT NULL, generation TEXT NOT NULL, model TEXT NOT NULL, expires REAL NOT NULL, data TEXT NOT NULL, PRIMARY KEY(account,generation,model));
                 CREATE INDEX IF NOT EXISTS observations_pair ON observations(account,gateway,at);
             ''')
@@ -102,10 +103,10 @@ class GatewayPool:
             token = settings.get('poolToken', '')
             if not isinstance(token, str) or len(token) > 1024 or any(ord(c) < 33 or ord(c) > 126 for c in token):
                 raise ValueError('池服务凭证无效')
-            # 已删除的候选立即退役，已发送的租约仍可排空；未发送的旧预约会被 sent 拒绝。
+            # 限定网关时，被移出的候选立即退役；已发送的租约仍可排空，未发送的旧预约会被 sent 拒绝。
             for row in db.execute('SELECT data FROM pairs').fetchall():
                 pair = json.loads(row['data'])
-                if pair['gateway'] not in settings['gateways'] and pair['state'] in {'ready','preparing'}:
+                if settings['gateways'] and pair['gateway'] not in settings['gateways'] and pair['state'] in {'ready','preparing'}:
                     policy.retire(pair, settings, degraded=False)
                     policy.settle(pair)
                     self.save(db,pair)
@@ -177,6 +178,13 @@ class GatewayPool:
             db.execute("DELETE FROM model_tickets WHERE expires<=? OR NOT EXISTS (SELECT 1 FROM pairs p WHERE p.account=model_tickets.account AND json_extract(p.data,'$.generation')=model_tickets.generation AND json_extract(p.data,'$.state')='ready')", (now,))
             if action == 'config':
                 return {**settings, 'enabled': True}
+            if action == 'active':
+                # 降智分组只用一个满血窗口：先返回持有窗口的账号（最新在前），再返回正在找票的账号。
+                rows = [json.loads(r['data']) for r in db.execute('SELECT data FROM pairs')]
+                ready = sorted((p for p in rows if p['state'] == 'ready'), key=lambda p: -(p.get('verifiedAt') or 0))
+                preparing = [p for p in rows if p['state'] == 'preparing']
+                accounts = list(dict.fromkeys(p['accountId'] for p in ready + preparing))
+                return {'accounts': accounts}
             account = data['accountId']
             if not isinstance(account, str) or not re.fullmatch(r'[A-Za-z0-9:_-]{1,128}', account):
                 raise ValueError('账号标识无效')
@@ -187,17 +195,29 @@ class GatewayPool:
                 row = db.execute('SELECT data FROM model_tickets WHERE account=? AND generation=? AND model=? AND expires>?', (account, data['generation'], self.model(data), now)).fetchone()
                 return json.loads(row['data']) if row else None
             if action in {'plan', 'claim'}:
-                candidates = settings['gateways']
-                pairs = [self.pair(db, account, gateway) for gateway in candidates]
-                ready = next((p for p in pairs if p['state'] == 'ready'), None)
+                catalog = self.catalog(db, account, data.get('catalog'), now)
+                # 默认跟随池服务目录；设置了限定网关时只在其中挑选。目录不可用时退回限定列表。
+                gateways = [entry['gateway'] for entry in catalog] if catalog is not None else list(settings['gateways'])
+                if settings['gateways'] and catalog is not None:
+                    gateways = [gateway for gateway in gateways if gateway in settings['gateways']]
+                entries = {entry['gateway']: entry for entry in catalog or []}
+                pairs = [self.pair(db, account, gateway) for gateway in gateways]
+                # 正在服务的组合即使暂时不在目录中，也继续服务到窗口或 Cookie 到期。
+                ready = next((json.loads(r['data']) for r in db.execute('SELECT data FROM pairs WHERE account=?', (account,)) if json.loads(r['data'])['state'] == 'ready'), None)
                 due = ready and policy.rotation_due(ready, settings, now, demand=data.get('demand') is True)
                 candidates = [p for p in pairs if p['state'] == 'unknown' or p['state'] == 'cooling' and p.get('restUntil', 0) <= now]
-                candidates.sort(key=lambda p: (p.get('lastContactAt', 0), p['gateway']))
+                candidates.sort(key=lambda p: policy.candidate_order(p, entries.get(p['gateway']), settings))
+                pairs = [json.loads(r['data']) for r in db.execute('SELECT data FROM pairs WHERE account=?', (account,))]
                 probe = candidates[0] if candidates and (data.get('demand') is True or settings['mode'] == 'continuous') and (not ready or due) else None
                 if action == 'plan':
                     return {'ready': ready, 'probe': probe, 'rotationDue': bool(due), 'preparing': any(p['state'] == 'preparing' for p in pairs)}
                 if not probe or any(p['state'] == 'preparing' for p in pairs):
                     return {'claimed': False}
+                # 其他账号已有未到期窗口或正在找票时不另开窗口，请求会转到那个账号。
+                for row in db.execute('SELECT data FROM pairs WHERE account<>?', (account,)):
+                    other = json.loads(row['data'])
+                    if other['state'] == 'preparing' or other['state'] == 'ready' and not policy.rotation_due(other, settings, now, demand=True):
+                        return {'claimed': False}
                 generation = uuid.uuid4().hex
                 probe.update(generation=generation, state='preparing', probeRestSeconds=probe.get('restSeconds') if probe.get('lastContactAt') is not None else None,
                              observedIdleSeconds=max(0, now-probe['lastContactAt']) if probe.get('lastContactAt') is not None else None,
@@ -269,13 +289,16 @@ class GatewayPool:
                 db.execute('INSERT INTO observations(at,account,gateway,data) VALUES (?,?,?,?)', (now, account, lease['gateway'], json.dumps(sample)))
                 if pair.get('generation') == lease['generation']:
                     if lease['kind'] == 'probe':
-                        if verdict == '21' and pair['gateway'] in settings['gateways'] and pair['state'] == 'preparing':
+                        if verdict == '21' and (not settings['gateways'] or pair['gateway'] in settings['gateways']) and pair['state'] == 'preparing':
                             material = data.get('material')
                             if material is not None:
                                 self.check_material(material, now)
                                 db.execute('INSERT OR REPLACE INTO materials VALUES (?,?,?,?)', (account, lease['generation'], material['expires'], json.dumps(material)))
+                            if material is not None:
+                                pair['cookieExpiresAt'] = material['expires']
                             policy.recover(pair, settings, pair.get('probeRestSeconds'))
-                            previous = db.execute('SELECT data FROM pairs WHERE account=? AND gateway<>?', (account, lease['gateway'])).fetchall()
+                            # 新窗口就绪后，整个分组的旧窗口都退役；未发送的请求随之切到新窗口。
+                            previous = db.execute('SELECT data FROM pairs WHERE NOT (account=? AND gateway=?)', (account, lease['gateway'])).fetchall()
                             previous_pair = None
                             for row in previous:
                                 old = json.loads(row['data'])
@@ -294,7 +317,7 @@ class GatewayPool:
                                     prior = db.execute("SELECT data FROM observations WHERE account=? AND gateway=? AND at<? AND json_extract(data,'$.firstContactAt') IS NOT NULL ORDER BY id DESC LIMIT 1", (account, old_gateway, pair['preparationStartedAt'])).fetchone()
                                     if prior:
                                         previous_pair = {**previous_pair, 'firstContactAt':json.loads(prior['data'])['firstContactAt']}
-                            switch = {'fromGateway': previous_pair['gateway'] if previous_pair else None, 'toGateway': pair['gateway'],
+                            switch = {'fromAccount': previous_pair['accountId'] if previous_pair else None, 'fromGateway': previous_pair['gateway'] if previous_pair else None, 'toGateway': pair['gateway'],
                                       'previousWindowSeconds': now-previous_pair['firstContactAt'] if previous_pair and previous_pair.get('firstContactAt') is not None else None,
                                       'preparationSeconds': now-pair['preparationStartedAt']}
                             db.execute('INSERT INTO switches(at,account,data) VALUES (?,?,?)', (now, account, json.dumps(switch)))
@@ -321,6 +344,25 @@ class GatewayPool:
             policy.settle(pair)
             self.save(db, pair)
             return {'accepted': True}
+
+    @staticmethod
+    def catalog(db, account, supplied, now):
+        """保存网关传来的池服务目录；未传时使用 5 分钟内的上一份。"""
+        if supplied is not None:
+            if not isinstance(supplied, list) or len(supplied) > 512:
+                raise ValueError('网关目录无效')
+            entries = []
+            for entry in supplied:
+                gateway = entry.get('gateway') if isinstance(entry, dict) else None
+                valid = entry.get('validForS') if isinstance(entry, dict) else None
+                country = entry.get('country') if isinstance(entry, dict) else None
+                if not isinstance(gateway, str) or not re.fullmatch(r'unified-[0-9]{1,6}', gateway) or isinstance(valid, bool) or not isinstance(valid, (int, float)) or not 0 <= valid <= 86400 or (country is not None and (not isinstance(country, str) or not re.fullmatch(r'[A-Z]{2}', country))):
+                    raise ValueError('网关目录无效')
+                entries.append({'gateway': gateway, 'validForS': valid, 'country': country})
+            db.execute('INSERT OR REPLACE INTO catalogs VALUES (?,?,?)', (account, now, json.dumps(entries)))
+            return entries
+        row = db.execute('SELECT at, data FROM catalogs WHERE account=?', (account,)).fetchone()
+        return json.loads(row['data']) if row and now - row['at'] <= 300 else None
 
     @staticmethod
     def model(data):
@@ -362,4 +404,5 @@ class GatewayPool:
                 switch_where.append("(json_extract(data,'$.fromGateway')=? OR json_extract(data,'$.toGateway')=?)"); switch_args.extend([gateway,gateway])
             condition = ' WHERE '+' AND '.join(switch_where) if switch_where else ''
             switches = [{**json.loads(r['data']), 'at':r['at'], 'accountId':r['account']} for r in db.execute('SELECT * FROM switches'+condition+' ORDER BY id DESC LIMIT ?', [*switch_args,limit])]
-            return {'settings': settings, 'pairs': pairs, 'observations': samples, 'switches': switches}
+            catalogs = {r['account']: {'at': r['at'], 'gateways': json.loads(r['data'])} for r in db.execute('SELECT * FROM catalogs' + (' WHERE account=?' if account else ''), [account] if account else [])}
+            return {'settings': settings, 'pairs': pairs, 'observations': samples, 'switches': switches, 'catalogs': catalogs}

@@ -504,6 +504,17 @@ impl Provider for CodexProvider {
                     state.continuation_scope == OpenAiContinuationScope::ConnectionLocal
                 }) || matches!(context.continuation(), Some(ContinuationBinding::Pinned(binding))
                         if binding.scope() == NativeContinuationScope::ConnectionLocal)));
+        let pool_enabled = if let Some(service) = self.gateway_pool.as_ref() {
+            service.enabled_for(&context).await.map_err(|_| {
+                provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent)
+            })?
+        } else {
+            false
+        };
+        let pool_preferred = match self.gateway_pool.as_ref() {
+            Some(service) if pool_enabled => service.active_accounts().await,
+            _ => Vec::new(),
+        };
         let selection_started_at = Instant::now();
         let lease = self
             .selector
@@ -517,6 +528,7 @@ impl Provider for CodexProvider {
                 cyber_policy_session_key.as_ref(),
                 session_affinity.as_ref(),
                 requires_websocket,
+                &pool_preferred,
             )
             .await
             .map_err(map_selection_error)?;
@@ -671,13 +683,6 @@ impl Provider for CodexProvider {
             CodexProviderTransport::HttpOnly
         } else {
             requested_transport
-        };
-        let pool_enabled = if let Some(service) = self.gateway_pool.as_ref() {
-            service.enabled_for(&context).await.map_err(|_| {
-                provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent)
-            })?
-        } else {
-            false
         };
         let transport = if pool_enabled {
             // 判据依赖 HTTP 200 响应头，WS 没有逐次响应头，不能误判成 21，直接拒绝。

@@ -163,7 +163,7 @@ function submit() {
             <BaseInput v-model="token" type="password" autocomplete="new-password" :placeholder="settings.poolTokenConfigured ? '已设置，留空保持不变' : '填写池服务 Bearer'" />
           </BaseFormItem>
         </div>
-        <BaseFormItem label="候选网关" :description="`共 ${gateways.length} 个，每行一个或用逗号分隔`">
+        <BaseFormItem label="限定网关（可选）" :description="gateways.length ? `只在这 ${gateways.length} 个网关中挑选，且须在池服务目录中` : '留空：跟随池服务当前可配对的网关，池中消失的网关自动不再作为候选'">
           <BaseTextarea v-model="gatewayText" :rows="4" placeholder="unified-142&#10;unified-143" class="font-mono" />
         </BaseFormItem>
         <p v-if="invalidGateways.length" role="alert" class="text-cp-xs text-cp-error-text">

@@ -28,12 +28,39 @@ impl CodexBackendClient {
         account: &str,
         gateway: &str,
     ) -> Result<serde_json::Value, ()> {
+        self.gateway_pool_get(
+            base,
+            token,
+            "cookie",
+            &[("account", account), ("gateway", gateway)],
+            16384,
+        )
+        .await
+    }
+    /// 池服务当前为该成员维护的网关目录（含 Cookie 剩余秒数与地区）。
+    pub(crate) async fn gateway_pool_catalog(
+        &self,
+        base: &str,
+        token: &str,
+        account: &str,
+    ) -> Result<serde_json::Value, ()> {
+        self.gateway_pool_get(base, token, "gateways", &[("account", account)], 262_144)
+            .await
+    }
+    async fn gateway_pool_get(
+        &self,
+        base: &str,
+        token: &str,
+        path: &str,
+        query: &[(&str, &str)],
+        limit: usize,
+    ) -> Result<serde_json::Value, ()> {
         let response = self
             .client
-            .get(format!("{}/cookie", base.trim_end_matches('/')))
+            .get(format!("{}/{path}", base.trim_end_matches('/')))
             .header(reqwest::header::USER_AGENT, "proxy-for-self")
             .bearer_auth(token)
-            .query(&[("account", account), ("gateway", gateway)])
+            .query(query)
             .timeout(std::time::Duration::from_secs(5))
             .send()
             .await
@@ -45,7 +72,7 @@ impl CodexBackendClient {
         let mut bytes = Vec::new();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|_| ())?;
-            if bytes.len() + chunk.len() > 16384 {
+            if bytes.len() + chunk.len() > limit {
                 return Err(());
             }
             bytes.extend_from_slice(&chunk);

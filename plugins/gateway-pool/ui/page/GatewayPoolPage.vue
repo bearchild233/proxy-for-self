@@ -68,7 +68,11 @@ const tabOptions = [
   { label: '切换记录', value: 'switches' },
 ]
 const accountOptions = computed(() => [{ label: '全部账号', value: '' }, ...accountCards.value.map(card => ({ label: card.name, value: card.id }))])
-const gatewayOptions = computed(() => [{ label: '全部网关', value: '' }, ...(settings.value?.gateways ?? []).map(gateway => ({ label: gateway, value: gateway }))])
+const knownGateways = computed(() => [...new Set([
+  ...(view.value?.pairs ?? []).map(pair => pair.gateway),
+  ...Object.values(view.value?.catalogs ?? {}).flatMap(catalog => catalog.gateways.map(entry => entry.gateway)),
+])].sort((a, b) => a.localeCompare(b, undefined, { numeric: true })))
+const gatewayOptions = computed(() => [{ label: '全部网关', value: '' }, ...knownGateways.value.map(gateway => ({ label: gateway, value: gateway }))])
 const observations = computed(() => (view.value?.observations ?? []).filter(sample =>
   (!accountFilter.value || sample.account === accountFilter.value) && (!gatewayFilter.value || sample.gateway === gatewayFilter.value)))
 const switches = computed(() => (view.value?.switches ?? []).filter(item =>
@@ -218,6 +222,7 @@ usePluginPolling(refresh, shallowRef(10_000))
             :pairs="card.pairs"
             :window-seconds="settings?.windowSeconds ?? 180"
             :probe-model="settings?.probeModel ?? 'gpt-6.1-sol'"
+            :catalog="view?.catalogs?.[card.id]"
             :now="now"
           />
           <BaseEmpty
@@ -322,7 +327,7 @@ usePluginPolling(refresh, shallowRef(10_000))
                 </td>
                 <td class="px-3 py-2">
                   <span class="flex items-center gap-2 font-mono text-cp-xs">
-                    <span :class="item.fromGateway ? 'text-cp-text-secondary' : 'text-cp-text-tertiary'">{{ item.fromGateway ?? '首次' }}</span>
+                    <span :class="item.fromGateway ? 'text-cp-text-secondary' : 'text-cp-text-tertiary'">{{ item.fromAccount && item.fromAccount !== item.accountId ? `${names.get(item.fromAccount) ?? item.fromAccount} · ` : '' }}{{ item.fromGateway ?? '首次' }}</span>
                     <ArrowRight class="size-3.5 text-cp-text-tertiary" aria-hidden="true" />
                     <span class="text-cp-success-text">{{ item.toGateway }}</span>
                   </span>

@@ -74,6 +74,51 @@ class GatewayPoolTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.call('ticket', generation=generation, model='GPT 6')
 
+    def test_candidates_follow_pool_catalog_and_cookie_expiry_rotates(self):
+        self.pool.configure({'gateways': []})
+        catalog = [{'gateway': 'unified-150', 'validForS': 100, 'country': 'CH'},
+                   {'gateway': 'unified-151', 'validForS': 2000, 'country': 'US'}]
+        # 不在目录中的网关不是候选；Cookie 剩余不足一个窗口的排在后面。
+        claim = self.call('claim', demand=True, catalog=catalog)
+        self.assertEqual(claim['pair']['gateway'], 'unified-151')
+        lease = claim['leaseId']
+        self.call('sent', leaseId=lease)
+        material = {'state': 's0', 'cookie': '__oailb=x; __cflb=y', 'expires': self.now + 600}
+        self.call('probeResult', leaseId=lease, status=200, stateReturned=False, paired=True, gatewayMatches=True, material=material)
+        self.call('finish', leaseId=lease)
+        pair = self.pair(gateway='unified-151')
+        self.assertEqual((pair['state'], pair['cookieExpiresAt']), ('ready', self.now + 600))
+        self.assertEqual(self.pool.view()['catalogs']['A']['gateways'][0]['country'], 'CH')
+        # 窗口未到，但 Cookie 即将到期：开始准备下一个；目录里已无此网关也继续服务。
+        self.now += 100
+        plan = self.call('plan', demand=True, catalog=[{'gateway': 'unified-150', 'validForS': 3000}])
+        self.assertFalse(plan['rotationDue'])
+        self.assertEqual(plan['ready']['gateway'], 'unified-151')
+        self.now += 450
+        plan = self.call('plan', demand=True, catalog=[{'gateway': 'unified-150', 'validForS': 3000}])
+        self.assertTrue(plan['rotationDue'])
+        self.assertEqual(plan['probe']['gateway'], 'unified-150')
+        with self.assertRaises(ValueError):
+            self.call('plan', demand=True, catalog=[{'gateway': 'evil', 'validForS': 1}])
+
+    def test_group_uses_single_window_across_accounts(self):
+        pair, _ = self.probe()
+        self.assertEqual(self.pool.runtime({'action': 'active'})['accounts'], ['A'])
+        run = lambda action, **data: self.pool.runtime({'action': action, 'accountId': 'B', **data})
+        # A 的窗口未到期：B 不另开窗口。
+        self.assertFalse(run('claim', demand=True)['claimed'])
+        self.now += 181
+        claim = run('claim', demand=True)
+        self.assertTrue(claim['claimed'])
+        self.assertEqual(self.pool.runtime({'action': 'active'})['accounts'], ['A', 'B'])
+        run('sent', leaseId=claim['leaseId'])
+        run('probeResult', leaseId=claim['leaseId'], status=200, stateReturned=False, paired=True, gatewayMatches=True)
+        run('finish', leaseId=claim['leaseId'])
+        self.assertEqual(self.pool.runtime({'action': 'active'})['accounts'], ['B'])
+        self.assertEqual(self.pair()['state'], 'cooling')
+        switch = self.pool.view(account='B')['switches'][0]
+        self.assertEqual((switch['fromAccount'], switch['fromGateway']), ('A', pair['gateway']))
+
     def pair(self, account='A', gateway='unified-142'):
         return next(p for p in self.pool.view()['pairs'] if p['accountId']==account and p['gateway']==gateway)
 
@@ -295,7 +340,7 @@ class GatewayPoolTests(unittest.TestCase):
         self.call('finish', leaseId=lease)
         claim = self.call('claim', demand=True)
         self.call('sent', leaseId=claim['leaseId'])
-        self.pool.configure({'gateways':[]})
+        self.pool.configure({'gateways':['unified-142']})
         self.call('probeResult', leaseId=claim['leaseId'], status=200, stateReturned=False, paired=True, gatewayMatches=True)
         self.call('finish', leaseId=claim['leaseId'])
         self.assertEqual(self.pair(gateway='unified-143')['state'],'cooling')

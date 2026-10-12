@@ -53,12 +53,24 @@ def settle(pair):
             pair.update(state='cooling', restUntil=pair['lastContactAt'] + pair['restSeconds'])
 
 
+# Cookie 到期前预留的准备时间；到期与窗口到期都触发轮换。
+COOKIE_LEAD_SECONDS = 60
+
+
 def rotation_due(pair, settings, now, *, demand):
+    window_over = pair.get('firstContactAt') is not None and now >= pair['firstContactAt'] + settings['windowSeconds']
+    cookie_ending = pair.get('cookieExpiresAt') is not None and now >= pair['cookieExpiresAt'] - COOKIE_LEAD_SECONDS
     return (
         pair.get('state') == 'ready'
-        and now >= pair['firstContactAt'] + settings['windowSeconds']
+        and (window_over or cookie_ending)
         and (demand or settings['mode'] == 'continuous')
     )
+
+
+def candidate_order(pair, entry, settings):
+    """优先 Cookie 剩余足够一个窗口的网关，其次最久未访问的。"""
+    short = entry is not None and entry.get('validForS', 0) < settings['windowSeconds'] + COOKIE_LEAD_SECONDS
+    return (short, pair.get('lastContactAt') or 0, pair['gateway'])
 
 
 def finite_seconds(value, name, maximum):

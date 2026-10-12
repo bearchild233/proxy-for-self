@@ -106,6 +106,8 @@ struct CredentialSelectionInput<'a> {
     attempt: &'a AttemptContext,
     session_affinity_key: Option<&'a ProviderSessionAffinityKey>,
     session_affinity_observation: Option<&'a CodexSessionAffinity>,
+    /// 网关池分组当前持有满血窗口（或正在找票）的账号，按优先顺序。
+    pool_preferred: &'a [ProviderAccountId],
 }
 
 #[derive(Clone)]
@@ -294,6 +296,7 @@ impl CodexCredentialSelector {
             attempt: request.attempt,
             session_affinity_key: request.session_affinity_key,
             session_affinity_observation: None,
+            pool_preferred: &[],
         };
         self.select_inner(&input, None, Some(request.upstream_model))
             .await
@@ -305,6 +308,7 @@ impl CodexCredentialSelector {
         cyber_policy_session_key: Option<&ProviderSessionAffinityKey>,
         session_affinity_observation: Option<&CodexSessionAffinity>,
         requires_websocket: bool,
+        pool_preferred: &[ProviderAccountId],
     ) -> Result<CodexCredentialLease, CredentialSelectionError> {
         let input = CredentialSelectionInput {
             requires_websocket,
@@ -312,6 +316,7 @@ impl CodexCredentialSelector {
             attempt: request.attempt,
             session_affinity_key: request.session_affinity_key,
             session_affinity_observation,
+            pool_preferred,
         };
         self.select_inner(
             &input,
@@ -335,6 +340,7 @@ impl CodexCredentialSelector {
             attempt: request.attempt,
             session_affinity_key: request.session_affinity.map(CodexSessionAffinity::key),
             session_affinity_observation: request.session_affinity,
+            pool_preferred: &[],
         };
         self.select_inner(&input, None, None).await
     }
@@ -544,8 +550,21 @@ impl CodexCredentialSelector {
             let policy = request.attempt.account_selection_policy();
 
             loop {
+                // 网关池分组只用一个满血窗口：持有窗口的账号优先于会话亲和与权重，
+                // 但不覆盖必须回原账号的续接。
+                let pool_account = request
+                    .pool_preferred
+                    .iter()
+                    .find(|id| {
+                        !excluded.contains(*id)
+                            && candidates
+                                .iter()
+                                .any(|candidate| candidate.account.id() == *id)
+                    })
+                    .cloned();
                 let preferred = pinned_account
                     .clone()
+                    .or(pool_account)
                     .or_else(|| affinity.preferred_account().cloned())
                     .or_else(|| interval_account.clone());
                 let context = AccountSelectionContext {

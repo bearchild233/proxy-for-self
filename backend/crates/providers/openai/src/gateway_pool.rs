@@ -102,6 +102,8 @@ pub(crate) struct GatewayPoolService {
     client: CodexBackendClient,
     materials: Mutex<HashMap<String, Material>>,
     tickets: Mutex<HashMap<String, Ticket>>,
+    /// 按池成员缓存的网关目录，60 秒内复用，避免每次找票都查询池服务。
+    catalogs: Mutex<HashMap<String, (Instant, Value)>>,
     /// 近期经过网关池的账号；持续模式只为它们后台轮换，不扫描全部账号。
     active: Mutex<HashMap<String, Instant>>,
     ticket_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
@@ -140,6 +142,7 @@ impl GatewayPoolService {
             materials: Mutex::new(HashMap::new()),
             tickets: Mutex::new(HashMap::new()),
             active: Mutex::new(HashMap::new()),
+            catalogs: Mutex::new(HashMap::new()),
             ticket_locks: Mutex::new(HashMap::new()),
             settings: Mutex::new(None),
             probes: Arc::new(Semaphore::new(4)),
@@ -248,6 +251,74 @@ impl GatewayPoolService {
         }
         Ok(())
     }
+    fn pool_client<'a>(&'a self, account_client: &'a CodexBackendClient) -> &'a CodexBackendClient {
+        #[cfg(feature = "gateway-pool-experiment")]
+        if self
+            .direct_pool_experiment
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return &self.client;
+        }
+        account_client
+    }
+    /// 读取池服务目录，只保留可配对的网关；失败返回空值，控制面退回限定列表或上一份目录。
+    async fn catalog(&self, account: &ProviderAccount, settings: &Settings) -> Value {
+        let Some(identity) = pool_member_id(settings, account) else {
+            return Value::Null;
+        };
+        if let Some((at, value)) = self.catalogs.lock().await.get(&identity)
+            && at.elapsed() < Duration::from_secs(60)
+        {
+            return value.clone();
+        }
+        let Ok(client) = self.client.for_account(account) else {
+            return Value::Null;
+        };
+        let Ok(response) = self
+            .pool_client(&client)
+            .gateway_pool_catalog(&settings.pool_url, &settings.pool_token, &identity)
+            .await
+        else {
+            return Value::Null;
+        };
+        let entries: Vec<Value> = response["gateways"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|entry| entry["pair_ready"] == true)
+            .filter_map(|entry| {
+                let gateway = entry["name"].as_str()?;
+                let valid = entry["valid_for_s"].as_f64()?;
+                let country = entry["datacenter_country"]
+                    .as_str()
+                    .filter(|c| c.len() == 2 && c.bytes().all(|b| b.is_ascii_uppercase()));
+                (gateway.strip_prefix("unified-").is_some_and(|n| {
+                    !n.is_empty() && n.len() <= 6 && n.bytes().all(|b| b.is_ascii_digit())
+                }) && valid.is_finite()
+                    && (0.0..=86400.0).contains(&valid))
+                .then(|| json!({"gateway":gateway,"validForS":valid,"country":country}))
+            })
+            .take(512)
+            .collect();
+        let value = Value::Array(entries);
+        let mut catalogs = self.catalogs.lock().await;
+        catalogs.retain(|_, (at, _)| at.elapsed() < Duration::from_secs(600));
+        catalogs.insert(identity, (Instant::now(), value.clone()));
+        value
+    }
+    /// 当前持有满血窗口的账号（最新在前），其次是正在找票的账号；读取失败时不施加偏好。
+    pub(crate) async fn active_accounts(&self) -> Vec<gateway_core::account::ProviderAccountId> {
+        let Ok(value) = self.call(json!({"action":"active"})).await else {
+            return Vec::new();
+        };
+        value["accounts"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|id| id.as_str())
+            .filter_map(|id| gateway_core::account::ProviderAccountId::new(id).ok())
+            .collect()
+    }
     async fn start_prepare(
         self: &Arc<Self>,
         account: ProviderAccount,
@@ -265,7 +336,7 @@ impl GatewayPoolService {
             return Err(());
         }
         let claim = self
-            .call(json!({"action":"claim","accountId":account.id().as_str(),"demand":demand}))
+            .call(json!({"action":"claim","accountId":account.id().as_str(),"demand":demand,"catalog":self.catalog(&account, &settings).await}))
             .await?;
         if claim["claimed"] == true {
             let service = Arc::clone(self);
@@ -299,7 +370,8 @@ impl GatewayPoolService {
                     if !matches!(service.eligible_account(&account).await, Ok(Some(_))) {
                         break;
                     }
-                    let Ok(next) = service.call(json!({"action":"claim","accountId":account.id().as_str(),"demand":demand})).await else { break; };
+                    let catalog = service.catalog(&account, &settings).await;
+                    let Ok(next) = service.call(json!({"action":"claim","accountId":account.id().as_str(),"demand":demand,"catalog":catalog})).await else { break; };
                     if next["claimed"] != true {
                         break;
                     }
@@ -331,7 +403,7 @@ impl GatewayPoolService {
                 return Err(());
             }
             let plan = self
-                .call(json!({"action":"plan","accountId":account.id().as_str(),"demand":true}))
+                .call(json!({"action":"plan","accountId":account.id().as_str(),"demand":true,"catalog":self.catalog(account, &settings).await}))
                 .await?;
             if !plan["probe"].is_null() {
                 self.start_prepare(account.clone(), true, cancellation.clone())
@@ -458,18 +530,8 @@ impl GatewayPoolService {
         let client = self.client.for_account(account).map_err(|_| ())?;
         let pool_id = pool_member_id(settings, account).ok_or(())?;
         let pool_id = &pool_id;
-        #[cfg(feature = "gateway-pool-experiment")]
-        let pool_client = if self
-            .direct_pool_experiment
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            &self.client
-        } else {
-            &client
-        };
-        #[cfg(not(feature = "gateway-pool-experiment"))]
-        let pool_client = &client;
-        let value = pool_client
+        let value = self
+            .pool_client(&client)
             .gateway_pool_cookie(
                 &settings.pool_url,
                 &settings.pool_token,
@@ -478,6 +540,12 @@ impl GatewayPoolService {
             )
             .await?;
         let cookie = routing_cookie(&value)?;
+        // 池服务给出的剩余有效期与 Cookie 自身 exp 取较早者。
+        let pool_deadline = value["valid_for_s"]
+            .as_f64()
+            .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+            .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
+            .and_then(|valid| SystemTime::now().checked_add(valid));
         if cookie_gateway(&cookie).as_deref() != Some(&pair.gateway) {
             return Err(());
         }
@@ -523,6 +591,7 @@ impl GatewayPoolService {
             return Ok((None, second.status, second.state_returned));
         }
         let expires = cookie_expiry(&resulting_cookie).ok_or(())?;
+        let expires = pool_deadline.map_or(expires, |deadline| expires.min(deadline));
         Ok((
             Some(Material {
                 pair: pair.clone(),

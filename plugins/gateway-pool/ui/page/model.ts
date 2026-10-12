@@ -28,6 +28,13 @@ export interface Pair {
   lastContactAt?: number | null
   retiredReason?: string
   ticketModels?: string[]
+  cookieExpiresAt?: number | null
+}
+
+export interface CatalogEntry {
+  gateway: string
+  validForS: number
+  country?: string | null
 }
 
 export interface Observation {
@@ -50,6 +57,7 @@ export interface Observation {
 export interface Switch {
   at: number
   accountId: string
+  fromAccount?: string | null
   fromGateway?: string | null
   toGateway: string
   previousWindowSeconds?: number | null
@@ -62,6 +70,7 @@ export interface PoolView {
   pairs: Pair[]
   observations: Observation[]
   switches: Switch[]
+  catalogs?: Record<string, { at: number, gateways: CatalogEntry[] }>
 }
 
 export interface DirectoryAccount {
@@ -76,7 +85,7 @@ export const stateLabels: Record<PairState, string> = {
   preparing: '检测中',
   draining: '排空中',
   cooling: '静置中',
-  unknown: '待检测',
+  unknown: '可检测',
 }
 
 export function duration(seconds?: number | null): string {
