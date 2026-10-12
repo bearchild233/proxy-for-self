@@ -39,6 +39,32 @@ class DiagnosticRules(unittest.TestCase):
 
 
 class PlatformContracts(unittest.TestCase):
+    def test_gateway_pool_permissions_and_private_endpoint(self):
+        from http.client import HTTPConnection
+        from server import BoundedServer, Handler
+        import threading
+        manifest = json.loads((REPO/'plugins/gateway-pool/plugin.json').read_text(encoding='utf-8'))
+        with patch.object(self.platform.store, 'state', return_value={'enabled':True,'current':'version'}), patch.object(self.platform.store, 'manifest', return_value=manifest):
+            with self.assertRaises(PermissionError):
+                self.platform.call('gateway-pool','version','gateway-pool.configure',{},'session','key','http://localhost')
+            with self.assertRaises(PermissionError):
+                self.platform.call('accounts','version','gateway-pool.read',{},'session','admin','http://localhost')
+        server = BoundedServer(('127.0.0.1',0),Handler)
+        server.platform = self.platform
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            for authorization, expected in [('',403),('Bearer wrong',403),('Bearer '+self.platform.gateway_pool_key,200)]:
+                connection = HTTPConnection(*server.server_address, timeout=2)
+                with patch.object(self.platform.gateway_pool,'runtime',return_value={'enabled':False}):
+                    connection.request('POST','/api/plugin-platform/internal/gateway-pool',json.dumps({'action':'config'}),{'Authorization':authorization})
+                    response = connection.getresponse()
+                    self.assertEqual(response.status,expected)
+                    response.read()
+                connection.close()
+        finally:
+            server.shutdown();server.server_close();thread.join()
+
     def test_forward_supplies_trusted_proxy_address_and_resets_context(self):
         connection = MagicMock()
         connection.getresponse.return_value.read.return_value = b'{}'

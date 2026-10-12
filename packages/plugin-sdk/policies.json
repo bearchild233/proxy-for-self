@@ -402,6 +402,12 @@
     ],
     "trustedUi": true
   },
+  "gateway-pool": {
+    "name": "网关池", "required": false, "category": "account-tools", "trustedUi": true,
+    "capabilities": ["gateway-pool.read","gateway-pool.configure","account-groups.get.admin.account-groups","accounts.get.admin.accounts"],
+    "description": "指定分组按账号与网关轮换，使用 astra 和固定配套材料观察 21／29 实验信号；独立保存退避、恢复与静置统计。",
+    "pages": [{"id":"main","title":"网关池","entry":"ui/module.js","roles":["admin"],"route":"/extensions/gateway-pool"}]
+  },
   "account-diagnostics": {
     "name": "账号诊断",
     "required": false,

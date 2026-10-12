@@ -7,6 +7,10 @@ publish.workspace = true
 rust-version.workspace = true
 autotests = false
 
+[features]
+# 独立、显式授权的真实实验入口；默认产品构建不包含此入口。
+gateway-pool-experiment = []
+
 [dependencies]
 async-stream = "0.3.6"
 async-trait = "0.1.89"

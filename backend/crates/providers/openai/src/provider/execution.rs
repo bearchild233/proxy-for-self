@@ -182,6 +182,7 @@ pub(super) struct ColdResponse {
     pub(super) websocket_retry_count: u32,
     pub(super) stream_max_retries: u32,
     pub(super) session_capture: Option<OpenAiSessionCapture>,
+    pub(super) gateway_pool: Option<Arc<crate::gateway_pool::GatewayPoolService>>,
 }
 
 pub(super) struct ColdJsonResponse {
@@ -328,6 +329,7 @@ pub(super) enum CodexHandshakeAttemptError {
     Client(CodexClientError),
     Cancelled,
     Timeout,
+    Policy(ProviderError),
 }
 
 pub(super) async fn create_response_attempt(
@@ -357,6 +359,7 @@ pub(super) fn map_handshake_attempt_error(
     error: CodexHandshakeAttemptError,
 ) -> MappedProviderFailure {
     match error {
+        CodexHandshakeAttemptError::Policy(error) => MappedProviderFailure::plain(error),
         CodexHandshakeAttemptError::Client(error) => map_handshake_error(error),
         CodexHandshakeAttemptError::Cancelled => MappedProviderFailure::plain(provider_error(
             ProviderErrorKind::Cancelled,
@@ -366,6 +369,194 @@ pub(super) fn map_handshake_attempt_error(
             ProviderErrorKind::Timeout,
             UpstreamSendState::Ambiguous,
         )),
+    }
+}
+
+struct GatewayPoolAttempt<'a> {
+    service: &'a Arc<crate::gateway_pool::GatewayPoolService>,
+    client: &'a CodexBackendClient,
+    request: &'a mut CodexResponsesRequest,
+    context: &'a AttemptContext,
+    lease: &'a CodexCredentialLease,
+    account: &'a ProviderAccount,
+    authorization: &'a SecretString,
+    selection: CodexAccountSelectionTelemetry<'a>,
+}
+
+impl GatewayPoolAttempt<'_> {
+    async fn send(
+        self,
+        held: &mut Option<crate::gateway_pool::GatewayPoolGuard>,
+    ) -> Result<CodexBackendStreamingResponse, CodexHandshakeAttemptError> {
+        let Self {
+            service,
+            client,
+            request,
+            context,
+            lease,
+            account,
+            authorization,
+            selection,
+        } = self;
+        let trace = context.trace();
+        // 只有客户端执行的工具可在未交付输出时重放。上游执行工具可能已有副作用。
+        let safe_replay = request.body().get("tools").is_none_or(|tools| {
+            tools.as_array().is_some_and(|tools| {
+                tools
+                    .iter()
+                    .all(|tool| matches!(tool["type"].as_str(), Some("function" | "custom")))
+            })
+        });
+        let mut sent = false;
+        loop {
+            let route = tokio::select! {
+                biased;
+                _ = context.cancellation().cancelled() => return Err(CodexHandshakeAttemptError::Cancelled),
+                _ = tokio::time::sleep(remaining(context.deadline()).ok_or(CodexHandshakeAttemptError::Timeout)?) => return Err(CodexHandshakeAttemptError::Timeout),
+                route = service.route(account, context.deadline(), context.cancellation()) => route,
+            };
+            let guard = route.map_err(|_| {
+                let error = provider_error(
+                    ProviderErrorKind::Unavailable,
+                    if sent {
+                        UpstreamSendState::Sent
+                    } else {
+                        UpstreamSendState::NotSent
+                    },
+                );
+                CodexHandshakeAttemptError::Policy(if sent && safe_replay {
+                    error.with_replay_safe()
+                } else {
+                    error
+                })
+            })?;
+            request.passthrough_headers.remove("x-codex-turn-state");
+            request.turn_state = Some(guard.state().to_owned());
+            // 原生 HTTP 直接发送 original_json；仅改 body 视图不能覆盖实体中的旧 state。
+            if let Some(original) = &request.original_json {
+                let mut entity: Value = serde_json::from_slice(original).map_err(|_| {
+                    CodexHandshakeAttemptError::Policy(provider_error(
+                        ProviderErrorKind::Protocol,
+                        UpstreamSendState::NotSent,
+                    ))
+                })?;
+                if let Some(metadata) = entity
+                    .get_mut("client_metadata")
+                    .and_then(Value::as_object_mut)
+                    && metadata.contains_key("x-codex-turn-state")
+                {
+                    metadata.insert(
+                        "x-codex-turn-state".to_owned(),
+                        Value::String(guard.state().to_owned()),
+                    );
+                    request.original_json = Some(
+                        serde_json::to_vec(&entity)
+                            .map_err(|_| {
+                                CodexHandshakeAttemptError::Policy(provider_error(
+                                    ProviderErrorKind::Protocol,
+                                    UpstreamSendState::NotSent,
+                                ))
+                            })?
+                            .into(),
+                    );
+                }
+            }
+            // 同一材料在头部与已有 metadata 投影中保持一致，其余客户端 metadata 保留。
+            if let Some(Value::Object(metadata)) = request.body_mut().get_mut("client_metadata")
+                && metadata.contains_key("x-codex-turn-state")
+            {
+                metadata.insert(
+                    "x-codex-turn-state".to_owned(),
+                    Value::String(guard.state().to_owned()),
+                );
+            }
+            let mut wire = codex_request_context(
+                request,
+                context.request_id().as_str(),
+                account,
+                lease.installation_id(),
+                authorization,
+                None,
+                selection,
+            )
+            .with_trace(&trace);
+            wire.turn_state = Some(guard.state());
+            wire.cookie_header = Some(guard.cookie());
+            let send_allowed = guard.sent().await.map_err(|_| {
+                CodexHandshakeAttemptError::Policy(provider_error(
+                    ProviderErrorKind::Unavailable,
+                    if sent {
+                        UpstreamSendState::Sent
+                    } else {
+                        UpstreamSendState::NotSent
+                    },
+                ))
+            })?;
+            if !send_allowed {
+                guard.finish().await;
+                continue;
+            }
+            let started = Instant::now();
+            sent = true;
+            let response = create_response_attempt(
+                client,
+                request,
+                wire,
+                account.id().as_str(),
+                context.deadline(),
+                context.cancellation(),
+            )
+            .await;
+            let response = match response {
+                Ok(response) => response,
+                Err(error) => {
+                    // 401/429/网络异常不是降智；沿用原有的错误反馈及重试策略。
+                    let status = match &error {
+                        CodexHandshakeAttemptError::Client(error) => {
+                            error.upstream_failure().map_or(0, |failure| {
+                                failure.status.map_or(0, |status| status.as_u16())
+                            })
+                        }
+                        _ => 0,
+                    };
+                    let _ = guard.observe(status, false, &[], started.elapsed()).await;
+                    return Err(error);
+                }
+            };
+            let status = response.diagnostics.status_code.unwrap_or(0);
+            let state_returned = response
+                .response_metadata
+                .client_headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("x-codex-turn-state"));
+            let cookies = response.set_cookie_headers.clone();
+            // 明确的 29 信号先关闭响应，再写统计；不让持久化 RPC 延迟取消上游生成。
+            let mut response = if status == 200 && state_returned {
+                drop(response);
+                None
+            } else {
+                Some(response)
+            };
+            let accepted = guard
+                .observe(status, state_returned, &cookies, started.elapsed())
+                .await;
+            if accepted == Ok(Some(true))
+                && let Some(response) = response.take()
+            {
+                // 租约保持到整个客户流结束。此处不读取、不关闭正常 SSE。
+                *held = Some(guard);
+                return Ok(response);
+            }
+            drop(response);
+            // 在任何下游输出前取消不合格响应，再由同账号的其他网关承接。
+            guard.finish().await;
+            if !safe_replay || accepted != Ok(Some(false)) {
+                return Err(CodexHandshakeAttemptError::Policy(provider_error(
+                    ProviderErrorKind::Unavailable,
+                    UpstreamSendState::Sent,
+                )));
+            }
+        }
     }
 }
 
@@ -591,7 +782,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
     let ColdResponse {
         client,
         response_origin,
-        request,
+        mut request,
         upstream_model,
         transport_policy,
         context,
@@ -606,6 +797,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
         websocket_retry_count,
         stream_max_retries,
         mut session_capture,
+        gateway_pool,
     } = response;
     Box::pin(async_stream::try_stream! {
         let cyber_policy_scope = lease.cyber_policy_scope().cloned();
@@ -639,7 +831,10 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
         );
         let request_transport_requirement = transport_requirement(&request);
         let trace = context.trace();
-        let response = create_response_attempt(
+        let mut pool_guard = None;
+        let response = if let Some(service) = gateway_pool.as_ref() {
+            GatewayPoolAttempt { service, client: &client, request: &mut request, context: &context, lease: &lease, account: &active_account, authorization: &authorization, selection: account_selection }.send(&mut pool_guard).await
+        } else { create_response_attempt(
             &client,
             &request,
             codex_request_context(
@@ -655,7 +850,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
             context.deadline(),
             &cancellation,
         )
-        .await;
+        .await };
         let websocket_failure_policy = match &response {
             Err(CodexHandshakeAttemptError::Client(error))
                 if transport_policy == CodexProviderTransport::PreferWebSocket =>
@@ -743,6 +938,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
             );
         }
         if allows_account_state_mutation
+            && pool_guard.is_none()
             && !response.set_cookie_headers.is_empty()
             && let Ok(outcome) = selector
                 .capture_response_cookies(

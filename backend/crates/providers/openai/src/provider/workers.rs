@@ -130,6 +130,32 @@ pub(super) fn scheduled_registration(
     )
 }
 
+pub(crate) fn gateway_pool_worker(
+    service: Arc<crate::gateway_pool::GatewayPoolService>,
+) -> Result<WorkerContribution, WorkerDefinitionError> {
+    Ok(WorkerContribution::Registration(scheduled_registration(
+        WorkerId::try_new(WorkerKind::QuotaCatalogHealth, "openai-gateway-pool")?,
+        Duration::from_secs(1),
+        Box::new(GatewayPoolTask { service }),
+    )?))
+}
+struct GatewayPoolTask {
+    service: Arc<crate::gateway_pool::GatewayPoolService>,
+}
+impl ScheduledTask for GatewayPoolTask {
+    fn run_cycle(&self, context: WorkerCycleContext) -> BoxFuture<'_, Result<(), WorkerTaskError>> {
+        Box::pin(async move {
+            if context.cancellation().is_cancelled() {
+                return Ok(());
+            }
+            self.service
+                .background(context.cancellation())
+                .await
+                .map_err(|_| WorkerTaskError::safe("gateway pool preparation unavailable"))
+        })
+    }
+}
+
 pub(super) struct OpenAiOAuthRefreshTask {
     service: Arc<CodexCredentialRefreshService>,
 }

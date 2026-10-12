@@ -673,6 +673,8 @@
       "admin"
     ]
   },
+  "gateway-pool.read": {"method":"GET","path":"/api/plugin-platform/gateway-pool","roles":["admin"]},
+  "gateway-pool.configure": {"method":"POST","path":"/api/plugin-platform/gateway-pool","roles":["admin"]},
   "diagnostic.observe": {
     "method": "POST",
     "path": "/api/admin/accounts/diagnostic",

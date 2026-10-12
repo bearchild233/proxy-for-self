@@ -173,11 +173,11 @@ export function usageTransportTypeClass(transport?: string | null) {
   return 'bg-cp-fill-tertiary text-cp-text-secondary'
 }
 
-export function usageAccountText(record: UsageCommonRecord) {
+export function usageAccountText(record: Pick<UsageCommonRecord, 'accountName' | 'accountEmail' | 'accountId'>) {
   return accountIdentity({ name: record.accountName, email: record.accountEmail, reference: record.accountId }).primary
 }
 
-export function usageAccountEmail(record: UsageCommonRecord) {
+export function usageAccountEmail(record: Pick<UsageCommonRecord, 'accountName' | 'accountEmail' | 'accountId'>) {
   return accountIdentity({ name: record.accountName, email: record.accountEmail, reference: record.accountId }).secondary
 }
 

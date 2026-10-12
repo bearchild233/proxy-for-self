@@ -166,6 +166,22 @@ class StaticPluginTests(unittest.TestCase):
             self.store.action('groups', 'rollback')
         self.assertEqual(state, self.store.state('groups'))
 
+    def test_gateway_pool_policy_is_hash_checked_and_not_granted_to_other_plugins(self):
+        self.store.policies['gateway-pool']={'name':'Pool','required':False,'trustedUi':True,'capabilities':['groups.list']}
+        policy=b"def classify(*args, **kwargs): return None"
+        def add_policy(manifest):
+            manifest.update(policyWorker='worker/policy.py')
+            manifest['resources']['worker/policy.py']=hashlib.sha256(policy).hexdigest()
+        state=self.install(plugin='gateway-pool',component=True,modify=add_policy,extra=[('worker/policy.py',policy)])
+        self.assertTrue(state['enabled'])
+        self.assertEqual(self.store.manifest('gateway-pool')['policyWorker'],'worker/policy.py')
+        self.store.policies['extra']['trustedUi']=True
+        with self.assertRaisesRegex(ValueError,'策略后台未授权'):
+            self.install(plugin='extra',component=True,modify=add_policy,extra=[('worker/policy.py',policy)])
+        with self.assertRaisesRegex(ValueError,'资源校验失败'):
+            self.install('2',plugin='gateway-pool',component=True,modify=add_policy,extra=[('worker/policy.py',b'changed')])
+        self.assertEqual(self.store.state('gateway-pool'),state)
+
 
 if __name__ == '__main__':
     unittest.main()

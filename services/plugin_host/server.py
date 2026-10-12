@@ -5,6 +5,7 @@ from ipaddress import ip_address
 import base64
 import gzip
 import hashlib
+import hmac
 from http.client import HTTPConnection, HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -17,6 +18,8 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from jobs import Jobs
 from lifecycle import Lifecycle
+from gateway_pool import GatewayPool
+import secrets
 import tarfile
 import tempfile
 from urllib.parse import urlencode, urlsplit
@@ -54,6 +57,17 @@ class Platform:
         self.jobs = Jobs(self)
         self.lifecycle = Lifecycle(self,local_excel,updater_socket)
         self.data_lock = threading.RLock()
+        self.gateway_pool = GatewayPool(self.root, self.store)
+        key_path = self.root / 'gateway-pool-runtime.key'
+        try:
+            with key_path.open('x', encoding='ascii') as output:
+                key_path.chmod(0o640)
+                output.write(secrets.token_hex(32))
+        except FileExistsError:
+            pass
+        self.gateway_pool_key = key_path.read_text(encoding='ascii').strip()
+        if not re.fullmatch('[0-9a-f]{64}', self.gateway_pool_key):
+            raise ValueError('网关池本机能力密钥无效')
 
     def register(self, registration):
         plugin_id=registration.get('id')
@@ -153,6 +167,17 @@ class Platform:
             raise PermissionError('插件没有此能力')
         if not isinstance(data, dict):
             raise ValueError('参数必须为对象')
+        if name.startswith('gateway-pool.'):
+            if role != 'admin' or plugin_id != 'gateway-pool':
+                raise PermissionError('没有网关池管理权限')
+            if name == 'gateway-pool.configure':
+                value = self.gateway_pool.configure(data)
+            elif name == 'gateway-pool.read':
+                value = self.gateway_pool.view(data.get('accountId'), data.get('gateway'), data.get('limit', 100), data.get('before'))
+                value['settings'] = self.gateway_pool.settings_for_ui()
+            else:
+                raise PermissionError('网关池能力未注册')
+            return 200, json.dumps(value, ensure_ascii=False).encode(), None
         if name == 'pricing.schedule.status':
             if role != 'admin' or plugin_id != 'pricing':
                 raise PermissionError('没有定价调度权限')
@@ -248,6 +273,16 @@ class Handler(BaseHTTPRequestHandler):
     def dispatch(self):
         self.connection.settimeout(15)
         platform = self.server.platform
+        if urlsplit(self.path).path == '/api/plugin-platform/internal/gateway-pool':
+            if self.command != 'POST' or not hmac.compare_digest(self.headers.get('Authorization', ''), 'Bearer '+platform.gateway_pool_key):
+                raise PermissionError('本机能力未授权')
+            size = int(self.headers.get('Content-Length', '0'))
+            if not 0 < size <= 65536:
+                raise ValueError('本机消息大小无效')
+            message = json.loads(self.rfile.read(size))
+            if not isinstance(message, dict):
+                raise ValueError('本机消息必须为对象')
+            return self.reply(platform.gateway_pool.runtime(message))
         origin = self.server.origin
         if self.headers.get('Host') != urlsplit(origin).netloc:
             raise PermissionError('请求主机无效')

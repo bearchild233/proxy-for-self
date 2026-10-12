@@ -108,6 +108,7 @@ use execution::*;
 pub use failure::openai_failure_affects_account_score;
 use failure::*;
 use observation::*;
+pub(crate) use workers::gateway_pool_worker;
 pub(crate) use workers::worker_contributions;
 
 const PROVIDER_NAME: &str = "openai";
@@ -157,6 +158,7 @@ pub struct CodexProvider {
     excel_worker: Option<Client>,
     excel_plugin_state_file: Option<std::path::PathBuf>,
     pinned_cli_profile: Option<crate::transport::profile::CodexWireProfile>,
+    gateway_pool: Option<Arc<crate::gateway_pool::GatewayPoolService>>,
 }
 
 impl CodexProvider {
@@ -214,11 +216,20 @@ impl CodexProvider {
             excel_worker: None,
             excel_plugin_state_file: None,
             pinned_cli_profile: None,
+            gateway_pool: None,
         })
     }
 
     pub(crate) fn with_session_identity(mut self, identity: CodexSessionIdentity) -> Self {
         self.session_identity = Some(identity);
+        self
+    }
+
+    pub(crate) fn with_gateway_pool(
+        mut self,
+        service: Option<Arc<crate::gateway_pool::GatewayPoolService>>,
+    ) -> Self {
+        self.gateway_pool = service;
         self
     }
 
@@ -661,6 +672,31 @@ impl Provider for CodexProvider {
         } else {
             requested_transport
         };
+        let pool_enabled = if let Some(service) = self.gateway_pool.as_ref() {
+            service.enabled_for(&context).await.map_err(|_| {
+                provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent)
+            })?
+        } else {
+            false
+        };
+        let transport = if pool_enabled {
+            // 实验判据先要求 HTTP 200 响应头，不能把 WS 没有头误判成 21。
+            if requirement.requires_websocket()
+                || upstream_model.as_str() != "gpt-6-astra"
+                || !matches!(
+                    lease.authentication(),
+                    crate::credential::CodexRuntimeAuthentication::OAuth(_)
+                )
+            {
+                return Err(provider_error(
+                    ProviderErrorKind::Unsupported,
+                    UpstreamSendState::NotSent,
+                ));
+            }
+            CodexProviderTransport::HttpOnly
+        } else {
+            transport
+        };
         apply_transport(&mut upstream_request, transport);
         let metadata = ProviderCallMetadata::new(
             provider_kind,
@@ -723,6 +759,7 @@ impl Provider for CodexProvider {
             websocket_retry_count,
             stream_max_retries: self.stream_max_retries,
             session_capture,
+            gateway_pool: pool_enabled.then(|| self.gateway_pool.clone()).flatten(),
         });
         let stream = ProviderStream::new(metadata, events, lease);
         Ok(if allows_account_state_mutation {

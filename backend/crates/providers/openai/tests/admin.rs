@@ -59,6 +59,8 @@ use crate::support::{
     account_policy, profile, secret,
 };
 
+mod gateway_pool;
+
 const COMPLETED_SESSION_SSE: &str = concat!(
     "event: response.completed\n",
     "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_initialized_session\",\"model\":\"gpt-5.4\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"

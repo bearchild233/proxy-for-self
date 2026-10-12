@@ -1,0 +1,976 @@
+//! 网关池传输桥。插件持久化冷却及配套路由材料；上游账号凭据只留在 Provider。
+use crate::{
+    credential::{CodexCredentialQuotaService, CodexCredentialRepository},
+    transport::{
+        CodexBackendClient, CodexRequestContext, protocol::responses::CodexResponsesRequest,
+    },
+};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use gateway_core::lifecycle::CancellationToken;
+use gateway_core::{account::ProviderAccount, engine::AttemptContext};
+use reqwest::{Client, redirect::Policy};
+use secrecy::{ExposeSecret, SecretString};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant, SystemTime},
+};
+use tokio::sync::{Mutex, Semaphore};
+use uuid::Uuid;
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct GatewayPoolConfig {
+    pub runtime_url: String,
+    pub key_file: PathBuf,
+}
+impl GatewayPoolConfig {
+    pub(crate) fn validate(&self) -> Result<(), ()> {
+        let url = url::Url::parse(&self.runtime_url).map_err(|_| ())?;
+        if url.scheme() != "http"
+            || url
+                .host_str()
+                .is_none_or(|host| host != "127.0.0.1" && host != "[::1]")
+            || url.username() != ""
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || !self.key_file.is_absolute()
+        {
+            return Err(());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct Settings {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    mode: String,
+    #[serde(default)]
+    group_ids: Vec<String>,
+    #[serde(default)]
+    pool_account_ids: HashMap<String, String>,
+    #[serde(default)]
+    pool_url: String,
+    #[serde(default)]
+    pool_token: String,
+    #[serde(default)]
+    probe_interval_ms: u64,
+    /// 打票用模型；业务请求固定使用由它取得并验证的 S0。
+    #[serde(default = "default_probe_model")]
+    probe_model: String,
+}
+fn default_probe_model() -> String {
+    "gpt-6-astra".into()
+}
+fn hi_request(model: &str) -> Option<CodexResponsesRequest> {
+    Some(CodexResponsesRequest::from_body(json!({"model":model,"input":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}],"instructions":"Do not use external tools.","tools":[],"stream":true,"store":false,"reasoning":{"effort":"low"}}).as_object().cloned()?))
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct Pair {
+    gateway: String,
+    generation: String,
+}
+#[derive(Clone)]
+struct Material {
+    pair: Pair,
+    state: SecretString,
+    cookie: SecretString,
+    expires: SystemTime,
+}
+
+pub(crate) struct GatewayPoolService {
+    http: Client,
+    url: String,
+    key: SecretString,
+    repository: CodexCredentialRepository,
+    quota: Arc<CodexCredentialQuotaService>,
+    client: CodexBackendClient,
+    materials: Mutex<HashMap<String, Material>>,
+    settings: Mutex<Option<(Instant, Settings)>>,
+    probes: Arc<Semaphore>,
+    #[cfg(feature = "gateway-pool-experiment")]
+    direct_pool_experiment: std::sync::atomic::AtomicBool,
+}
+
+impl GatewayPoolService {
+    pub(crate) async fn new(
+        config: &GatewayPoolConfig,
+        repository: CodexCredentialRepository,
+        client: CodexBackendClient,
+        quota: Arc<CodexCredentialQuotaService>,
+    ) -> Result<Arc<Self>, ()> {
+        config.validate()?;
+        let key = tokio::fs::read_to_string(&config.key_file)
+            .await
+            .map_err(|_| ())?;
+        if key.trim().len() != 64 || !key.trim().bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(());
+        }
+        Ok(Arc::new(Self {
+            http: Client::builder()
+                .no_proxy()
+                .redirect(Policy::none())
+                .timeout(Duration::from_secs(3))
+                .build()
+                .map_err(|_| ())?,
+            url: config.runtime_url.clone(),
+            key: SecretString::from(key.trim().to_owned()),
+            repository,
+            quota,
+            client,
+            materials: Mutex::new(HashMap::new()),
+            settings: Mutex::new(None),
+            probes: Arc::new(Semaphore::new(4)),
+            #[cfg(feature = "gateway-pool-experiment")]
+            direct_pool_experiment: std::sync::atomic::AtomicBool::new(false),
+        }))
+    }
+    async fn call(&self, value: Value) -> Result<Value, ()> {
+        let response = self
+            .http
+            .post(&self.url)
+            .bearer_auth(self.key.expose_secret())
+            .json(&value)
+            .send()
+            .await
+            .map_err(|_| ())?;
+        if response.status() != 200 {
+            return Err(());
+        }
+        let bytes = response.bytes().await.map_err(|_| ())?;
+        if bytes.len() > 131072 {
+            return Err(());
+        }
+        serde_json::from_slice(&bytes).map_err(|_| ())
+    }
+    async fn settings(&self) -> Result<Settings, ()> {
+        let mut held = self.settings.lock().await;
+        if let Some((at, settings)) = &*held
+            && at.elapsed() < Duration::from_millis(250)
+        {
+            return Ok(settings.clone());
+        }
+        let settings: Settings =
+            serde_json::from_value(self.call(json!({"action":"config"})).await?).map_err(|_| ())?;
+        *held = Some((Instant::now(), settings.clone()));
+        Ok(settings)
+    }
+    pub(crate) async fn enabled_for(&self, context: &AttemptContext) -> Result<bool, ()> {
+        let Some(scope) = context.account_scope() else {
+            return Ok(false);
+        };
+        let groups = scope.routing_snapshot();
+        if groups.groups_snapshot().is_empty() {
+            return Ok(false);
+        }
+        let settings = match self.settings().await {
+            Ok(settings) => settings,
+            Err(()) => {
+                // 已知未选此插件的组不受控制面故障影响；启用组继续失败关闭。
+                let cached = self.settings.lock().await;
+                if cached.as_ref().is_some_and(|(_, settings)| {
+                    !groups.groups_snapshot().iter().any(|group| {
+                        settings
+                            .group_ids
+                            .iter()
+                            .any(|id| id == group.id().as_str())
+                    })
+                }) {
+                    return Ok(false);
+                }
+                return Err(());
+            }
+        };
+        Ok(settings.enabled
+            && context.account_scope().is_some_and(|scope| {
+                scope
+                    .routing_snapshot()
+                    .groups_snapshot()
+                    .iter()
+                    .any(|g| settings.group_ids.iter().any(|id| id == g.id().as_str()))
+            }))
+    }
+    pub(crate) async fn background(
+        self: &Arc<Self>,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ()> {
+        let settings = self.settings().await?;
+        if !settings.enabled || settings.mode != "continuous" {
+            return Ok(());
+        }
+        for account in self
+            .repository
+            .store()
+            .list_accounts()
+            .await
+            .map_err(|_| ())?
+        {
+            if account.provider().as_str() == "openai"
+                && account.enabled()
+                && settings
+                    .pool_account_ids
+                    .contains_key(account.id().as_str())
+            {
+                self.start_prepare(account, false, cancellation.clone())
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+    async fn start_prepare(
+        self: &Arc<Self>,
+        account: ProviderAccount,
+        demand: bool,
+        cancellation: CancellationToken,
+    ) -> Result<(), ()> {
+        let Ok(permit) = Arc::clone(&self.probes).try_acquire_owned() else {
+            return Ok(());
+        };
+        let Some(account) = self.eligible_account(&account).await? else {
+            return Ok(());
+        };
+        let settings = self.settings().await?;
+        if !settings.enabled {
+            return Err(());
+        }
+        let claim = self
+            .call(json!({"action":"claim","accountId":account.id().as_str(),"demand":demand}))
+            .await?;
+        if claim["claimed"] == true {
+            let service = Arc::clone(self);
+            tokio::spawn(async move {
+                let _permit = permit;
+                let mut claim = claim;
+                let mut settings = settings;
+                loop {
+                    if service
+                        .prepare(account.clone(), claim, settings.clone(), &cancellation)
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    if cancellation.is_cancelled() {
+                        break;
+                    }
+                    // 候选失败后 50ms 即尝试下一组合，不等待下一次 1s Worker 周期。
+                    tokio::time::sleep(Duration::from_millis(
+                        settings.probe_interval_ms.clamp(1, 1000),
+                    ))
+                    .await;
+                    let Ok(next_settings) = service.settings().await else {
+                        break;
+                    };
+                    if !next_settings.enabled || !demand && next_settings.mode != "continuous" {
+                        break;
+                    }
+                    settings = next_settings;
+                    if !matches!(service.eligible_account(&account).await, Ok(Some(_))) {
+                        break;
+                    }
+                    let Ok(next) = service.call(json!({"action":"claim","accountId":account.id().as_str(),"demand":demand})).await else { break; };
+                    if next["claimed"] != true {
+                        break;
+                    }
+                    claim = next;
+                }
+            });
+        }
+        Ok(())
+    }
+    pub(crate) async fn route(
+        self: &Arc<Self>,
+        account: &ProviderAccount,
+        deadline: SystemTime,
+        cancellation: &CancellationToken,
+    ) -> Result<GatewayPoolGuard, ()> {
+        let settings = self.settings().await?;
+        if !settings.enabled
+            || !settings
+                .pool_account_ids
+                .contains_key(account.id().as_str())
+        {
+            return Err(());
+        }
+        loop {
+            if self.eligible_account(account).await?.is_none() {
+                return Err(());
+            }
+            if SystemTime::now() >= deadline {
+                return Err(());
+            }
+            let plan = self
+                .call(json!({"action":"plan","accountId":account.id().as_str(),"demand":true}))
+                .await?;
+            if !plan["probe"].is_null() {
+                self.start_prepare(account.clone(), true, cancellation.clone())
+                    .await?;
+            }
+            if let Ok(pair) = serde_json::from_value::<Pair>(plan["ready"].clone()) {
+                let key = format!("{}:{}", account.id().as_str(), pair.generation);
+                let material = self
+                    .materials
+                    .lock()
+                    .await
+                    .get(&key)
+                    .cloned()
+                    .filter(|m| m.expires > SystemTime::now());
+                let material = if material.is_some() {
+                    material
+                } else {
+                    // A/B 与重启共用私有材料，不因另一个进程的内存缓存缺失而退役可用组合。
+                    let shared = self.call(json!({"action":"material","accountId":account.id().as_str(),"generation":pair.generation})).await?;
+                    shared["state"]
+                        .as_str()
+                        .zip(shared["cookie"].as_str())
+                        .and_then(|(state, cookie)| {
+                            let expires = SystemTime::UNIX_EPOCH.checked_add(
+                                Duration::try_from_secs_f64(shared["expires"].as_f64()?).ok()?,
+                            )?;
+                            (expires > SystemTime::now()
+                                && cookie_gateway(cookie).as_deref() == Some(pair.gateway.as_str()))
+                            .then(|| Material {
+                                pair: pair.clone(),
+                                state: SecretString::from(state.to_owned()),
+                                cookie: SecretString::from(cookie.to_owned()),
+                                expires,
+                            })
+                        })
+                };
+                if let Some(material) = material {
+                    let reservation = self.call(json!({"action":"reserve","accountId":account.id().as_str(),"gateway":pair.gateway,"generation":pair.generation,"deadline":epoch(deadline)})).await?;
+                    if reservation["reserved"] == true {
+                        return Ok(GatewayPoolGuard {
+                            service: Arc::clone(self),
+                            account: account.id().as_str().to_owned(),
+                            lease: reservation["leaseId"].as_str().ok_or(())?.to_owned(),
+                            material,
+                            finished: false,
+                        });
+                    }
+                } else {
+                    // 重启或 A/B 切换时不能把仅有持久化状态、没有配套材料的组合当成可用。
+                    let reservation = self.call(json!({"action":"reserve","accountId":account.id().as_str(),"gateway":pair.gateway,"generation":pair.generation,"deadline":epoch(deadline)})).await?;
+                    if let Some(lease) = reservation["leaseId"].as_str() {
+                        self.call(json!({"action":"invalidate","accountId":account.id().as_str(),"leaseId":lease})).await?;
+                        self.call(json!({"action":"finish","accountId":account.id().as_str(),"leaseId":lease})).await?;
+                    }
+                }
+            } else if plan["probe"].is_null() && plan["preparing"] != true {
+                // 所有候选均冷却，不绕过静置；交给原账号选择器尝试其他授权账号。
+                return Err(());
+            }
+            tokio::time::sleep(Duration::from_millis(
+                settings.probe_interval_ms.clamp(1, 1000),
+            ))
+            .await;
+        }
+    }
+    async fn prepare(
+        self: &Arc<Self>,
+        account: ProviderAccount,
+        claim: Value,
+        settings: Settings,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ()> {
+        let lease = claim["leaseId"].as_str().ok_or(())?.to_owned();
+        let pair: Pair = serde_json::from_value(claim["pair"].clone()).map_err(|_| ())?;
+        let started = Instant::now();
+        let result = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => None,
+            result = tokio::time::timeout(Duration::from_secs(35), self.prepare_material(&account, &pair, &lease, &settings)) => result.ok().and_then(Result::ok),
+        };
+        let observation = result.as_ref().map(|(material, status, returned)| json!({"status":status,"stateReturned":returned,"paired":material.is_some(),"gatewayMatches":material.is_some()})).unwrap_or_else(|| json!({"status":null,"stateReturned":false,"paired":false,"gatewayMatches":false,"failed":true}));
+        let private_material = result.as_ref().and_then(|(material, status, returned)| (*status == 200 && !returned).then_some(material.as_ref()).flatten()).map(|material| json!({"state":material.state.expose_secret(),"cookie":material.cookie.expose_secret(),"expires":epoch(material.expires)}));
+        if let Some((Some(material), 200, false)) = result {
+            let mut materials = self.materials.lock().await;
+            materials.retain(|_, m| m.expires > SystemTime::now());
+            if materials.len() >= 512
+                && let Some(key) = materials.keys().next().cloned()
+            {
+                materials.remove(&key);
+            }
+            materials.insert(
+                format!("{}:{}", account.id().as_str(), pair.generation),
+                material,
+            );
+        }
+        let report = self.call(json!({"action":"probeResult","accountId":account.id().as_str(),"leaseId":lease,"durationMs":started.elapsed().as_millis(),
+            "status":observation["status"],"stateReturned":observation["stateReturned"],"paired":observation["paired"],"gatewayMatches":observation["gatewayMatches"],"failed":observation["failed"],"material":private_material})).await;
+        let finish = self
+            .call(json!({"action":"finish","accountId":account.id().as_str(),"leaseId":lease}))
+            .await;
+        report?;
+        finish?;
+        Ok(())
+    }
+    async fn prepare_material(
+        &self,
+        account: &ProviderAccount,
+        pair: &Pair,
+        lease: &str,
+        settings: &Settings,
+    ) -> Result<(Option<Material>, u16, bool), ()> {
+        let account = self.eligible_account(account).await?.ok_or(())?;
+        let account = &account;
+        let credential = self
+            .repository
+            .load_runtime_credential(account)
+            .await
+            .map_err(|_| ())?;
+        if credential.authentication.oauth().is_none() {
+            return Err(());
+        }
+        let client = self.client.for_account(account).map_err(|_| ())?;
+        let pool_id = settings
+            .pool_account_ids
+            .get(account.id().as_str())
+            .ok_or(())?;
+        #[cfg(feature = "gateway-pool-experiment")]
+        let pool_client = if self
+            .direct_pool_experiment
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            &self.client
+        } else {
+            &client
+        };
+        #[cfg(not(feature = "gateway-pool-experiment"))]
+        let pool_client = &client;
+        let value = pool_client
+            .gateway_pool_cookie(
+                &settings.pool_url,
+                &settings.pool_token,
+                pool_id,
+                &pair.gateway,
+            )
+            .await?;
+        let cookie = routing_cookie(&value)?;
+        if cookie_gateway(&cookie).as_deref() != Some(&pair.gateway) {
+            return Err(());
+        }
+        let authorization = credential
+            .authentication
+            .authorization_header()
+            .map_err(|_| ())?;
+        let id = Uuid::new_v4().to_string();
+        let mut context = CodexRequestContext::auxiliary(
+            authorization.expose_secret(),
+            account.upstream_account_id(),
+            &id,
+            Some(&credential.installation_id),
+        );
+        context.cookie_header = Some(&cookie);
+        let request = hi_request(&settings.probe_model).ok_or(())?;
+        let first = self
+            .probe_headers(account, pair, lease, &client, &request, context)
+            .await?;
+        self.observe_probe_quota(account, &first).await?;
+        if first.status != 200 {
+            return Ok((None, first.status, false));
+        }
+        let state = first
+            .state
+            .filter(|s| !s.is_empty() && s.len() <= 16384)
+            .ok_or(())?;
+        let paired_cookie = merge_cookie(&cookie, &first.cookies)?;
+        if cookie_gateway(&paired_cookie).as_deref() != Some(&pair.gateway) {
+            return Ok((None, 200, false));
+        }
+        context.turn_state = Some(&state);
+        context.cookie_header = Some(&paired_cookie);
+        if self.eligible_account(account).await?.is_none() {
+            return Err(());
+        }
+        let second = self
+            .probe_headers(account, pair, lease, &client, &request, context)
+            .await?;
+        self.observe_probe_quota(account, &second).await?;
+        let resulting_cookie = merge_cookie(&paired_cookie, &second.cookies)?;
+        if cookie_gateway(&resulting_cookie).as_deref() != Some(&pair.gateway) {
+            return Ok((None, second.status, second.state_returned));
+        }
+        let expires = cookie_expiry(&resulting_cookie).ok_or(())?;
+        Ok((
+            Some(Material {
+                pair: pair.clone(),
+                state: SecretString::from(state),
+                cookie: SecretString::from(resulting_cookie),
+                expires,
+            }),
+            second.status,
+            second.state_returned,
+        ))
+    }
+    async fn probe_headers(
+        &self,
+        account: &ProviderAccount,
+        pair: &Pair,
+        lease: &str,
+        client: &CodexBackendClient,
+        request: &CodexResponsesRequest,
+        context: CodexRequestContext<'_>,
+    ) -> Result<crate::transport::probe::ProbeObservation, ()> {
+        for attempt in 0..=1 {
+            if self.eligible_account(account).await?.is_none() {
+                return Err(());
+            }
+            self.call(json!({"action":"sent","accountId":account.id().as_str(),"leaseId":lease}))
+                .await?;
+            let started = Instant::now();
+            let observed = tokio::time::timeout(
+                Duration::from_secs(15),
+                client.diagnostic_observation(request, context, true),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok);
+            // 每次访问独立留痕；bootstrap 行仅是材料获取，不参与 21/29 判定。
+            self.call(json!({"action":"probeAttempt","accountId":account.id().as_str(),"leaseId":lease,"phase":if context.turn_state.is_some() {"replay"} else {"bootstrap"},"retry":attempt,"status":observed.as_ref().map(|o|o.status),"stateReturned":observed.as_ref().is_some_and(|o|o.state_returned),"durationMs":started.elapsed().as_millis(),"gateway":pair.gateway})).await?;
+            if let Some(observation) = observed {
+                if observation.status == 200 || attempt == 1 {
+                    return Ok(observation);
+                }
+                self.quota
+                    .synchronize_passive_headers(account, &observation.rate_limit_headers)
+                    .await
+                    .map_err(|_| ())?;
+                // Retry-After 超过此次探测预算时不抢跑；交给冷却后的下一次探测。
+                if observation
+                    .retry_after
+                    .is_some_and(|delay| delay > Duration::from_secs(5))
+                {
+                    return Ok(observation);
+                }
+                let delay = observation.retry_after.unwrap_or(Duration::from_millis(50));
+                tokio::time::sleep(delay).await;
+            } else if attempt == 0 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+        Err(())
+    }
+    async fn eligible_account(
+        &self,
+        account: &ProviderAccount,
+    ) -> Result<Option<ProviderAccount>, ()> {
+        let Some(current) = self
+            .repository
+            .store()
+            .get_account(account.id())
+            .await
+            .map_err(|_| ())?
+        else {
+            return Ok(None);
+        };
+        let probe_model = self.settings().await?.probe_model;
+        if !current.enabled()
+            || current.authentication_kind() != "oauth"
+            || !current.model_access().allows(&probe_model)
+        {
+            return Ok(None);
+        }
+        let cooldown = self.quota.cooldown(current.id()).await.map_err(|_| ())?;
+        if current
+            .status_projection(SystemTime::now(), cooldown)
+            .status
+            != gateway_core::account::AccountStatus::Normal
+        {
+            return Ok(None);
+        }
+        // 没有额度材料时先走既有额度刷新器，使用账号绑定的出口；读取失败不探测。
+        let snapshot = match self
+            .quota
+            .read_account(current.id())
+            .await
+            .map_err(|_| ())?
+        {
+            Some(snapshot) => snapshot,
+            None => self
+                .quota
+                .refresh_account(current.id())
+                .await
+                .map_err(|_| ())?,
+        };
+        if snapshot.quota().is_exhausted() {
+            return Ok(None);
+        }
+        Ok(Some(current))
+    }
+    async fn observe_probe_quota(
+        &self,
+        account: &ProviderAccount,
+        observation: &crate::transport::probe::ProbeObservation,
+    ) -> Result<(), ()> {
+        self.quota
+            .synchronize_passive_headers(account, &observation.rate_limit_headers)
+            .await
+            .map_err(|_| ())?;
+        if observation.status == 429 {
+            self.quota
+                .apply_rate_limit_429(account, observation.retry_after, SystemTime::now())
+                .await
+                .map_err(|_| ())?;
+        }
+        Ok(())
+    }
+}
+
+pub(crate) struct GatewayPoolGuard {
+    service: Arc<GatewayPoolService>,
+    account: String,
+    lease: String,
+    material: Material,
+    finished: bool,
+}
+impl GatewayPoolGuard {
+    pub(crate) fn state(&self) -> &str {
+        self.material.state.expose_secret()
+    }
+    pub(crate) fn cookie(&self) -> &str {
+        self.material.cookie.expose_secret()
+    }
+    pub(crate) async fn sent(&self) -> Result<bool, ()> {
+        self.service
+            .call(json!({"action":"sent","accountId":self.account,"leaseId":self.lease}))
+            .await
+            .map(|value| value["accepted"] == true)
+    }
+    pub(crate) async fn observe(
+        &self,
+        status: u16,
+        state_returned: bool,
+        cookies: &[String],
+        duration: Duration,
+    ) -> Result<Option<bool>, ()> {
+        let cookie = merge_cookie(self.cookie(), cookies)?;
+        let matches = cookie_gateway(&cookie).as_deref() == Some(&self.material.pair.gateway);
+        let value = self.service.call(json!({"action":"businessResult","accountId":self.account,"leaseId":self.lease,"status":status,"stateReturned":state_returned,"paired":true,"gatewayMatches":matches,"durationMs":duration.as_millis()})).await?;
+        Ok(match value["classification"].as_str() {
+            Some("21") if matches => Some(true),
+            Some("29") if matches => Some(false),
+            _ => None,
+        })
+    }
+    pub(crate) async fn finish(mut self) {
+        if self
+            .service
+            .call(json!({"action":"finish","accountId":self.account,"leaseId":self.lease}))
+            .await
+            .is_ok()
+        {
+            self.finished = true;
+        }
+    }
+}
+impl Drop for GatewayPoolGuard {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let service = Arc::clone(&self.service);
+            let payload = json!({"action":"finish","accountId":self.account,"leaseId":self.lease});
+            handle.spawn(async move {
+                let _ = service.call(payload).await;
+            });
+        }
+    }
+}
+
+/// 真实实验仅复用生产的路由、材料、额度和响应头判定，不注册公网接口。
+#[cfg(feature = "gateway-pool-experiment")]
+#[derive(Clone)]
+pub struct GatewayPoolExperiment(Arc<GatewayPoolService>);
+
+#[cfg(feature = "gateway-pool-experiment")]
+impl GatewayPoolExperiment {
+    pub(crate) fn new(service: Arc<GatewayPoolService>) -> Self {
+        Self(service)
+    }
+    /// 仅显式授权的独立实验启用：池元数据直连，账号上游出口保持不变。
+    pub fn allow_direct_pool_metadata(&self) {
+        self.0
+            .direct_pool_experiment
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub async fn background(&self, cancellation: &CancellationToken) -> bool {
+        self.0.background(cancellation).await.is_ok()
+    }
+
+    pub async fn refresh_quota(&self, id: &gateway_core::account::ProviderAccountId) -> bool {
+        self.0
+            .quota
+            .refresh_account(id)
+            .await
+            .is_ok_and(|s| !s.quota().is_exhausted())
+    }
+
+    /// 固定 body 与会话的完整 SSE 缓存实验；每个实验通道独立保留已验证材料。
+    pub async fn cache_sample(
+        &self,
+        id: &gateway_core::account::ProviderAccountId,
+        body: serde_json::Map<String, Value>,
+        session: &str,
+        deadline: SystemTime,
+        cancellation: &CancellationToken,
+    ) -> Value {
+        let Ok(Some(account)) = self.0.repository.store().get_account(id).await else {
+            return json!({"result":"account_unavailable"});
+        };
+        let guard = match self.0.route(&account, deadline, cancellation).await {
+            Ok(guard) => guard,
+            Err(()) => return json!({"result":"route_unavailable"}),
+        };
+        let result = async {
+            // 找票的额度响应会更新账号投影，凭据校验必须使用发送前的最新快照。
+            let account = self.0.eligible_account(&account).await.map_err(|_| "account_reload_failed")?.ok_or("account_unavailable_after_prepare")?;
+            let credential = self.0.repository.load_runtime_credential(&account).await.map_err(|_| "credential_unavailable")?;
+            let authorization = credential.authentication.authorization_header().map_err(|_| "authorization_unavailable")?;
+            let client = self.0.client.for_account(&account).map_err(|_| "transport_unavailable")?;
+            let mut context = CodexRequestContext::auxiliary(authorization.expose_secret(), account.upstream_account_id(), session, Some(&credential.installation_id));
+            context.session_id = Some(session);
+            context.thread_id = Some(session);
+            context.turn_state = Some(guard.state());
+            context.cookie_header = Some(guard.cookie());
+            if !guard.sent().await.map_err(|_| "reservation_failed")? { return Err("reservation_retired"); }
+            let mut request = CodexResponsesRequest::from_body(body);
+            request.force_http_sse = true;
+            let started = Instant::now();
+            let observation = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Err("cancelled"),
+                value = tokio::time::timeout(Duration::from_secs(45), client.cache_observation(&request, context)) => value.map_err(|_| "request_timeout")?.map_err(|_| "response_read_failed")?,
+            };
+            let _ = self.0.observe_probe_quota(&account, &observation).await;
+            let classification = guard.observe(observation.status, observation.state_returned, &observation.cookies, started.elapsed()).await.map_err(|_| "observation_failed")?;
+            let input = observation.usage.as_ref().and_then(|u| u["input_tokens"].as_u64());
+            let cached = observation.usage.as_ref().and_then(|u| u["input_tokens_details"]["cached_tokens"].as_u64());
+            Ok::<_, &str>(json!({"result":"cache_sample","requestSent":true,"gateway":guard.material.pair.gateway,"ticketFingerprint":fingerprint(guard.state()),"status":observation.status,"classification":match classification {Some(true)=>Some("21"),Some(false)=>Some("29"),None=>None},"stateReturned":observation.state_returned,"gatewayMatches":classification.is_some(),"inputTokens":input,"cachedTokens":cached,"cacheWriteTokens":observation.usage.as_ref().and_then(|u| u["input_tokens_details"]["cache_write_tokens"].as_u64()),"outputTokens":observation.usage.as_ref().and_then(|u| u["output_tokens"].as_u64()),"usage":observation.usage,"streamFailure":observation.stream_failure,"assistantText":observation.text,"durationMs":started.elapsed().as_millis()}))
+        }.await;
+        let gateway = guard.material.pair.gateway.clone();
+        guard.finish().await;
+        result.unwrap_or_else(|stage| json!({"result":"transport_or_observation_failed","stage":stage,"gateway":gateway,"requestSent":matches!(stage,"request_timeout"|"response_read_failed"|"observation_failed")}))
+    }
+
+    pub async fn sample(
+        &self,
+        id: &gateway_core::account::ProviderAccountId,
+        deadline: SystemTime,
+        cancellation: &CancellationToken,
+    ) -> Value {
+        self.model_sample(id, "gpt-6-astra", true, deadline, cancellation)
+            .await
+    }
+
+    /// 在当前已验证的票上发送指定模型的 `hi`，只看响应头。`classify` 为 false 时
+    /// 只记录事实，不把结果计入组合判定，避免跨模型观察误伤打票模型的组合。
+    pub async fn model_sample(
+        &self,
+        id: &gateway_core::account::ProviderAccountId,
+        model: &str,
+        classify: bool,
+        deadline: SystemTime,
+        cancellation: &CancellationToken,
+    ) -> Value {
+        let Ok(Some(account)) = self.0.repository.store().get_account(id).await else {
+            return json!({"result":"account_unavailable"});
+        };
+        if !matches!(self.0.eligible_account(&account).await, Ok(Some(_))) {
+            return json!({"result":"quota_or_account_unavailable"});
+        }
+        let guard = match tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return json!({"result":"cancelled"}),
+            result = self.0.route(&account, deadline, cancellation) => result,
+        } {
+            Ok(guard) => guard,
+            Err(()) => return json!({"result":"route_unavailable"}),
+        };
+        // 找票的额度响应会更新账号投影，加载凭据前必须改用最新快照。
+        let Ok(Some(account)) = self.0.eligible_account(&account).await else {
+            guard.finish().await;
+            return json!({"result":"account_unavailable_after_prepare","model":model});
+        };
+        let mut result = self
+            .sample_reserved(&account, &guard, model, classify, cancellation)
+            .await;
+        result["model"] = json!(model);
+        result["classified"] = json!(classify);
+        guard.finish().await;
+        result
+    }
+
+    async fn sample_reserved(
+        &self,
+        account: &ProviderAccount,
+        guard: &GatewayPoolGuard,
+        model: &str,
+        classify: bool,
+        cancellation: &CancellationToken,
+    ) -> Value {
+        let Ok(credential) = self.0.repository.load_runtime_credential(account).await else {
+            return json!({"result":"credential_unavailable"});
+        };
+        let Ok(authorization) = credential.authentication.authorization_header() else {
+            return json!({"result":"credential_unavailable"});
+        };
+        let Ok(client) = self.0.client.for_account(account) else {
+            return json!({"result":"transport_unavailable"});
+        };
+        let session = Uuid::new_v4().to_string();
+        let mut context = CodexRequestContext::auxiliary(
+            authorization.expose_secret(),
+            account.upstream_account_id(),
+            &session,
+            Some(&credential.installation_id),
+        );
+        context.turn_state = Some(guard.state());
+        context.cookie_header = Some(guard.cookie());
+        let Some(request) = hi_request(model) else {
+            return json!({"result":"invalid_model"});
+        };
+        for retry in 0..=1 {
+            if !matches!(self.0.eligible_account(account).await, Ok(Some(_))) {
+                return json!({"result":"quota_or_account_unavailable"});
+            }
+            if !matches!(guard.sent().await, Ok(true)) {
+                return json!({"result":"reservation_retired"});
+            }
+            let started = Instant::now();
+            let observation = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return json!({"result":"cancelled"}),
+                result = tokio::time::timeout(Duration::from_secs(15), client.diagnostic_observation(&request, context, true)) => result.ok().and_then(Result::ok),
+            };
+            if let Some(observation) = observation {
+                let _ = self.0.observe_probe_quota(account, &observation).await;
+                let classification = if classify {
+                    guard
+                        .observe(
+                            observation.status,
+                            observation.state_returned,
+                            &observation.cookies,
+                            started.elapsed(),
+                        )
+                        .await
+                } else {
+                    Ok(None)
+                };
+                let gateway_matches = merge_cookie(guard.cookie(), &observation.cookies)
+                    .ok()
+                    .and_then(|cookie| cookie_gateway(&cookie))
+                    .is_some_and(|gateway| gateway == guard.material.pair.gateway);
+                let result = json!({"result":"headers","gateway":guard.material.pair.gateway,"status":observation.status,"stateReturned":observation.state_returned,"stateEchoed":observation.state.as_deref().map(|state| state == guard.state()),"stateFingerprint":observation.state.as_deref().map(fingerprint),"ticketFingerprint":fingerprint(guard.state()),"gatewayMatches":gateway_matches,"classification":match classification {Ok(Some(true))=>Some("21"),Ok(Some(false))=>Some("29"),_=>None},"durationMs":started.elapsed().as_millis(),"retry":retry});
+                if observation.status == 200 || !classify {
+                    return result;
+                }
+                if retry == 1
+                    || observation
+                        .retry_after
+                        .is_some_and(|d| d > Duration::from_secs(5))
+                {
+                    let _ = self.0.call(json!({"action":"invalidate","accountId":guard.account,"leaseId":guard.lease})).await;
+                    return result;
+                }
+                tokio::time::sleep(observation.retry_after.unwrap_or(Duration::from_millis(50)))
+                    .await;
+            } else if retry == 1 && !classify {
+                return json!({"result":"transport_failed","gateway":guard.material.pair.gateway});
+            } else if retry == 1 {
+                let _ = self.0.call(json!({"action":"businessResult","accountId":guard.account,"leaseId":guard.lease,"status":null,"stateReturned":false,"paired":true,"gatewayMatches":true,"failed":true,"durationMs":started.elapsed().as_millis()})).await;
+                let _ = self.0.call(json!({"action":"invalidate","accountId":guard.account,"leaseId":guard.lease})).await;
+                return json!({"result":"transport_failed","gateway":guard.material.pair.gateway});
+            } else {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+        json!({"result":"transport_failed"})
+    }
+}
+
+/// 实验对照用：只输出 SHA-256 前 8 位，便于比较两次 state 是否相同，不暴露原文。
+#[cfg(feature = "gateway-pool-experiment")]
+fn fingerprint(value: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(&Sha256::digest(value.as_bytes())[..4])
+}
+fn epoch(time: SystemTime) -> f64 {
+    time.duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+}
+fn claims(cookie: &str) -> Option<Value> {
+    let token = cookie
+        .split(';')
+        .find_map(|part| part.trim().strip_prefix("__oailb="))?;
+    let bytes = URL_SAFE_NO_PAD
+        .decode(token.split('.').nth(1)?.trim_end_matches('='))
+        .ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+pub(crate) fn cookie_gateway(cookie: &str) -> Option<String> {
+    let value = claims(cookie)?;
+    value["host"]
+        .as_str()?
+        .split('.')
+        .find(|s| {
+            s.strip_prefix("unified-")
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .map(str::to_owned)
+}
+fn cookie_expiry(cookie: &str) -> Option<SystemTime> {
+    let expiry = SystemTime::UNIX_EPOCH
+        .checked_add(Duration::from_secs(claims(cookie)?["exp"].as_u64()?))?;
+    (expiry > SystemTime::now()).then_some(expiry)
+}
+fn routing_cookie(value: &Value) -> Result<String, ()> {
+    if let Some(cookie) = value["cookie"].as_str() {
+        return merge_cookie(cookie, &[]);
+    }
+    let values = value.get("cookies").unwrap_or(value);
+    let oailb = values["__oailb"]
+        .as_str()
+        .or_else(|| values["oailb"].as_str())
+        .ok_or(())?;
+    let cflb = values["__cflb"]
+        .as_str()
+        .or_else(|| values["cflb"].as_str())
+        .ok_or(())?;
+    merge_cookie(&format!("__oailb={oailb}; __cflb={cflb}"), &[])
+}
+fn merge_cookie(original: &str, updates: &[String]) -> Result<String, ()> {
+    let mut values = HashMap::new();
+    for value in original.split(';').chain(
+        updates
+            .iter()
+            .map(|s| s.split(';').next().unwrap_or_default()),
+    ) {
+        let Some((name, value)) = value.trim().split_once('=') else {
+            continue;
+        };
+        if matches!(name, "__oailb" | "__cflb") {
+            values.insert(name, value);
+        }
+    }
+    let cookie = format!(
+        "__oailb={}; __cflb={}",
+        values.get("__oailb").ok_or(())?,
+        values.get("__cflb").ok_or(())?
+    );
+    if cookie.len() > 16384 || reqwest::header::HeaderValue::from_str(&cookie).is_err() {
+        return Err(());
+    }
+    Ok(cookie)
+}
