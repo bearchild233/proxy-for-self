@@ -67,7 +67,7 @@ struct Settings {
     probe_model: String,
 }
 fn default_probe_model() -> String {
-    "gpt-6-astra".into()
+    "gpt-6.1-sol".into()
 }
 fn hi_request(model: &str) -> Option<CodexResponsesRequest> {
     Some(CodexResponsesRequest::from_body(json!({"model":model,"input":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}],"instructions":"Do not use external tools.","tools":[],"stream":true,"store":false,"reasoning":{"effort":"low"}}).as_object().cloned()?))
@@ -77,6 +77,13 @@ fn hi_request(model: &str) -> Option<CodexResponsesRequest> {
 struct Pair {
     gateway: String,
     generation: String,
+}
+/// 同一组合窗口内其他模型的票：只拿 state，不单独判定，随组合代次失效。
+#[derive(Clone)]
+struct Ticket {
+    state: SecretString,
+    cookie: SecretString,
+    expires: SystemTime,
 }
 #[derive(Clone)]
 struct Material {
@@ -94,6 +101,10 @@ pub(crate) struct GatewayPoolService {
     quota: Arc<CodexCredentialQuotaService>,
     client: CodexBackendClient,
     materials: Mutex<HashMap<String, Material>>,
+    tickets: Mutex<HashMap<String, Ticket>>,
+    /// 近期经过网关池的账号；持续模式只为它们后台轮换，不扫描全部账号。
+    active: Mutex<HashMap<String, Instant>>,
+    ticket_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     settings: Mutex<Option<(Instant, Settings)>>,
     probes: Arc<Semaphore>,
     #[cfg(feature = "gateway-pool-experiment")]
@@ -127,6 +138,9 @@ impl GatewayPoolService {
             quota,
             client,
             materials: Mutex::new(HashMap::new()),
+            tickets: Mutex::new(HashMap::new()),
+            active: Mutex::new(HashMap::new()),
+            ticket_locks: Mutex::new(HashMap::new()),
             settings: Mutex::new(None),
             probes: Arc::new(Semaphore::new(4)),
             #[cfg(feature = "gateway-pool-experiment")]
@@ -206,6 +220,14 @@ impl GatewayPoolService {
         if !settings.enabled || settings.mode != "continuous" {
             return Ok(());
         }
+        let active = {
+            let mut active = self.active.lock().await;
+            active.retain(|_, seen| seen.elapsed() < Duration::from_secs(1800));
+            active
+                .keys()
+                .cloned()
+                .collect::<std::collections::HashSet<_>>()
+        };
         for account in self
             .repository
             .store()
@@ -215,9 +237,10 @@ impl GatewayPoolService {
         {
             if account.provider().as_str() == "openai"
                 && account.enabled()
-                && settings
-                    .pool_account_ids
-                    .contains_key(account.id().as_str())
+                && (active.contains(account.id().as_str())
+                    || settings
+                        .pool_account_ids
+                        .contains_key(account.id().as_str()))
             {
                 self.start_prepare(account, false, cancellation.clone())
                     .await?;
@@ -293,13 +316,13 @@ impl GatewayPoolService {
         cancellation: &CancellationToken,
     ) -> Result<GatewayPoolGuard, ()> {
         let settings = self.settings().await?;
-        if !settings.enabled
-            || !settings
-                .pool_account_ids
-                .contains_key(account.id().as_str())
-        {
+        if !settings.enabled || pool_member_id(&settings, account).is_none() {
             return Err(());
         }
+        self.active
+            .lock()
+            .await
+            .insert(account.id().as_str().to_owned(), Instant::now());
         loop {
             if self.eligible_account(account).await?.is_none() {
                 return Err(());
@@ -353,6 +376,8 @@ impl GatewayPoolService {
                             account: account.id().as_str().to_owned(),
                             lease: reservation["leaseId"].as_str().ok_or(())?.to_owned(),
                             material,
+                            model: settings.probe_model.clone(),
+                            ticket: None,
                             finished: false,
                         });
                     }
@@ -431,10 +456,8 @@ impl GatewayPoolService {
             return Err(());
         }
         let client = self.client.for_account(account).map_err(|_| ())?;
-        let pool_id = settings
-            .pool_account_ids
-            .get(account.id().as_str())
-            .ok_or(())?;
+        let pool_id = pool_member_id(settings, account).ok_or(())?;
+        let pool_id = &pool_id;
         #[cfg(feature = "gateway-pool-experiment")]
         let pool_client = if self
             .direct_pool_experiment
@@ -630,14 +653,157 @@ pub(crate) struct GatewayPoolGuard {
     account: String,
     lease: String,
     material: Material,
+    /// 当前请求使用的模型；初始为打票模型。
+    model: String,
+    /// 非打票模型的票；为空时使用组合自身的 S0。
+    ticket: Option<Ticket>,
     finished: bool,
 }
 impl GatewayPoolGuard {
     pub(crate) fn state(&self) -> &str {
-        self.material.state.expose_secret()
+        self.ticket
+            .as_ref()
+            .map_or(&self.material.state, |ticket| &ticket.state)
+            .expose_secret()
     }
     pub(crate) fn cookie(&self) -> &str {
-        self.material.cookie.expose_secret()
+        self.ticket
+            .as_ref()
+            .map_or(&self.material.cookie, |ticket| &ticket.cookie)
+            .expose_secret()
+    }
+    /// 切换到请求模型的票。窗口由打票模型验证，其他模型共用窗口，只需各自的 state：
+    /// 先读本进程缓存、再读 A/B 共享存储，都没有时用该模型发一次 `hi`，拿到响应头即断开，
+    /// 不做第二轮判定。同组合同模型的拿票在进程内合并。
+    pub(crate) async fn use_model(
+        &mut self,
+        model: &str,
+        client: &CodexBackendClient,
+        account: &ProviderAccount,
+        authorization: &str,
+        installation_id: &str,
+    ) -> Result<(), ()> {
+        if model == self.model {
+            return Ok(());
+        }
+        if model.is_empty()
+            || model.len() > 64
+            || !model
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-')
+        {
+            return Err(());
+        }
+        let key = format!("{}:{}:{model}", self.account, self.material.pair.generation);
+        let lock = {
+            let mut locks = self.service.ticket_locks.lock().await;
+            locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+            Arc::clone(locks.entry(key.clone()).or_default())
+        };
+        let _held = lock.lock().await;
+        let cached = self
+            .service
+            .tickets
+            .lock()
+            .await
+            .get(&key)
+            .filter(|ticket| ticket.expires > SystemTime::now())
+            .cloned();
+        let ticket = match cached {
+            Some(ticket) => ticket,
+            None => match self.shared_ticket(model).await? {
+                Some(ticket) => ticket,
+                None => {
+                    self.fetch_ticket(model, client, account, authorization, installation_id)
+                        .await?
+                }
+            },
+        };
+        let mut tickets = self.service.tickets.lock().await;
+        tickets.retain(|_, ticket| ticket.expires > SystemTime::now());
+        if tickets.len() >= 512
+            && let Some(old) = tickets.keys().next().cloned()
+        {
+            tickets.remove(&old);
+        }
+        tickets.insert(key, ticket.clone());
+        drop(tickets);
+        self.model = model.to_owned();
+        self.ticket = Some(ticket);
+        Ok(())
+    }
+    async fn shared_ticket(&self, model: &str) -> Result<Option<Ticket>, ()> {
+        let shared = self.service.call(json!({"action":"ticket","accountId":self.account,"generation":self.material.pair.generation,"model":model})).await?;
+        Ok(shared["state"]
+            .as_str()
+            .zip(shared["cookie"].as_str())
+            .and_then(|(state, cookie)| {
+                let expires = SystemTime::UNIX_EPOCH
+                    .checked_add(Duration::try_from_secs_f64(shared["expires"].as_f64()?).ok()?)?;
+                (expires > SystemTime::now()
+                    && cookie_gateway(cookie).as_deref()
+                        == Some(self.material.pair.gateway.as_str()))
+                .then(|| Ticket {
+                    state: SecretString::from(state.to_owned()),
+                    cookie: SecretString::from(cookie.to_owned()),
+                    expires,
+                })
+            }))
+    }
+    async fn fetch_ticket(
+        &self,
+        model: &str,
+        client: &CodexBackendClient,
+        account: &ProviderAccount,
+        authorization: &str,
+        installation_id: &str,
+    ) -> Result<Ticket, ()> {
+        // 拿票是真实上游访问，记在本业务租约上；组合已退役时不再发送。
+        if !self.sent().await? {
+            return Err(());
+        }
+        let id = Uuid::new_v4().to_string();
+        let base = self.material.cookie.expose_secret();
+        let mut context = CodexRequestContext::auxiliary(
+            authorization,
+            account.upstream_account_id(),
+            &id,
+            Some(installation_id),
+        );
+        context.cookie_header = Some(base);
+        let request = hi_request(model).ok_or(())?;
+        let started = Instant::now();
+        let observed = tokio::time::timeout(
+            Duration::from_secs(15),
+            client.diagnostic_observation(&request, context, true),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok);
+        if let Some(observation) = &observed {
+            let _ = self.service.observe_probe_quota(account, observation).await;
+        }
+        let ticket = observed
+            .as_ref()
+            .filter(|observation| observation.status == 200)
+            .and_then(|observation| {
+                let state = observation
+                    .state
+                    .clone()
+                    .filter(|state| !state.is_empty() && state.len() <= 16384)?;
+                let cookie = merge_cookie(base, &observation.cookies).ok()?;
+                (cookie_gateway(&cookie).as_deref() == Some(self.material.pair.gateway.as_str()))
+                    .then_some(())?;
+                let expires = cookie_expiry(&cookie)?.min(self.material.expires);
+                Some(Ticket {
+                    state: SecretString::from(state),
+                    cookie: SecretString::from(cookie),
+                    expires,
+                })
+            });
+        let material = ticket.as_ref().map(|ticket| json!({"state":ticket.state.expose_secret(),"cookie":ticket.cookie.expose_secret(),"expires":epoch(ticket.expires)}));
+        self.service.call(json!({"action":"ticketResult","accountId":self.account,"leaseId":self.lease,"model":model,"status":observed.as_ref().map(|o| o.status),"stateReturned":observed.as_ref().is_some_and(|o| o.state_returned),"durationMs":started.elapsed().as_millis(),"material":material})).await?;
+        ticket.ok_or(())
     }
     pub(crate) async fn sent(&self) -> Result<bool, ()> {
         self.service
@@ -654,7 +820,7 @@ impl GatewayPoolGuard {
     ) -> Result<Option<bool>, ()> {
         let cookie = merge_cookie(self.cookie(), cookies)?;
         let matches = cookie_gateway(&cookie).as_deref() == Some(&self.material.pair.gateway);
-        let value = self.service.call(json!({"action":"businessResult","accountId":self.account,"leaseId":self.lease,"status":status,"stateReturned":state_returned,"paired":true,"gatewayMatches":matches,"durationMs":duration.as_millis()})).await?;
+        let value = self.service.call(json!({"action":"businessResult","accountId":self.account,"leaseId":self.lease,"model":self.model,"status":status,"stateReturned":state_returned,"paired":true,"gatewayMatches":matches,"durationMs":duration.as_millis()})).await?;
         Ok(match value["classification"].as_str() {
             Some("21") if matches => Some(true),
             Some("29") if matches => Some(false),
@@ -904,6 +1070,20 @@ impl GatewayPoolExperiment {
 fn fingerprint(value: &str) -> String {
     use sha2::{Digest, Sha256};
     hex::encode(&Sha256::digest(value.as_bytes())[..4])
+}
+/// 池服务成员标识：管理员显式映射优先，否则按上游账号与用户自动生成。
+fn pool_member_id(settings: &Settings, account: &ProviderAccount) -> Option<String> {
+    settings
+        .pool_account_ids
+        .get(account.id().as_str())
+        .cloned()
+        .or_else(|| {
+            Some(format!(
+                "gwpool-member:{}/{}",
+                account.upstream_account_id()?,
+                account.upstream_user_id()?
+            ))
+        })
 }
 fn epoch(time: SystemTime) -> f64 {
     time.duration_since(SystemTime::UNIX_EPOCH)

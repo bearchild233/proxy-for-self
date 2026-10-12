@@ -731,7 +731,7 @@ async fn run(exhausted: bool, tools: Value) -> (Vec<String>, usize) {
         let data:Value = input.body_json().unwrap();
         let generation = if selected.load(Ordering::SeqCst) {"second"}else{"first"};
         let value = match data["action"].as_str().unwrap() {
-            "config" => json!({"enabled":true,"groupIds":[GROUP],"poolAccountIds":{ACCOUNT:"demo"},"probeIntervalMs":50}),
+            "config" => json!({"enabled":true,"groupIds":[GROUP],"poolAccountIds":{ACCOUNT:"demo"},"probeIntervalMs":50,"probeModel":"gpt-6-astra"}),
             "plan" => json!({"ready":{"gateway":if generation=="first" {"unified-142"}else{"unified-143"},"generation":generation},"probe":null,"preparing":false}),
             "material" => {
                 let host = if data["generation"]=="first" {"unified-142"}else{"unified-143"};
@@ -838,6 +838,117 @@ async fn pool_does_not_replay_upstream_tools_with_unknown_side_effects() {
 async fn pool_skips_account_with_confirmed_exhausted_quota() {
     let (_, count) = run(true, json!([])).await;
     assert_eq!(count, 0);
+}
+
+/// 打票模型为 sol 时，Astra 请求在同一窗口内先用 Astra 发 `hi` 只拿 state，
+/// 不做第二轮判定；业务请求带 Astra 自己的票，不使用 sol 的 S0。
+#[tokio::test]
+async fn pool_fetches_model_ticket_within_shared_window() {
+    let upstream = MockServer::start().await;
+    let runtime = MockServer::start().await;
+    let store = Arc::new(MemoryAccountStore::default());
+    store
+        .seed_oauth_credential(ImportCodexOAuthCredential {
+            account_id: ACCOUNT.into(),
+            name: "Demo".into(),
+            secret: secret("demo-token"),
+            verified_account: profile("demo-upstream"),
+            next_refresh_at: None,
+            enabled: true,
+        })
+        .await;
+    let account = store.account(ACCOUNT).unwrap();
+    let now = SystemTime::now();
+    store.compare_and_swap_quota(QuotaObservation {plan_type:None,account_id:account.id().clone(),expected_revision:account.revision(),observed_at:now,state:QuotaState::allowed(now),quota:OpaqueProviderData::new(json!({"rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{"used_percent":10,"reset_at":Utc::now().timestamp()+18000}}}).as_object().unwrap().clone())}).await.unwrap();
+    let actions = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+    let seen = Arc::clone(&actions);
+    let payload = URL_SAFE_NO_PAD.encode(
+        json!({"host":"unified-142.example.invalid","exp":Utc::now().timestamp()+600}).to_string(),
+    );
+    let cookie = format!("__oailb=h.{payload}.s; __cflb=demo");
+    Mock::given(method("POST")).respond_with(move |input:&wiremock::Request| {
+        let data:Value = input.body_json().unwrap();
+        seen.lock().unwrap().push(data.clone());
+        let value = match data["action"].as_str().unwrap() {
+            "config" => json!({"enabled":true,"groupIds":[GROUP],"poolAccountIds":{ACCOUNT:"demo"},"probeIntervalMs":50,"probeModel":"gpt-6.1-sol"}),
+            "plan" => json!({"ready":{"gateway":"unified-142","generation":"first"},"probe":null,"preparing":false}),
+            "material" => json!({"state":"sol-s0","cookie":cookie,"expires":Utc::now().timestamp()+600}),
+            "reserve" => json!({"reserved":true,"leaseId":"lease-1"}),
+            "ticket" => Value::Null,
+            "businessResult" => json!({"accepted":true,"classification":if data["stateReturned"]==true {"29"} else {"21"}}),
+            _ => json!({"accepted":true}),
+        };
+        ResponseTemplate::new(200).set_body_json(value)
+    }).mount(&runtime).await;
+    Mock::given(method("POST")).and(path("/codex/responses")).respond_with(|input:&wiremock::Request| {
+        let state = input.headers.get("x-codex-turn-state").map(|value| value.to_str().unwrap().to_owned());
+        assert_ne!(state.as_deref(), Some("sol-s0"), "sol 的 S0 不能用于 Astra");
+        match state.as_deref() {
+            None => ResponseTemplate::new(200).insert_header("content-type","text/event-stream").insert_header("x-codex-turn-state","astra-ticket").set_body_string("data: {}
+
+"),
+            Some("astra-ticket") => ResponseTemplate::new(200).insert_header("content-type","text/event-stream").set_body_string("data: {\"type\":\"response.output_text.delta\",\"item_id\":\"item\",\"output_index\":0,\"content_index\":0,\"delta\":\"complete good answer\"}
+
+data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_pool\",\"status\":\"completed\",\"output\":[]}}
+
+"),
+            Some(other) => panic!("unexpected state {other}"),
+        }
+    }).mount(&upstream).await;
+    let mut config = valid_config();
+    let key = config._runtime.path().join("pool.key");
+    std::fs::write(&key, "a".repeat(64)).unwrap();
+    config.config.api.base_url = upstream.uri();
+    config.config.gateway_pool = Some(provider_openai::gateway_pool::GatewayPoolConfig {
+        runtime_url: runtime.uri(),
+        key_file: key,
+    });
+    let bundle = provider_openai::initialize(
+        config.config.clone(),
+        provider_ports_with(store, Arc::new(TestOAuthPending::default())),
+    )
+    .await
+    .unwrap();
+    let mut stream = bundle
+        .core_provider()
+        .execute(request(json!([])), context())
+        .await
+        .unwrap();
+    let mut events = Vec::new();
+    while let Some(event) = stream.next().await {
+        if let Some(wire) = event.unwrap().wire_event() {
+            events.push(wire.data().to_string());
+        }
+    }
+    assert!(events.join(" ").contains("complete good answer"));
+    let requests = upstream.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    let decode = |body: &[u8]| -> Value {
+        serde_json::from_slice(&zstd::stream::decode_all(body).unwrap_or_else(|_| body.to_vec()))
+            .unwrap()
+    };
+    let ticket_request = decode(&requests[0].body);
+    assert_eq!(ticket_request["model"], "gpt-6-astra");
+    assert_eq!(ticket_request["input"][0]["content"][0]["text"], "hi");
+    assert_eq!(requests[1].headers["x-codex-turn-state"], "astra-ticket");
+    let actions = actions.lock().unwrap();
+    let ticket = actions
+        .iter()
+        .find(|a| a["action"] == "ticketResult")
+        .expect("ticket recorded");
+    assert_eq!(ticket["model"], "gpt-6-astra");
+    assert_eq!(ticket["material"]["state"], "astra-ticket");
+    let business = actions
+        .iter()
+        .find(|a| a["action"] == "businessResult")
+        .unwrap();
+    assert_eq!(business["model"], "gpt-6-astra");
+    // 拿票只是材料获取，不单独判定，也不触发找票。
+    assert!(
+        !actions
+            .iter()
+            .any(|a| a["action"] == "probeResult" || a["action"] == "claim")
+    );
 }
 
 // 走完整找票流程，响应体故意不是 SSE：探测只读头，错误最多重试一次。

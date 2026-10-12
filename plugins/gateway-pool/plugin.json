@@ -1,8 +1,8 @@
 {
-  "id": "gateway-pool", "version": "0.1.0", "protocol": 2, "kind": "ui", "sdk": 1,
+  "id": "gateway-pool", "version": "0.2.0", "protocol": 2, "kind": "ui", "sdk": 1,
   "runtime": "vue-component", "hostApi": 1,
   "pages": [{"id":"main","title":"网关池","entry":"ui/module.js","roles":["admin"],"route":"/extensions/gateway-pool"}],
   "capabilities": ["gateway-pool.read","gateway-pool.configure","account-groups.get.admin.account-groups","accounts.get.admin.accounts"],
   "policyWorker": "worker/policy.py",
-  "releaseNotes": ["按账号与网关独立检测、轮换和持久化退避。","支持持续与懒模式，记录实际静置时长及切换统计。"]
+  "releaseNotes": ["默认以 6.1 Sol 打票；满血窗口按账号×网关共用，各模型在窗口内按需拿票。","选定分组所有 HTTP 模型经过网关池，原生 WS 请求拒绝。","池成员标识自动生成，界面重做：账号视图、窗口进度、网关状态与静置倒计时。"]
 }

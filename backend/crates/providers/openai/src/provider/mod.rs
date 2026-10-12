@@ -680,9 +680,8 @@ impl Provider for CodexProvider {
             false
         };
         let transport = if pool_enabled {
-            // 实验判据先要求 HTTP 200 响应头，不能把 WS 没有头误判成 21。
+            // 判据依赖 HTTP 200 响应头，WS 没有逐次响应头，不能误判成 21，直接拒绝。
             if requirement.requires_websocket()
-                || upstream_model.as_str() != "gpt-6-astra"
                 || !matches!(
                     lease.authentication(),
                     crate::credential::CodexRuntimeAuthentication::OAuth(_)

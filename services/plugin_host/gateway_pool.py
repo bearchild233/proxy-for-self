@@ -27,6 +27,7 @@ class GatewayPool:
                 CREATE TABLE IF NOT EXISTS observations (id INTEGER PRIMARY KEY, at REAL NOT NULL, account TEXT NOT NULL, gateway TEXT NOT NULL, data TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS switches (id INTEGER PRIMARY KEY, at REAL NOT NULL, account TEXT NOT NULL, data TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS materials (account TEXT NOT NULL, generation TEXT NOT NULL, expires REAL NOT NULL, data TEXT NOT NULL, PRIMARY KEY(account,generation));
+                CREATE TABLE IF NOT EXISTS model_tickets (account TEXT NOT NULL, generation TEXT NOT NULL, model TEXT NOT NULL, expires REAL NOT NULL, data TEXT NOT NULL, PRIMARY KEY(account,generation,model));
                 CREATE INDEX IF NOT EXISTS observations_pair ON observations(account,gateway,at);
             ''')
         self.path.chmod(0o640)
@@ -89,7 +90,7 @@ class GatewayPool:
                 values = settings[field]
                 if not isinstance(values, list) or len(values) > 512 or any(not isinstance(v, str) or not re.fullmatch(pattern, v) for v in values) or len(set(values)) != len(values):
                     raise ValueError(field + '无效')
-            # 打票模型只接受官方模型标识格式；默认 Astra。
+            # 打票模型只接受官方模型标识格式；默认 6.1 Sol。
             if not isinstance(settings['probeModel'], str) or not re.fullmatch(r'gpt-[0-9a-z.-]{1,60}', settings['probeModel']):
                 raise ValueError('打票模型无效')
             mapping = settings['poolAccountIds']
@@ -172,6 +173,8 @@ class GatewayPool:
             settings = self.settings(db, private=True)
             self.reap(db, settings, policy, now)
             db.execute('DELETE FROM materials WHERE expires<=?', (now,))
+            # 其他模型的票只属于当前可用窗口；组合退役或换代后立即作废。
+            db.execute("DELETE FROM model_tickets WHERE expires<=? OR NOT EXISTS (SELECT 1 FROM pairs p WHERE p.account=model_tickets.account AND json_extract(p.data,'$.generation')=model_tickets.generation AND json_extract(p.data,'$.state')='ready')", (now,))
             if action == 'config':
                 return {**settings, 'enabled': True}
             account = data['accountId']
@@ -179,6 +182,9 @@ class GatewayPool:
                 raise ValueError('账号标识无效')
             if action == 'material':
                 row = db.execute('SELECT data FROM materials WHERE account=? AND generation=? AND expires>?', (account, data['generation'], now)).fetchone()
+                return json.loads(row['data']) if row else None
+            if action == 'ticket':
+                row = db.execute('SELECT data FROM model_tickets WHERE account=? AND generation=? AND model=? AND expires>?', (account, data['generation'], self.model(data), now)).fetchone()
                 return json.loads(row['data']) if row else None
             if action in {'plan', 'claim'}:
                 candidates = settings['gateways']
@@ -234,6 +240,19 @@ class GatewayPool:
                           'firstContactAt':pair.get('firstContactAt'),'previousContactAt':pair.get('previousContactAt'),
                           'lastContactAt':pair.get('lastContactAt'),'completedAt':now}
                 db.execute('INSERT INTO observations(at,account,gateway,data) VALUES (?,?,?,?)',(now,account,lease['gateway'],json.dumps(sample)))
+            elif action == 'ticketResult':
+                # 窗口内其他模型拿票：只记录事实并保存 state，不做 21/29 判定。
+                model = self.model(data)
+                if lease['kind'] != 'business' or not lease['sent']:
+                    raise ValueError('拿票记录无效')
+                sample = {'source': 'ticket', 'model': model, 'status': data.get('status'), 'stateReturned': data.get('stateReturned') is True,
+                          'classification': None, 'durationMs': data.get('durationMs'), 'firstContactAt': pair.get('firstContactAt'),
+                          'lastContactAt': pair.get('lastContactAt'), 'completedAt': now}
+                db.execute('INSERT INTO observations(at,account,gateway,data) VALUES (?,?,?,?)', (now, account, lease['gateway'], json.dumps(sample)))
+                material = data.get('material')
+                if material is not None and pair['state'] == 'ready' and pair.get('generation') == lease['generation']:
+                    self.check_material(material, now)
+                    db.execute('INSERT OR REPLACE INTO model_tickets VALUES (?,?,?,?,?)', (account, lease['generation'], model, material['expires'], json.dumps(material)))
             elif action in {'probeResult', 'businessResult'}:
                 if (action == 'probeResult') != (lease['kind'] == 'probe'):
                     raise ValueError('租约类型不匹配')
@@ -241,7 +260,7 @@ class GatewayPool:
                                           gateway_matches=data.get('gatewayMatches') is True, failed=data.get('failed') is True)
                 if verdict is not None and not lease['sent']:
                     raise ValueError('未发送请求不能判定')
-                sample = {'source': lease['kind'], 'status': data.get('status'), 'stateReturned': data.get('stateReturned') is True, 'classification': verdict,
+                sample = {'source': lease['kind'], 'model': self.model(data) if data.get('model') is not None else None, 'status': data.get('status'), 'stateReturned': data.get('stateReturned') is True, 'classification': verdict,
                           'durationMs': data.get('durationMs'), 'plannedRestSeconds': pair.get('probeRestSeconds') if lease['kind'] == 'probe' else None,
                           'observedIdleSeconds': pair.get('observedIdleSeconds') if lease['kind'] == 'probe' else None}
                 sample.update(gatewayMatches=data.get('gatewayMatches') is True, firstContactAt=pair.get('firstContactAt'),
@@ -253,8 +272,7 @@ class GatewayPool:
                         if verdict == '21' and pair['gateway'] in settings['gateways'] and pair['state'] == 'preparing':
                             material = data.get('material')
                             if material is not None:
-                                if not isinstance(material, dict) or set(material) != {'state','cookie','expires'} or any(not isinstance(material[k], str) or not 1 <= len(material[k]) <= 16384 or '\r' in material[k] or '\n' in material[k] for k in ('state','cookie')) or not isinstance(material['expires'], (float,int)) or not now < material['expires'] <= now+86400*365:
-                                    raise ValueError('配套材料无效')
+                                self.check_material(material, now)
                                 db.execute('INSERT OR REPLACE INTO materials VALUES (?,?,?,?)', (account, lease['generation'], material['expires'], json.dumps(material)))
                             policy.recover(pair, settings, pair.get('probeRestSeconds'))
                             previous = db.execute('SELECT data FROM pairs WHERE account=? AND gateway<>?', (account, lease['gateway'])).fetchall()
@@ -304,6 +322,18 @@ class GatewayPool:
             self.save(db, pair)
             return {'accepted': True}
 
+    @staticmethod
+    def model(data):
+        model = data.get('model')
+        if not isinstance(model, str) or not re.fullmatch(r'[a-z0-9.-]{1,64}', model):
+            raise ValueError('模型标识无效')
+        return model
+
+    @staticmethod
+    def check_material(material, now):
+        if not isinstance(material, dict) or set(material) != {'state','cookie','expires'} or any(not isinstance(material[k], str) or not 1 <= len(material[k]) <= 16384 or '\r' in material[k] or '\n' in material[k] for k in ('state','cookie')) or not isinstance(material['expires'], (float,int)) or not now < material['expires'] <= now+86400*365:
+            raise ValueError('配套材料无效')
+
     def view(self, account=None, gateway=None, limit=100, before=None):
         limit = min(500, max(1, int(limit)))
         # 停用也能读历史；冷却记录不随插件卸载删除。
@@ -318,6 +348,9 @@ class GatewayPool:
                 where.append('gateway=?'); args.append(gateway)
             pair_where = ' WHERE ' + ' AND '.join(where) if where else ''
             pairs = [json.loads(r['data']) for r in db.execute('SELECT data FROM pairs'+pair_where+' ORDER BY account,gateway', args)]
+            # 只返回已拿到票的模型名，不返回 state 或 Cookie。
+            for pair in pairs:
+                pair['ticketModels'] = [r['model'] for r in db.execute('SELECT model FROM model_tickets WHERE account=? AND generation=? AND expires>? ORDER BY model', (pair['accountId'], pair.get('generation'), self.clock()))] if pair['state'] == 'ready' else []
             if before is not None:
                 where.append('id<?'); args.append(int(before))
             sample_where = ' WHERE ' + ' AND '.join(where) if where else ''

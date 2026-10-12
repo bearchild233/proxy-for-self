@@ -298,7 +298,11 @@ pub async fn initialize(
         profile_statistics,
     )
     .map_err(|_| OpenAiInitializeError::Worker)?;
-    if let Some(service) = gateway_pool.clone() {
+    #[cfg(feature = "gateway-pool-experiment")]
+    let gateway_pool_experiment = gateway_pool
+        .clone()
+        .map(gateway_pool::GatewayPoolExperiment::new);
+    if let Some(service) = gateway_pool {
         worker_contributions.push(
             provider::gateway_pool_worker(service).map_err(|_| OpenAiInitializeError::Worker)?,
         );
@@ -306,7 +310,7 @@ pub async fn initialize(
 
     Ok(ProviderBundle {
         #[cfg(feature = "gateway-pool-experiment")]
-        gateway_pool_experiment: gateway_pool.map(gateway_pool::GatewayPoolExperiment::new),
+        gateway_pool_experiment,
         core_provider,
         admin_provider,
         worker_contributions,

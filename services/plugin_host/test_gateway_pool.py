@@ -33,7 +33,7 @@ class GatewayPoolTests(unittest.TestCase):
         self.now = 10000
         self.store = Store(self.temp.name)
         self.pool = GatewayPool(self.temp.name, self.store, lambda:self.now)
-        self.pool.configure({'gateways':['unified-142','unified-143']})
+        self.pool.configure({'gateways':['unified-142','unified-143'], 'initialRestSeconds':3600})
 
     def call(self, action, **data):
         return self.pool.runtime({'action':action, 'accountId':'A', **data})
@@ -46,6 +46,33 @@ class GatewayPoolTests(unittest.TestCase):
         result = self.call('probeResult', leaseId=lease, status=200, stateReturned=state, paired=True, gatewayMatches=True, **data)
         self.call('finish', leaseId=lease)
         return claim['pair'], result
+
+    def test_model_ticket_shares_window_and_expires_with_generation(self):
+        self.assertEqual(self.pool.settings_for_ui()['probeModel'], 'gpt-6.1-sol')
+        pair, _ = self.probe(False)
+        generation = pair['generation']
+        reserved = self.call('reserve', gateway=pair['gateway'], generation=generation, deadline=self.now+60)
+        lease = reserved['leaseId']
+        ticket = {'state':'astra-state','cookie':'__oailb=x; __cflb=y','expires':self.now+600}
+        # 未实际发送的租约不能记录拿票。
+        with self.assertRaises(ValueError):
+            self.call('ticketResult', leaseId=lease, model='gpt-6-astra', status=200, stateReturned=True, material=ticket)
+        self.call('sent', leaseId=lease)
+        self.call('ticketResult', leaseId=lease, model='gpt-6-astra', status=200, stateReturned=True, durationMs=5, material=ticket)
+        self.assertEqual(self.call('ticket', generation=generation, model='gpt-6-astra'), ticket)
+        self.assertEqual(self.pair()['ticketModels'], ['gpt-6-astra'])
+        self.assertNotIn('astra-state', json.dumps(self.pool.view()))
+        self.assertIsNone(self.call('ticket', generation=generation, model='gpt-6.1-sol'))
+        sample = self.pool.view()['observations'][0]
+        self.assertEqual((sample['source'], sample['model'], sample['classification']), ('ticket', 'gpt-6-astra', None))
+        # 拿票不做判定，窗口仍是同一组合；29 退役后该代次的票全部作废。
+        self.assertEqual(self.pair()['state'], 'ready')
+        self.call('businessResult', leaseId=lease, model='gpt-6-astra', status=200, stateReturned=True, paired=True, gatewayMatches=True)
+        self.call('finish', leaseId=lease)
+        self.assertEqual(self.pair()['state'], 'cooling')
+        self.assertIsNone(self.call('ticket', generation=generation, model='gpt-6-astra'))
+        with self.assertRaises(ValueError):
+            self.call('ticket', generation=generation, model='GPT 6')
 
     def pair(self, account='A', gateway='unified-142'):
         return next(p for p in self.pool.view()['pairs'] if p['accountId']==account and p['gateway']==gateway)
@@ -108,7 +135,7 @@ class GatewayPoolTests(unittest.TestCase):
 
     def test_two_equal_recoveries_learn_and_different_recovery_resets(self):
         policy = self.pool.policy()
-        pair, settings = {}, policy.DEFAULTS
+        pair, settings = {}, {**policy.DEFAULTS, 'initialRestSeconds': 3600}
         policy.recover(pair, settings, 7200)
         self.assertEqual(policy.initial(settings, pair.get('learnedRestSeconds')), 3600)
         policy.recover(pair, settings, 7200)

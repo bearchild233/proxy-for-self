@@ -415,7 +415,7 @@ impl GatewayPoolAttempt<'_> {
                 _ = tokio::time::sleep(remaining(context.deadline()).ok_or(CodexHandshakeAttemptError::Timeout)?) => return Err(CodexHandshakeAttemptError::Timeout),
                 route = service.route(account, context.deadline(), context.cancellation()) => route,
             };
-            let guard = route.map_err(|_| {
+            let unavailable = || {
                 let error = provider_error(
                     ProviderErrorKind::Unavailable,
                     if sent {
@@ -429,7 +429,29 @@ impl GatewayPoolAttempt<'_> {
                 } else {
                     error
                 })
-            })?;
+            };
+            let mut guard = route.map_err(|_| unavailable())?;
+            // 窗口由打票模型验证；其他模型在本窗口内只需拿到自己的 state。
+            let model = request
+                .body()
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            if guard
+                .use_model(
+                    &model,
+                    client,
+                    account,
+                    authorization.expose_secret(),
+                    lease.installation_id(),
+                )
+                .await
+                .is_err()
+            {
+                guard.finish().await;
+                return Err(unavailable());
+            }
             request.passthrough_headers.remove("x-codex-turn-state");
             request.turn_state = Some(guard.state().to_owned());
             // 原生 HTTP 直接发送 original_json；仅改 body 视图不能覆盖实体中的旧 state。

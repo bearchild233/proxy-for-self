@@ -3,9 +3,9 @@ import math
 
 
 DEFAULTS = {
-    'mode': 'lazy', 'windowSeconds': 180, 'initialRestSeconds': 3600,
+    'mode': 'lazy', 'windowSeconds': 180, 'initialRestSeconds': 7200,
     'maximumRestSeconds': 86400, 'probeIntervalMs': 50, 'groupIds': [], 'gateways': [],
-    'poolAccountIds': {}, 'poolUrl': 'https://pool.0102400.xyz', 'probeModel': 'gpt-6-astra',
+    'poolAccountIds': {}, 'poolUrl': 'https://pool.0102400.xyz', 'probeModel': 'gpt-6.1-sol',
 }
 
 
