@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { enabled } from '@sdk/catalog'
 import type { ApiKeyFormValue } from '../composables/useApiKeyMutations'
 import type { Account, AccountGroup } from '@/api'
+import { rotationOptions } from '@kit/rotation'
 import { Copy, DollarSign, KeyRound, Upload } from '@lucide/vue'
-import { computed, shallowRef, watch } from 'vue'
+import { enabled } from '@sdk/catalog'
 
+import { computed, shallowRef, watch } from 'vue'
 import { getAccounts } from '@/api'
 import AccountGroupCheckboxGrid from '@/components/AccountGroupCheckboxGrid.vue'
 import BaseButton from '@/components/base/BaseButton.vue'
@@ -19,7 +20,6 @@ import BaseSwitch from '@/components/base/BaseSwitch.vue'
 import KeyCapabilityNotice from '@/components/KeyCapabilityNotice.vue'
 import { excelAvailable, refreshPlugins } from '@/plugins/catalog'
 import PluginSlot from '@/plugins/PluginSlot.vue'
-import { rotationOptions } from '@kit/rotation'
 
 const props = defineProps<{
   groups: AccountGroup[]
@@ -200,7 +200,7 @@ watch(open, async (active, _previous, onCleanup) => {
       <BaseFormItem label="轮转方式">
         <BaseSelect v-model="form.rotationStrategy" :options="strategyOptions" :disabled="saving" aria-label="轮转方式" class="w-full" />
         <p class="mt-2 text-cp-xs text-cp-text-secondary">
-          新会话按策略选号，已有会话优先保持账号，Native 额度耗尽时仅在历史完整且尚未交付结果的条件下恢复
+          降智组优先按网关池顺序使用，全部不可用时按所选轮转方式使用普通账号。已有请求和严格续接遵循原有安全规则。
         </p>
       </BaseFormItem>
       <p v-if="accountError" role="alert" class="text-cp-xs text-cp-error-text">

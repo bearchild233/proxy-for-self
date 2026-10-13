@@ -504,22 +504,20 @@ impl Provider for CodexProvider {
                     state.continuation_scope == OpenAiContinuationScope::ConnectionLocal
                 }) || matches!(context.continuation(), Some(ContinuationBinding::Pinned(binding))
                         if binding.scope() == NativeContinuationScope::ConnectionLocal)));
-        let pool_enabled = if let Some(service) = self.gateway_pool.as_ref() {
-            service.enabled_for(&context).await.map_err(|_| {
+        let pool_selection = if let Some(service) = self.gateway_pool.as_ref() {
+            service.selection(&context).await.map_err(|_| {
                 provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent)
             })?
         } else {
-            false
+            crate::gateway_pool::GatewayPoolSelection::default()
         };
-        let pool_preferred = match self.gateway_pool.as_ref() {
-            Some(service) if pool_enabled => service.active_accounts().await,
-            _ => Vec::new(),
-        };
-        // 单窗口：续接请求的原账号没有窗口而窗口在别的账号上时，不为它另开窗口；
-        // 报告原账号不可调度，由核心排除原账号并用保存的历史在持窗账号上重放。
+        // 续接原账号不再优先时，交给核心按原有安全规则恢复历史；
+        // 不能把 previous_response_id 或工具状态直接交给队首的另一个账号。
         if context.continuation_attempt() == ContinuationAttempt::Native
             && let Some(ContinuationBinding::Pinned(binding)) = context.continuation()
-            && pool_preferred
+            && pool_selection.members.contains(binding.account())
+            && pool_selection
+                .preferred
                 .first()
                 .is_some_and(|active| active != binding.account())
         {
@@ -541,13 +539,15 @@ impl Provider for CodexProvider {
                 cyber_policy_session_key.as_ref(),
                 session_affinity.as_ref(),
                 requires_websocket,
-                &pool_preferred,
+                &pool_selection.preferred,
+                &pool_selection.members,
             )
             .await
             .map_err(map_selection_error)?;
         let account_selection_wait_ms =
             u64::try_from(selection_started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
         let lease = Arc::new(lease);
+        let pool_enabled = pool_selection.members.contains(lease.account_id());
         // 首字计时的起点：账号选择完成之后、上游建立之前。
         if !replaying
             && previous_session.as_ref().is_some_and(|state| {

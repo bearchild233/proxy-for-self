@@ -49,6 +49,28 @@ class PlatformContracts(unittest.TestCase):
                 self.platform.call('gateway-pool','version','gateway-pool.configure',{},'session','key','http://localhost')
             with self.assertRaises(PermissionError):
                 self.platform.call('accounts','version','gateway-pool.read',{},'session','admin','http://localhost')
+            for plugin,role in [('gateway-pool','key'),('accounts','admin')]:
+                with self.assertRaises(PermissionError):
+                    self.platform.call(plugin,'version','gateway-pool.history.read',{},'session',role,'http://localhost')
+            status,body,_ = self.platform.call('gateway-pool','version','gateway-pool.history.read',{},'session','admin','http://localhost')
+            self.assertEqual(status,200)
+            self.assertEqual(json.loads(body)['version'],2)
+            old = {**manifest,'capabilities':[c for c in manifest['capabilities'] if c!='gateway-pool.history.read']}
+            with patch.object(self.platform.store,'manifest',return_value=old), self.assertRaises(PermissionError):
+                self.platform.call('gateway-pool','version','gateway-pool.history.read',{},'session','admin','http://localhost')
+            for plugin,role in [('gateway-pool','key'),('accounts','admin')]:
+                with self.assertRaises(PermissionError):
+                    self.platform.call(plugin,'version','gateway-pool.queue.update',{},'session',role,'http://localhost')
+            with patch.object(self.platform.gateway_pool,'update_queue',return_value={'revision':1,'accounts':[]}) as update:
+                status,body,_=self.platform.call('gateway-pool','version','gateway-pool.queue.update',{'revision':0,'accountIds':[]},'session','admin','http://localhost')
+                self.assertEqual(status,200)
+                update.assert_called_once_with({'revision':0,'accountIds':[]})
+            old={**manifest,'capabilities':[c for c in manifest['capabilities'] if c!='gateway-pool.queue.update']}
+            with patch.object(self.platform.store,'manifest',return_value=old), self.assertRaises(PermissionError):
+                self.platform.call('gateway-pool','version','gateway-pool.queue.update',{},'session','admin','http://localhost')
+        with patch.object(self.platform.store,'action',return_value={'enabled':False}), patch.object(self.platform.gateway_pool,'interrupt_history') as interrupt:
+            self.platform.lifecycle.begin('gateway-pool','disable','session','http://localhost')
+            interrupt.assert_called_once_with('disabled')
         server = BoundedServer(('127.0.0.1',0),Handler)
         server.platform = self.platform
         thread = threading.Thread(target=server.serve_forever, daemon=True)
