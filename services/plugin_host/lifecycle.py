@@ -92,7 +92,10 @@ class Lifecycle:
     def begin(self, plugin_id, action, cookie, origin, expected_current=None, expected_previous=None):
         self.platform.store.directory(plugin_id)
         if plugin_id!='excel-bridge':
-            return self.platform.install(plugin_id) if action in {'install','update'} else self.platform.store.action(plugin_id,action,expected_current,expected_previous)
+            result = self.platform.install(plugin_id) if action in {'install','update'} else self.platform.store.action(plugin_id,action,expected_current,expected_previous)
+            if plugin_id == 'gateway-pool' and action in {'disable','uninstall'}:
+                self.platform.gateway_pool.interrupt_history('disabled')
+            return result
         if action not in {'install','update','enable','disable','uninstall'}:
             raise ValueError('Excel Worker 仅支持安装、更新、启用、停用与卸载；更新失败自动恢复')
         with self.lock:

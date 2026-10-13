@@ -673,6 +673,8 @@
       "admin"
     ]
   },
+  "gateway-pool.queue.update": {"method":"POST","path":"/api/plugin-platform/gateway-pool/queue","roles":["admin"]},
+  "gateway-pool.history.read": {"method":"GET","path":"/api/plugin-platform/gateway-pool/history","roles":["admin"]},
   "gateway-pool.read": {"method":"GET","path":"/api/plugin-platform/gateway-pool","roles":["admin"]},
   "gateway-pool.configure": {"method":"POST","path":"/api/plugin-platform/gateway-pool","roles":["admin"]},
   "diagnostic.observe": {

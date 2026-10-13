@@ -7,7 +7,10 @@ use crate::{
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use gateway_core::lifecycle::CancellationToken;
-use gateway_core::{account::ProviderAccount, engine::AttemptContext};
+use gateway_core::{
+    account::{ProviderAccount, ProviderAccountId},
+    engine::AttemptContext,
+};
 use reqwest::{Client, redirect::Policy};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -104,6 +107,41 @@ struct Material {
     state: SecretString,
     cookie: SecretString,
     expires: SystemTime,
+}
+
+/// UTC 起点用于跨请求合并，耗时只用单调时钟；在 RPC 前固定终态时间。
+struct AccessTiming {
+    id: String,
+    at: f64,
+    started: Instant,
+    ended: Option<(Duration, &'static str)>,
+}
+impl AccessTiming {
+    fn new(id: String) -> Self {
+        Self {
+            id,
+            at: epoch(SystemTime::now()),
+            started: Instant::now(),
+            ended: None,
+        }
+    }
+    fn end(&mut self, outcome: &'static str) {
+        self.ended
+            .get_or_insert_with(|| (self.started.elapsed(), outcome));
+    }
+    fn value(&self) -> Value {
+        let (elapsed, outcome) = self
+            .ended
+            .unwrap_or_else(|| (self.started.elapsed(), "headers"));
+        json!({"id":self.id,"startedAt":self.at,"elapsedMs":elapsed.as_millis(),"ended":self.ended.is_some(),"outcome":outcome})
+    }
+}
+
+/// 当前 Key 的降智账号集合与可用队列；普通账号由原有选择器处理。
+#[derive(Default)]
+pub(crate) struct GatewayPoolSelection {
+    pub members: Vec<ProviderAccountId>,
+    pub preferred: Vec<ProviderAccountId>,
 }
 
 pub(crate) struct GatewayPoolService {
@@ -215,41 +253,6 @@ impl GatewayPoolService {
         *held = Some((Instant::now(), settings.clone()));
         Ok(settings)
     }
-    pub(crate) async fn enabled_for(&self, context: &AttemptContext) -> Result<bool, ()> {
-        let Some(scope) = context.account_scope() else {
-            return Ok(false);
-        };
-        let groups = scope.routing_snapshot();
-        if groups.groups_snapshot().is_empty() {
-            return Ok(false);
-        }
-        let settings = match self.settings().await {
-            Ok(settings) => settings,
-            Err(()) => {
-                // 已知未选此插件的组不受控制面故障影响；启用组继续失败关闭。
-                let cached = self.settings.lock().await;
-                if cached.as_ref().is_some_and(|(_, settings)| {
-                    !groups.groups_snapshot().iter().any(|group| {
-                        settings
-                            .group_ids
-                            .iter()
-                            .any(|id| id == group.id().as_str())
-                    })
-                }) {
-                    return Ok(false);
-                }
-                return Err(());
-            }
-        };
-        Ok(settings.enabled
-            && context.account_scope().is_some_and(|scope| {
-                scope
-                    .routing_snapshot()
-                    .groups_snapshot()
-                    .iter()
-                    .any(|g| settings.group_ids.iter().any(|id| id == g.id().as_str()))
-            }))
-    }
     pub(crate) async fn background(
         self: &Arc<Self>,
         cancellation: &CancellationToken,
@@ -266,21 +269,27 @@ impl GatewayPoolService {
                 .cloned()
                 .collect::<std::collections::HashSet<_>>()
         };
-        for account in self
+        let accounts = self
             .repository
             .store()
             .list_accounts()
             .await
             .map_err(|_| ())?
-        {
-            if account.provider().as_str() == "openai"
-                && account.enabled()
-                && (active.contains(account.id().as_str())
-                    || settings
-                        .pool_account_ids
-                        .contains_key(account.id().as_str()))
-            {
-                self.start_prepare(account, false, cancellation.clone())
+            .into_iter()
+            .filter(|account| {
+                account.provider().as_str() == "openai"
+                    && account.authentication_kind() == "oauth"
+                    && account.enabled()
+                    && (active.contains(account.id().as_str())
+                        || settings
+                            .pool_account_ids
+                            .contains_key(account.id().as_str()))
+            })
+            .collect::<Vec<_>>();
+        let ordered = self.ordered_accounts(&accounts).await?;
+        for id in ordered {
+            if let Some(account) = accounts.iter().find(|account| account.id() == &id) {
+                self.start_prepare(account.clone(), false, cancellation.clone())
                     .await?;
             }
         }
@@ -349,18 +358,102 @@ impl GatewayPoolService {
         catalogs.insert(identity, (Instant::now(), value.clone()));
         value
     }
-    /// 当前持有满血窗口的账号（最新在前），其次是正在找票的账号；读取失败时不施加偏好。
-    pub(crate) async fn active_accounts(&self) -> Vec<gateway_core::account::ProviderAccountId> {
-        let Ok(value) = self.call(json!({"action":"active"})).await else {
-            return Vec::new();
+    /// 按冻结目录中的实际成员身份分类，直接选账号与多分组使用相同规则。
+    pub(crate) async fn selection(
+        &self,
+        context: &AttemptContext,
+    ) -> Result<GatewayPoolSelection, ()> {
+        let Some(scope) = context.account_scope() else {
+            return Ok(GatewayPoolSelection::default());
         };
-        value["accounts"]
-            .as_array()
+        let (settings, available) = match self.settings().await {
+            Ok(settings) => (settings, true),
+            Err(()) => (
+                self.settings
+                    .lock()
+                    .await
+                    .as_ref()
+                    .map(|(_, settings)| settings.clone())
+                    .ok_or(())?,
+                false,
+            ),
+        };
+        if !settings.enabled {
+            return Ok(GatewayPoolSelection::default());
+        }
+        let accounts = self
+            .repository
+            .store()
+            .list_accounts()
+            .await
+            .map_err(|_| ())?
             .into_iter()
-            .flatten()
+            .filter(|account| {
+                account.provider().as_str() == "openai"
+                    && account.authentication_kind() == "oauth"
+                    && scope.allows(account.id())
+                    && scope
+                        .directory()
+                        .account(account.id())
+                        .is_some_and(|entry| {
+                            entry.group_ids().iter().any(|group| {
+                                settings.group_ids.iter().any(|id| id == group.as_str())
+                            })
+                        })
+            })
+            .collect::<Vec<_>>();
+        let members = accounts
+            .iter()
+            .map(|account| account.id().clone())
+            .collect::<Vec<_>>();
+        // 控制面不可用时池账号失败关闭，已确认的普通账号仍能按原策略使用。
+        let preferred = if available && !accounts.is_empty() {
+            self.ordered_accounts(&accounts)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|id| members.contains(id))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Ok(GatewayPoolSelection { members, preferred })
+    }
+    async fn ordered_accounts(
+        &self,
+        accounts: &[ProviderAccount],
+    ) -> Result<Vec<ProviderAccountId>, ()> {
+        self.quota.prepare_scheduling(accounts).await;
+        let mut candidates = Vec::new();
+        for account in accounts {
+            let mut exhausted = account.status_projection(SystemTime::now(), None).status
+                == gateway_core::account::AccountStatus::QuotaExhausted;
+            if !exhausted
+                && self
+                    .quota
+                    .scheduling_signals(account)
+                    .is_some_and(|signals| signals.remaining_rank() == Some(0))
+            {
+                exhausted = self
+                    .quota
+                    .read_account(account.id())
+                    .await
+                    .map_err(|_| ())?
+                    .is_some_and(|snapshot| snapshot.quota().is_exhausted());
+            }
+            candidates.push(json!({"id":account.id().as_str(),"exhausted":exhausted}));
+        }
+        let value = self
+            .call(json!({"action":"active","candidates":candidates}))
+            .await?;
+        let accounts = value["accounts"]
+            .as_array()
+            .ok_or(())?
+            .iter()
             .filter_map(|id| id.as_str())
             .filter_map(|id| gateway_core::account::ProviderAccountId::new(id).ok())
-            .collect()
+            .collect();
+        Ok(accounts)
     }
     async fn start_prepare(
         self: &Arc<Self>,
@@ -387,6 +480,7 @@ impl GatewayPoolService {
                 let _permit = permit;
                 let mut claim = claim;
                 let mut settings = settings;
+                let queue_turn = claim["queueTurn"].clone();
                 loop {
                     if service
                         .prepare(account.clone(), claim, settings.clone(), &cancellation)
@@ -414,7 +508,7 @@ impl GatewayPoolService {
                         break;
                     }
                     let catalog = service.catalog(&account, &settings).await;
-                    let Ok(next) = service.call(json!({"action":"claim","accountId":account.id().as_str(),"demand":demand,"catalog":catalog})).await else { break; };
+                    let Ok(next) = service.call(json!({"action":"claim","accountId":account.id().as_str(),"demand":demand,"catalog":catalog,"queueTurn":queue_turn})).await else { break; };
                     if next["claimed"] != true {
                         break;
                     }
@@ -438,6 +532,7 @@ impl GatewayPoolService {
             .lock()
             .await
             .insert(account.id().as_str().to_owned(), Instant::now());
+        let mut queue_turn = Value::Null;
         loop {
             if self.eligible_account(account).await?.is_none() {
                 return Err(());
@@ -448,6 +543,12 @@ impl GatewayPoolService {
             let plan = self
                 .call(json!({"action":"plan","accountId":account.id().as_str(),"demand":true,"catalog":self.catalog(account, &settings).await}))
                 .await?;
+            if plan["yieldAccount"] == true
+                || (!queue_turn.is_null() && plan["queueTurn"] != queue_turn)
+            {
+                return Err(());
+            }
+            queue_turn = plan["queueTurn"].clone();
             if !plan["probe"].is_null() {
                 self.start_prepare(account.clone(), true, cancellation.clone())
                     .await?;
@@ -493,6 +594,7 @@ impl GatewayPoolService {
                             material,
                             model: settings.probe_model.clone(),
                             ticket: None,
+                            timing: std::sync::Mutex::new(None),
                             finished: false,
                         });
                     }
@@ -524,6 +626,7 @@ impl GatewayPoolService {
         let lease = claim["leaseId"].as_str().ok_or(())?.to_owned();
         let pair: Pair = serde_json::from_value(claim["pair"].clone()).map_err(|_| ())?;
         let started = Instant::now();
+        let preparation_started_at = epoch(SystemTime::now());
         let result = tokio::select! {
             biased;
             _ = cancellation.cancelled() => None,
@@ -544,7 +647,7 @@ impl GatewayPoolService {
                 material,
             );
         }
-        let report = self.call(json!({"action":"probeResult","accountId":account.id().as_str(),"leaseId":lease,"durationMs":started.elapsed().as_millis(),
+        let report = self.call(json!({"action":"probeResult","accountId":account.id().as_str(),"leaseId":lease,"durationMs":started.elapsed().as_millis(),"preparationStartedAt":preparation_started_at,
             "status":observation["status"],"stateReturned":observation["stateReturned"],"paired":observation["paired"],"gatewayMatches":observation["gatewayMatches"],"failed":observation["failed"],"material":private_material})).await;
         let finish = self
             .call(json!({"action":"finish","accountId":account.id().as_str(),"leaseId":lease}))
@@ -659,9 +762,14 @@ impl GatewayPoolService {
             if self.eligible_account(account).await?.is_none() {
                 return Err(());
             }
-            self.call(json!({"action":"sent","accountId":account.id().as_str(),"leaseId":lease}))
+            let access_id = Uuid::new_v4().to_string();
+            let sent = self.call(json!({"action":"sent","accountId":account.id().as_str(),"leaseId":lease,"timingVersion":2,"accessId":access_id,"purpose":if context.turn_state.is_some() {"replay"} else {"bootstrap"}}))
                 .await?;
+            if sent["accepted"] != true {
+                return Err(());
+            }
             let started = Instant::now();
+            let mut timing = AccessTiming::new(access_id);
             let observed = tokio::time::timeout(
                 Duration::from_secs(15),
                 client.diagnostic_observation(request, context, true),
@@ -669,8 +777,13 @@ impl GatewayPoolService {
             .await
             .ok()
             .and_then(Result::ok);
+            timing.end(if observed.is_some() {
+                "headers"
+            } else {
+                "failed"
+            });
             // 每次访问独立留痕；bootstrap 行仅是材料获取，不参与 21/29 判定。
-            self.call(json!({"action":"probeAttempt","accountId":account.id().as_str(),"leaseId":lease,"phase":if context.turn_state.is_some() {"replay"} else {"bootstrap"},"retry":attempt,"status":observed.as_ref().map(|o|o.status),"stateReturned":observed.as_ref().is_some_and(|o|o.state_returned),"durationMs":started.elapsed().as_millis(),"gateway":pair.gateway})).await?;
+            self.call(json!({"action":"probeAttempt","accountId":account.id().as_str(),"leaseId":lease,"phase":if context.turn_state.is_some() {"replay"} else {"bootstrap"},"retry":attempt,"status":observed.as_ref().map(|o|o.status),"stateReturned":observed.as_ref().is_some_and(|o|o.state_returned),"durationMs":started.elapsed().as_millis(),"gateway":pair.gateway,"access":timing.value()})).await?;
             if let Some(observation) = observed {
                 if observation.status == 200 || attempt == 1 {
                     return Ok(observation);
@@ -715,11 +828,14 @@ impl GatewayPoolService {
             return Ok(None);
         }
         let cooldown = self.quota.cooldown(current.id()).await.map_err(|_| ())?;
-        if current
+        let status = current
             .status_projection(SystemTime::now(), cooldown)
-            .status
-            != gateway_core::account::AccountStatus::Normal
-        {
+            .status;
+        if status == gateway_core::account::AccountStatus::QuotaExhausted {
+            self.call(json!({"action":"quota","accountId":current.id().as_str(),"exhausted":true}))
+                .await?;
+        }
+        if status != gateway_core::account::AccountStatus::Normal {
             return Ok(None);
         }
         // 没有额度材料时先走既有额度刷新器，使用账号绑定的出口；读取失败不探测。
@@ -736,6 +852,7 @@ impl GatewayPoolService {
                 .await
                 .map_err(|_| ())?,
         };
+        self.call(json!({"action":"quota","accountId":current.id().as_str(),"exhausted":snapshot.quota().is_exhausted()})).await?;
         if snapshot.quota().is_exhausted() {
             return Ok(None);
         }
@@ -769,6 +886,7 @@ pub(crate) struct GatewayPoolGuard {
     model: String,
     /// 非打票模型的票；为空时使用组合自身的 S0。
     ticket: Option<Ticket>,
+    timing: std::sync::Mutex<Option<AccessTiming>>,
     finished: bool,
 }
 impl GatewayPoolGuard {
@@ -871,7 +989,8 @@ impl GatewayPoolGuard {
         installation_id: &str,
     ) -> Result<Ticket, ()> {
         // 拿票是真实上游访问，记在本业务租约上；组合已退役时不再发送。
-        if !self.sent().await? {
+        let access_id = Uuid::new_v4().to_string();
+        if !self.sent_for("ticket", &access_id).await? {
             return Err(());
         }
         let id = Uuid::new_v4().to_string();
@@ -885,6 +1004,7 @@ impl GatewayPoolGuard {
         context.cookie_header = Some(base);
         let request = hi_request(model).ok_or(())?;
         let started = Instant::now();
+        let mut timing = AccessTiming::new(access_id);
         let observed = tokio::time::timeout(
             Duration::from_secs(15),
             client.diagnostic_observation(&request, context, true),
@@ -892,6 +1012,11 @@ impl GatewayPoolGuard {
         .await
         .ok()
         .and_then(Result::ok);
+        timing.end(if observed.is_some() {
+            "headers"
+        } else {
+            "failed"
+        });
         if let Some(observation) = &observed {
             let _ = self.service.observe_probe_quota(account, observation).await;
         }
@@ -914,12 +1039,20 @@ impl GatewayPoolGuard {
                 })
             });
         let material = ticket.as_ref().map(|ticket| json!({"state":ticket.state.expose_secret(),"cookie":ticket.cookie.expose_secret(),"expires":epoch(ticket.expires)}));
-        self.service.call(json!({"action":"ticketResult","accountId":self.account,"leaseId":self.lease,"model":model,"status":observed.as_ref().map(|o| o.status),"stateReturned":observed.as_ref().is_some_and(|o| o.state_returned),"durationMs":started.elapsed().as_millis(),"material":material})).await?;
+        self.service.call(json!({"action":"ticketResult","accountId":self.account,"leaseId":self.lease,"model":model,"status":observed.as_ref().map(|o| o.status),"stateReturned":observed.as_ref().is_some_and(|o| o.state_returned),"durationMs":started.elapsed().as_millis(),"material":material,"access":timing.value()})).await?;
         ticket.ok_or(())
     }
     pub(crate) async fn sent(&self) -> Result<bool, ()> {
+        let access_id = Uuid::new_v4().to_string();
+        let accepted = self.sent_for("business", &access_id).await?;
+        if accepted && let Ok(mut timing) = self.timing.lock() {
+            *timing = Some(AccessTiming::new(access_id));
+        }
+        Ok(accepted)
+    }
+    async fn sent_for(&self, purpose: &str, access_id: &str) -> Result<bool, ()> {
         self.service
-            .call(json!({"action":"sent","accountId":self.account,"leaseId":self.lease}))
+            .call(json!({"action":"sent","accountId":self.account,"leaseId":self.lease,"purpose":purpose,"timingVersion":2,"accessId":access_id}))
             .await
             .map(|value| value["accepted"] == true)
     }
@@ -930,22 +1063,38 @@ impl GatewayPoolGuard {
         cookies: &[String],
         duration: Duration,
     ) -> Result<Option<bool>, ()> {
+        if status != 200 || state_returned {
+            self.end_access(if status == 200 { "rejected" } else { "failed" });
+        }
         let cookie = merge_cookie(self.cookie(), cookies)?;
         let matches = cookie_gateway(&cookie).as_deref() == Some(&self.material.pair.gateway);
-        let value = self.service.call(json!({"action":"businessResult","accountId":self.account,"leaseId":self.lease,"model":self.model,"status":status,"stateReturned":state_returned,"paired":true,"gatewayMatches":matches,"durationMs":duration.as_millis()})).await?;
+        let value = self.service.call(json!({"action":"businessResult","accountId":self.account,"leaseId":self.lease,"model":self.model,"status":status,"stateReturned":state_returned,"paired":true,"gatewayMatches":matches,"durationMs":duration.as_millis(),"access":self.access_value()})).await?;
         Ok(match value["classification"].as_str() {
             Some("21") if matches => Some(true),
             Some("29") if matches => Some(false),
             _ => None,
         })
     }
-    pub(crate) async fn finish(mut self) {
-        if self
-            .service
-            .call(json!({"action":"finish","accountId":self.account,"leaseId":self.lease}))
-            .await
-            .is_ok()
+    pub(crate) fn end_access(&self, outcome: &'static str) {
+        if let Ok(mut timing) = self.timing.lock()
+            && let Some(timing) = timing.as_mut()
         {
+            timing.end(outcome);
+        }
+    }
+    fn access_value(&self) -> Option<Value> {
+        self.timing
+            .lock()
+            .ok()
+            .and_then(|timing| timing.as_ref().map(AccessTiming::value))
+    }
+    fn finish_payload(&self) -> Value {
+        self.end_access("interrupted");
+        json!({"action":"finish","accountId":self.account,"leaseId":self.lease,"access":self.access_value()})
+    }
+    pub(crate) async fn finish(mut self) {
+        let payload = self.finish_payload();
+        if self.service.call(payload).await.is_ok() {
             self.finished = true;
         }
     }
@@ -957,7 +1106,7 @@ impl Drop for GatewayPoolGuard {
         }
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let service = Arc::clone(&self.service);
-            let payload = json!({"action":"finish","accountId":self.account,"leaseId":self.lease});
+            let payload = self.finish_payload();
             handle.spawn(async move {
                 let _ = service.call(payload).await;
             });

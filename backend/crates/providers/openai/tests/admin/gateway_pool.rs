@@ -643,13 +643,23 @@ async fn authorized_real_header_only_experiment() {
 }
 
 fn scope() -> Arc<FrozenAccountScope> {
+    scope_for(&[ACCOUNT])
+}
+
+fn scope_for(ids: &[&str]) -> Arc<FrozenAccountScope> {
     let group = AccountGroupId::new(GROUP).unwrap();
     let provider = ProviderKind::new("openai").unwrap();
     Arc::new(FrozenAccountScope::new(
-        Arc::new(RuntimeAccountDirectory::new(BTreeMap::from([(
-            ProviderAccountId::new(ACCOUNT).unwrap(),
-            RuntimeAccount::new(provider.clone(), BTreeSet::from([group.clone()])),
-        )]))),
+        Arc::new(RuntimeAccountDirectory::new(
+            ids.iter()
+                .map(|id| {
+                    (
+                        ProviderAccountId::new(*id).unwrap(),
+                        RuntimeAccount::new(provider.clone(), BTreeSet::from([group.clone()])),
+                    )
+                })
+                .collect(),
+        )),
         ClientRoutingScope::restricted(
             vec![RoutingGroupSnapshot::new(group.clone(), "Pool".into())],
             BTreeSet::from([group]),
@@ -697,6 +707,10 @@ fn request(tools: Value) -> ProviderRequest {
 }
 
 fn context() -> AttemptContext {
+    context_for(scope())
+}
+
+fn context_for(account_scope: Arc<FrozenAccountScope>) -> AttemptContext {
     AttemptContext::new(
         RequestAttemptContext::new(
             ModelRequestId::new("req_gateway_pool").unwrap(),
@@ -705,7 +719,7 @@ fn context() -> AttemptContext {
         NonZeroU32::new(1).unwrap(),
         SystemTime::now() + Duration::from_secs(10),
         account_policy(),
-        AccountAttemptContext::new(BTreeSet::new(), None, None).with_account_scope(scope()),
+        AccountAttemptContext::new(BTreeSet::new(), None, None).with_account_scope(account_scope),
         None,
         CancellationToken::new(),
     )
@@ -735,6 +749,7 @@ async fn run(exhausted: bool, tools: Value) -> (Vec<String>, usize) {
         let generation = if selected.load(Ordering::SeqCst) {"second"}else{"first"};
         let value = match data["action"].as_str().unwrap() {
             "config" => json!({"enabled":true,"groupIds":[GROUP],"poolAccountIds":{ACCOUNT:"demo"},"probeIntervalMs":50,"probeModel":"gpt-6-astra"}),
+            "active" => json!({"accounts":[ACCOUNT],"queue":true}),
             "plan" => json!({"ready":{"gateway":if generation=="first" {"unified-142"}else{"unified-143"},"generation":generation},"probe":null,"preparing":false}),
             "material" => {
                 let host = if data["generation"]=="first" {"unified-142"}else{"unified-143"};
@@ -875,6 +890,7 @@ async fn pool_fetches_model_ticket_within_shared_window() {
         seen.lock().unwrap().push(data.clone());
         let value = match data["action"].as_str().unwrap() {
             "config" => json!({"enabled":true,"groupIds":[GROUP],"poolAccountIds":{ACCOUNT:"demo"},"probeIntervalMs":50,"probeModel":"gpt-6.1-sol"}),
+            "active" => json!({"accounts":[ACCOUNT],"queue":true}),
             "plan" => json!({"ready":{"gateway":"unified-142","generation":"first"},"probe":null,"preparing":false}),
             "material" => json!({"state":"sol-s0","cookie":cookie,"expires":Utc::now().timestamp()+600}),
             "reserve" => json!({"reserved":true,"leaseId":"lease-1"}),
@@ -936,6 +952,23 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_pool\",\"stat
     assert_eq!(ticket_request["model"], "gpt-6-astra");
     assert_eq!(ticket_request["input"][0]["content"][0]["text"], "hi");
     assert_eq!(requests[1].headers["x-codex-turn-state"], "astra-ticket");
+    drop(stream);
+    // Guard 的回报由析构异步提交；等待回报后核对收头与流终态是独立事实。
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if actions
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|a| a["action"] == "finish")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
     let actions = actions.lock().unwrap();
     let ticket = actions
         .iter()
@@ -948,6 +981,17 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_pool\",\"stat
         .find(|a| a["action"] == "businessResult")
         .unwrap();
     assert_eq!(business["model"], "gpt-6-astra");
+    assert_eq!(ticket["access"]["ended"], true);
+    assert_eq!(business["access"]["ended"], false);
+    assert_ne!(ticket["access"]["id"], business["access"]["id"]);
+    let finished = actions.iter().find(|a| a["action"] == "finish").unwrap();
+    assert_eq!(finished["access"]["id"], business["access"]["id"]);
+    assert_eq!(finished["access"]["ended"], true);
+    assert_eq!(finished["access"]["outcome"], "completed");
+    assert!(
+        finished["access"]["elapsedMs"].as_u64().unwrap()
+            >= business["access"]["elapsedMs"].as_u64().unwrap()
+    );
     // 拿票只是材料获取，不单独判定，也不触发找票。
     assert!(
         !actions
@@ -1091,6 +1135,7 @@ async fn probe_retries(status: u16, phase: &'static str, recovers: bool) {
         let data:Value = input.body_json().unwrap();
         let value = match data["action"].as_str().unwrap() {
             "config" => json!({"enabled":true,"groupIds":[GROUP],"poolAccountIds":{ACCOUNT:"demo"},"poolUrl":pool_url,"poolToken":"demo-pool-token","probeIntervalMs":50}),
+            "active" => json!({"accounts":[ACCOUNT],"queue":true}),
             "plan" => if r.load(Ordering::SeqCst) { json!({"ready":{"gateway":"unified-142","generation":"probe"},"probe":null,"preparing":false}) } else { json!({"ready":null,"probe":if d.load(Ordering::SeqCst) {Value::Null}else{json!({"gateway":"unified-142"})},"preparing":c.load(Ordering::SeqCst)&&!d.load(Ordering::SeqCst)}) },
             "claim" => if !c.swap(true,Ordering::SeqCst) {json!({"claimed":true,"leaseId":"probe","pair":{"gateway":"unified-142","generation":"probe"}})} else {json!({"claimed":false})},
             "probeResult" => {d.store(true,Ordering::SeqCst);r.store(data["status"]==200 && data["paired"]==true,Ordering::SeqCst); json!({"accepted":true})},
@@ -1138,6 +1183,14 @@ async fn probe_retries(status: u16, phase: &'static str, recovers: bool) {
     assert_eq!(probe_attempts[0]["status"], status);
     assert_eq!(probe_attempts[0]["retry"], 0);
     assert_eq!(probe_attempts[1]["retry"], 1);
+    assert_ne!(
+        probe_attempts[0]["access"]["id"],
+        probe_attempts[1]["access"]["id"]
+    );
+    for attempt in &probe_attempts {
+        assert_eq!(attempt["access"]["ended"], true);
+        assert!(attempt["access"]["startedAt"].as_f64().unwrap() > 0.0);
+    }
     let final_record = records
         .iter()
         .find(|v| v["action"] == "probeResult")
@@ -1269,4 +1322,339 @@ async fn cache_experiment_reloads_account_projection_after_route_preparation() {
         .await;
     assert_eq!(follow_up["classification"], "21", "{follow_up}");
     assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn shared_pool_queue_controls_selection_with_scope_and_quota_guards() {
+    const SECOND: &str = "acct_queue_second";
+    // 首个案例故意让队首权重较低；其余覆盖停用白名单、Key 范围和额度不可用。
+    for (queue, ids, exhausted, expected) in [
+        (vec![SECOND, ACCOUNT], vec![ACCOUNT, SECOND], false, SECOND),
+        (vec![ACCOUNT], vec![ACCOUNT, SECOND], false, ACCOUNT),
+        (vec![SECOND, ACCOUNT], vec![ACCOUNT], false, ACCOUNT),
+        (vec![SECOND, ACCOUNT], vec![ACCOUNT, SECOND], true, ACCOUNT),
+    ] {
+        let runtime = MockServer::start().await;
+        let store = Arc::new(MemoryAccountStore::default());
+        for id in [ACCOUNT, SECOND] {
+            store
+                .seed_oauth_credential(ImportCodexOAuthCredential {
+                    account_id: id.into(),
+                    name: id.into(),
+                    secret: secret("demo-token"),
+                    verified_account: profile(id),
+                    next_refresh_at: None,
+                    enabled: true,
+                })
+                .await;
+            store.set_scheduling(
+                id,
+                None,
+                gateway_core::account::AccountWeight::new(if id == ACCOUNT { 90 } else { 1 })
+                    .unwrap(),
+            );
+            let account = store.account(id).unwrap();
+            let now = SystemTime::now();
+            let denied = exhausted && id == SECOND;
+            store.compare_and_swap_quota(QuotaObservation {
+                plan_type: None, account_id: account.id().clone(), expected_revision: account.revision(), observed_at: now,
+                state: if denied { QuotaState::exhausted(QuotaEvidence::ProviderDenied, now, None) } else { QuotaState::allowed(now) },
+                quota: OpaqueProviderData::new(json!({"rate_limit":{"allowed":!denied,"limit_reached":denied,"primary_window":{"used_percent":if denied {100}else{10},"reset_at":Utc::now().timestamp()+18000}}}).as_object().unwrap().clone()),
+            }).await.unwrap();
+        }
+        let authorized = ids.clone();
+        Mock::given(method("POST")).respond_with(move |input: &wiremock::Request| {
+            let data: Value = input.body_json().unwrap();
+            let value = match data["action"].as_str().unwrap() {
+                "config" => json!({"enabled":true,"groupIds":[GROUP],"probeIntervalMs":50,"probeModel":"gpt-6-astra"}),
+                "active" => {
+                    let candidates = data["candidates"].as_array().unwrap();
+                    assert_eq!(candidates.len(), authorized.len());
+                    assert!(candidates.iter().all(|item| authorized.contains(&item["id"].as_str().unwrap())));
+                    json!({"accounts":queue,"queue":true})
+                },
+                "plan" => json!({"ready":null,"probe":null,"preparing":false}),
+                "quota" => json!({"accepted":true}),
+                other => panic!("unexpected runtime action {other}"),
+            };
+            ResponseTemplate::new(200).set_body_json(value)
+        }).mount(&runtime).await;
+        let mut config = valid_config();
+        let key = config._runtime.path().join("pool.key");
+        std::fs::write(&key, "a".repeat(64)).unwrap();
+        config.config.gateway_pool = Some(provider_openai::gateway_pool::GatewayPoolConfig {
+            runtime_url: runtime.uri(),
+            key_file: key,
+            fallback_url: None,
+        });
+        let bundle = provider_openai::initialize(
+            config.config.clone(),
+            provider_ports_with(store, Arc::new(TestOAuthPending::default())),
+        )
+        .await
+        .unwrap();
+        // 无可用网关时停止于选定账号的计划查询，不向真实上游发送请求。
+        let mut stream = bundle
+            .core_provider()
+            .execute(request(json!([])), context_for(scope_for(&ids)))
+            .await
+            .unwrap();
+        let mut failed = false;
+        while let Some(event) = stream.next().await {
+            if event.is_err() {
+                failed = true;
+                break;
+            }
+        }
+        assert!(failed);
+        let records = runtime.received_requests().await.unwrap();
+        let plans: Vec<Value> = records
+            .iter()
+            .map(|r| r.body_json::<Value>().unwrap())
+            .filter(|v| v["action"] == "plan")
+            .collect();
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0]["accountId"], expected);
+    }
+}
+
+#[tokio::test]
+async fn mixed_key_prefers_pool_then_falls_back_and_recovers_for_accounts_and_groups() {
+    use gateway_core::engine::ContinuationAttempt;
+    use gateway_core::engine::continuation::{
+        ContinuationBinding, NativeContinuationPin, PreviousResponseId,
+    };
+    use std::sync::atomic::AtomicUsize;
+    const NORMAL: &str = "acct_normal";
+    const LOWER: &str = "acct_normal_lower";
+    const OUTSIDE: &str = "acct_outside";
+    for direct in [false, true] {
+        let upstream = MockServer::start().await;
+        let runtime = MockServer::start().await;
+        let store = Arc::new(MemoryAccountStore::default());
+        let provider = ProviderKind::new("openai").unwrap();
+        let pool_group = AccountGroupId::new(GROUP).unwrap();
+        let normal_group = AccountGroupId::new("grp_00000000000000000000000000000002").unwrap();
+        let outside_group = AccountGroupId::new("grp_00000000000000000000000000000003").unwrap();
+        let mut directory = BTreeMap::new();
+        for (id, weight, groups) in [
+            (
+                ACCOUNT,
+                1,
+                BTreeSet::from([pool_group.clone(), normal_group.clone()]),
+            ),
+            (NORMAL, 80, BTreeSet::from([normal_group.clone()])),
+            (LOWER, 10, BTreeSet::from([normal_group.clone()])),
+            (OUTSIDE, 100, BTreeSet::from([outside_group])),
+        ] {
+            directory.insert(
+                ProviderAccountId::new(id).unwrap(),
+                RuntimeAccount::new(provider.clone(), groups),
+            );
+            store
+                .seed_oauth_credential(ImportCodexOAuthCredential {
+                    account_id: id.into(),
+                    name: id.into(),
+                    secret: secret(id),
+                    verified_account: profile(id),
+                    next_refresh_at: None,
+                    enabled: true,
+                })
+                .await;
+            store.set_scheduling(
+                id,
+                None,
+                gateway_core::account::AccountWeight::new(weight).unwrap(),
+            );
+            let account = store.account(id).unwrap();
+            let now = SystemTime::now();
+            store.compare_and_swap_quota(QuotaObservation {
+                plan_type: None, account_id: account.id().clone(), expected_revision: account.revision(), observed_at: now,
+                state: QuotaState::allowed(now), quota: OpaqueProviderData::new(json!({"rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{"used_percent":10,"reset_at":Utc::now().timestamp()+18000}}}).as_object().unwrap().clone()),
+            }).await.unwrap();
+        }
+        let directory = Arc::new(RuntimeAccountDirectory::new(directory));
+        let scope = if direct {
+            ClientRoutingScope::accounts(
+                [ACCOUNT, NORMAL, LOWER]
+                    .iter()
+                    .map(|id| ProviderAccountId::new(*id).unwrap())
+                    .collect(),
+                &directory,
+            )
+        } else {
+            ClientRoutingScope::restricted(
+                vec![
+                    RoutingGroupSnapshot::new(pool_group.clone(), "Pool".into()),
+                    RoutingGroupSnapshot::new(normal_group.clone(), "Normal".into()),
+                ],
+                BTreeSet::from([pool_group, normal_group]),
+                BTreeSet::from([provider]),
+            )
+            .unwrap()
+        };
+        let scope = Arc::new(FrozenAccountScope::new(directory, scope));
+        let phase = Arc::new(AtomicUsize::new(0));
+        let current = phase.clone();
+        let payload = URL_SAFE_NO_PAD.encode(
+            json!({"host":"unified-142.example.invalid","exp":Utc::now().timestamp()+600})
+                .to_string(),
+        );
+        let cookie = format!("__oailb=h.{payload}.s; __cflb=demo");
+        Mock::given(method("POST")).respond_with(move |input: &wiremock::Request| {
+            let data: Value = input.body_json().unwrap();
+            let value = match data["action"].as_str().unwrap() {
+                "config" => json!({"enabled":true,"groupIds":[GROUP],"probeIntervalMs":50,"probeModel":"gpt-6-astra"}),
+                "active" => {
+                    let candidates = data["candidates"].as_array().unwrap();
+                    assert_eq!(candidates.len(), 1, "ordinary and unauthorized accounts must never enter pool queue");
+                    assert_eq!(candidates[0]["id"], ACCOUNT);
+                    if current.load(Ordering::SeqCst) == 3 { return ResponseTemplate::new(503); }
+                    json!({"accounts":if current.load(Ordering::SeqCst)==1 {vec![]}else{vec![ACCOUNT]},"queue":true})
+                },
+                "plan" => {
+                    assert_eq!(data["accountId"], ACCOUNT);
+                    json!({"ready":{"gateway":"unified-142","generation":"mixed"},"probe":null,"preparing":false})
+                },
+                "material" => json!({"state":"pool-state","cookie":cookie,"expires":Utc::now().timestamp()+600}),
+                "reserve" => json!({"reserved":true,"leaseId":"mixed-business"}),
+                "businessResult" => json!({"accepted":true,"classification":"21"}),
+                _ => json!({"accepted":true}),
+            };
+            ResponseTemplate::new(200).set_body_json(value)
+        }).mount(&runtime).await;
+        Mock::given(method("POST")).and(path("/codex/responses")).respond_with(|input: &wiremock::Request| {
+            if input.headers["authorization"] == format!("Bearer {ACCOUNT}") {
+                assert_eq!(input.headers["x-codex-turn-state"], "pool-state");
+                assert!(input.headers.contains_key("cookie"));
+            } else {
+                assert_eq!(input.headers["authorization"], format!("Bearer {NORMAL}"));
+                assert_ne!(input.headers.get("x-codex-turn-state").and_then(|v|v.to_str().ok()), Some("pool-state"));
+                assert!(!input.headers.contains_key("cookie"));
+            }
+            ResponseTemplate::new(200).insert_header("content-type","text/event-stream").set_body_string("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_mixed\",\"status\":\"completed\",\"output\":[]}}\n\n")
+        }).mount(&upstream).await;
+        let mut config = valid_config();
+        let key = config._runtime.path().join("pool.key");
+        std::fs::write(&key, "a".repeat(64)).unwrap();
+        config.config.api.base_url = upstream.uri();
+        config.config.gateway_pool = Some(provider_openai::gateway_pool::GatewayPoolConfig {
+            runtime_url: runtime.uri(),
+            key_file: key,
+            fallback_url: None,
+        });
+        let bundle = provider_openai::initialize(
+            config.config.clone(),
+            provider_ports_with(store.clone(), Arc::new(TestOAuthPending::default())),
+        )
+        .await
+        .unwrap();
+        // 池可用、池停用/冷却、恢复、控制面失败、请求内已排除池账号。
+        for (step, expected) in [
+            (0, ACCOUNT),
+            (1, NORMAL),
+            (2, ACCOUNT),
+            (3, NORMAL),
+            (4, NORMAL),
+            (5, NORMAL),
+            (6, NORMAL),
+            (7, NORMAL),
+        ] {
+            phase.store(step, Ordering::SeqCst);
+            if step == 7 {
+                let account = store.account(ACCOUNT).unwrap();
+                let now = SystemTime::now();
+                store.compare_and_swap_quota(QuotaObservation {
+                    plan_type: None, account_id: account.id().clone(), expected_revision: account.revision(), observed_at: now,
+                    state: QuotaState::exhausted(QuotaEvidence::ProviderDenied, now, None),
+                    quota: OpaqueProviderData::new(json!({"rate_limit":{"allowed":false,"limit_reached":true,"primary_window":{"used_percent":100,"reset_at":Utc::now().timestamp()+18000}}}).as_object().unwrap().clone()),
+                }).await.unwrap();
+            }
+
+            let mut context = context_for(scope.clone());
+            if step == 4 {
+                context = AttemptContext::new(
+                    RequestAttemptContext::new(
+                        ModelRequestId::new("req_mixed_retry").unwrap(),
+                        ClientApiKeyId::new("key_gateway_pool").unwrap(),
+                    ),
+                    NonZeroU32::new(2).unwrap(),
+                    SystemTime::now() + Duration::from_secs(10),
+                    account_policy(),
+                    AccountAttemptContext::new(
+                        BTreeSet::from([ProviderAccountId::new(ACCOUNT).unwrap()]),
+                        None,
+                        None,
+                    )
+                    .with_account_scope(scope.clone()),
+                    None,
+                    CancellationToken::new(),
+                );
+            }
+            if step == 5 {
+                let pin = NativeContinuationPin::new(
+                    PreviousResponseId::new("resp_previous"),
+                    PreviousResponseId::new("resp_upstream"),
+                    ClientApiKeyId::new("key_gateway_pool").unwrap(),
+                    ProviderKind::new("openai").unwrap(),
+                    ProviderAccountId::new(NORMAL).unwrap(),
+                );
+                context = AttemptContext::new(
+                    RequestAttemptContext::new(
+                        ModelRequestId::new("req_mixed_native").unwrap(),
+                        ClientApiKeyId::new("key_gateway_pool").unwrap(),
+                    ),
+                    NonZeroU32::new(1).unwrap(),
+                    SystemTime::now() + Duration::from_secs(10),
+                    account_policy(),
+                    AccountAttemptContext::new(BTreeSet::new(), None, None)
+                        .with_account_scope(scope.clone()),
+                    Some(ContinuationBinding::Pinned(pin)),
+                    CancellationToken::new(),
+                )
+                .with_continuation_attempt(ContinuationAttempt::Native);
+            }
+            if step == 6 {
+                context = AttemptContext::new(
+                    RequestAttemptContext::new(
+                        ModelRequestId::new("req_mixed_owner").unwrap(),
+                        ClientApiKeyId::new("key_gateway_pool").unwrap(),
+                    ),
+                    NonZeroU32::new(1).unwrap(),
+                    SystemTime::now() + Duration::from_secs(10),
+                    account_policy(),
+                    AccountAttemptContext::new(
+                        BTreeSet::new(),
+                        Some(ProviderAccountId::new(NORMAL).unwrap()),
+                        None,
+                    )
+                    .with_account_scope(scope.clone()),
+                    None,
+                    CancellationToken::new(),
+                );
+            }
+            let result = bundle
+                .core_provider()
+                .execute(request(json!([])), context)
+                .await;
+            if step == 5 {
+                // 未提供合法续接历史时保持原恢复错误，不把状态交给池账号。
+                let Err(error) = result else {
+                    panic!("missing native history must require recovery")
+                };
+                assert_eq!(
+                    error.kind(),
+                    gateway_core::error::ProviderErrorKind::ContinuationRecoveryRequired
+                );
+                continue;
+            }
+            let mut stream = result.unwrap();
+            assert_eq!(stream.metadata().provider_account_id().as_str(), expected);
+            while let Some(event) = stream.next().await {
+                event.unwrap();
+            }
+            drop(stream);
+        }
+        assert_eq!(upstream.received_requests().await.unwrap().len(), 7);
+    }
 }

@@ -1,4 +1,16 @@
 // 网关池页面的数据结构与展示工具。所有时间戳均为秒。
+import type { CoolingStep } from './history'
+
+export interface CoolingVisit extends CoolingStep {
+  idleSeconds: number | null
+  afterDueSeconds: number
+}
+
+export interface CoolingSummary {
+  current: CoolingStep | null
+  visits: CoolingVisit[]
+  hasMore: boolean
+}
 export interface Settings {
   mode: 'lazy' | 'continuous'
   windowSeconds: number
@@ -17,6 +29,7 @@ export interface Settings {
 export type PairState = 'unknown' | 'preparing' | 'ready' | 'draining' | 'cooling'
 
 export interface Pair {
+  coolingSummary?: CoolingSummary
   accountId: string
   gateway: string
   state: PairState
@@ -65,7 +78,13 @@ export interface Switch {
   preparationSeconds: number
 }
 
+export interface AccountQueue {
+  revision: number
+  accounts: { accountId: string, enabled: boolean, quotaExhausted: boolean, reason: string | null }[]
+}
+
 export interface PoolView {
+  accountQueue: AccountQueue
   preview?: boolean
   settings: Settings
   pairs: Pair[]

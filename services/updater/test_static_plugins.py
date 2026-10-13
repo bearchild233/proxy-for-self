@@ -65,6 +65,16 @@ class StaticPluginTests(unittest.TestCase):
     def install(self, version='1', plugin='groups', **kwargs):
         return self.store.install(plugin, *self.bundle(version, plugin, **kwargs))
 
+    def test_gateway_history_capability_requires_platform_upgrade(self):
+        self.store.policies['gateway-pool'] = {'name':'Pool','required':False,'trustedUi':True,'capabilities':['groups.list']}
+        original = self.install(plugin='gateway-pool',component=True)
+        capabilities = ['groups.list','gateway-pool.history.read']
+        with self.assertRaises(ValueError):
+            self.install('2',plugin='gateway-pool',component=True,modify=lambda m:m.update(capabilities=capabilities))
+        self.assertEqual(self.store.state('gateway-pool'),original)
+        self.store.policies['gateway-pool']['capabilities'] = capabilities
+        self.install('2',plugin='gateway-pool',component=True,modify=lambda m:m.update(capabilities=capabilities))
+
     def test_component_runtime_requires_host_trust_and_compatible_api(self):
         original = self.install()['current']
         with self.assertRaisesRegex(ValueError, '未授权'):

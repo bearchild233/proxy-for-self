@@ -172,9 +172,16 @@ class Platform:
                 raise PermissionError('没有网关池管理权限')
             if name == 'gateway-pool.configure':
                 value = self.gateway_pool.configure(data)
+            elif name == 'gateway-pool.queue.update':
+                value = self.gateway_pool.update_queue(data)
             elif name == 'gateway-pool.read':
                 value = self.gateway_pool.view(data.get('accountId'), data.get('gateway'), data.get('limit', 100), data.get('before'))
                 value['settings'] = self.gateway_pool.settings_for_ui()
+            elif name == 'gateway-pool.history.read':
+                try:
+                    value = self.gateway_pool.statistics(data)
+                except ValueError as error:
+                    return 400, json.dumps({'error':str(error)}, ensure_ascii=False).encode(), None
             else:
                 raise PermissionError('网关池能力未注册')
             return 200, json.dumps(value, ensure_ascii=False).encode(), None

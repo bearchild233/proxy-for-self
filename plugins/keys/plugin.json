@@ -1,6 +1,6 @@
 {
   "id": "keys",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "protocol": 2,
   "kind": "ui",
   "sdk": 1,
@@ -41,10 +41,10 @@
     "auth.post.auth.logout",
     "display-order.save"
   ],
-  "releasedAt": "2026-10-08T20:01:10.354854+00:00",
+  "releasedAt": "2026-10-13T00:00:00+08:00",
   "releaseNotes": [
-    "可见页面每30秒静默同步数据，切回页面立即补刷，隐藏时暂停。",
-    "刷新保留分页与筛选；设置草稿不被后台读取覆盖。"
+    "Key 轮转方式说明新增降智组优先、不可用时回退普通账号的规则。",
+    "保留多账号与多分组二选一；实际选号需要配套 Rust 网关及网关池控制面更新。"
   ],
   "runtime": "vue-component",
   "hostApi": 1

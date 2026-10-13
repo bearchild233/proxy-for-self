@@ -993,6 +993,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                 }
                 raw.extend_from_slice(&chunk);
             }
+            if let Some(guard) = &pool_guard { guard.end_access("completed"); }
             let meta = json_response_meta(&raw, context.request_id().as_str(), upstream_model.as_str());
             yield ProviderEvent::canonical(GatewayEvent::Started(meta.clone()));
             if let Some(usage) = json_response_usage(&raw) {
@@ -1033,6 +1034,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
         let mut pre_commit_events = PreCommitClientEvents::new();
         loop {
             let Some(stream_deadline) = remaining(context.deadline()) else {
+                if let Some(guard) = &pool_guard { guard.end_access("failed"); }
                 if allows_account_state_mutation {
                     synchronize_passive_quota(
                         &quota,
@@ -1081,6 +1083,9 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                     continue;
                 }
                 Err(mut failure) => {
+                    if let Some(guard) = &pool_guard {
+                        guard.end_access(if cancellation.is_cancelled() { "cancelled" } else { "failed" });
+                    }
                     let updates = take_rate_limit_updates(rate_limit_updates.as_ref()).await;
                     let rate_limits_changed = if updates.is_empty() {
                         false
@@ -1163,6 +1168,15 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                     (events, Some((error, semantic_output_seen)))
                 }
             };
+            // 原样透传可能把 canonical Completed 延迟到 EOF；收到实际终态就固定计时。
+            if let Some(guard) = &pool_guard {
+                if canonical_failure.is_some() || terminal_response_is_incomplete(&events) {
+                    guard.end_access("failed");
+                } else if events.iter().any(|event| terminal_response_output(event).is_some())
+                    || events.iter().flat_map(ProviderEvent::canonical_facts).any(|event| matches!(event, GatewayEvent::Completed(_))) {
+                    guard.end_access("completed");
+                }
+            }
             let metadata_merge = merge_response_metadata_updates(
                 response_metadata_updates.as_ref(),
                 &mut session_capture,
@@ -1290,6 +1304,11 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                 (events, Some((error, semantic_output_seen)))
             }
         };
+        if let Some(guard) = &pool_guard {
+            let completed = events.iter().any(|event| terminal_response_output(event).is_some())
+                || events.iter().flat_map(ProviderEvent::canonical_facts).any(|event| matches!(event, GatewayEvent::Completed(_)));
+            guard.end_access(if canonical_failure.is_some() || terminal_response_is_incomplete(&events) { "failed" } else if completed { "completed" } else { "interrupted" });
+        }
         let terminal_failure = canonical_failure.map(|(error, semantic_output_seen)| {
             log_canonical_upstream_error(
                 UpstreamErrorLogContext::new(

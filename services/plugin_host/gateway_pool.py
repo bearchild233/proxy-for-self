@@ -9,6 +9,8 @@ import sqlite3
 import time
 from urllib.parse import urlsplit
 import uuid
+import gateway_pool_history as history
+import gateway_pool_queue as queue
 
 
 class GatewayPool:
@@ -17,6 +19,12 @@ class GatewayPool:
         self.root.mkdir(parents=True, exist_ok=True)
         self.root.chmod(0o750)
         self.path = self.root / 'state.sqlite3'
+        # 报表持有只读快照时仍允许运行租约写入，避免长查询阻塞调度提交。
+        connection = sqlite3.connect(self.path, timeout=5)
+        try:
+            connection.execute('PRAGMA journal_mode=WAL')
+        finally:
+            connection.close()
         self.store, self.clock = store, clock
         self.cached_policy = None
         with self.db() as db:
@@ -31,14 +39,16 @@ class GatewayPool:
                 CREATE TABLE IF NOT EXISTS model_tickets (account TEXT NOT NULL, generation TEXT NOT NULL, model TEXT NOT NULL, expires REAL NOT NULL, data TEXT NOT NULL, PRIMARY KEY(account,generation,model));
                 CREATE INDEX IF NOT EXISTS observations_pair ON observations(account,gateway,at);
             ''')
+            history.install(db, self.clock())
+            queue.install(db)
         self.path.chmod(0o640)
 
     @contextmanager
-    def db(self):
-        db = sqlite3.connect(self.path, timeout=5, isolation_level=None)
+    def db(self, *, readonly=False):
+        db = sqlite3.connect(self.path.resolve().as_uri()+'?mode=ro' if readonly else self.path, uri=readonly, timeout=5, isolation_level=None)
         db.row_factory = sqlite3.Row
         try:
-            db.execute('BEGIN IMMEDIATE')
+            db.execute('BEGIN' if readonly else 'BEGIN IMMEDIATE')
             yield db
             db.commit()
         except BaseException:
@@ -79,7 +89,8 @@ class GatewayPool:
         if set(data) - allowed:
             raise ValueError('网关池设置字段无效')
         with self.db() as db:
-            settings = {**self.settings(db, private=True), **data}
+            previous_settings = self.settings(db, private=True)
+            settings = {**previous_settings, **data}
             for name, maximum in [('windowSeconds', 3600), ('initialRestSeconds', 86400), ('maximumRestSeconds', 86400), ('probeIntervalMs', 1000)]:
                 settings[name] = policy.finite_seconds(settings[name], name, maximum)
             if not settings['probeIntervalMs'].is_integer():
@@ -105,6 +116,10 @@ class GatewayPool:
             token = settings.get('poolToken', '')
             if not isinstance(token, str) or len(token) > 1024 or any(ord(c) < 33 or ord(c) > 126 for c in token):
                 raise ValueError('池服务凭证无效')
+            if any(settings[key] != previous_settings[key] for key in ('gateways', 'groupIds', 'poolAccountIds', 'poolUrl')):
+                history.record(db, history.interrupt, self.clock(), 'configuration')
+                # 候选集合变更后下一轮按新目录重新开始，不等待已移除的网关。
+                db.execute('UPDATE gp_account_queue SET remaining=NULL')
             # 限定网关时，被移出的候选立即退役；已发送的租约仍可排空，未发送的旧预约会被 sent 拒绝。
             for row in db.execute('SELECT data FROM pairs').fetchall():
                 pair = json.loads(row['data'])
@@ -119,18 +134,63 @@ class GatewayPool:
         with self.db() as db:
             return self.settings(db)
 
+    def update_queue(self, data):
+        policy = self.policy()
+        with self.db() as db:
+            result = queue.update(db,data)
+            if data.get('enabled') is False:
+                self.retire_account(db,data['accountId'],self.settings(db),policy)
+            return result
+
+    def retire_account(self, db, account, settings, policy):
+        for row in db.execute('SELECT data FROM pairs WHERE account=?',(account,)).fetchall():
+            pair=json.loads(row['data'])
+            if pair['state'] in {'ready','preparing'}:
+                policy.retire(pair,settings,degraded=False)
+                policy.settle(pair)
+                self.save(db,pair)
+
+    def schedulable(self, db, account, settings, policy, now):
+        # 只读已有目录和冷却事实，不因选号主动访问上游。
+        pairs=[json.loads(r['data']) for r in db.execute('SELECT data FROM pairs WHERE account=?',(account,))]
+        ready=next((p for p in pairs if p['state']=='ready'),None)
+        if ready and policy.rotation_due(ready,settings,now,demand=True) and queue.remaining(db,account)==[ready['gateway']]:
+            policy.retire(ready,settings,degraded=False)
+            policy.settle(ready)
+            self.save(db,ready)
+        elif ready:
+            return True
+        if any(p['state']=='preparing' for p in pairs):
+            return True
+        # 其他 Key 持有更靠前的窗口时，当前账号暂不能找票；让本 Key 回退普通账号。
+        position=db.execute('SELECT position FROM gp_account_queue WHERE account=?',(account,)).fetchone()[0]
+        for row in db.execute('SELECT p.data FROM pairs p JOIN gp_account_queue q ON q.account=p.account WHERE q.position<? AND q.enabled=1 AND q.quota_exhausted=0',(position,)):
+            other=json.loads(row['data'])
+            if other['state']=='preparing' or other['state']=='ready' and not policy.rotation_due(other,settings,now,demand=True):
+                return False
+        catalog=self.catalog(db,account,None,now)
+        gateways=[e['gateway'] for e in catalog] if catalog is not None else list(settings['gateways'])
+        if settings['gateways'] and catalog is not None:
+            gateways=[g for g in gateways if g in settings['gateways']]
+        if not gateways:
+            return catalog is None and not settings['gateways']
+        return any((p:=self.pair(db,account,g))['state']=='unknown' or p['state']=='cooling' and p.get('restUntil',0)<=now for g in gateways)
+
     @staticmethod
     def pair(db, account, gateway):
         row = db.execute('SELECT data FROM pairs WHERE account=? AND gateway=?', (account, gateway)).fetchone()
         return json.loads(row['data']) if row else {'accountId': account, 'gateway': gateway, 'state': 'unknown', 'inFlight': 0}
 
-    @staticmethod
-    def save(db, pair):
+    def save(self, db, pair):
+        previous = self.pair(db,pair['accountId'],pair['gateway'])['state']
+        queue.retired(db,pair,previous)
+        history.record(db, history.sync, pair, self.clock())
         db.execute('INSERT OR REPLACE INTO pairs VALUES (?,?,?)', (pair['accountId'], pair['gateway'], json.dumps(pair)))
 
     def reap(self, db, settings, policy, now):
         # 请求租约超时后保守地从超时点重新静置；重启不能把未完成访问当成已休息。
         for lease in db.execute('SELECT * FROM leases WHERE expires<=?', (now,)).fetchall():
+            history.record(db, history.finish, lease, {}, now, True)
             pair = self.pair(db, lease['account'], lease['gateway'])
             pair['inFlight'] = max(0, pair.get('inFlight', 0) - 1)
             if lease['sent']:
@@ -148,6 +208,7 @@ class GatewayPool:
                 lease = db.execute('SELECT * FROM leases WHERE id=? AND account=?', (data['leaseId'], data['accountId'])).fetchone()
                 if not lease:
                     return {'accepted': False}
+                history.record(db, history.finish, lease, data, self.clock())
                 pair = self.pair(db, lease['account'], lease['gateway'])
                 pair['inFlight'] = max(0, pair.get('inFlight', 0)-1)
                 if lease['sent']:
@@ -168,6 +229,8 @@ class GatewayPool:
                 db.execute('DELETE FROM leases WHERE id=?', (lease['id'],))
                 return {'accepted': True}
         if data.get('action') == 'config' and not self.store.state('gateway-pool').get('enabled'):
+            with self.db() as db:
+                history.record(db, history.interrupt, self.clock(), 'disabled')
             return {'enabled': False}
         policy = self.policy()
         now = self.clock()
@@ -181,6 +244,19 @@ class GatewayPool:
             if action == 'config':
                 return {**settings, 'enabled': True}
             if action == 'active':
+                if 'candidates' in data:
+                    candidates = data['candidates']
+                    if not isinstance(candidates,list) or any(not isinstance(c,dict) or not isinstance(c.get('exhausted'),bool) for c in candidates):
+                        raise ValueError('调度候选无效')
+                    ids=queue.identifiers([c.get('id') for c in candidates])
+                    queue.register(db,ids)
+                    for candidate in candidates:
+                        queue.quota(db,candidate['id'],candidate['exhausted'])
+                        if not queue.allowed(db,candidate['id']):
+                            self.retire_account(db,candidate['id'],settings,policy)
+                    usable={account for account in ids if queue.allowed(db,account) and self.schedulable(db,account,settings,policy,now)}
+                    ordered=[r['accountId'] for r in queue.view(db)['accounts'] if r['accountId'] in usable]
+                    return {'accounts':ordered,'queue':True}
                 # 降智分组只用一个满血窗口：先返回持有窗口的账号（最新在前），再返回正在找票的账号。
                 rows = [json.loads(r['data']) for r in db.execute('SELECT data FROM pairs')]
                 ready = sorted((p for p in rows if p['state'] == 'ready'), key=lambda p: -(p.get('verifiedAt') or 0))
@@ -190,6 +266,15 @@ class GatewayPool:
             account = data['accountId']
             if not isinstance(account, str) or not re.fullmatch(r'[A-Za-z0-9:_-]{1,128}', account):
                 raise ValueError('账号标识无效')
+            if action == 'quota':
+                if not isinstance(data.get('exhausted'),bool):
+                    raise ValueError('额度状态无效')
+                queue.quota(db,account,data['exhausted'])
+                if data['exhausted']:
+                    self.retire_account(db,account,settings,policy)
+                return {'accepted':True}
+            if action in {'plan','claim','reserve'} and not queue.allowed(db,account):
+                return {'claimed':False,'reserved':False,'yieldAccount':True}
             if action == 'material':
                 row = db.execute('SELECT data FROM materials WHERE account=? AND generation=? AND expires>?', (account, data['generation'], now)).fetchone()
                 return json.loads(row['data']) if row else None
@@ -197,6 +282,10 @@ class GatewayPool:
                 row = db.execute('SELECT data FROM model_tickets WHERE account=? AND generation=? AND model=? AND expires>?', (account, data['generation'], self.model(data), now)).fetchone()
                 return json.loads(row['data']) if row else None
             if action in {'plan', 'claim'}:
+                queue.register(db,[account])
+                turn=db.execute('SELECT position FROM gp_account_queue WHERE account=?',(account,)).fetchone()[0]
+                if data.get('queueTurn') is not None and data['queueTurn'] != turn:
+                    return {'claimed':False,'yieldAccount':True}
                 catalog = self.catalog(db, account, data.get('catalog'), now)
                 # 默认跟随池服务目录；设置了限定网关时只在其中挑选。目录不可用时退回限定列表。
                 gateways = [entry['gateway'] for entry in catalog] if catalog is not None else list(settings['gateways'])
@@ -207,26 +296,39 @@ class GatewayPool:
                 # 正在服务的组合即使暂时不在目录中，也继续服务到窗口或 Cookie 到期。
                 ready = next((json.loads(r['data']) for r in db.execute('SELECT data FROM pairs WHERE account=?', (account,)) if json.loads(r['data'])['state'] == 'ready'), None)
                 due = ready and policy.rotation_due(ready, settings, now, demand=data.get('demand') is True)
+                pending = queue.remaining(db,account)
+                if due and pending == [ready['gateway']]:
+                    policy.retire(ready,settings,degraded=False)
+                    policy.settle(ready)
+                    self.save(db,ready)
+                    return {'claimed':False,'yieldAccount':True}
                 candidates = [p for p in pairs if p['state'] == 'unknown' or p['state'] == 'cooling' and p.get('restUntil', 0) <= now]
-                candidates.sort(key=lambda p: policy.candidate_order(p, entries.get(p['gateway']), settings))
+                candidates.sort(key=lambda p: (pending is not None and p['gateway'] not in pending, policy.candidate_order(p, entries.get(p['gateway']), settings)))
                 pairs = [json.loads(r['data']) for r in db.execute('SELECT data FROM pairs WHERE account=?', (account,))]
                 probe = candidates[0] if candidates and (data.get('demand') is True or settings['mode'] == 'continuous') and (not ready or due) else None
                 if action == 'plan':
-                    return {'ready': ready, 'probe': probe, 'rotationDue': bool(due), 'preparing': any(p['state'] == 'preparing' for p in pairs)}
+                    return {'ready': ready, 'probe': probe, 'rotationDue': bool(due), 'preparing': any(p['state'] == 'preparing' for p in pairs), 'queueTurn':turn}
                 if not probe or any(p['state'] == 'preparing' for p in pairs):
                     return {'claimed': False}
                 # 其他账号已有未到期窗口或正在找票时不另开窗口，请求会转到那个账号。
                 for row in db.execute('SELECT data FROM pairs WHERE account<>?', (account,)):
                     other = json.loads(row['data'])
                     if other['state'] == 'preparing' or other['state'] == 'ready' and not policy.rotation_due(other, settings, now, demand=True):
-                        return {'claimed': False}
+                        order=[r['accountId'] for r in queue.view(db)['accounts']]
+                        if account not in order or other['accountId'] not in order or order.index(other['accountId']) < order.index(account):
+                            return {'claimed': False}
+                        policy.retire(other,settings,degraded=False)
+                        policy.settle(other)
+                        self.save(db,other)
                 generation = uuid.uuid4().hex
+                queue.begin(db,account,gateways)
                 probe.update(generation=generation, state='preparing', probeRestSeconds=probe.get('restSeconds') if probe.get('lastContactAt') is not None else None,
                              observedIdleSeconds=max(0, now-probe['lastContactAt']) if probe.get('lastContactAt') is not None else None,
                              preparationStartedAt=now, firstContactAt=None, inFlight=probe['inFlight']+1)
+                history.record(db, history.begin, probe, gateways, now)
                 self.save(db, probe)
                 db.execute('INSERT INTO leases VALUES (?,?,?,?,?,?,0,?)', (generation, account, probe['gateway'], generation, 'probe', now+60, '{}'))
-                return {'claimed': True, 'leaseId': generation, 'pair': probe}
+                return {'claimed': True, 'leaseId': generation, 'pair': probe, 'queueTurn':turn}
             if action == 'reserve':
                 pair = self.pair(db, account, data['gateway'])
                 if pair['state'] != 'ready' or pair.get('generation') != data['generation']:
@@ -244,6 +346,10 @@ class GatewayPool:
                 return {'accepted': False}
             pair = self.pair(db, account, lease['gateway'])
             if action == 'sent':
+                if not queue.allowed(db,account):
+                    return {'accepted':False}
+                if lease['kind'] == 'probe' and (pair['state'] != 'preparing' or pair.get('generation') != lease['generation']):
+                    return {'accepted':False}
                 # 保留尚未发送的请求：已切换时重新选择，不能凭旧预约发送到退役组合。
                 if lease['kind'] == 'business' and (pair['state'] != 'ready' or pair.get('generation') != lease['generation']):
                     return {'accepted': False}
@@ -252,25 +358,28 @@ class GatewayPool:
                     pair.update(firstContactAt=now, previousContactAt=previous,
                                 observedIdleSeconds=max(0, now-previous) if previous is not None else None)
                 db.execute('UPDATE leases SET sent=1 WHERE id=?', (lease['id'],))
+                history.record(db, history.sent, lease, data, now)
                 pair['lastContactAt'] = now
             elif action == 'probeAttempt':
                 if lease['kind'] != 'probe' or not lease['sent'] or data.get('phase') not in {'bootstrap','replay'} or data.get('retry') not in {0,1}:
                     raise ValueError('探测访问记录无效')
-                sample = {'source':'probe-attempt','phase':data['phase'],'retry':data['retry'],'status':data.get('status'),
+                sample = {'generation':lease['generation'],'source':'probe-attempt','phase':data['phase'],'retry':data['retry'],'status':data.get('status'),
                           'stateReturned':data.get('stateReturned') is True,'classification':None,'durationMs':data.get('durationMs'),
                           'plannedRestSeconds':pair.get('probeRestSeconds'),'observedIdleSeconds':pair.get('observedIdleSeconds'),
                           'firstContactAt':pair.get('firstContactAt'),'previousContactAt':pair.get('previousContactAt'),
                           'lastContactAt':pair.get('lastContactAt'),'completedAt':now}
                 db.execute('INSERT INTO observations(at,account,gateway,data) VALUES (?,?,?,?)',(now,account,lease['gateway'],json.dumps(sample)))
+                history.record(db, history.report, lease, data, now)
             elif action == 'ticketResult':
                 # 窗口内其他模型拿票：只记录事实并保存 state，不做 21/29 判定。
                 model = self.model(data)
                 if lease['kind'] != 'business' or not lease['sent']:
                     raise ValueError('拿票记录无效')
-                sample = {'source': 'ticket', 'model': model, 'status': data.get('status'), 'stateReturned': data.get('stateReturned') is True,
+                sample = {'generation': lease['generation'], 'source': 'ticket', 'model': model, 'status': data.get('status'), 'stateReturned': data.get('stateReturned') is True,
                           'classification': None, 'durationMs': data.get('durationMs'), 'firstContactAt': pair.get('firstContactAt'),
                           'lastContactAt': pair.get('lastContactAt'), 'completedAt': now}
                 db.execute('INSERT INTO observations(at,account,gateway,data) VALUES (?,?,?,?)', (now, account, lease['gateway'], json.dumps(sample)))
+                history.record(db, history.report, lease, data, now)
                 material = data.get('material')
                 if material is not None and pair['state'] == 'ready' and pair.get('generation') == lease['generation']:
                     self.check_material(material, now)
@@ -282,16 +391,17 @@ class GatewayPool:
                                           gateway_matches=data.get('gatewayMatches') is True, failed=data.get('failed') is True)
                 if verdict is not None and not lease['sent']:
                     raise ValueError('未发送请求不能判定')
-                sample = {'source': lease['kind'], 'model': self.model(data) if data.get('model') is not None else None, 'status': data.get('status'), 'stateReturned': data.get('stateReturned') is True, 'classification': verdict,
+                sample = {'generation': lease['generation'], 'source': lease['kind'], 'model': self.model(data) if data.get('model') is not None else None, 'status': data.get('status'), 'stateReturned': data.get('stateReturned') is True, 'classification': verdict,
                           'durationMs': data.get('durationMs'), 'plannedRestSeconds': pair.get('probeRestSeconds') if lease['kind'] == 'probe' else None,
                           'observedIdleSeconds': pair.get('observedIdleSeconds') if lease['kind'] == 'probe' else None}
                 sample.update(gatewayMatches=data.get('gatewayMatches') is True, firstContactAt=pair.get('firstContactAt'),
                               previousContactAt=pair.get('previousContactAt'), lastContactAt=pair.get('lastContactAt'),
                               preparationStartedAt=pair.get('preparationStartedAt'), completedAt=now)
                 db.execute('INSERT INTO observations(at,account,gateway,data) VALUES (?,?,?,?)', (now, account, lease['gateway'], json.dumps(sample)))
+                history.record(db, history.result, lease, data, verdict, now)
                 if pair.get('generation') == lease['generation']:
                     if lease['kind'] == 'probe':
-                        if verdict == '21' and (not settings['gateways'] or pair['gateway'] in settings['gateways']) and pair['state'] == 'preparing':
+                        if verdict == '21' and queue.allowed(db,account) and (not settings['gateways'] or pair['gateway'] in settings['gateways']) and pair['state'] == 'preparing':
                             material = data.get('material')
                             if material is not None:
                                 self.check_material(material, now)
@@ -378,10 +488,23 @@ class GatewayPool:
         if not isinstance(material, dict) or set(material) != {'state','cookie','expires'} or any(not isinstance(material[k], str) or not 1 <= len(material[k]) <= 16384 or '\r' in material[k] or '\n' in material[k] for k in ('state','cookie')) or not isinstance(material['expires'], (float,int)) or not now < material['expires'] <= now+86400*365:
             raise ValueError('配套材料无效')
 
+    def statistics(self, query):
+        from gateway_pool_history_query import read
+        now = self.clock()
+        with self.db() as db:
+            history.record(db, history.close_idle, now)
+        with self.db(readonly=True) as db:
+            return read(db, now, query)
+
+    def interrupt_history(self, reason):
+        with self.db() as db:
+            history.record(db, history.interrupt, self.clock(), reason)
+
     def view(self, account=None, gateway=None, limit=100, before=None):
+        from gateway_pool_history_query import cooling_summary
         limit = min(500, max(1, int(limit)))
         # 停用也能读历史；冷却记录不随插件卸载删除。
-        with self.db() as db:
+        with self.db(readonly=True) as db:
             row = db.execute('SELECT data FROM settings WHERE id=1').fetchone()
             settings = json.loads(row['data']) if row else {}
             settings['poolTokenConfigured'] = bool(settings.pop('poolToken', None))
@@ -394,6 +517,7 @@ class GatewayPool:
             pairs = [json.loads(r['data']) for r in db.execute('SELECT data FROM pairs'+pair_where+' ORDER BY account,gateway', args)]
             # 只返回已拿到票的模型名，不返回 state 或 Cookie。
             for pair in pairs:
+                pair['coolingSummary'] = cooling_summary(db, pair['accountId'], pair['gateway'])
                 pair['ticketModels'] = [r['model'] for r in db.execute('SELECT model FROM model_tickets WHERE account=? AND generation=? AND expires>? ORDER BY model', (pair['accountId'], pair.get('generation'), self.clock()))] if pair['state'] == 'ready' else []
             if before is not None:
                 where.append('id<?'); args.append(int(before))
@@ -407,4 +531,4 @@ class GatewayPool:
             condition = ' WHERE '+' AND '.join(switch_where) if switch_where else ''
             switches = [{**json.loads(r['data']), 'at':r['at'], 'accountId':r['account']} for r in db.execute('SELECT * FROM switches'+condition+' ORDER BY id DESC LIMIT ?', [*switch_args,limit])]
             catalogs = {r['account']: {'at': r['at'], 'gateways': json.loads(r['data'])} for r in db.execute('SELECT * FROM catalogs' + (' WHERE account=?' if account else ''), [account] if account else [])}
-            return {'settings': settings, 'pairs': pairs, 'observations': samples, 'switches': switches, 'catalogs': catalogs}
+            return {'settings': settings, 'pairs': pairs, 'observations': samples, 'switches': switches, 'catalogs': catalogs, 'accountQueue':queue.view(db)}
