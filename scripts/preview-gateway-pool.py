@@ -27,7 +27,8 @@ def seed(pool):
     with pool.db() as db:
         db.execute('UPDATE gp_history_meta SET started=?', (now,))
     gateways = ['unified-142','unified-143','unified-144','unified-145']
-    pool.configure({'gateways':gateways,'groupIds':['preview-group'],'initialRestSeconds':7200})
+    pool.configure({'gateways':gateways,'groupIds':['preview-group'],'initialRestSeconds':7200,
+                    'dynamicGroups':True,'normalGroupId':'preview-normal-group','degradedGroupId':'preview-group'})
 
     def call(action, account, **data):
         return pool.runtime({'action':action,'accountId':account,**data})
@@ -68,6 +69,13 @@ def seed(pool):
     with pool.db() as db:
         for account in ('preview-alpha','preview-beta'):
             pool.catalog(db,account,[{'gateway':f'unified-{number}','validForS':900} for number in range(142,242)],now)
+    # 动态分组记录：确认降智移入、持续满血恢复移回、一次写入失败、一次处理中。
+    for offset,account,direction,status in [(7200,'preview-alpha','degraded','moved'),(5400,'preview-beta','degraded','moved'),(3000,'preview-alpha','recovered','moved'),(900,'preview-beta','recovered','failed'),(60,'preview-normal','degraded',None)]:
+        pool.clock = lambda offset=offset: now - offset
+        event = pool.runtime({'action':'regroup','accountId':account,'direction':direction,'model':'gpt-6.1-sol'})['move']['eventId']
+        if status:
+            pool.clock = lambda offset=offset: now - offset + 2
+            pool.runtime({'action':'regroupResult','accountId':account,'eventId':event,'status':status})
     pool.clock = time.time
 
 

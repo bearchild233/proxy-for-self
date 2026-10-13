@@ -17,7 +17,7 @@ const groupNames = computed(() => new Map(props.groups.map(group => [group.id, g
 const accountName = (id: string) => accountNames.value.get(id) ?? id
 const groupName = (id: string) => groupNames.value.get(id) ?? id
 const time = (seconds: number) => new Date(seconds * 1000).toLocaleString('zh-CN', { hour12: false })
-const tagType = (status: GroupEvent['status']) => status === 'moved' ? 'success' : status === 'failed' ? 'error' : status === 'pending' ? 'info' : 'neutral'
+const tagType = (status: GroupEvent['status']) => status === 'moved' ? 'success' : status === 'failed' ? 'danger' : status === 'pending' ? 'info' : 'neutral'
 </script>
 
 <template>
@@ -58,7 +58,7 @@ const tagType = (status: GroupEvent['status']) => status === 'moved' ? 'success'
               {{ accountName(event.accountId) }}
             </td>
             <td class="px-3 py-2">
-              <BaseTag size="sm" :type="event.direction === 'degraded' ? 'error' : 'success'">
+              <BaseTag size="sm" :type="event.direction === 'degraded' ? 'danger' : 'success'">
                 {{ event.direction === 'degraded' ? '确认降智' : '持续满血，已恢复' }}
               </BaseTag>
             </td>
