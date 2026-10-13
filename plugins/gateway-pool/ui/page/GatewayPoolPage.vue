@@ -36,11 +36,10 @@ useIntervalFn(() => {
 const names = computed(() => new Map(accounts.value.map(account => [account.id, account.name || account.email || account.id])))
 const settings = computed(() => view.value?.settings)
 const enabledGroups = computed(() => groups.value.filter(group => settings.value?.groupIds.includes(group.id)))
-// 账号卡片：选定分组的成员，加上已有组合记录但已离开分组的账号。
+// 账号卡片：只显示选定分组的当前成员；已移出分组的账号不再显示，它们的历史记录仍在“轮转明细”里。
 const accountCards = computed(() => {
   const pairs = view.value?.pairs ?? []
   const ids = new Set(accounts.value.filter(account => account.groups?.some(group => settings.value?.groupIds.includes(group.id))).map(account => account.id))
-  pairs.forEach(pair => ids.add(pair.accountId))
   return [...ids]
     .map(id => ({ id, name: names.value.get(id) ?? id, pairs: pairs.filter(pair => pair.accountId === id) }))
     .sort((a, b) => queuePosition(a.id) - queuePosition(b.id))
@@ -84,7 +83,9 @@ async function saveOrder(change: { originalIds: string[], orderedIds: string[] }
 const hourAgo = computed(() => now.value - 3600)
 const recent = computed(() => (view.value?.observations ?? []).filter(sample => sample.at >= hourAgo.value))
 const stats = computed(() => {
-  const pairs = view.value?.pairs ?? []
+  // 统计只算当前分组成员，已移出分组的账号不计入。
+  const members = new Set(accountCards.value.map(card => card.id))
+  const pairs = (view.value?.pairs ?? []).filter(pair => members.has(pair.accountId))
   const switches = (view.value?.switches ?? []).filter(item => item.at >= hourAgo.value)
   return {
     serving: pairs.filter(pair => pair.state === 'ready').length,
@@ -112,10 +113,24 @@ async function refresh() {
       return
     view.value = response
     error.value = ''
+    // 动态分组移入/移出完成后立刻重读目录，账号卡片随分组成员变化。
+    const moved = (response.groupEvents ?? []).filter(event => event.status !== 'pending').map(event => `${event.id}:${event.status}`).join(',')
+    if (movedSignature !== null && moved !== movedSignature)
+      void loadDirectory()
+    movedSignature = moved
   }
   catch (e) { error.value = e instanceof Error ? e.message : '读取网关池失败' }
 }
+let movedSignature: string | null = null
+let loadingDirectory = false
 async function loadDirectory() {
+  if (loadingDirectory)
+    return
+  loadingDirectory = true
+  try { await readDirectory() }
+  finally { loadingDirectory = false }
+}
+async function readDirectory() {
   // 分页读取完整目录，不把首屏当作全部账号与分组。
   function unpack<T>(result: { data?: T } | T): T {
     return (result && typeof result === 'object' && 'data' in result ? result.data : result) as T
@@ -155,6 +170,8 @@ onMounted(() => {
   void loadDirectory()
 })
 usePluginPolling(refresh, shallowRef(10_000))
+// 管理员在账号页手动调整分组不产生分组变动记录，目录定期重读，移入和移出都会在一分钟内反映。
+usePluginPolling(loadDirectory, shallowRef(60_000))
 </script>
 
 <template>

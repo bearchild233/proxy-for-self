@@ -65,6 +65,11 @@ def seed(pool):
                     call('finish',account,leaseId=lease)
                 now += 20
         now += (wave+1)*2*3600
+    # 已移出分组的账号仍有历史记录和一个服务中的组合：页面不应再显示它。
+    claim = call('claim','preview-normal',demand=True,catalog=[{'gateway':name,'validForS':900} for name in gateways])
+    call('sent','preview-normal',leaseId=claim['leaseId'])
+    call('probeResult','preview-normal',leaseId=claim['leaseId'],status=200,stateReturned=False,paired=True,gatewayMatches=True)
+    call('finish','preview-normal',leaseId=claim['leaseId'])
     # 模拟百个候选的展示密度，轮转历史仍来自上述真实状态机事件。
     with pool.db() as db:
         for account in ('preview-alpha','preview-beta'):
