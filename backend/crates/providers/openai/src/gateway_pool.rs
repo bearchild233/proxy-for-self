@@ -142,6 +142,72 @@ impl AccessTiming {
 pub(crate) struct GatewayPoolSelection {
     pub members: Vec<ProviderAccountId>,
     pub preferred: Vec<ProviderAccountId>,
+    /// 其中已持有满血窗口（或正在找票）的账号；续接请求优先留在这些账号上。
+    pub live: Vec<ProviderAccountId>,
+    /// Key 的账号范围内是否还有降智组之外的账号可作退路。
+    pub ordinary: bool,
+}
+
+/// 控制面 `active` 的结果：可调度账号（持窗账号在前）、持窗账号，以及不可调度账号的原因。
+#[derive(Default)]
+struct OrderedAccounts {
+    accounts: Vec<ProviderAccountId>,
+    live: Vec<ProviderAccountId>,
+    blocked: Vec<ProviderAccountId>,
+}
+
+/// 同一 Key 内的退路：别的降智账号，或降智组之外的普通账号。
+#[derive(Clone, Default)]
+pub(crate) struct Fallback {
+    pub alternatives: Vec<String>,
+    pub ordinary: bool,
+}
+
+/// 网关池拒绝或无法完成路由的原因；写入错误诊断，管理员在错误排查里能直接看到。
+#[derive(Debug, Clone)]
+pub(crate) struct PoolFailure {
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl PoolFailure {
+    fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+    fn control_plane() -> Self {
+        Self::new(
+            "control_plane_unavailable",
+            "网关池控制面暂时不可用，读不到设置或调度状态，请检查插件服务是否在运行",
+        )
+    }
+    /// 控制面返回的阻塞原因，原因码只接受已知的几种。
+    fn from_block(value: &Value) -> Option<Self> {
+        let code = match value["code"].as_str()? {
+            "queue_disabled" => "queue_disabled",
+            "quota_exhausted" => "quota_exhausted",
+            "catalog_empty" => "catalog_empty",
+            "all_resting" => "all_resting",
+            _ => "pool_blocked",
+        };
+        let message = value["message"]
+            .as_str()
+            .unwrap_or("网关池暂时不能调度该账号");
+        Some(Self::new(code, message))
+    }
+}
+
+/// 把控制面调用失败统一成可读原因。
+trait Control<T> {
+    fn control(self) -> Result<T, PoolFailure>;
+}
+
+impl<T> Control<T> for Result<T, ()> {
+    fn control(self) -> Result<T, PoolFailure> {
+        self.map_err(|()| PoolFailure::control_plane())
+    }
 }
 
 pub(crate) struct GatewayPoolService {
@@ -286,10 +352,18 @@ impl GatewayPoolService {
                             .contains_key(account.id().as_str()))
             })
             .collect::<Vec<_>>();
-        let ordered = self.ordered_accounts(&accounts).await?;
-        for id in ordered {
-            if let Some(account) = accounts.iter().find(|account| account.id() == &id) {
-                self.start_prepare(account.clone(), false, cancellation.clone())
+        let ordered = self.ordered_accounts(&accounts).await?.accounts;
+        for id in &ordered {
+            if let Some(account) = accounts.iter().find(|account| account.id() == id) {
+                let fallback = Fallback {
+                    alternatives: ordered
+                        .iter()
+                        .filter(|other| *other != id)
+                        .map(|other| other.as_str().to_owned())
+                        .collect(),
+                    ordinary: false,
+                };
+                self.start_prepare(account.clone(), false, cancellation.clone(), fallback)
                     .await?;
             }
         }
@@ -381,25 +455,35 @@ impl GatewayPoolService {
         if !settings.enabled {
             return Ok(GatewayPoolSelection::default());
         }
-        let accounts = self
+        let listed = self
             .repository
             .store()
             .list_accounts()
             .await
-            .map_err(|_| ())?
+            .map_err(|_| ())?;
+        let in_pool = |account: &ProviderAccount| {
+            account.authentication_kind() == "oauth"
+                && scope
+                    .directory()
+                    .account(account.id())
+                    .is_some_and(|entry| {
+                        entry
+                            .group_ids()
+                            .iter()
+                            .any(|group| settings.group_ids.iter().any(|id| id == group.as_str()))
+                    })
+        };
+        let ordinary = listed.iter().any(|account| {
+            account.provider().as_str() == "openai"
+                && scope.allows(account.id())
+                && !in_pool(account)
+        });
+        let accounts = listed
             .into_iter()
             .filter(|account| {
                 account.provider().as_str() == "openai"
-                    && account.authentication_kind() == "oauth"
                     && scope.allows(account.id())
-                    && scope
-                        .directory()
-                        .account(account.id())
-                        .is_some_and(|entry| {
-                            entry.group_ids().iter().any(|group| {
-                                settings.group_ids.iter().any(|id| id == group.as_str())
-                            })
-                        })
+                    && in_pool(account)
             })
             .collect::<Vec<_>>();
         let members = accounts
@@ -407,22 +491,56 @@ impl GatewayPoolService {
             .map(|account| account.id().clone())
             .collect::<Vec<_>>();
         // 控制面不可用时池账号失败关闭，已确认的普通账号仍能按原策略使用。
-        let preferred = if available && !accounts.is_empty() {
-            self.ordered_accounts(&accounts)
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|id| members.contains(id))
-                .collect()
+        let ordered = if available && !accounts.is_empty() {
+            self.ordered_accounts(&accounts).await.unwrap_or_default()
         } else {
-            Vec::new()
+            OrderedAccounts::default()
         };
-        Ok(GatewayPoolSelection { members, preferred })
+        let keep = |ids: Vec<ProviderAccountId>| {
+            ids.into_iter()
+                .filter(|id| members.contains(id))
+                .collect::<Vec<_>>()
+        };
+        // 成员按“可调度在前、不可调度在后”排列：只有降智账号的 Key 没有可调度账号时，
+        // 仍从最靠前的账号开始，由路由阶段给出具体原因。
+        let mut members_ordered = keep(ordered.accounts.clone());
+        for id in keep(ordered.blocked) {
+            if !members_ordered.contains(&id) {
+                members_ordered.push(id);
+            }
+        }
+        for id in &members {
+            if !members_ordered.contains(id) {
+                members_ordered.push(id.clone());
+            }
+        }
+        Ok(GatewayPoolSelection {
+            members: members_ordered,
+            preferred: keep(ordered.accounts),
+            live: keep(ordered.live),
+            ordinary,
+        })
     }
-    async fn ordered_accounts(
+    /// 本 Key 范围内可替代的别的降智账号和普通账号，用来判断账号能否让位。
+    pub(crate) async fn fallback(
         &self,
-        accounts: &[ProviderAccount],
-    ) -> Result<Vec<ProviderAccountId>, ()> {
+        context: &AttemptContext,
+        account: &ProviderAccount,
+    ) -> Fallback {
+        match self.selection(context).await {
+            Ok(selection) => Fallback {
+                alternatives: selection
+                    .preferred
+                    .iter()
+                    .filter(|id| *id != account.id())
+                    .map(|id| id.as_str().to_owned())
+                    .collect(),
+                ordinary: selection.ordinary,
+            },
+            Err(()) => Fallback::default(),
+        }
+    }
+    async fn ordered_accounts(&self, accounts: &[ProviderAccount]) -> Result<OrderedAccounts, ()> {
         self.quota.prepare_scheduling(accounts).await;
         let mut candidates = Vec::new();
         for account in accounts {
@@ -446,20 +564,41 @@ impl GatewayPoolService {
         let value = self
             .call(json!({"action":"active","candidates":candidates}))
             .await?;
-        let accounts = value["accounts"]
+        let ids = |value: &Value| -> Vec<ProviderAccountId> {
+            value
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|id| id.as_str())
+                        .filter_map(|id| gateway_core::account::ProviderAccountId::new(id).ok())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let blocked = value["blocked"]
             .as_array()
-            .ok_or(())?
-            .iter()
-            .filter_map(|id| id.as_str())
-            .filter_map(|id| gateway_core::account::ProviderAccountId::new(id).ok())
-            .collect();
-        Ok(accounts)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item["accountId"].as_str())
+                    .filter_map(|id| gateway_core::account::ProviderAccountId::new(id).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        value["accounts"].as_array().ok_or(())?;
+        Ok(OrderedAccounts {
+            accounts: ids(&value["accounts"]),
+            live: ids(&value["live"]),
+            blocked,
+        })
     }
     async fn start_prepare(
         self: &Arc<Self>,
         account: ProviderAccount,
         demand: bool,
         cancellation: CancellationToken,
+        fallback: Fallback,
     ) -> Result<(), ()> {
         let Ok(permit) = Arc::clone(&self.probes).try_acquire_owned() else {
             return Ok(());
@@ -472,7 +611,7 @@ impl GatewayPoolService {
             return Err(());
         }
         let claim = self
-            .call(json!({"action":"claim","accountId":account.id().as_str(),"demand":demand,"catalog":self.catalog(&account, &settings).await}))
+            .call(json!({"action":"claim","accountId":account.id().as_str(),"demand":demand,"catalog":self.catalog(&account, &settings).await,"alternatives":fallback.alternatives,"ordinary":fallback.ordinary}))
             .await?;
         if claim["claimed"] == true {
             let service = Arc::clone(self);
@@ -508,7 +647,7 @@ impl GatewayPoolService {
                         break;
                     }
                     let catalog = service.catalog(&account, &settings).await;
-                    let Ok(next) = service.call(json!({"action":"claim","accountId":account.id().as_str(),"demand":demand,"catalog":catalog,"queueTurn":queue_turn})).await else { break; };
+                    let Ok(next) = service.call(json!({"action":"claim","accountId":account.id().as_str(),"demand":demand,"catalog":catalog,"queueTurn":queue_turn,"alternatives":fallback.alternatives,"ordinary":fallback.ordinary})).await else { break; };
                     if next["claimed"] != true {
                         break;
                     }
@@ -523,35 +662,70 @@ impl GatewayPoolService {
         account: &ProviderAccount,
         deadline: SystemTime,
         cancellation: &CancellationToken,
-    ) -> Result<GatewayPoolGuard, ()> {
-        let settings = self.settings().await?;
-        if !settings.enabled || pool_member_id(&settings, account).is_none() {
-            return Err(());
+        fallback: &Fallback,
+    ) -> Result<GatewayPoolGuard, PoolFailure> {
+        let settings = self.settings().await.control()?;
+        if !settings.enabled {
+            return Err(PoolFailure::new(
+                "pool_disabled",
+                "网关池插件已停用，降智组账号暂时无法使用",
+            ));
+        }
+        if pool_member_id(&settings, account).is_none() {
+            return Err(PoolFailure::new(
+                "member_unknown",
+                "无法生成池成员标识：账号缺少上游账号 ID 或用户 ID，请重新登录该账号或在网关池设置里指定",
+            ));
         }
         self.active
             .lock()
             .await
             .insert(account.id().as_str().to_owned(), Instant::now());
+        // 比请求期限早一点放弃，这里才来得及给出具体原因，而不是被外层超时先截断。
+        let give_up_at = deadline
+            .checked_sub(Duration::from_millis(1500))
+            .unwrap_or(deadline);
         let mut queue_turn = Value::Null;
+        let mut waiting = String::from("尚未收到调度状态");
         loop {
-            if self.eligible_account(account).await?.is_none() {
-                return Err(());
+            if self.eligible_account(account).await.control()?.is_none() {
+                return Err(self.ineligible(account).await);
             }
-            if SystemTime::now() >= deadline {
-                return Err(());
+            if SystemTime::now() >= give_up_at {
+                return Err(PoolFailure::new(
+                    "wait_timeout",
+                    format!("等待满血窗口超过请求期限：{waiting}"),
+                ));
             }
             let plan = self
-                .call(json!({"action":"plan","accountId":account.id().as_str(),"demand":true,"catalog":self.catalog(account, &settings).await}))
-                .await?;
-            if plan["yieldAccount"] == true
-                || (!queue_turn.is_null() && plan["queueTurn"] != queue_turn)
-            {
-                return Err(());
+                .call(json!({"action":"plan","accountId":account.id().as_str(),"demand":true,"catalog":self.catalog(account, &settings).await,"queueTurn":queue_turn,"alternatives":fallback.alternatives,"ordinary":fallback.ordinary}))
+                .await
+                .control()?;
+            if plan["yieldAccount"] == true {
+                return Err(PoolFailure::new(
+                    "yielded",
+                    "该账号本轮网关已轮完并让位给同一 Key 内的其他账号，请重试",
+                ));
+            }
+            if let Some(failure) = PoolFailure::from_block(&plan["blocked"]) {
+                return Err(failure);
             }
             queue_turn = plan["queueTurn"].clone();
             if !plan["probe"].is_null() {
-                self.start_prepare(account.clone(), true, cancellation.clone())
-                    .await?;
+                waiting = format!(
+                    "正在检测网关 {}，尚未得到满血判定",
+                    plan["probe"]["gateway"].as_str().unwrap_or("?")
+                );
+                self.start_prepare(
+                    account.clone(),
+                    true,
+                    cancellation.clone(),
+                    fallback.clone(),
+                )
+                .await
+                .control()?;
+            } else if plan["preparing"] == true {
+                waiting = "另一个请求正在为该账号检测网关".to_owned();
             }
             if let Ok(pair) = serde_json::from_value::<Pair>(plan["ready"].clone()) {
                 let key = format!("{}:{}", account.id().as_str(), pair.generation);
@@ -566,7 +740,7 @@ impl GatewayPoolService {
                     material
                 } else {
                     // A/B 与重启共用私有材料，不因另一个进程的内存缓存缺失而退役可用组合。
-                    let shared = self.call(json!({"action":"material","accountId":account.id().as_str(),"generation":pair.generation})).await?;
+                    let shared = self.call(json!({"action":"material","accountId":account.id().as_str(),"generation":pair.generation})).await.control()?;
                     shared["state"]
                         .as_str()
                         .zip(shared["cookie"].as_str())
@@ -585,12 +759,18 @@ impl GatewayPoolService {
                         })
                 };
                 if let Some(material) = material {
-                    let reservation = self.call(json!({"action":"reserve","accountId":account.id().as_str(),"gateway":pair.gateway,"generation":pair.generation,"deadline":epoch(deadline)})).await?;
+                    let reservation = self.call(json!({"action":"reserve","accountId":account.id().as_str(),"gateway":pair.gateway,"generation":pair.generation,"deadline":epoch(deadline)})).await.control()?;
+                    if let Some(failure) = PoolFailure::from_block(&reservation["blocked"]) {
+                        return Err(failure);
+                    }
                     if reservation["reserved"] == true {
                         return Ok(GatewayPoolGuard {
                             service: Arc::clone(self),
                             account: account.id().as_str().to_owned(),
-                            lease: reservation["leaseId"].as_str().ok_or(())?.to_owned(),
+                            lease: reservation["leaseId"]
+                                .as_str()
+                                .ok_or_else(PoolFailure::control_plane)?
+                                .to_owned(),
                             material,
                             model: settings.probe_model.clone(),
                             ticket: None,
@@ -598,22 +778,71 @@ impl GatewayPoolService {
                             finished: false,
                         });
                     }
+                    waiting = format!("网关 {} 的窗口刚刚切换，正在重新预约", pair.gateway);
                 } else {
                     // 重启或 A/B 切换时不能把仅有持久化状态、没有配套材料的组合当成可用。
-                    let reservation = self.call(json!({"action":"reserve","accountId":account.id().as_str(),"gateway":pair.gateway,"generation":pair.generation,"deadline":epoch(deadline)})).await?;
+                    waiting = format!("网关 {} 缺少配套材料，正在重新检测", pair.gateway);
+                    let reservation = self.call(json!({"action":"reserve","accountId":account.id().as_str(),"gateway":pair.gateway,"generation":pair.generation,"deadline":epoch(deadline)})).await.control()?;
                     if let Some(lease) = reservation["leaseId"].as_str() {
-                        self.call(json!({"action":"invalidate","accountId":account.id().as_str(),"leaseId":lease})).await?;
-                        self.call(json!({"action":"finish","accountId":account.id().as_str(),"leaseId":lease})).await?;
+                        self.call(json!({"action":"invalidate","accountId":account.id().as_str(),"leaseId":lease})).await.control()?;
+                        self.call(json!({"action":"finish","accountId":account.id().as_str(),"leaseId":lease})).await.control()?;
                     }
                 }
             } else if plan["probe"].is_null() && plan["preparing"] != true {
                 // 所有候选均冷却，不绕过静置；交给原账号选择器尝试其他授权账号。
-                return Err(());
+                return Err(PoolFailure::new(
+                    "no_candidate",
+                    "该账号目前没有可检测的网关（全部在静置或目录为空）",
+                ));
             }
             tokio::time::sleep(Duration::from_millis(
                 settings.probe_interval_ms.clamp(1, 1000),
             ))
             .await;
+        }
+    }
+    /// 账号不满足网关池准入条件时的具体原因。
+    async fn ineligible(&self, account: &ProviderAccount) -> PoolFailure {
+        let Ok(Some(current)) = self.repository.store().get_account(account.id()).await else {
+            return PoolFailure::new("account_missing", "账号已被删除或归档");
+        };
+        let model = self
+            .settings()
+            .await
+            .map(|settings| settings.probe_model)
+            .unwrap_or_default();
+        if !current.enabled() {
+            return PoolFailure::new("account_disabled", "账号已停用");
+        }
+        if current.authentication_kind() != "oauth" {
+            return PoolFailure::new("not_oauth", "网关池只支持 OAuth 账号");
+        }
+        if !current.model_access().allows(&model) {
+            return PoolFailure::new(
+                "no_probe_model_access",
+                format!("账号没有打票模型 {model} 的使用权限，无法检测网关"),
+            );
+        }
+        let cooldown = self.quota.cooldown(current.id()).await.ok().flatten();
+        match current
+            .status_projection(SystemTime::now(), cooldown)
+            .status
+        {
+            gateway_core::account::AccountStatus::QuotaExhausted => {
+                PoolFailure::new("quota_exhausted", "账号额度已耗尽，等待额度重置")
+            }
+            gateway_core::account::AccountStatus::RateLimited => {
+                PoolFailure::new("rate_limited", "账号正在限流冷却，稍后再试")
+            }
+            gateway_core::account::AccountStatus::Error => {
+                PoolFailure::new("account_error", "账号处于错误状态，需要重新授权或检查凭据")
+            }
+            gateway_core::account::AccountStatus::Disabled => {
+                PoolFailure::new("account_disabled", "账号已停用")
+            }
+            gateway_core::account::AccountStatus::Normal => {
+                PoolFailure::new("quota_unreadable", "读取不到账号额度，网关池暂不检测该账号")
+            }
         }
     }
     async fn prepare(
@@ -1114,6 +1343,19 @@ impl Drop for GatewayPoolGuard {
     }
 }
 
+/// `state_probe` 的观察结果；`state` 与 `cookies` 只交给实验调用方保管，不得输出。
+#[cfg(feature = "gateway-pool-experiment")]
+pub struct StateProbe {
+    pub status: Option<u16>,
+    pub state: Option<String>,
+    pub state_returned: bool,
+    pub fingerprint: Option<String>,
+    pub cookies: Vec<String>,
+    pub gateway: Option<String>,
+    pub duration_ms: u128,
+    pub error: Option<&'static str>,
+}
+
 /// 真实实验仅复用生产的路由、材料、额度和响应头判定，不注册公网接口。
 #[cfg(feature = "gateway-pool-experiment")]
 #[derive(Clone)]
@@ -1155,9 +1397,15 @@ impl GatewayPoolExperiment {
         let Ok(Some(account)) = self.0.repository.store().get_account(id).await else {
             return json!({"result":"account_unavailable"});
         };
-        let guard = match self.0.route(&account, deadline, cancellation).await {
+        let guard = match self
+            .0
+            .route(&account, deadline, cancellation, &Fallback::default())
+            .await
+        {
             Ok(guard) => guard,
-            Err(()) => return json!({"result":"route_unavailable"}),
+            Err(failure) => {
+                return json!({"result":"route_unavailable","code":failure.code,"message":failure.message});
+            }
         };
         let result = async {
             // 找票的额度响应会更新账号投影，凭据校验必须使用发送前的最新快照。
@@ -1200,6 +1448,76 @@ impl GatewayPoolExperiment {
             .await
     }
 
+    /// 状态存活实验的单次观察：不经过池路由，按给定 state 与 Cookie 发送 `hi`，
+    /// 只看响应头。state 与 Cookie 由调用方保管，这里只输出布尔值与指纹。
+    pub async fn state_probe(
+        &self,
+        id: &gateway_core::account::ProviderAccountId,
+        model: &str,
+        state: Option<&str>,
+        cookie: Option<&str>,
+        cancellation: &CancellationToken,
+    ) -> StateProbe {
+        let fail = |error: &'static str| StateProbe {
+            status: None,
+            state: None,
+            state_returned: false,
+            fingerprint: None,
+            cookies: Vec::new(),
+            gateway: None,
+            duration_ms: 0,
+            error: Some(error),
+        };
+        let Ok(Some(account)) = self.0.repository.store().get_account(id).await else {
+            return fail("account_unavailable");
+        };
+        // 状态实验不依赖池设置：只确认账号仍启用且是 OAuth 账号，额度由实验入口先刷新。
+        if !account.enabled() || account.authentication_kind() != "oauth" {
+            return fail("account_unavailable");
+        }
+        let Ok(credential) = self.0.repository.load_runtime_credential(&account).await else {
+            return fail("credential_unavailable");
+        };
+        let Ok(authorization) = credential.authentication.authorization_header() else {
+            return fail("credential_unavailable");
+        };
+        let Ok(client) = self.0.client.for_account(&account) else {
+            return fail("transport_unavailable");
+        };
+        let Some(request) = hi_request(model) else {
+            return fail("invalid_model");
+        };
+        let session = Uuid::new_v4().to_string();
+        let mut context = CodexRequestContext::auxiliary(
+            authorization.expose_secret(),
+            account.upstream_account_id(),
+            &session,
+            Some(&credential.installation_id),
+        );
+        context.turn_state = state;
+        context.cookie_header = cookie;
+        let started = Instant::now();
+        let observation = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return fail("cancelled"),
+            result = tokio::time::timeout(Duration::from_secs(20), client.diagnostic_observation(&request, context, true)) => result.ok().and_then(Result::ok),
+        };
+        let Some(observation) = observation else {
+            return fail("transport_failed");
+        };
+        let _ = self.0.observe_probe_quota(&account, &observation).await;
+        StateProbe {
+            status: Some(observation.status),
+            fingerprint: observation.state.as_deref().map(fingerprint),
+            state: observation.state.clone(),
+            state_returned: observation.state_returned,
+            gateway: observation.cookies.iter().find_map(|c| cookie_gateway(c)),
+            cookies: observation.cookies,
+            duration_ms: started.elapsed().as_millis(),
+            error: None,
+        }
+    }
+
     /// 在当前已验证的票上发送指定模型的 `hi`，只看响应头。`classify` 为 false 时
     /// 只记录事实，不把结果计入组合判定，避免跨模型观察误伤打票模型的组合。
     pub async fn model_sample(
@@ -1216,13 +1534,16 @@ impl GatewayPoolExperiment {
         if !matches!(self.0.eligible_account(&account).await, Ok(Some(_))) {
             return json!({"result":"quota_or_account_unavailable"});
         }
+        let fallback = Fallback::default();
         let guard = match tokio::select! {
             biased;
             _ = cancellation.cancelled() => return json!({"result":"cancelled"}),
-            result = self.0.route(&account, deadline, cancellation) => result,
+            result = self.0.route(&account, deadline, cancellation, &fallback) => result,
         } {
             Ok(guard) => guard,
-            Err(()) => return json!({"result":"route_unavailable"}),
+            Err(failure) => {
+                return json!({"result":"route_unavailable","code":failure.code,"message":failure.message});
+            }
         };
         // 找票的额度响应会更新账号投影，加载凭据前必须改用最新快照。
         let Ok(Some(account)) = self.0.eligible_account(&account).await else {

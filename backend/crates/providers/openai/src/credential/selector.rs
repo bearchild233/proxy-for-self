@@ -383,11 +383,25 @@ impl CodexCredentialSelector {
                 accounts.push(account);
             }
             let mut model_access_rejected = 0_usize;
+            // 降智组账号暂时不可调度时让位给普通账号；Key 里没有普通账号可退时不能把它们
+            // 过滤掉，否则请求在选号阶段就失败，看不到网关池给出的具体原因。固定账号同理。
+            let has_ordinary_account = accounts.iter().any(|account| {
+                account.provider() == &self.provider_kind
+                    && !request.pool_members.contains(account.id())
+                    && (diagnostic
+                        || request
+                            .attempt
+                            .account_scope()
+                            .is_some_and(|scope| scope.allows(account.id())))
+            });
+            let required_account_id = request.attempt.required_account();
             let accounts = accounts
                 .into_iter()
                 .filter(|account| {
                     account.provider() == &self.provider_kind
-                        && (!request.pool_members.contains(account.id())
+                        && (!has_ordinary_account
+                            || required_account_id == Some(account.id())
+                            || !request.pool_members.contains(account.id())
                             || request.pool_preferred.contains(account.id()))
                         && (diagnostic
                             || request
@@ -572,18 +586,26 @@ impl CodexCredentialSelector {
                     account_scope: request.attempt.account_scope().cloned(),
                 };
                 // 按共用顺序寻找真正可调度的候选；前者额度/并发不可用时不能回退到权重乱序。
+                let selectable = |id: &&ProviderAccountId| {
+                    candidates
+                        .iter()
+                        .find(|candidate| candidate.account.id() == *id)
+                        .is_some_and(|candidate| {
+                            AccountSelector
+                                .select(std::slice::from_ref(candidate), &context)
+                                .is_some()
+                        })
+                };
                 let pool_account = request
                     .pool_preferred
                     .iter()
-                    .find(|id| {
-                        candidates
-                            .iter()
-                            .find(|candidate| candidate.account.id() == *id)
-                            .is_some_and(|candidate| {
-                                AccountSelector
-                                    .select(std::slice::from_ref(candidate), &context)
-                                    .is_some()
-                            })
+                    .find(selectable)
+                    // 只有降智组账号的 Key 没有退路：队列里没有可调度账号时仍按优先级选首个，
+                    // 由网关池在路由阶段给出具体原因，而不是在这里报“没有可用账号”。
+                    .or_else(|| {
+                        (!has_ordinary_account)
+                            .then(|| request.pool_members.iter().find(selectable))
+                            .flatten()
                     })
                     .cloned();
                 let preferred = pinned_account

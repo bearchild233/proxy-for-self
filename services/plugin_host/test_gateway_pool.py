@@ -101,23 +101,21 @@ class GatewayPoolTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.call('plan', demand=True, catalog=[{'gateway': 'evil', 'validForS': 1}])
 
-    def test_group_uses_single_window_across_accounts(self):
+    def test_windows_are_independent_per_account(self):
         pair, _ = self.probe()
         self.assertEqual(self.pool.runtime({'action': 'active'})['accounts'], ['A'])
         run = lambda action, **data: self.pool.runtime({'action': action, 'accountId': 'B', **data})
-        # A 的窗口未到期：B 不另开窗口。
-        self.assertFalse(run('claim', demand=True)['claimed'])
-        self.now += 181
+        # A 的窗口未到期：B 属于另一个 Key 的选择，可以独立开自己的窗口。
         claim = run('claim', demand=True)
         self.assertTrue(claim['claimed'])
-        self.assertEqual(self.pool.runtime({'action': 'active'})['accounts'], ['A', 'B'])
         run('sent', leaseId=claim['leaseId'])
         run('probeResult', leaseId=claim['leaseId'], status=200, stateReturned=False, paired=True, gatewayMatches=True)
         run('finish', leaseId=claim['leaseId'])
-        self.assertEqual(self.pool.runtime({'action': 'active'})['accounts'], ['B'])
-        self.assertEqual(self.pair()['state'], 'cooling')
+        self.assertEqual(sorted(self.pool.runtime({'action': 'active'})['accounts']), ['A', 'B'])
+        self.assertEqual(self.pair()['state'], 'ready')
+        self.assertEqual(self.pair('B')['state'], 'ready')
         switch = self.pool.view(account='B')['switches'][0]
-        self.assertEqual((switch['fromAccount'], switch['fromGateway']), ('A', pair['gateway']))
+        self.assertEqual((switch['fromAccount'], switch['fromGateway']), (None, None))
 
     def pair(self, account='A', gateway='unified-142'):
         return next(p for p in self.pool.view()['pairs'] if p['accountId']==account and p['gateway']==gateway)

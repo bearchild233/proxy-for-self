@@ -4,7 +4,7 @@ import type { OpsError } from '@/api'
 import { computed } from 'vue'
 import BaseButton from '@/components/base/BaseButton.vue'
 import BaseModal from '@/components/base/BaseModal/index.vue'
-import { errorOriginText, failureClassText } from '../utils/opsErrorPresentation'
+import { errorOriginText, failureClassText, opsErrorAccount } from '../utils/opsErrorPresentation'
 import RequestDiagnosticsPanel from './RequestDiagnosticsPanel.vue'
 import UsageDetailCodePanel from './UsageDetailCodePanel.vue'
 import UsageDetailFieldGrid from './UsageDetailFieldGrid.vue'
@@ -26,10 +26,7 @@ const open = defineModel<boolean>({ default: false })
 const panelClass = 'min-w-0 rounded-cp-card bg-cp-fill-quaternary px-4 py-3.5'
 const panelTitleClass = 'm-0 text-cp-sm leading-none font-heavy text-cp-text-secondary'
 
-const accountLabel = computed(() => props.record?.accountEmail
-  || props.record?.accountName
-  || props.record?.metadata.accountLabel
-  || props.record?.accountId)
+const accountLabel = computed(() => opsErrorAccount(props.record).full)
 
 const errorFields = computed(() => visibleFields([
   { label: '错误来源', value: errorOriginText(props.record) },

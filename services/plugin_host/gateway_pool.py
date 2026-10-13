@@ -13,6 +13,16 @@ import gateway_pool_history as history
 import gateway_pool_queue as queue
 
 
+def span(seconds):
+    """把秒数写成人能读的中文时长，用于错误和状态说明。"""
+    seconds = max(0, int(seconds))
+    if seconds < 90:
+        return '%d 秒' % seconds
+    if seconds < 5400:
+        return '%d 分钟' % round(seconds / 60)
+    return '%.1f 小时' % (seconds / 3600)
+
+
 class GatewayPool:
     def __init__(self, root, store, clock=time.time):
         self.root = Path(root) / 'gateway-pool-runtime'
@@ -150,31 +160,59 @@ class GatewayPool:
                 policy.settle(pair)
                 self.save(db,pair)
 
-    def schedulable(self, db, account, settings, policy, now):
-        # 只读已有目录和冷却事实，不因选号主动访问上游。
-        pairs=[json.loads(r['data']) for r in db.execute('SELECT data FROM pairs WHERE account=?',(account,))]
-        ready=next((p for p in pairs if p['state']=='ready'),None)
-        if ready and policy.rotation_due(ready,settings,now,demand=True) and queue.remaining(db,account)==[ready['gateway']]:
-            policy.retire(ready,settings,degraded=False)
+    def availability(self, db, account, settings, policy, now):
+        """账号当前能否被网关池调度，以及不能时的原因。只读已有目录和冷却事实，不因选号访问上游。
+        优先级不是排队：任何可探测或持有窗口的账号都可被选中，不要求排在队首。"""
+        row = db.execute('SELECT enabled,quota_exhausted FROM gp_account_queue WHERE account=?', (account,)).fetchone()
+        if row is not None and not row['enabled']:
+            return dict(usable=False, live=False, code='queue_disabled', message='该账号已在网关池队列中停用')
+        if row is not None and row['quota_exhausted']:
+            return dict(usable=False, live=False, code='quota_exhausted', message='该账号额度已耗尽，暂不参与网关池调度')
+        pairs = [json.loads(r['data']) for r in db.execute('SELECT data FROM pairs WHERE account=?', (account,))]
+        ready = next((p for p in pairs if p['state'] == 'ready'), None)
+        if ready and policy.rotation_due(ready, settings, now, demand=True) and queue.remaining(db, account) == [ready['gateway']]:
+            # 本轮网关轮完且窗口到期：账号沉到最后，之后重新开始新一轮。
+            policy.retire(ready, settings, degraded=False)
             policy.settle(ready)
-            self.save(db,ready)
+            self.save(db, ready)
+            pairs = [json.loads(r['data']) for r in db.execute('SELECT data FROM pairs WHERE account=?', (account,))]
+            ready = None
         elif ready:
-            return True
-        if any(p['state']=='preparing' for p in pairs):
-            return True
-        # 其他 Key 持有更靠前的窗口时，当前账号暂不能找票；让本 Key 回退普通账号。
-        position=db.execute('SELECT position FROM gp_account_queue WHERE account=?',(account,)).fetchone()[0]
-        for row in db.execute('SELECT p.data FROM pairs p JOIN gp_account_queue q ON q.account=p.account WHERE q.position<? AND q.enabled=1 AND q.quota_exhausted=0',(position,)):
-            other=json.loads(row['data'])
-            if other['state']=='preparing' or other['state']=='ready' and not policy.rotation_due(other,settings,now,demand=True):
-                return False
-        catalog=self.catalog(db,account,None,now)
-        gateways=[e['gateway'] for e in catalog] if catalog is not None else list(settings['gateways'])
+            return dict(usable=True, live=not policy.rotation_due(ready, settings, now, demand=True))
+        if any(p['state'] == 'preparing' for p in pairs):
+            return dict(usable=True, live=True)
+        reason = self.no_candidate(db, account, pairs, settings, now)
+        if reason is not None:
+            return dict(usable=False, live=False, **reason)
+        return dict(usable=True, live=False)
+
+    def schedulable(self, db, account, settings, policy, now):
+        return self.availability(db, account, settings, policy, now)['usable']
+
+    def no_candidate(self, db, account, pairs, settings, now):
+        """没有任何可探测网关时的原因；有可探测网关返回 None。"""
+        catalog = self.catalog(db, account, None, now)
+        gateways = [e['gateway'] for e in catalog] if catalog is not None else list(settings['gateways'])
         if settings['gateways'] and catalog is not None:
-            gateways=[g for g in gateways if g in settings['gateways']]
+            gateways = [g for g in gateways if g in settings['gateways']]
         if not gateways:
-            return catalog is None and not settings['gateways']
-        return any((p:=self.pair(db,account,g))['state']=='unknown' or p['state']=='cooling' and p.get('restUntil',0)<=now for g in gateways)
+            if catalog is None and not settings['gateways']:
+                return None
+            message = '限定网关与池服务目录没有交集' if settings['gateways'] else '池服务目录里没有这个账号可用的网关'
+            return dict(code='catalog_empty', message=message)
+        known = {p['gateway']: p for p in pairs}
+        resting = []
+        for gateway in gateways:
+            pair = known.get(gateway) or {'state': 'unknown'}
+            if pair['state'] == 'unknown' or pair['state'] == 'cooling' and pair.get('restUntil', 0) <= now:
+                return None
+            if pair['state'] == 'cooling':
+                resting.append(pair.get('restUntil', now))
+        if resting:
+            earliest = min(resting)
+            return dict(code='all_resting', nextRecoveryAt=earliest,
+                        message='该账号可用的 %d 个网关全部在静置，最早 %s后可重新检测' % (len(gateways), span(earliest - now)))
+        return None
 
     @staticmethod
     def pair(db, account, gateway):
@@ -254,10 +292,14 @@ class GatewayPool:
                         queue.quota(db,candidate['id'],candidate['exhausted'])
                         if not queue.allowed(db,candidate['id']):
                             self.retire_account(db,candidate['id'],settings,policy)
-                    usable={account for account in ids if queue.allowed(db,account) and self.schedulable(db,account,settings,policy,now)}
-                    ordered=[r['accountId'] for r in queue.view(db)['accounts'] if r['accountId'] in usable]
-                    return {'accounts':ordered,'queue':True}
-                # 降智分组只用一个满血窗口：先返回持有窗口的账号（最新在前），再返回正在找票的账号。
+                    info={account:self.availability(db,account,settings,policy,now) for account in ids}
+                    order=[r['accountId'] for r in queue.view(db)['accounts'] if r['accountId'] in info]
+                    # 持有窗口的账号先用（同一把窗口继续服务），其余按优先级；优先级不是排队，任何位置都可取。
+                    live=[a for a in order if info[a]['usable'] and info[a]['live']]
+                    ordered=live+[a for a in order if info[a]['usable'] and not info[a]['live']]
+                    blocked=[{'accountId':a,**{k:v for k,v in info[a].items() if k in ('code','message','nextRecoveryAt')}} for a in order if not info[a]['usable']]
+                    return {'accounts':ordered,'live':live,'blocked':blocked,'queue':True}
+                # 无候选清单的旧调用：先返回持有窗口的账号（最新在前），再返回正在找票的账号。
                 rows = [json.loads(r['data']) for r in db.execute('SELECT data FROM pairs')]
                 ready = sorted((p for p in rows if p['state'] == 'ready'), key=lambda p: -(p.get('verifiedAt') or 0))
                 preparing = [p for p in rows if p['state'] == 'preparing']
@@ -274,7 +316,8 @@ class GatewayPool:
                     self.retire_account(db,account,settings,policy)
                 return {'accepted':True}
             if action in {'plan','claim','reserve'} and not queue.allowed(db,account):
-                return {'claimed':False,'reserved':False,'yieldAccount':True}
+                info=self.availability(db,account,settings,policy,now)
+                return {'claimed':False,'reserved':False,'blocked':{k:info[k] for k in ('code','message') if k in info}}
             if action == 'material':
                 row = db.execute('SELECT data FROM materials WHERE account=? AND generation=? AND expires>?', (account, data['generation'], now)).fetchone()
                 return json.loads(row['data']) if row else None
@@ -284,7 +327,11 @@ class GatewayPool:
             if action in {'plan', 'claim'}:
                 queue.register(db,[account])
                 turn=db.execute('SELECT position FROM gp_account_queue WHERE account=?',(account,)).fetchone()[0]
-                if data.get('queueTurn') is not None and data['queueTurn'] != turn:
+                # 本 Key 范围内还有别的可用账号时，账号被沉底后才让位；没有退路就继续用本账号。
+                alternatives=[a for a in queue.identifiers(data.get('alternatives') or []) if a!=account and queue.allowed(db,a) and self.availability(db,a,settings,policy,now)['usable']]
+                # 普通账号也是退路：Key 里除了降智账号还有别的账号时，让位后由调度器改用它们。
+                has_exit=bool(alternatives) or data.get('ordinary') is True
+                if data.get('queueTurn') is not None and data['queueTurn'] != turn and has_exit:
                     return {'claimed':False,'yieldAccount':True}
                 catalog = self.catalog(db, account, data.get('catalog'), now)
                 # 默认跟随池服务目录；设置了限定网关时只在其中挑选。目录不可用时退回限定列表。
@@ -301,25 +348,21 @@ class GatewayPool:
                     policy.retire(ready,settings,degraded=False)
                     policy.settle(ready)
                     self.save(db,ready)
-                    return {'claimed':False,'yieldAccount':True}
+                    if has_exit:
+                        return {'claimed':False,'yieldAccount':True}
+                    # 没有退路：账号沉底后立即开始新一轮。
+                    ready,due,pending=None,False,queue.remaining(db,account)
                 candidates = [p for p in pairs if p['state'] == 'unknown' or p['state'] == 'cooling' and p.get('restUntil', 0) <= now]
                 candidates.sort(key=lambda p: (pending is not None and p['gateway'] not in pending, policy.candidate_order(p, entries.get(p['gateway']), settings)))
                 pairs = [json.loads(r['data']) for r in db.execute('SELECT data FROM pairs WHERE account=?', (account,))]
                 probe = candidates[0] if candidates and (data.get('demand') is True or settings['mode'] == 'continuous') and (not ready or due) else None
                 if action == 'plan':
-                    return {'ready': ready, 'probe': probe, 'rotationDue': bool(due), 'preparing': any(p['state'] == 'preparing' for p in pairs), 'queueTurn':turn}
+                    plan={'ready': ready, 'probe': probe, 'rotationDue': bool(due), 'preparing': any(p['state'] == 'preparing' for p in pairs), 'queueTurn':turn}
+                    if not ready and not probe and not plan['preparing']:
+                        plan['blocked']=self.no_candidate(db,account,pairs,settings,now)
+                    return plan
                 if not probe or any(p['state'] == 'preparing' for p in pairs):
                     return {'claimed': False}
-                # 其他账号已有未到期窗口或正在找票时不另开窗口，请求会转到那个账号。
-                for row in db.execute('SELECT data FROM pairs WHERE account<>?', (account,)):
-                    other = json.loads(row['data'])
-                    if other['state'] == 'preparing' or other['state'] == 'ready' and not policy.rotation_due(other, settings, now, demand=True):
-                        order=[r['accountId'] for r in queue.view(db)['accounts']]
-                        if account not in order or other['accountId'] not in order or order.index(other['accountId']) < order.index(account):
-                            return {'claimed': False}
-                        policy.retire(other,settings,degraded=False)
-                        policy.settle(other)
-                        self.save(db,other)
                 generation = uuid.uuid4().hex
                 queue.begin(db,account,gateways)
                 probe.update(generation=generation, state='preparing', probeRestSeconds=probe.get('restSeconds') if probe.get('lastContactAt') is not None else None,
@@ -409,8 +452,8 @@ class GatewayPool:
                             if material is not None:
                                 pair['cookieExpiresAt'] = material['expires']
                             policy.recover(pair, settings, pair.get('probeRestSeconds'))
-                            # 新窗口就绪后，整个分组的旧窗口都退役；未发送的请求随之切到新窗口。
-                            previous = db.execute('SELECT data FROM pairs WHERE NOT (account=? AND gateway=?)', (account, lease['gateway'])).fetchall()
+                            # 新窗口就绪后，本账号的旧窗口退役；未发送的请求随之切到新窗口。其他账号的窗口属于别的 Key，不受影响。
+                            previous = db.execute('SELECT data FROM pairs WHERE account=? AND gateway<>?', (account, lease['gateway'])).fetchall()
                             previous_pair = None
                             for row in previous:
                                 old = json.loads(row['data'])

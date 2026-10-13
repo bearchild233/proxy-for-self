@@ -408,15 +408,17 @@ impl GatewayPoolAttempt<'_> {
             })
         });
         let mut sent = false;
+        // 本 Key 的退路：别的降智账号或普通账号；没有退路的账号不能因轮完一遍而让位。
+        let fallback = service.fallback(context, account).await;
         loop {
             let route = tokio::select! {
                 biased;
                 _ = context.cancellation().cancelled() => return Err(CodexHandshakeAttemptError::Cancelled),
                 _ = tokio::time::sleep(remaining(context.deadline()).ok_or(CodexHandshakeAttemptError::Timeout)?) => return Err(CodexHandshakeAttemptError::Timeout),
-                route = service.route(account, context.deadline(), context.cancellation()) => route,
+                route = service.route(account, context.deadline(), context.cancellation(), &fallback) => route,
             };
-            let unavailable = || {
-                let error = provider_error(
+            let unavailable_with = |failure: Option<&crate::gateway_pool::PoolFailure>| {
+                let mut error = provider_error(
                     ProviderErrorKind::Unavailable,
                     if sent {
                         UpstreamSendState::Sent
@@ -424,13 +426,24 @@ impl GatewayPoolAttempt<'_> {
                         UpstreamSendState::NotSent
                     },
                 );
+                if let Some(failure) = failure {
+                    // 原因码与中文说明进入错误诊断，管理员在错误排查里直接可见。
+                    error = error.with_diagnostic(
+                        gateway_core::error::ProviderDiagnostic::new(format!(
+                            "网关池：{}",
+                            failure.message
+                        ))
+                        .with_classification("gateway_pool", failure.code),
+                    );
+                }
                 CodexHandshakeAttemptError::Policy(if sent && safe_replay {
                     error.with_replay_safe()
                 } else {
                     error
                 })
             };
-            let mut guard = route.map_err(|_| unavailable())?;
+            let unavailable = || unavailable_with(None);
+            let mut guard = route.map_err(|failure| unavailable_with(Some(&failure)))?;
             // 窗口由打票模型验证；其他模型在本窗口内只需拿到自己的 state。
             let model = request
                 .body()

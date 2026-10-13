@@ -511,15 +511,21 @@ impl Provider for CodexProvider {
         } else {
             crate::gateway_pool::GatewayPoolSelection::default()
         };
-        // 续接原账号不再优先时，交给核心按原有安全规则恢复历史；
-        // 不能把 previous_response_id 或工具状态直接交给队首的另一个账号。
+        // 续接原账号没有窗口而本 Key 的窗口在别的账号上、或原账号已不可调度但还有退路时，
+        // 交给核心按原有安全规则恢复历史；不能把 previous_response_id 或工具状态直接交给
+        // 另一个账号。原账号自己持窗，或没有任何退路时留在原账号，由网关池给出具体原因。
         if context.continuation_attempt() == ContinuationAttempt::Native
             && let Some(ContinuationBinding::Pinned(binding)) = context.continuation()
             && pool_selection.members.contains(binding.account())
-            && pool_selection
-                .preferred
-                .first()
-                .is_some_and(|active| active != binding.account())
+            && {
+                let bound = binding.account();
+                let bound_live = pool_selection.live.contains(bound);
+                let live_elsewhere = pool_selection.live.iter().any(|id| id != bound);
+                let bound_unusable = !pool_selection.preferred.contains(bound);
+                (live_elsewhere && !bound_live)
+                    || (bound_unusable
+                        && (pool_selection.ordinary || !pool_selection.preferred.is_empty()))
+            }
         {
             return Err(provider_error(
                 ProviderErrorKind::NoEligibleAccount,

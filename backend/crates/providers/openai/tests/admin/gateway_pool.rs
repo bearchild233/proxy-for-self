@@ -524,6 +524,137 @@ async fn authorized_real_cross_model_experiment() {
     record(json!({"result":"stopped","reason":reason}));
 }
 
+/// 普通账号 state 存活实验：同一个 S0 在 0~10 分钟内反复重放，看何时开始返回新 state。
+/// 两条链并行：`jar` 带 bootstrap 响应给出的路由 Cookie，`nocookie` 完全不带；每个时间点
+/// 再各做一次新 bootstrap 加立即重放作为对照，确认账号当时确实是 21。
+#[cfg(feature = "gateway-pool-experiment")]
+#[tokio::test]
+#[ignore = "requires explicit authorization and private experiment input"]
+async fn authorized_real_state_lifetime_experiment() {
+    use std::collections::BTreeMap;
+    use std::io::Write;
+    let root = std::path::PathBuf::from(
+        std::env::var("GATEWAY_POOL_EXPERIMENT_ROOT").expect("private experiment root"),
+    );
+    let (input, id, store) = experiment_account(&root).await;
+    let model = input["model"].as_str().unwrap_or("gpt-6.1-sol").to_owned();
+    let points: Vec<u64> = input["points"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_u64().unwrap())
+        .collect();
+    assert!(!points.is_empty() && points.len() <= 16 && points.iter().all(|p| *p <= 7200));
+    let runner = experiment_runner(&root, &input, &store, "state").await;
+    let started = std::time::Instant::now();
+    let stop = CancellationToken::new();
+    let log = Arc::new(std::sync::Mutex::new(
+        std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(root.join("samples.jsonl"))
+            .unwrap(),
+    ));
+    let record = {
+        let log = Arc::clone(&log);
+        let root = root.clone();
+        move |data: Value| {
+            let item = json!({"at":Utc::now().to_rfc3339(),"elapsedSeconds":started.elapsed().as_secs_f64(),"data":data});
+            let mut file = log.lock().unwrap();
+            writeln!(file, "{item}").unwrap();
+            file.flush().unwrap();
+            file.sync_data().unwrap();
+            std::fs::write(root.join("status.tmp"), item.to_string()).unwrap();
+            std::fs::rename(root.join("status.tmp"), root.join("status.json")).unwrap();
+        }
+    };
+    record(json!({"result":"starting","mode":"state-lifetime","model":model,"points":points}));
+    if !runner.refresh_quota(&id).await {
+        record(json!({"result":"stopped","reason":"quota_refresh_failed_or_exhausted"}));
+        return;
+    }
+    // Cookie 只保存名称到值，输出时永远不带值。
+    fn jar_update(jar: &mut BTreeMap<String, String>, cookies: &[String]) {
+        for cookie in cookies {
+            if let Some((name, value)) = cookie.split(';').next().and_then(|s| s.split_once('=')) {
+                jar.insert(name.trim().to_owned(), value.trim().to_owned());
+            }
+        }
+    }
+    fn jar_header(jar: &BTreeMap<String, String>) -> Option<String> {
+        (!jar.is_empty()).then(|| {
+            jar.iter()
+                .map(|(name, value)| format!("{name}={value}"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
+    }
+    let mut tasks = Vec::new();
+    for chain in ["jar", "nocookie"] {
+        let (runner, id, model, points, record, stop, root) = (
+            runner.clone(),
+            id.clone(),
+            model.clone(),
+            points.clone(),
+            record.clone(),
+            stop.clone(),
+            root.clone(),
+        );
+        tasks.push(tokio::spawn(async move {
+            let use_jar = chain == "jar";
+            let boot = runner.state_probe(&id, &model, None, None, &stop).await;
+            let mut jar = BTreeMap::new();
+            if use_jar {
+                jar_update(&mut jar, &boot.cookies);
+            }
+            record(json!({"chain":chain,"step":"bootstrap","status":boot.status,"stateReturned":boot.state_returned,"fingerprint":boot.fingerprint,"gateway":boot.gateway,"cookieNames":boot.cookies.iter().filter_map(|c| c.split('=').next()).collect::<Vec<_>>(),"error":boot.error}));
+            let Some(s0) = boot.state else {
+                record(json!({"chain":chain,"step":"abort","reason":"bootstrap_returned_no_state"}));
+                return;
+            };
+            let chain_started = std::time::Instant::now();
+            let mut schedule = vec![0_u64];
+            schedule.extend(points);
+            for point in schedule {
+                let wait = Duration::from_secs(point).saturating_sub(chain_started.elapsed());
+                tokio::select! {
+                    _ = tokio::time::sleep(wait) => {}
+                    _ = stop.cancelled() => return,
+                }
+                if root.join("STOP").exists() {
+                    record(json!({"chain":chain,"step":"stopped","reason":"manual_stop"}));
+                    return;
+                }
+                let header = jar_header(&jar);
+                let replay = runner
+                    .state_probe(&id, &model, Some(&s0), header.as_deref(), &stop)
+                    .await;
+                record(json!({"chain":chain,"step":"replay","atSeconds":point,"actualSeconds":chain_started.elapsed().as_secs(),"status":replay.status,"stateReturned":replay.state_returned,"sameAsS0":replay.fingerprint==boot.fingerprint,"fingerprint":replay.fingerprint,"gateway":replay.gateway,"error":replay.error}));
+                // 对照：新 bootstrap 后立即带新 state 重放，确认账号此刻是 21。
+                let fresh = runner.state_probe(&id, &model, None, None, &stop).await;
+                let mut fresh_jar = BTreeMap::new();
+                if use_jar {
+                    jar_update(&mut fresh_jar, &fresh.cookies);
+                }
+                let control = match fresh.state.as_deref() {
+                    Some(state) => Some(
+                        runner
+                            .state_probe(&id, &model, Some(state), jar_header(&fresh_jar).as_deref(), &stop)
+                            .await,
+                    ),
+                    None => None,
+                };
+                record(json!({"chain":chain,"step":"control","atSeconds":point,"freshBootstrapStatus":fresh.status,"freshStateReturned":fresh.state_returned,"controlStatus":control.as_ref().and_then(|c| c.status),"controlStateReturned":control.as_ref().map(|c| c.state_returned),"controlClassification":control.as_ref().map(|c| if c.state_returned {"29"} else {"21"}),"error":control.as_ref().and_then(|c| c.error).or(fresh.error)}));
+            }
+        }));
+    }
+    for task in tasks {
+        let _ = task.await;
+    }
+    stop.cancel();
+    record(json!({"result":"stopped","reason":"completed"}));
+}
+
 /// 必须手动提供私有输入目录；CI 不读取凭据，也不会运行真实上游实验。
 #[cfg(feature = "gateway-pool-experiment")]
 #[tokio::test]
@@ -1000,34 +1131,72 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_pool\",\"stat
     );
 }
 
-/// 单窗口：续接请求的原账号没有窗口而窗口在别的账号上时，不另开窗口，
-/// 报告原账号不可调度，交给核心排除原账号后在持窗账号上重放。
+/// 同一 Key 里别的账号持有窗口、原账号没有窗口时，带 previous_response_id 的续接请求
+/// 报告原账号不可调度，交给核心排除原账号后在持窗账号上重放；原账号自己持窗或没有退路时留下。
 #[tokio::test]
 async fn pool_pinned_continuation_yields_to_active_window_account() {
+    const HOLDER: &str = "acct_window_holder";
+    for (ids, active, expect_yield) in [
+        // 窗口在同一 Key 的另一个账号上：让位。
+        (
+            vec![ACCOUNT, HOLDER],
+            json!({"accounts":[HOLDER,ACCOUNT],"live":[HOLDER]}),
+            true,
+        ),
+        // 原账号自己持窗：留在原账号，不让位。
+        (
+            vec![ACCOUNT, HOLDER],
+            json!({"accounts":[ACCOUNT,HOLDER],"live":[ACCOUNT]}),
+            false,
+        ),
+        // Key 里只有这一个降智账号：没有退路，不让位。
+        (
+            vec![ACCOUNT],
+            json!({"accounts":[],"live":[],"blocked":[{"accountId":ACCOUNT,"code":"all_resting","message":"静置"}]}),
+            false,
+        ),
+    ] {
+        let kind = pinned_continuation_kind(&ids, active).await;
+        assert_eq!(
+            kind == Some(gateway_core::error::ProviderErrorKind::NoEligibleAccount),
+            expect_yield,
+            "{ids:?} -> {kind:?}"
+        );
+    }
+}
+
+/// 返回续接请求的错误类别；进入路由后因控制面回复而失败时类别是 Unavailable。
+async fn pinned_continuation_kind(
+    ids: &[&str],
+    active: Value,
+) -> Option<gateway_core::error::ProviderErrorKind> {
     use gateway_core::engine::ContinuationAttempt;
     use gateway_core::engine::continuation::{
         ContinuationBinding, NativeContinuationPin, PreviousResponseId,
     };
-    use gateway_core::error::ProviderErrorKind;
     let upstream = MockServer::start().await;
     let runtime = MockServer::start().await;
     let store = Arc::new(MemoryAccountStore::default());
-    store
-        .seed_oauth_credential(ImportCodexOAuthCredential {
-            account_id: ACCOUNT.into(),
-            name: "Demo".into(),
-            secret: secret("demo-token"),
-            verified_account: profile("demo-upstream"),
-            next_refresh_at: None,
-            enabled: true,
-        })
-        .await;
+    for id in ids {
+        store
+            .seed_oauth_credential(ImportCodexOAuthCredential {
+                account_id: (*id).into(),
+                name: (*id).into(),
+                secret: secret("demo-token"),
+                verified_account: profile(id),
+                next_refresh_at: None,
+                enabled: true,
+            })
+            .await;
+    }
     Mock::given(method("POST"))
-        .respond_with(|input: &wiremock::Request| {
+        .respond_with(move |input: &wiremock::Request| {
             let data: Value = input.body_json().unwrap();
             let value = match data["action"].as_str().unwrap() {
                 "config" => json!({"enabled":true,"groupIds":[GROUP],"probeIntervalMs":50}),
-                "active" => json!({"accounts":["acct_window_holder"]}),
+                "active" => active.clone(),
+                // 进入路由说明没有在选号阶段让位；控制面直接回复阻塞原因即可结束。
+                "plan" => json!({"ready":null,"probe":null,"preparing":false,"blocked":{"code":"all_resting","message":"静置"}}),
                 other => panic!("unexpected runtime action {other}"),
             };
             ResponseTemplate::new(200).set_body_json(value)
@@ -1065,20 +1234,150 @@ async fn pool_pinned_continuation_yields_to_active_window_account() {
         NonZeroU32::new(1).unwrap(),
         SystemTime::now() + Duration::from_secs(10),
         account_policy(),
-        AccountAttemptContext::new(BTreeSet::new(), None, None).with_account_scope(scope()),
+        AccountAttemptContext::new(BTreeSet::new(), None, None).with_account_scope(scope_for(ids)),
         Some(ContinuationBinding::Pinned(pin)),
         CancellationToken::new(),
     )
     .with_continuation_attempt(ContinuationAttempt::Native);
-    let Err(error) = bundle
+    let result = bundle
         .core_provider()
         .execute(request(json!([])), context)
-        .await
-    else {
-        panic!("pinned account without the window must yield");
-    };
-    assert_eq!(error.kind(), ProviderErrorKind::NoEligibleAccount);
+        .await;
     assert!(upstream.received_requests().await.unwrap().is_empty());
+    match result {
+        Err(error) => Some(error.kind()),
+        Ok(mut stream) => {
+            while let Some(event) = stream.next().await {
+                if let Err(error) = event {
+                    return Some(error.kind());
+                }
+            }
+            None
+        }
+    }
+}
+
+/// 只绑定一个降智账号的 Key：账号不在“可调度名单”里也必须进入路由，失败时给出具体原因，
+/// 而不是在选号阶段报没有可用账号。
+#[tokio::test]
+async fn pool_only_key_reaches_routing_and_reports_the_reason() {
+    for (plan, expected_code, expected_text) in [
+        (
+            json!({"ready":null,"probe":null,"preparing":false,"blocked":{"code":"all_resting","message":"该账号可用的 3 个网关全部在静置，最早 12 分钟后可重新检测"}}),
+            "all_resting",
+            "全部在静置",
+        ),
+        (
+            json!({"claimed":false,"reserved":false,"blocked":{"code":"queue_disabled","message":"该账号已在网关池队列中停用"}}),
+            "queue_disabled",
+            "停用",
+        ),
+        (
+            json!({"ready":null,"probe":null,"preparing":true,"queueTurn":1}),
+            "wait_timeout",
+            "另一个请求正在为该账号检测网关",
+        ),
+    ] {
+        let runtime = MockServer::start().await;
+        let store = Arc::new(MemoryAccountStore::default());
+        store
+            .seed_oauth_credential(ImportCodexOAuthCredential {
+                account_id: ACCOUNT.into(),
+                name: "Demo".into(),
+                secret: secret("demo-token"),
+                verified_account: profile("demo-upstream"),
+                next_refresh_at: None,
+                enabled: true,
+            })
+            .await;
+        let account = store.account(ACCOUNT).unwrap();
+        let now = SystemTime::now();
+        store.compare_and_swap_quota(QuotaObservation {plan_type:None,account_id:account.id().clone(),expected_revision:account.revision(),observed_at:now,state:QuotaState::allowed(now),quota:OpaqueProviderData::new(json!({"rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{"used_percent":10,"reset_at":Utc::now().timestamp()+18000}}}).as_object().unwrap().clone())}).await.unwrap();
+        let reply = plan.clone();
+        Mock::given(method("POST"))
+            .respond_with(move |input: &wiremock::Request| {
+                let data: Value = input.body_json().unwrap();
+                let value = match data["action"].as_str().unwrap() {
+                    "config" => json!({"enabled":true,"groupIds":[GROUP],"probeIntervalMs":50,"probeModel":"gpt-6-astra"}),
+                    // 控制面认为该账号暂时不可调度：名单里没有它。
+                    "active" => json!({"accounts":[],"live":[],"blocked":[{"accountId":ACCOUNT,"code":"all_resting","message":"静置"}]}),
+                    "plan" | "claim" => reply.clone(),
+                    "quota" => json!({"accepted":true}),
+                    other => panic!("unexpected runtime action {other}"),
+                };
+                ResponseTemplate::new(200).set_body_json(value)
+            })
+            .mount(&runtime)
+            .await;
+        let mut config = valid_config();
+        let key = config._runtime.path().join("pool.key");
+        std::fs::write(&key, "a".repeat(64)).unwrap();
+        config.config.gateway_pool = Some(provider_openai::gateway_pool::GatewayPoolConfig {
+            runtime_url: runtime.uri(),
+            key_file: key,
+            fallback_url: None,
+        });
+        let bundle = provider_openai::initialize(
+            config.config.clone(),
+            provider_ports_with(store, Arc::new(TestOAuthPending::default())),
+        )
+        .await
+        .unwrap();
+        // 请求期限只有 3 秒，等待型原因在期限前就要报出具体说明。
+        let context = AttemptContext::new(
+            RequestAttemptContext::new(
+                ModelRequestId::new("req_gateway_pool_reason").unwrap(),
+                ClientApiKeyId::new("key_gateway_pool").unwrap(),
+            ),
+            NonZeroU32::new(1).unwrap(),
+            SystemTime::now() + Duration::from_secs(3),
+            account_policy(),
+            AccountAttemptContext::new(BTreeSet::new(), None, None).with_account_scope(scope()),
+            None,
+            CancellationToken::new(),
+        );
+        let result = bundle
+            .core_provider()
+            .execute(request(json!([])), context)
+            .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(mut stream) => loop {
+                match stream.next().await {
+                    Some(Err(error)) => break error,
+                    Some(Ok(_)) => {}
+                    None => panic!("the request must fail with a reason"),
+                }
+            },
+        };
+        let diagnostic = error
+            .diagnostic()
+            .expect("pool failure carries a diagnostic");
+        assert_eq!(
+            diagnostic.code(),
+            Some(expected_code),
+            "{}",
+            diagnostic.as_str()
+        );
+        assert!(
+            diagnostic.as_str().contains(expected_text),
+            "{}",
+            diagnostic.as_str()
+        );
+        // 路由阶段确实向控制面询问过这个账号（没有在选号阶段被过滤）。
+        let plans: Vec<Value> = runtime
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.body_json::<Value>().unwrap())
+            .filter(|v| v["action"] == "plan")
+            .collect();
+        assert!(!plans.is_empty());
+        assert_eq!(plans[0]["accountId"], ACCOUNT);
+        assert_eq!(plans[0]["ordinary"], false);
+        assert_eq!(plans[0]["alternatives"], json!([]));
+    }
 }
 
 // 走完整找票流程，响应体故意不是 SSE：探测只读头，错误最多重试一次。

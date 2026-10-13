@@ -40,7 +40,9 @@ class GatewayPoolQueueTests(unittest.TestCase):
         self.assertFalse(self.call('sent',leaseId=unsent)['accepted'])
         self.assertFalse(self.call('reserve',gateway=pair['gateway'],generation=pair['generation'],deadline=self.now+100)['reserved'])
         self.assertFalse(self.call('claim',demand=True)['claimed'])
-        self.assertTrue(self.call('plan',demand=True)['yieldAccount'])
+        blocked=self.call('plan',demand=True)['blocked']
+        self.assertEqual(blocked['code'],'queue_disabled')
+        self.assertIn('停用',blocked['message'])
         self.finish(sent,access)
         self.call('finish',leaseId=unsent)
         with self.pool.db(readonly=True) as db:
@@ -54,9 +56,10 @@ class GatewayPoolQueueTests(unittest.TestCase):
         first=self.probe();self.retire(first)
         self.assertEqual(self.order(),['A','B','C'])
         second=self.probe();self.now+=181
-        self.assertTrue(self.call('plan',demand=True)['yieldAccount'])
+        # 本 Key 里还有别的可用账号：轮完一遍后让位，账号沉到最后。
+        self.assertTrue(self.call('plan',demand=True,alternatives=['B','C'])['yieldAccount'])
         self.assertEqual(self.order(),['B','C','A'])
-        self.assertFalse(self.call('claim',demand=True,queueTurn=turn)['claimed'])
+        self.assertFalse(self.call('claim',demand=True,queueTurn=turn,alternatives=['B','C'])['claimed'])
         self.call('finish',leaseId=second['generation'])
         self.assertEqual(self.order(),['B','C','A'])
 
@@ -77,8 +80,9 @@ class GatewayPoolQueueTests(unittest.TestCase):
         self.register();pair=self.probe();lease,access=self.business(pair)
         self.pool.update_queue({'revision':self.queue()['revision'],'accountIds':['B','A','C']})
         claim=self.call('claim',accountId='B',demand=True)
+        # B 排到前面后可以独立找票；A 的窗口属于别的 Key，不受影响。
         self.assertTrue(claim['claimed'])
-        self.assertEqual(self.pool.view(account='A')['pairs'][0]['state'],'draining')
+        self.assertEqual(self.pool.view(account='A')['pairs'][0]['state'],'ready')
         self.finish(lease,access)
         self.assertEqual(self.pool.view(account='A')['pairs'][0]['inFlight'],0)
 
@@ -114,7 +118,7 @@ class GatewayPoolQueueTests(unittest.TestCase):
         self.pool.configure({'gateways':['unified-142']})
         self.now+=10
         self.probe();self.now+=181
-        self.assertTrue(self.call('plan',demand=True)['yieldAccount'])
+        self.assertTrue(self.call('plan',demand=True,alternatives=['B'])['yieldAccount'])
         self.assertEqual(self.order(),['B','C','A'])
 
     def test_all_cooling_skips_account_without_probing_and_restores_after_cooldown(self):
@@ -135,13 +139,48 @@ class GatewayPoolQueueTests(unittest.TestCase):
         self.register()
         self.assertEqual(self.queue()['revision'],revision)
 
-    def test_other_keys_earlier_window_does_not_leave_candidate_waiting(self):
+    def test_other_accounts_window_never_blocks_a_candidate(self):
         self.register();self.probe()
         result=self.pool.runtime({'action':'active','candidates':[{'id':'B','exhausted':False}]})
-        self.assertEqual(result['accounts'],[])
+        self.assertEqual(result['accounts'],['B'])
         self.pool.update_queue({'revision':self.queue()['revision'],'accountIds':['B','A','C']})
         result=self.pool.runtime({'action':'active','candidates':[{'id':'B','exhausted':False}]})
         self.assertEqual(result['accounts'],['B'])
+
+    def test_priority_is_not_a_queue_any_listed_account_may_take_the_turn(self):
+        self.register()
+        # A 不在队首也无妨：B 持有窗口时本 Key 复用 B；A 可探测但排在持窗账号之后。
+        claim=self.call('claim',accountId='B',demand=True)
+        self.call('sent',accountId='B',leaseId=claim['leaseId'])
+        self.call('probeResult',accountId='B',leaseId=claim['leaseId'],status=200,stateReturned=False,paired=True,gatewayMatches=True)
+        self.call('finish',accountId='B',leaseId=claim['leaseId'])
+        result=self.register()
+        self.assertEqual(result['accounts'],['B','A','C'])
+        self.assertEqual(result['live'],['B'])
+
+    def test_blocked_accounts_carry_a_reason_and_message(self):
+        self.register()
+        self.pool.update_queue({'revision':self.queue()['revision'],'accountId':'B','enabled':False})
+        self.probe('29');self.probe('29')
+        result=self.pool.runtime({'action':'active','candidates':[{'id':'A','exhausted':False},{'id':'B','exhausted':False},{'id':'C','exhausted':True}]})
+        reasons={item['accountId']:item for item in result['blocked']}
+        self.assertEqual(reasons['A']['code'],'all_resting')
+        self.assertIn('静置',reasons['A']['message'])
+        self.assertGreater(reasons['A']['nextRecoveryAt'],self.now)
+        self.assertEqual(reasons['B']['code'],'queue_disabled')
+        self.assertEqual(reasons['C']['code'],'quota_exhausted')
+        self.assertEqual(result['accounts'],[])
+        plan=self.call('plan',demand=True)
+        self.assertEqual(plan['blocked']['code'],'all_resting')
+
+    def test_single_account_key_restarts_its_round_instead_of_yielding(self):
+        self.register();self.retire(self.probe());self.probe();self.now+=181
+        plan=self.call('plan',demand=True)
+        self.assertNotIn('yieldAccount',plan)
+        self.assertTrue(plan['probe'])
+        self.assertEqual(self.order(),['B','C','A'])
+        claim=self.call('claim',demand=True)
+        self.assertTrue(claim['claimed'])
 
 
 if __name__ == '__main__':

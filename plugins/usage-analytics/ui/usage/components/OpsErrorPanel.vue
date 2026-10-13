@@ -13,7 +13,7 @@ import CatalogFilter from '@/components/CatalogFilter.vue'
 import ProviderIconGroup from '@/components/ProviderIconGroup.vue'
 import { useOpsErrorsTable } from '../composables/useOpsErrorsTable'
 import { opsErrorColumns } from '../constants'
-import { errorOriginText, opsErrorSummary } from '../utils/opsErrorPresentation'
+import { errorOriginText, opsErrorAccount, opsErrorSummary } from '../utils/opsErrorPresentation'
 import { usageUserAgent } from '../utils/records'
 import OpsErrorDetailModal from './OpsErrorDetailModal.vue'
 import UsageClientIpCell from './UsageClientIpCell.vue'
@@ -55,14 +55,6 @@ const upstreamSendStateLabels: Record<string, string> = {
 function showDetail(record: OpsError) {
   selectedRecord.value = record
   detailOpen.value = true
-}
-
-function accountText(record: OpsError) {
-  return record.accountEmail
-    || record.accountName
-    || record.metadata.accountLabel
-    || record.accountId
-    || '未记录'
 }
 
 function modelText(record: OpsError) {
@@ -175,10 +167,17 @@ function upstreamSendStateText(value: string | null | undefined) {
         </template>
         <template #accountId="{ row }">
           <span
-            class="block max-w-full truncate font-mono text-cp-sm font-bold text-cp-text"
-            :title="accountText(row)"
+            class="block max-w-full truncate py-0.5 font-mono text-cp-sm leading-normal font-bold text-cp-text"
+            :title="opsErrorAccount(row).full"
           >
-            {{ accountText(row) }}
+            {{ opsErrorAccount(row).primary }}
+          </span>
+          <span
+            v-if="opsErrorAccount(row).secondary"
+            class="mt-1 block max-w-full truncate font-mono text-cp-xs text-cp-text-quaternary"
+            :title="opsErrorAccount(row).secondary"
+          >
+            {{ opsErrorAccount(row).secondary }}
           </span>
         </template>
         <template #model="{ row }">
