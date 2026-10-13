@@ -167,6 +167,22 @@ pub(crate) struct GatewayPoolSelection {
     pub degraded: Vec<ProviderAccountId>,
 }
 
+impl GatewayPoolSelection {
+    /// 本 Key 范围内可替代 `account` 的别的降智账号和普通账号，用来判断账号能否让位。
+    pub(crate) fn fallback_for(&self, account: &ProviderAccountId) -> Fallback {
+        Fallback {
+            alternatives: self
+                .preferred
+                .iter()
+                .filter(|id| *id != account)
+                .map(|id| id.as_str().to_owned())
+                .collect(),
+            ordinary: self.ordinary,
+            recoverable: self.degraded.contains(account),
+        }
+    }
+}
+
 /// 控制面 `active` 的结果：可调度账号（持窗账号在前）、持窗账号，以及不可调度账号的原因。
 #[derive(Default)]
 struct OrderedAccounts {
@@ -840,26 +856,6 @@ impl GatewayPoolService {
             ordinary,
             degraded,
         })
-    }
-    /// 本 Key 范围内可替代的别的降智账号和普通账号，用来判断账号能否让位。
-    pub(crate) async fn fallback(
-        &self,
-        context: &AttemptContext,
-        account: &ProviderAccount,
-    ) -> Fallback {
-        match self.selection(context).await {
-            Ok(selection) => Fallback {
-                alternatives: selection
-                    .preferred
-                    .iter()
-                    .filter(|id| *id != account.id())
-                    .map(|id| id.as_str().to_owned())
-                    .collect(),
-                ordinary: selection.ordinary,
-                recoverable: selection.degraded.contains(account.id()),
-            },
-            Err(()) => Fallback::default(),
-        }
     }
     async fn ordered_accounts(&self, accounts: &[ProviderAccount]) -> Result<OrderedAccounts, ()> {
         self.quota.prepare_scheduling(accounts).await;

@@ -185,6 +185,8 @@ pub(super) struct ColdResponse {
     pub(super) gateway_pool: Option<Arc<crate::gateway_pool::GatewayPoolService>>,
     /// 普通账号的降智检测；只有网关池服务存在且账号不在降智组时才有。
     pub(super) degradation_watch: Option<Arc<crate::gateway_pool::GatewayPoolService>>,
+    /// 本 Key 内可替代该降智账号的退路，由选号阶段的结果得出。
+    pub(super) pool_fallback: crate::gateway_pool::Fallback,
 }
 
 pub(super) struct ColdJsonResponse {
@@ -446,6 +448,7 @@ fn merged_cookie_header(existing: Option<&str>, updates: &[String]) -> Option<St
 
 struct GatewayPoolAttempt<'a> {
     service: &'a Arc<crate::gateway_pool::GatewayPoolService>,
+    fallback: &'a crate::gateway_pool::Fallback,
     client: &'a CodexBackendClient,
     request: &'a mut CodexResponsesRequest,
     context: &'a AttemptContext,
@@ -462,6 +465,7 @@ impl GatewayPoolAttempt<'_> {
     ) -> Result<CodexBackendStreamingResponse, CodexHandshakeAttemptError> {
         let Self {
             service,
+            fallback,
             client,
             request,
             context,
@@ -473,14 +477,12 @@ impl GatewayPoolAttempt<'_> {
         let trace = context.trace();
         let safe_replay = request_replay_safe(request);
         let mut sent = false;
-        // 本 Key 的退路：别的降智账号或普通账号；没有退路的账号不能因轮完一遍而让位。
-        let fallback = service.fallback(context, account).await;
         loop {
             let route = tokio::select! {
                 biased;
                 _ = context.cancellation().cancelled() => return Err(CodexHandshakeAttemptError::Cancelled),
                 _ = tokio::time::sleep(remaining(context.deadline()).ok_or(CodexHandshakeAttemptError::Timeout)?) => return Err(CodexHandshakeAttemptError::Timeout),
-                route = service.route(account, context.deadline(), context.cancellation(), &fallback) => route,
+                route = service.route(account, context.deadline(), context.cancellation(), fallback) => route,
             };
             let unavailable_with = |failure: Option<&crate::gateway_pool::PoolFailure>| {
                 let mut error = provider_error(
@@ -899,6 +901,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
         mut session_capture,
         gateway_pool,
         degradation_watch,
+        pool_fallback,
     } = response;
     Box::pin(async_stream::try_stream! {
         let cyber_policy_scope = lease.cyber_policy_scope().cloned();
@@ -934,7 +937,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
         let trace = context.trace();
         let mut pool_guard = None;
         let response = if let Some(service) = gateway_pool.as_ref() {
-            GatewayPoolAttempt { service, client: &client, request: &mut request, context: &context, lease: &lease, account: &active_account, authorization: &authorization, selection: account_selection }.send(&mut pool_guard).await
+            GatewayPoolAttempt { service, fallback: &pool_fallback, client: &client, request: &mut request, context: &context, lease: &lease, account: &active_account, authorization: &authorization, selection: account_selection }.send(&mut pool_guard).await
         } else { create_response_attempt(
             &client,
             &request,
