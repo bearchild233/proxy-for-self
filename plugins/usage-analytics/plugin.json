@@ -1,6 +1,6 @@
 {
   "id": "usage-analytics",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "protocol": 2,
   "kind": "ui",
   "sdk": 1,
@@ -63,8 +63,9 @@
     "usage.get.admin.usage.records.detail",
     "usage.get.admin.usage.records.summary"
   ],
-  "releasedAt": "2026-10-10T03:36:16Z",
+  "releasedAt": "2026-10-13T12:30:00Z",
   "releaseNotes": [
+    "错误排查的账号列与详情：名称在上、邮箱在下，不再只显示邮箱。",
     "消耗明细优先显示当前账号名称，邮箱作为次级信息，不展示账号引用 ID。",
     "图表、使用记录及请求详情统一按名称和邮箱展示账号。",
     "归档账号保留名称；目录读取失败时保留现有展示，避免触发上游刷新。"
