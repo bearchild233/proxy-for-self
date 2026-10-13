@@ -8,6 +8,7 @@ import BaseInput from '@/components/base/BaseInput.vue'
 import BaseModal from '@/components/base/BaseModal/index.vue'
 import BaseNumberInput from '@/components/base/BaseNumberInput.vue'
 import BaseSegmented from '@/components/base/BaseSegmented.vue'
+import BaseSelect from '@/components/base/BaseSelect.vue'
 import BaseSwitch from '@/components/base/BaseSwitch.vue'
 import BaseTextarea from '@/components/base/BaseTextarea.vue'
 
@@ -43,6 +44,19 @@ watch(open, (value) => {
   showOverrides.value = Object.keys(props.settings.poolAccountIds).length > 0
 })
 
+const groupOptions = computed(() => props.groups.map(group => ({ label: group.name, value: group.id })))
+// 开启动态分组必须明确两个不同的分组，降智分组须在上面选中的适用分组里。
+const dynamicProblem = computed(() => {
+  if (!draft.value.dynamicGroups)
+    return ''
+  if (!draft.value.normalGroupId || !draft.value.degradedGroupId)
+    return '请选择正常分组和降智分组'
+  if (draft.value.normalGroupId === draft.value.degradedGroupId)
+    return '正常分组与降智分组不能相同'
+  if (!draft.value.groupIds.includes(draft.value.degradedGroupId))
+    return '降智分组须在上面的适用分组中'
+  return ''
+})
 const gateways = computed(() => [...new Set(gatewayText.value.split(/[\s,;]+/).filter(Boolean))])
 const invalidGateways = computed(() => gateways.value.filter(item => !/^unified-\d{1,6}$/.test(item)))
 const members = computed(() => props.accounts.filter(account => account.groups?.some(group => draft.value.groupIds.includes(group.id))))
@@ -63,7 +77,7 @@ function toggleGroup(id: string, checked: boolean) {
   draft.value.groupIds = [...ids]
 }
 function submit() {
-  if (invalidGateways.value.length)
+  if (invalidGateways.value.length || dynamicProblem.value)
     return
   const overrides = Object.fromEntries(
     Object.entries(draft.value.poolAccountIds).map(([id, value]) => [id, value.trim()]).filter(([, value]) => value),
@@ -74,6 +88,9 @@ function submit() {
     probeIntervalMs: draft.value.probeIntervalMs,
     probeModel: draft.value.probeModel.trim(),
     poolDirect: draft.value.poolDirect,
+    dynamicGroups: draft.value.dynamicGroups ?? false,
+    normalGroupId: draft.value.normalGroupId ?? '',
+    degradedGroupId: draft.value.degradedGroupId ?? '',
     groupIds: draft.value.groupIds,
     gateways: gateways.value,
     poolUrl: draft.value.poolUrl.trim(),
@@ -107,6 +124,30 @@ function submit() {
         </p>
         <p class="text-cp-xs text-cp-text-tertiary">
           选定分组只接受 HTTP 请求，原生 WS 请求会被拒绝；所有模型共用满血窗口，各模型使用自己的票。
+        </p>
+      </section>
+
+      <section class="grid gap-3">
+        <h3 class="text-cp font-emphasis text-cp-text">
+          动态分组
+        </h3>
+        <div class="flex items-start justify-between gap-4 rounded-cp border border-cp-border px-3 py-2.5">
+          <div class="grid gap-0.5">
+            <span class="text-cp-sm text-cp-text">按检测结果自动调整账号分组</span>
+            <span class="text-cp-xs text-cp-text-tertiary">普通账号在带 state 的 HTTP 请求上被确认降智时，自动从正常分组移到降智分组，并把这次请求交给其他账号；降智账号持续满血恢复后移回。每次调整都记录在“分组变动”里。</span>
+          </div>
+          <BaseSwitch v-model="draft.dynamicGroups" label="动态分组" />
+        </div>
+        <div v-if="draft.dynamicGroups" class="grid gap-4 sm:grid-cols-2">
+          <BaseFormItem label="正常分组" description="恢复后账号回到这里">
+            <BaseSelect v-model="draft.normalGroupId" aria-label="正常分组" :options="groupOptions" searchable />
+          </BaseFormItem>
+          <BaseFormItem label="降智分组" description="确认降智的账号移到这里">
+            <BaseSelect v-model="draft.degradedGroupId" aria-label="降智分组" :options="groupOptions" searchable />
+          </BaseFormItem>
+        </div>
+        <p v-if="dynamicProblem" role="alert" class="text-cp-xs text-cp-error-text">
+          {{ dynamicProblem }}
         </p>
       </section>
 
@@ -200,7 +241,7 @@ function submit() {
         <BaseButton @click="open = false">
           取消
         </BaseButton>
-        <BaseButton variant="primary" :loading="saving" :disabled="readOnly || invalidGateways.length > 0" @click="submit">
+        <BaseButton variant="primary" :loading="saving" :disabled="readOnly || invalidGateways.length > 0 || !!dynamicProblem" @click="submit">
           保存设置
         </BaseButton>
       </div>

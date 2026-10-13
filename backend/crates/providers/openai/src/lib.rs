@@ -197,6 +197,7 @@ pub async fn initialize(
                     profile.clone(),
                 ),
                 Arc::clone(&quota),
+                ports.group_mover(),
             )
             .await
             .map_err(|_| OpenAiInitializeError::Transport)?,

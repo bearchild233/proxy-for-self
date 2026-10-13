@@ -183,6 +183,8 @@ pub(super) struct ColdResponse {
     pub(super) stream_max_retries: u32,
     pub(super) session_capture: Option<OpenAiSessionCapture>,
     pub(super) gateway_pool: Option<Arc<crate::gateway_pool::GatewayPoolService>>,
+    /// 普通账号的降智检测；只有网关池服务存在且账号不在降智组时才有。
+    pub(super) degradation_watch: Option<Arc<crate::gateway_pool::GatewayPoolService>>,
 }
 
 pub(super) struct ColdJsonResponse {
@@ -372,6 +374,76 @@ pub(super) fn map_handshake_attempt_error(
     }
 }
 
+/// 只有客户端执行的工具可在未交付输出时重放。上游执行工具可能已有副作用。
+fn request_replay_safe(request: &CodexResponsesRequest) -> bool {
+    request.body().get("tools").is_none_or(|tools| {
+        tools.as_array().is_some_and(|tools| {
+            tools
+                .iter()
+                .all(|tool| matches!(tool["type"].as_str(), Some("function" | "custom")))
+        })
+    })
+}
+
+/// 请求是否携带了客户端的 turn state（头、字段或 client_metadata）。
+fn request_carried_turn_state(request: &CodexResponsesRequest) -> bool {
+    request.turn_state.is_some()
+        || request
+            .passthrough_headers
+            .contains_key("x-codex-turn-state")
+        || request
+            .body()
+            .get("client_metadata")
+            .and_then(Value::as_object)
+            .is_some_and(|metadata| metadata.contains_key("x-codex-turn-state"))
+}
+
+/// 响应头里的 turn state（只在内存里用于确认，不记录、不输出）。
+fn response_turn_state(response: &CodexBackendStreamingResponse) -> Option<String> {
+    response
+        .response_metadata
+        .client_headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("x-codex-turn-state"))
+        .and_then(|(_, value)| std::str::from_utf8(value).ok().map(str::to_owned))
+}
+
+/// 账号 Cookie 与本次响应的 Set-Cookie 合并成确认请求要带的 Cookie 头。
+fn merged_cookie_header(existing: Option<&str>, updates: &[String]) -> Option<String> {
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    let mut put = |name: &str, value: &str| {
+        let name = name.trim();
+        if name.is_empty() {
+            return;
+        }
+        match pairs.iter_mut().find(|(key, _)| key == name) {
+            Some(pair) => pair.1 = value.trim().to_owned(),
+            None => pairs.push((name.to_owned(), value.trim().to_owned())),
+        }
+    };
+    for part in existing.unwrap_or_default().split(';') {
+        if let Some((name, value)) = part.split_once('=') {
+            put(name, value);
+        }
+    }
+    for update in updates {
+        if let Some((name, value)) = update
+            .split(';')
+            .next()
+            .and_then(|part| part.split_once('='))
+        {
+            put(name, value);
+        }
+    }
+    (!pairs.is_empty()).then(|| {
+        pairs
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join("; ")
+    })
+}
+
 struct GatewayPoolAttempt<'a> {
     service: &'a Arc<crate::gateway_pool::GatewayPoolService>,
     client: &'a CodexBackendClient,
@@ -399,14 +471,7 @@ impl GatewayPoolAttempt<'_> {
             selection,
         } = self;
         let trace = context.trace();
-        // 只有客户端执行的工具可在未交付输出时重放。上游执行工具可能已有副作用。
-        let safe_replay = request.body().get("tools").is_none_or(|tools| {
-            tools.as_array().is_some_and(|tools| {
-                tools
-                    .iter()
-                    .all(|tool| matches!(tool["type"].as_str(), Some("function" | "custom")))
-            })
-        });
+        let safe_replay = request_replay_safe(request);
         let mut sent = false;
         // 本 Key 的退路：别的降智账号或普通账号；没有退路的账号不能因轮完一遍而让位。
         let fallback = service.fallback(context, account).await;
@@ -833,6 +898,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
         stream_max_retries,
         mut session_capture,
         gateway_pool,
+        degradation_watch,
     } = response;
     Box::pin(async_stream::try_stream! {
         let cyber_policy_scope = lease.cyber_policy_scope().cloned();
@@ -943,6 +1009,58 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
             .await;
             Err(failure.error)?;
             return;
+        }
+        // 普通账号降智检测：带 state 的 HTTP 请求又返回 state，先用返回的 state 做一次短确认。
+        // 确认降智则兜底：未输出、可安全重放且无续接约束时放弃本次响应交给核心换号；其余情况
+        // 照常交付，但仍记录信号并按配置调整分组。没带 state 的请求（如首条）默认当作正常。
+        if let Some(watch) = degradation_watch.as_ref()
+            && response.transport == CodexBackendTransport::HttpSse
+            && !response.is_json
+            && response.diagnostics.status_code == Some(200)
+            && request_carried_turn_state(&request)
+            && let Some(returned_state) = response_turn_state(&response)
+            && watch.dynamic_groups().await
+        {
+            let model = request
+                .body()
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| upstream_model.as_str())
+                .to_owned();
+            let cookie = merged_cookie_header(
+                cookie_header.as_ref().map(ExposeSecret::expose_secret),
+                &response.set_cookie_headers,
+            );
+            let verdict = watch
+                .confirm_degraded(
+                    &client,
+                    &active_account,
+                    authorization.expose_secret(),
+                    lease.installation_id(),
+                    &model,
+                    &returned_state,
+                    cookie.as_deref(),
+                )
+                .await;
+            if verdict == crate::gateway_pool::Confirmation::Confirmed {
+                watch.report_degraded(active_account.id(), &model);
+                let may_abort = context.continuation_attempt() == ContinuationAttempt::None
+                    && context.required_account().is_none()
+                    && !context.is_diagnostic_required_account()
+                    && request_replay_safe(&request);
+                if may_abort {
+                    drop(response);
+                    Err(provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::Sent)
+                        .with_pre_delivery_retry()
+                        .with_diagnostic(
+                            gateway_core::error::ProviderDiagnostic::new(
+                                "网关池：账号返回降智信号（带 state 的请求又返回 state，确认请求同样如此），本次请求交给其他账号重放",
+                            )
+                            .with_classification("gateway_pool", "account_degraded"),
+                        ))?;
+                    return;
+                }
+            }
         }
         if let Some(capture) = session_capture.as_mut() {
             capture.continuation_scope = Some(if capture.response_store {

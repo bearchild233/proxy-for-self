@@ -48,6 +48,9 @@ class GatewayPool:
                 CREATE TABLE IF NOT EXISTS catalogs (account TEXT PRIMARY KEY, at REAL NOT NULL, data TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS model_tickets (account TEXT NOT NULL, generation TEXT NOT NULL, model TEXT NOT NULL, expires REAL NOT NULL, data TEXT NOT NULL, PRIMARY KEY(account,generation,model));
                 CREATE INDEX IF NOT EXISTS observations_pair ON observations(account,gateway,at);
+                CREATE TABLE IF NOT EXISTS group_events (id TEXT PRIMARY KEY, at REAL NOT NULL, account TEXT NOT NULL, direction TEXT NOT NULL, from_group TEXT NOT NULL, to_group TEXT NOT NULL, model TEXT, status TEXT NOT NULL, finished_at REAL);
+                CREATE INDEX IF NOT EXISTS group_events_account ON group_events(account,direction,at);
+                CREATE TABLE IF NOT EXISTS recovery_checks (account TEXT PRIMARY KEY, paused_until REAL NOT NULL DEFAULT 0, claimed_generation TEXT, claimed_at REAL, last_outcome TEXT, last_at REAL);
             ''')
             history.install(db, self.clock())
             queue.install(db)
@@ -101,7 +104,7 @@ class GatewayPool:
         with self.db() as db:
             previous_settings = self.settings(db, private=True)
             settings = {**previous_settings, **data}
-            for name, maximum in [('windowSeconds', 3600), ('initialRestSeconds', 86400), ('maximumRestSeconds', 86400), ('probeIntervalMs', 1000)]:
+            for name, maximum in [('windowSeconds', 3600), ('initialRestSeconds', 86400), ('maximumRestSeconds', 86400), ('probeIntervalMs', 1000), ('recoverySeconds', 3600), ('recoveryPauseSeconds', 86400)]:
                 settings[name] = policy.finite_seconds(settings[name], name, maximum)
             if not settings['probeIntervalMs'].is_integer():
                 raise ValueError('候选间隔必须是整数毫秒')
@@ -114,6 +117,17 @@ class GatewayPool:
                     raise ValueError(field + '无效')
             if not isinstance(settings['poolDirect'], bool):
                 raise ValueError('池服务直连设置无效')
+            # 动态分组：开启时必须明确两个不同的分组，降智分组必须在网关池分组范围内。
+            if not isinstance(settings['dynamicGroups'], bool):
+                raise ValueError('动态分组开关无效')
+            for field in ('normalGroupId', 'degradedGroupId'):
+                if not isinstance(settings[field], str) or (settings[field] and not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', settings[field])):
+                    raise ValueError(field + '无效')
+            if settings['dynamicGroups']:
+                if not settings['normalGroupId'] or not settings['degradedGroupId'] or settings['normalGroupId'] == settings['degradedGroupId']:
+                    raise ValueError('动态分组需要指定不同的正常分组与降智分组')
+                if settings['degradedGroupId'] not in settings['groupIds']:
+                    raise ValueError('降智分组必须在网关池分组范围内')
             # 打票模型只接受官方模型标识格式；默认 6.1 Sol。
             if not isinstance(settings['probeModel'], str) or not re.fullmatch(r'gpt-[0-9a-z.-]{1,60}', settings['probeModel']):
                 raise ValueError('打票模型无效')
@@ -159,6 +173,71 @@ class GatewayPool:
                 policy.retire(pair,settings,degraded=False)
                 policy.settle(pair)
                 self.save(db,pair)
+
+    def regroup(self, db, settings, account, data, now):
+        """记录一次动态分组决定，并告诉网关该移动哪个分组。移动本身由 Rust 侧完成。"""
+        direction = data.get('direction')
+        if direction not in {'degraded', 'recovered'}:
+            raise ValueError('分组方向无效')
+        model = data.get('model')
+        if model is not None and (not isinstance(model, str) or not re.fullmatch(r'[0-9a-z.-]{1,64}', model)):
+            raise ValueError('模型无效')
+        normal, degraded = settings['normalGroupId'], settings['degradedGroupId']
+        if not (settings['dynamicGroups'] and normal and degraded and normal != degraded):
+            return {'move': None, 'reason': 'disabled'}
+        source, target = (normal, degraded) if direction == 'degraded' else (degraded, normal)
+        # 同一账号同一方向 10 分钟内已经移动过，或刚发出还没回报，不重复移动。
+        recent = db.execute("SELECT 1 FROM group_events WHERE account=? AND direction=? AND ((status='moved' AND at>?) OR (status='pending' AND at>?))", (account, direction, now - 600, now - 120)).fetchone()
+        if recent:
+            return {'move': None, 'reason': 'recent'}
+        event = uuid.uuid4().hex
+        db.execute("INSERT INTO group_events(id,at,account,direction,from_group,to_group,model,status) VALUES (?,?,?,?,?,?,?,'pending')", (event, now, account, direction, source, target, model))
+        return {'move': {'eventId': event, 'removeGroup': source, 'addGroup': target}}
+
+    def recovery_candidate(self, db, account, settings, now):
+        """降智分组里的账号：某代次的 state 已超过恢复时长、整代只有满血判定且材料仍有效，
+        就领取一次恢复检测。检测失败的账号暂停检测一段时间。"""
+        if not settings['dynamicGroups']:
+            return None
+        row = db.execute('SELECT * FROM recovery_checks WHERE account=?', (account,)).fetchone()
+        if row and row['paused_until'] > now:
+            return None
+        best = None
+        for stored in db.execute('SELECT data FROM pairs WHERE account=?', (account,)):
+            pair = json.loads(stored['data'])
+            first, generation = pair.get('firstContactAt'), pair.get('generation')
+            if first is None or generation is None or now - first < settings['recoverySeconds']:
+                continue
+            if row and row['claimed_generation'] == generation:
+                continue
+            # 整代只有满血判定：出现过降智或检测失败的代次不能作为恢复证据。
+            bad = db.execute("SELECT 1 FROM observations WHERE account=? AND json_extract(data,'$.generation')=? AND json_extract(data,'$.source') IN ('probe','business') AND (json_extract(data,'$.classification') IS NULL OR json_extract(data,'$.classification')='29')", (account, generation)).fetchone()
+            if bad:
+                continue
+            if not db.execute('SELECT 1 FROM materials WHERE account=? AND generation=? AND expires>?', (account, generation, now + 20)).fetchone():
+                continue
+            if best is None or first > best[0]:
+                best = (first, generation, pair['gateway'])
+        if best is None:
+            return None
+        db.execute('INSERT INTO recovery_checks(account,paused_until,claimed_generation,claimed_at) VALUES (?,0,?,?) ON CONFLICT(account) DO UPDATE SET claimed_generation=excluded.claimed_generation, claimed_at=excluded.claimed_at', (account, best[1], now))
+        return {'generation': best[1], 'gateway': best[2], 'ageSeconds': int(now - best[0])}
+
+    def recovery_result(self, db, settings, account, data, now):
+        outcome = data.get('outcome')
+        if outcome not in {'recovered', 'failed', 'unavailable'}:
+            raise ValueError('恢复检测结果无效')
+        # 失败暂停较长时间；无法检测（网络、额度）短暂等待；已恢复的账号马上会离开降智分组。
+        pause = {'failed': settings['recoveryPauseSeconds'], 'unavailable': 300, 'recovered': 600}[outcome]
+        db.execute('INSERT INTO recovery_checks(account,paused_until,last_outcome,last_at) VALUES (?,?,?,?) ON CONFLICT(account) DO UPDATE SET paused_until=excluded.paused_until, last_outcome=excluded.last_outcome, last_at=excluded.last_at', (account, now + pause, outcome, now))
+        return {'accepted': True, 'pausedUntil': now + pause}
+
+    def regroup_result(self, db, account, data, now):
+        event, status = data.get('eventId'), data.get('status')
+        if not isinstance(event, str) or not re.fullmatch(r'[0-9a-f]{32}', event) or status not in {'moved', 'unchanged', 'failed', 'unsupported'}:
+            raise ValueError('分组结果无效')
+        db.execute('UPDATE group_events SET status=?, finished_at=? WHERE id=? AND account=? AND status=?', (status, now, event, account, 'pending'))
+        return {'accepted': True}
 
     def availability(self, db, account, settings, policy, now):
         """账号当前能否被网关池调度，以及不能时的原因。只读已有目录和冷却事实，不因选号访问上游。
@@ -315,6 +394,14 @@ class GatewayPool:
                 if data['exhausted']:
                     self.retire_account(db,account,settings,policy)
                 return {'accepted':True}
+            if action == 'recoveryCheck':
+                return {'check': self.recovery_candidate(db, account, settings, now)}
+            if action == 'recoveryResult':
+                return self.recovery_result(db, settings, account, data, now)
+            if action == 'regroup':
+                return self.regroup(db, settings, account, data, now)
+            if action == 'regroupResult':
+                return self.regroup_result(db, account, data, now)
             if action in {'plan','claim','reserve'} and not queue.allowed(db,account):
                 info=self.availability(db,account,settings,policy,now)
                 return {'claimed':False,'reserved':False,'blocked':{k:info[k] for k in ('code','message') if k in info}}
@@ -574,4 +661,6 @@ class GatewayPool:
             condition = ' WHERE '+' AND '.join(switch_where) if switch_where else ''
             switches = [{**json.loads(r['data']), 'at':r['at'], 'accountId':r['account']} for r in db.execute('SELECT * FROM switches'+condition+' ORDER BY id DESC LIMIT ?', [*switch_args,limit])]
             catalogs = {r['account']: {'at': r['at'], 'gateways': json.loads(r['data'])} for r in db.execute('SELECT * FROM catalogs' + (' WHERE account=?' if account else ''), [account] if account else [])}
-            return {'settings': settings, 'pairs': pairs, 'observations': samples, 'switches': switches, 'catalogs': catalogs, 'accountQueue':queue.view(db)}
+            events = [{'id': r['id'], 'at': r['at'], 'accountId': r['account'], 'direction': r['direction'], 'fromGroup': r['from_group'], 'toGroup': r['to_group'], 'model': r['model'], 'status': r['status'], 'finishedAt': r['finished_at']}
+                      for r in db.execute('SELECT * FROM group_events ORDER BY at DESC LIMIT 200')]
+            return {'settings': settings, 'pairs': pairs, 'observations': samples, 'switches': switches, 'catalogs': catalogs, 'accountQueue':queue.view(db), 'groupEvents': events}

@@ -91,6 +91,37 @@ impl PgProviderAccountRepository {
     }
 }
 
+impl gateway_core::provider_ports::ProviderGroupMovePort for PgProviderAccountRepository {
+    fn move_account_group<'a>(
+        &'a self,
+        request: &'a gateway_core::provider_ports::AccountGroupMove,
+    ) -> futures::future::BoxFuture<
+        'a,
+        Result<
+            gateway_core::provider_ports::AccountGroupMoveOutcome,
+            gateway_core::provider_ports::ProviderStoreError,
+        >,
+    > {
+        use gateway_core::provider_ports::{ProviderStoreError, ProviderStoreErrorKind};
+        Box::pin(async move {
+            move_account_group_in_pool(&self.pool, request)
+                .await
+                .map_err(|error| match error {
+                    StoreError::NotFound { .. } | StoreError::InvalidData { .. } => {
+                        ProviderStoreError::new(
+                            ProviderStoreErrorKind::InvalidData,
+                            "move account group",
+                        )
+                    }
+                    _ => ProviderStoreError::new(
+                        ProviderStoreErrorKind::Unavailable,
+                        "move account group",
+                    ),
+                })
+        })
+    }
+}
+
 #[async_trait]
 impl ProviderAccountRepository for PgProviderAccountRepository {
     async fn load_provider_account(&self, id: &str) -> StoreResult<Option<ProviderAccountRecord>> {
@@ -1157,6 +1188,125 @@ pub(super) fn validate_batch_update_group_ids(group_ids: &[AccountGroupId]) -> S
         return Err(invalid("account batch update contains duplicate group IDs"));
     }
     Ok(())
+}
+
+/// 网关池自动调整账号分组：只增删指定分组的成员关系，同一事务提升配置版本并写审计。
+pub(crate) async fn move_account_group_in_pool(
+    pool: &PgPool,
+    request: &gateway_core::provider_ports::AccountGroupMove,
+) -> StoreResult<gateway_core::provider_ports::AccountGroupMoveOutcome> {
+    use gateway_core::provider_ports::AccountGroupMoveOutcome;
+    let account_id = request.account.as_str();
+    validate_admin_account_ids(std::slice::from_ref(&account_id.to_owned()))?;
+    let add =
+        AccountGroupId::new(request.add_group.clone()).map_err(|_| StoreError::InvalidData {
+            entity: "account group",
+            message: "invalid group ID".to_owned(),
+        })?;
+    let remove = request
+        .remove_group
+        .as_ref()
+        .map(|group| AccountGroupId::new(group.clone()))
+        .transpose()
+        .map_err(|_| StoreError::InvalidData {
+            entity: "account group",
+            message: "invalid group ID".to_owned(),
+        })?;
+    if remove.as_ref() == Some(&add) {
+        return Err(StoreError::InvalidData {
+            entity: "account group",
+            message: "source and target groups must differ".to_owned(),
+        });
+    }
+    let mut transaction = pool
+        .begin()
+        .await
+        .map_err(|_| postgres_unavailable("begin account group move"))?;
+    let result = async {
+        let exists = sqlx::query_scalar::<_, bool>(
+            "select exists(select 1 from provider_accounts where id = $1)",
+        )
+        .bind(account_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|_| postgres_unavailable("check account for group move"))?;
+        if !exists {
+            return Err(StoreError::NotFound {
+                entity: ENTITY,
+                id: account_id.to_owned(),
+            });
+        }
+        let known = sqlx::query_scalar::<_, bool>(
+            "select exists(select 1 from account_groups where id = $1)",
+        )
+        .bind(add.as_str())
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|_| postgres_unavailable("check target account group"))?;
+        if !known {
+            return Err(StoreError::NotFound {
+                entity: "account group",
+                id: add.as_str().to_owned(),
+            });
+        }
+        // 先锁住账号的成员行再判断，避免与管理端同时改分组时丢更新。
+        let current = sqlx::query_scalar::<_, String>(
+            "select account_group_id from account_group_accounts
+             where provider_account_id = $1 for update",
+        )
+        .bind(account_id)
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(|_| postgres_unavailable("read account group membership"))?;
+        let has_add = current.iter().any(|group| group == add.as_str());
+        let has_remove = remove
+            .as_ref()
+            .is_some_and(|group| current.iter().any(|item| item == group.as_str()));
+        if has_add && !has_remove {
+            return Ok(AccountGroupMoveOutcome::Unchanged);
+        }
+        let revision = bump_config_revision_in_transaction(&mut transaction).await?;
+        if let Some(group) = remove.as_ref().filter(|_| has_remove) {
+            sqlx::query(
+                "delete from account_group_accounts
+                 where provider_account_id = $1 and account_group_id = $2",
+            )
+            .bind(account_id)
+            .bind(group.as_str())
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| postgres_unavailable("leave account group"))?;
+        }
+        if !has_add {
+            sqlx::query(
+                "insert into account_group_accounts
+                 (account_group_id, provider_account_id, created_at)
+                 values ($1, $2, now()) on conflict do nothing",
+            )
+            .bind(add.as_str())
+            .bind(account_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| postgres_unavailable("join account group"))?;
+        }
+        let audit = AdminAuditEvent {
+            id: format!("audit_{}", uuid::Uuid::now_v7().simple()),
+            actor_kind: crate::postgres::AdminAuditActorKind::System,
+            actor_admin_user_id: None,
+            actor_ref: "gateway_pool".to_owned(),
+            admin_request_id: None,
+            action: "regroup".to_owned(),
+            entity_kind: "provider_account".to_owned(),
+            entity_ref: account_id.to_owned(),
+            config_revision: None,
+            changed_fields: vec!["groups".to_owned()],
+            created_at: Utc::now(),
+        };
+        append_admin_audit_event_in_transaction(&mut transaction, audit, revision).await?;
+        Ok(AccountGroupMoveOutcome::Moved)
+    }
+    .await;
+    finish_admin_transaction(transaction, result, "account group move").await
 }
 
 pub(crate) async fn finish_admin_transaction<T>(

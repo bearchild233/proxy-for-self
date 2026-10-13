@@ -78,6 +78,23 @@ struct Settings {
     /// 取网关目录与 Cookie 时走 VPS 直连；打票、业务与额度请求仍走账号出口。
     #[serde(default = "default_pool_direct")]
     pool_direct: bool,
+    /// 按降智检测结果自动调整账号分组。
+    #[serde(default)]
+    dynamic_groups: bool,
+    #[serde(default)]
+    normal_group_id: String,
+    #[serde(default)]
+    degraded_group_id: String,
+}
+impl Settings {
+    /// 动态分组可用：两个分组都已配置且不同。
+    fn dynamic_groups_ready(&self) -> bool {
+        self.enabled
+            && self.dynamic_groups
+            && !self.normal_group_id.is_empty()
+            && !self.degraded_group_id.is_empty()
+            && self.normal_group_id != self.degraded_group_id
+    }
 }
 fn default_pool_direct() -> bool {
     true
@@ -146,6 +163,8 @@ pub(crate) struct GatewayPoolSelection {
     pub live: Vec<ProviderAccountId>,
     /// Key 的账号范围内是否还有降智组之外的账号可作退路。
     pub ordinary: bool,
+    /// 其中属于动态分组里“降智分组”的账号：它们持续满血时可自动恢复到正常分组。
+    pub degraded: Vec<ProviderAccountId>,
 }
 
 /// 控制面 `active` 的结果：可调度账号（持窗账号在前）、持窗账号，以及不可调度账号的原因。
@@ -156,11 +175,35 @@ struct OrderedAccounts {
     blocked: Vec<ProviderAccountId>,
 }
 
+/// 普通账号降智确认的结论。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Confirmation {
+    /// 用刚返回的 state 再发一次短请求仍返回新 state：确认降智。
+    Confirmed,
+    /// 再发一次没有返回 state：原响应是满血，继续交付。
+    Normal,
+    /// 无法确认（限流、网络、超时或同账号刚确认过）：按正常处理。
+    Unknown,
+}
+
+/// 把响应里的 Set-Cookie 合成 Cookie 头；没有可用的 Cookie 时返回 None。
+fn merged_cookie_pairs(updates: &[String]) -> Option<String> {
+    let pairs = updates
+        .iter()
+        .filter_map(|update| update.split(';').next())
+        .filter(|pair| pair.contains('='))
+        .map(str::trim)
+        .collect::<Vec<_>>();
+    (!pairs.is_empty()).then(|| pairs.join("; "))
+}
+
 /// 同一 Key 内的退路：别的降智账号，或降智组之外的普通账号。
 #[derive(Clone, Default)]
 pub(crate) struct Fallback {
     pub alternatives: Vec<String>,
     pub ordinary: bool,
+    /// 账号在动态分组的降智分组里：路由时登记，后台据此做恢复检测。
+    pub recoverable: bool,
 }
 
 /// 网关池拒绝或无法完成路由的原因；写入错误诊断，管理员在错误排查里能直接看到。
@@ -229,6 +272,14 @@ pub(crate) struct GatewayPoolService {
     ticket_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     settings: Mutex<Option<(Instant, Settings)>>,
     probes: Arc<Semaphore>,
+    /// 自动调整账号分组的存储端口；没有配置时只记录检测，不移动账号。
+    group_mover: Option<Arc<dyn gateway_core::provider_ports::ProviderGroupMovePort>>,
+    /// 同一账号短时间内只确认一次，确认请求不放大流量。
+    confirmations: Mutex<HashMap<String, Instant>>,
+    /// 近期经过路由、且在降智分组里的账号；后台据此做恢复检测，不依赖是否还有请求。
+    recoverable: Mutex<HashMap<String, Instant>>,
+    /// 正在做恢复检测的账号，避免重复启动。
+    recovering: Mutex<std::collections::HashSet<String>>,
     #[cfg(feature = "gateway-pool-experiment")]
     direct_pool_experiment: std::sync::atomic::AtomicBool,
 }
@@ -239,6 +290,7 @@ impl GatewayPoolService {
         repository: CodexCredentialRepository,
         client: CodexBackendClient,
         quota: Arc<CodexCredentialQuotaService>,
+        group_mover: Option<Arc<dyn gateway_core::provider_ports::ProviderGroupMovePort>>,
     ) -> Result<Arc<Self>, ()> {
         config.validate()?;
         let key = tokio::fs::read_to_string(&config.key_file)
@@ -268,9 +320,252 @@ impl GatewayPoolService {
             ticket_locks: Mutex::new(HashMap::new()),
             settings: Mutex::new(None),
             probes: Arc::new(Semaphore::new(4)),
+            group_mover,
+            confirmations: Mutex::new(HashMap::new()),
+            recoverable: Mutex::new(HashMap::new()),
+            recovering: Mutex::new(std::collections::HashSet::new()),
             #[cfg(feature = "gateway-pool-experiment")]
             direct_pool_experiment: std::sync::atomic::AtomicBool::new(false),
         }))
+    }
+    /// 单次状态探测：按给定 state 与 Cookie 发 `hi` 只看响应头，返回 (状态码, 是否返回 state, 返回的 state, Set-Cookie)。
+    async fn probe_state(
+        &self,
+        account: &ProviderAccount,
+        model: &str,
+        state: Option<&str>,
+        cookie: Option<&str>,
+    ) -> Option<(u16, bool, Option<String>, Vec<String>)> {
+        let credential = self
+            .repository
+            .load_runtime_credential(account)
+            .await
+            .ok()?;
+        let authorization = credential.authentication.authorization_header().ok()?;
+        let client = self.client.for_account(account).ok()?;
+        let request = hi_request(model)?;
+        let session = Uuid::new_v4().to_string();
+        let mut context = CodexRequestContext::auxiliary(
+            authorization.expose_secret(),
+            account.upstream_account_id(),
+            &session,
+            Some(&credential.installation_id),
+        );
+        context.turn_state = state;
+        context.cookie_header = cookie;
+        let observation = tokio::time::timeout(
+            Duration::from_secs(20),
+            client.diagnostic_observation(&request, context, true),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        let _ = self.observe_probe_quota(account, &observation).await;
+        Some((
+            observation.status,
+            observation.state_returned,
+            observation.state,
+            observation.cookies,
+        ))
+    }
+    /// 后台每秒调用：为降智分组里的账号领取并执行恢复检测。
+    pub(crate) async fn recovery_scan(self: &Arc<Self>) {
+        if !self.dynamic_groups().await {
+            return;
+        }
+        let ids = {
+            let mut map = self.recoverable.lock().await;
+            map.retain(|_, seen| seen.elapsed() < Duration::from_secs(1800));
+            map.keys().cloned().collect::<Vec<_>>()
+        };
+        for id in ids {
+            let Ok(reply) = self
+                .call(json!({"action":"recoveryCheck","accountId":id}))
+                .await
+            else {
+                continue;
+            };
+            let (Some(generation), true) = (
+                reply["check"]["generation"].as_str().map(str::to_owned),
+                self.recovering.lock().await.insert(id.clone()),
+            ) else {
+                continue;
+            };
+            let service = Arc::clone(self);
+            tokio::spawn(async move {
+                let outcome = service.recovery_check(&id, &generation).await;
+                let _ = service
+                    .call(json!({"action":"recoveryResult","accountId":id,"outcome":outcome}))
+                    .await;
+                service.recovering.lock().await.remove(&id);
+            });
+        }
+    }
+    /// 恢复检测：先用已过 8 分钟的旧 state 重放，仍满血再做两次全新的 bootstrap 加重放；
+    /// 全部为 21 才算恢复并移回正常分组。返回 recovered / failed / unavailable。
+    async fn recovery_check(self: &Arc<Self>, id: &str, generation: &str) -> &'static str {
+        let Ok(account_id) = ProviderAccountId::new(id) else {
+            return "unavailable";
+        };
+        let Ok(Some(account)) = self.repository.store().get_account(&account_id).await else {
+            return "unavailable";
+        };
+        let Ok(Some(account)) = self.eligible_account(&account).await else {
+            return "unavailable";
+        };
+        let Ok(settings) = self.settings().await else {
+            return "unavailable";
+        };
+        let Ok(material) = self
+            .call(json!({"action":"material","accountId":id,"generation":generation}))
+            .await
+        else {
+            return "unavailable";
+        };
+        let (Some(state), Some(cookie)) = (material["state"].as_str(), material["cookie"].as_str())
+        else {
+            return "unavailable";
+        };
+        let model = settings.probe_model.as_str();
+        // 旧 state 已经用了 8 分钟：仍不返回新 state 才继续。
+        match self
+            .probe_state(&account, model, Some(state), Some(cookie))
+            .await
+        {
+            Some((200, false, _, _)) => {}
+            Some((200, true, _, _)) => return "failed",
+            _ => return "unavailable",
+        }
+        // 全新的 bootstrap 加重放，连续两次都是 21。
+        for _ in 0..2 {
+            let Some((200, true, Some(fresh), cookies)) =
+                self.probe_state(&account, model, None, None).await
+            else {
+                return "unavailable";
+            };
+            let jar = merged_cookie_pairs(&cookies);
+            match self
+                .probe_state(&account, model, Some(&fresh), jar.as_deref())
+                .await
+            {
+                Some((200, false, _, _)) => {}
+                Some((200, true, _, _)) => return "failed",
+                _ => return "unavailable",
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        self.report_regroup(&account_id, "recovered", model);
+        "recovered"
+    }
+    /// 动态分组是否开启；设置读取失败时保守返回 false，不影响业务请求。
+    pub(crate) async fn dynamic_groups(&self) -> bool {
+        self.settings()
+            .await
+            .is_ok_and(|settings| settings.dynamic_groups_ready())
+    }
+    /// 普通账号的响应在携带 state 的请求上又返回了 state：用返回的 state 再发一次短请求确认。
+    /// 同一账号、同一模型、同一 Cookie 与出口；确认请求只读响应头，立刻关闭。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn confirm_degraded(
+        &self,
+        client: &CodexBackendClient,
+        account: &ProviderAccount,
+        authorization: &str,
+        installation_id: &str,
+        model: &str,
+        state: &str,
+        cookie: Option<&str>,
+    ) -> Confirmation {
+        {
+            let mut recent = self.confirmations.lock().await;
+            recent.retain(|_, at| at.elapsed() < Duration::from_secs(20));
+            if recent.contains_key(account.id().as_str()) {
+                return Confirmation::Unknown;
+            }
+            recent.insert(account.id().as_str().to_owned(), Instant::now());
+        }
+        let valid_model = !model.is_empty()
+            && model.len() <= 64
+            && model
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-');
+        let Some(request) = valid_model.then(|| hi_request(model)).flatten() else {
+            return Confirmation::Unknown;
+        };
+        let session = Uuid::new_v4().to_string();
+        let mut context = CodexRequestContext::auxiliary(
+            authorization,
+            account.upstream_account_id(),
+            &session,
+            Some(installation_id),
+        );
+        context.turn_state = Some(state);
+        context.cookie_header = cookie;
+        match tokio::time::timeout(
+            Duration::from_secs(15),
+            client.diagnostic_observation(&request, context, true),
+        )
+        .await
+        {
+            Ok(Ok(observation)) if observation.status == 200 => {
+                if observation.state_returned {
+                    Confirmation::Confirmed
+                } else {
+                    Confirmation::Normal
+                }
+            }
+            _ => Confirmation::Unknown,
+        }
+    }
+    /// 确认降智后记录并按配置移组；在后台完成，不拖慢兜底重试。
+    pub(crate) fn report_degraded(self: &Arc<Self>, account: &ProviderAccountId, model: &str) {
+        self.report_regroup(account, "degraded", model);
+    }
+    /// 记录一次分组决定并执行移组；方向为 degraded（移进降智分组）或 recovered（移回正常分组）。
+    fn report_regroup(
+        self: &Arc<Self>,
+        account: &ProviderAccountId,
+        direction: &'static str,
+        model: &str,
+    ) {
+        let service = Arc::clone(self);
+        let account = account.clone();
+        let model = model.to_owned();
+        tokio::spawn(async move {
+            let Ok(reply) = service
+                .call(json!({"action":"regroup","accountId":account.as_str(),"direction":direction,"model":model}))
+                .await
+            else {
+                return;
+            };
+            let Some(event) = reply["move"]["eventId"].as_str() else {
+                return;
+            };
+            let status = match service.group_mover.as_ref() {
+                None => "unsupported",
+                Some(mover) => {
+                    let request = gateway_core::provider_ports::AccountGroupMove {
+                        account: account.clone(),
+                        remove_group: reply["move"]["removeGroup"].as_str().map(str::to_owned),
+                        add_group: reply["move"]["addGroup"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_owned(),
+                        reason: format!("gateway_pool:{direction}"),
+                    };
+                    match mover.move_account_group(&request).await {
+                        Ok(gateway_core::provider_ports::AccountGroupMoveOutcome::Moved) => "moved",
+                        Ok(gateway_core::provider_ports::AccountGroupMoveOutcome::Unchanged) => {
+                            "unchanged"
+                        }
+                        Err(_) => "failed",
+                    }
+                }
+            };
+            let _ = service
+                .call(json!({"action":"regroupResult","accountId":account.as_str(),"eventId":event,"status":status}))
+                .await;
+        });
     }
     async fn call(&self, value: Value) -> Result<Value, ()> {
         use std::sync::atomic::Ordering;
@@ -324,6 +619,10 @@ impl GatewayPoolService {
         cancellation: &CancellationToken,
     ) -> Result<(), ()> {
         let settings = self.settings().await?;
+        // 动态分组的恢复检测不依赖运行模式：懒模式下也按时发起。
+        if settings.dynamic_groups_ready() {
+            self.recovery_scan().await;
+        }
         if !settings.enabled || settings.mode != "continuous" {
             return Ok(());
         }
@@ -362,6 +661,7 @@ impl GatewayPoolService {
                         .map(|other| other.as_str().to_owned())
                         .collect(),
                     ordinary: false,
+                    recoverable: false,
                 };
                 self.start_prepare(account.clone(), false, cancellation.clone(), fallback)
                     .await?;
@@ -514,11 +814,31 @@ impl GatewayPoolService {
                 members_ordered.push(id.clone());
             }
         }
+        let degraded = if settings.dynamic_groups_ready() {
+            accounts
+                .iter()
+                .filter(|account| {
+                    scope
+                        .directory()
+                        .account(account.id())
+                        .is_some_and(|entry| {
+                            entry
+                                .group_ids()
+                                .iter()
+                                .any(|group| group.as_str() == settings.degraded_group_id)
+                        })
+                })
+                .map(|account| account.id().clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
         Ok(GatewayPoolSelection {
             members: members_ordered,
             preferred: keep(ordered.accounts),
             live: keep(ordered.live),
             ordinary,
+            degraded,
         })
     }
     /// 本 Key 范围内可替代的别的降智账号和普通账号，用来判断账号能否让位。
@@ -536,6 +856,7 @@ impl GatewayPoolService {
                     .map(|id| id.as_str().to_owned())
                     .collect(),
                 ordinary: selection.ordinary,
+                recoverable: selection.degraded.contains(account.id()),
             },
             Err(()) => Fallback::default(),
         }
@@ -681,6 +1002,12 @@ impl GatewayPoolService {
             .lock()
             .await
             .insert(account.id().as_str().to_owned(), Instant::now());
+        if fallback.recoverable {
+            self.recoverable
+                .lock()
+                .await
+                .insert(account.id().as_str().to_owned(), Instant::now());
+        }
         // 比请求期限早一点放弃，这里才来得及给出具体原因，而不是被外层超时先截断。
         let give_up_at = deadline
             .checked_sub(Duration::from_millis(1500))
@@ -1375,6 +1702,15 @@ impl GatewayPoolExperiment {
 
     pub async fn background(&self, cancellation: &CancellationToken) -> bool {
         self.0.background(cancellation).await.is_ok()
+    }
+
+    /// 模拟账号近期经过降智分组的路由，让后台恢复检测可以发现它。
+    pub async fn mark_recoverable(&self, id: &gateway_core::account::ProviderAccountId) {
+        self.0
+            .recoverable
+            .lock()
+            .await
+            .insert(id.as_str().to_owned(), Instant::now());
     }
 
     pub async fn refresh_quota(&self, id: &gateway_core::account::ProviderAccountId) -> bool {

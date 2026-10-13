@@ -16,6 +16,7 @@ import BaseTable from '@/components/base/BaseTable/index.vue'
 import BaseTag from '@/components/base/BaseTag.vue'
 import { toast } from '@/components/base/BaseToast'
 import AccountPoolCard from './components/AccountPoolCard.vue'
+import PoolGroupEvents from './components/PoolGroupEvents.vue'
 import PoolSettingsModal from './components/PoolSettingsModal.vue'
 import PoolStatistics from './components/PoolStatistics.vue'
 
@@ -100,6 +101,7 @@ const tabOptions = [
   { label: '账号与网关', value: 'accounts' },
   { label: '轮转明细', value: 'records' },
   { label: '轮转统计', value: 'statistics' },
+  { label: '分组变动', value: 'groups' },
 ]
 async function refresh() {
   if (savingQueue.value)
@@ -262,8 +264,10 @@ usePluginPolling(refresh, shallowRef(10_000))
           </BaseEmpty>
         </div>
 
+        <PoolGroupEvents v-if="tab === 'groups'" :events="view?.groupEvents ?? []" :accounts="accounts" :groups="groups" :enabled="!!settings?.dynamicGroups" />
+
         <KeepAlive>
-          <PoolStatistics v-if="tab !== 'accounts'" :accounts="accounts" :mode="tab === 'statistics' ? 'summary' : 'records'" @records="tab = 'records'" />
+          <PoolStatistics v-if="tab === 'records' || tab === 'statistics'" :accounts="accounts" :mode="tab === 'statistics' ? 'summary' : 'records'" @records="tab = 'records'" />
         </KeepAlive>
       </template>
     </BaseCard>

@@ -24,6 +24,23 @@ export interface Settings {
   poolAccountIds: Record<string, string>
   poolUrl: string
   poolTokenConfigured?: boolean
+  /** 按降智检测结果自动在正常分组与降智分组之间调整账号。 */
+  dynamicGroups?: boolean
+  normalGroupId?: string
+  degradedGroupId?: string
+}
+
+/** 一次自动分组调整的记录；status 为 pending 表示已决定、尚未回报结果。 */
+export interface GroupEvent {
+  id: string
+  at: number
+  accountId: string
+  direction: 'degraded' | 'recovered'
+  fromGroup: string
+  toGroup: string
+  model?: string | null
+  status: 'pending' | 'moved' | 'unchanged' | 'failed' | 'unsupported'
+  finishedAt?: number | null
 }
 
 export type PairState = 'unknown' | 'preparing' | 'ready' | 'draining' | 'cooling'
@@ -91,6 +108,7 @@ export interface PoolView {
   observations: Observation[]
   switches: Switch[]
   catalogs?: Record<string, { at: number, gateways: CatalogEntry[] }>
+  groupEvents?: GroupEvent[]
 }
 
 export interface DirectoryAccount {
@@ -140,4 +158,12 @@ export function sourceLabel(sample: Observation): string {
   if (sample.source === 'probe')
     return '打票判定'
   return sample.phase === 'bootstrap' ? '取 S0' : sample.retry ? '重放 · 重试' : '重放'
+}
+
+export const groupEventLabels: Record<GroupEvent['status'], string> = {
+  pending: '处理中',
+  moved: '已移动',
+  unchanged: '无需移动',
+  failed: '移动失败',
+  unsupported: '未启用写入',
 }

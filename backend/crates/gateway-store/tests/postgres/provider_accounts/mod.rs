@@ -3196,6 +3196,111 @@ async fn account_count(pool: &sqlx::PgPool, account_id: &str) -> i64 {
         .expect("count provider account")
 }
 
+/// 网关池自动调整分组：只改指定两个分组的成员关系，保留其他分组；同一事务提升配置版本并写审计；
+/// 已满足时不产生版本和审计；目标分组不存在时整体失败。
+#[tokio::test]
+async fn gateway_pool_group_move_changes_only_the_named_groups_and_audits_once() {
+    use gateway_core::account::ProviderAccountId;
+    use gateway_core::provider_ports::{
+        AccountGroupMove, AccountGroupMoveOutcome, ProviderGroupMovePort,
+    };
+    const NORMAL: &str = "grp_00000000000000000000000000000081";
+    const DEGRADED: &str = "grp_00000000000000000000000000000082";
+    const OTHER: &str = "grp_00000000000000000000000000000083";
+    let Some(database) = TestDatabase::create("provider_account_group_move").await else {
+        return;
+    };
+    let repository = PgProviderAccountRepository::new(database.pool.clone());
+    repository
+        .insert_provider_account(account("acct_move", "user-move"))
+        .await
+        .expect("insert account");
+    for (id, name) in [(NORMAL, "Normal"), (DEGRADED, "Degraded"), (OTHER, "Other")] {
+        sqlx::query(
+            "insert into account_groups (id, name, description, color, enabled, created_at, updated_at)
+             values ($1, $2, null, '#2563EBFF', true, now(), now())",
+        )
+        .bind(id)
+        .bind(name)
+        .execute(&database.pool)
+        .await
+        .expect("insert group");
+    }
+    for id in [NORMAL, OTHER] {
+        sqlx::query(
+            "insert into account_group_accounts (account_group_id, provider_account_id, created_at)
+             values ($1, 'acct_move', now())",
+        )
+        .bind(id)
+        .execute(&database.pool)
+        .await
+        .expect("assign group");
+    }
+    let revision = current_revision(&database.pool).await;
+    let request = AccountGroupMove {
+        account: ProviderAccountId::new("acct_move").unwrap(),
+        remove_group: Some(NORMAL.to_owned()),
+        add_group: DEGRADED.to_owned(),
+        reason: "degraded".to_owned(),
+    };
+    let moved = repository
+        .move_account_group(&request)
+        .await
+        .expect("move account");
+    assert_eq!(moved, AccountGroupMoveOutcome::Moved);
+    assert_eq!(
+        account_group_ids(&database.pool, "acct_move").await,
+        vec![DEGRADED, OTHER]
+    );
+    assert_eq!(current_revision(&database.pool).await, revision + 1);
+    let audits: i64 = sqlx::query_scalar(
+        "select count(*) from admin_audit_events where entity_ref = 'acct_move' and action = 'regroup' and actor_ref = 'gateway_pool'",
+    )
+    .fetch_one(&database.pool)
+    .await
+    .expect("count audits");
+    assert_eq!(audits, 1);
+    // 重复请求：成员关系已满足，不再提升版本或写审计。
+    let again = repository
+        .move_account_group(&request)
+        .await
+        .expect("repeat move");
+    assert_eq!(again, AccountGroupMoveOutcome::Unchanged);
+    assert_eq!(current_revision(&database.pool).await, revision + 1);
+    // 移回正常组，降智组成员关系被移除。
+    let back = repository
+        .move_account_group(&AccountGroupMove {
+            account: ProviderAccountId::new("acct_move").unwrap(),
+            remove_group: Some(DEGRADED.to_owned()),
+            add_group: NORMAL.to_owned(),
+            reason: "recovered".to_owned(),
+        })
+        .await
+        .expect("move back");
+    assert_eq!(back, AccountGroupMoveOutcome::Moved);
+    assert_eq!(
+        account_group_ids(&database.pool, "acct_move").await,
+        vec![NORMAL, OTHER]
+    );
+    // 目标分组不存在：失败，成员关系与版本都不变。
+    let revision = current_revision(&database.pool).await;
+    let missing = repository
+        .move_account_group(&AccountGroupMove {
+            account: ProviderAccountId::new("acct_move").unwrap(),
+            remove_group: Some(NORMAL.to_owned()),
+            add_group: "grp_00000000000000000000000000000099".to_owned(),
+            reason: "degraded".to_owned(),
+        })
+        .await;
+    assert!(missing.is_err());
+    assert_eq!(
+        account_group_ids(&database.pool, "acct_move").await,
+        vec![NORMAL, OTHER]
+    );
+    assert_eq!(current_revision(&database.pool).await, revision);
+    database.close().await;
+}
+
 async fn account_group_ids(pool: &sqlx::PgPool, account_id: &str) -> Vec<String> {
     sqlx::query_scalar(
         "select account_group_id from account_group_accounts

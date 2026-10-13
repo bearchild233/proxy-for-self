@@ -801,15 +801,26 @@ fn scope_for(ids: &[&str]) -> Arc<FrozenAccountScope> {
 }
 
 fn request(tools: Value) -> ProviderRequest {
-    let body = json!({"model":"gpt-6-astra","input":[{"role":"user","content":[{"type":"input_text","text":"original user input"}]}],"tools":tools,"client_metadata":{"x-codex-turn-state":"old-body-state","custom":"keep"},"unknown_test_field":"preserve","store":true,"stream":true});
+    request_with(tools, true)
+}
+
+/// `carries_state` 为 false 时模拟没有 turn state 的首条请求。
+fn request_with(tools: Value, carries_state: bool) -> ProviderRequest {
+    let metadata = if carries_state {
+        json!({"x-codex-turn-state":"old-body-state","custom":"keep"})
+    } else {
+        json!({"custom":"keep"})
+    };
+    let body = json!({"model":"gpt-6-astra","input":[{"role":"user","content":[{"type":"input_text","text":"original user input"}]}],"tools":tools,"client_metadata":metadata,"unknown_test_field":"preserve","store":true,"stream":true});
+    let mut payload_context = Map::from_iter([("use_websocket".into(), json!(false))]);
+    if carries_state {
+        payload_context.insert("turn_state".into(), json!("client-state-must-not-win"));
+    }
     let operation = Operation::Generate(GenerateRequest::from_protocol_payload(
         ProtocolPayload::json_object("openai", body.as_object().unwrap().clone())
             .unwrap()
             .with_original_json(bytes::Bytes::from(body.to_string()))
-            .with_context(Map::from_iter([
-                ("use_websocket".into(), json!(false)),
-                ("turn_state".into(), json!("client-state-must-not-win")),
-            ])),
+            .with_context(payload_context),
     ));
     let provider = ProviderKind::new("openai").unwrap();
     let model = UpstreamModelId::new("gpt-6-astra").unwrap();
@@ -839,6 +850,30 @@ fn request(tools: Value) -> ProviderRequest {
 
 fn context() -> AttemptContext {
     context_for(scope())
+}
+
+/// 请求携带的 turn state 由 `owner` 账号创建：只有选中同一账号时才会随请求发往上游。
+fn context_owned_by(account_scope: Arc<FrozenAccountScope>, owner: &str) -> AttemptContext {
+    AttemptContext::new(
+        RequestAttemptContext::new(
+            ModelRequestId::new("req_gateway_pool").unwrap(),
+            ClientApiKeyId::new("key_gateway_pool").unwrap(),
+        ),
+        NonZeroU32::new(1).unwrap(),
+        SystemTime::now() + Duration::from_secs(10),
+        account_policy(),
+        AccountAttemptContext::new(
+            BTreeSet::new(),
+            None,
+            Some(gateway_core::engine::ProviderAccountStateOwner::new(
+                ProviderKind::new("openai").unwrap(),
+                ProviderAccountId::new(owner).unwrap(),
+            )),
+        )
+        .with_account_scope(account_scope),
+        None,
+        CancellationToken::new(),
+    )
 }
 
 fn context_for(account_scope: Arc<FrozenAccountScope>) -> AttemptContext {
@@ -1129,6 +1164,362 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_pool\",\"stat
             .iter()
             .any(|a| a["action"] == "probeResult" || a["action"] == "claim")
     );
+}
+
+/// 记录自动移组请求的存储端口替身。
+#[derive(Default)]
+struct RecordingMover {
+    calls: std::sync::Mutex<Vec<gateway_core::provider_ports::AccountGroupMove>>,
+}
+
+impl gateway_core::provider_ports::ProviderGroupMovePort for RecordingMover {
+    fn move_account_group<'a>(
+        &'a self,
+        request: &'a gateway_core::provider_ports::AccountGroupMove,
+    ) -> futures::future::BoxFuture<
+        'a,
+        Result<
+            gateway_core::provider_ports::AccountGroupMoveOutcome,
+            gateway_core::provider_ports::ProviderStoreError,
+        >,
+    > {
+        self.calls.lock().unwrap().push(request.clone());
+        Box::pin(async { Ok(gateway_core::provider_ports::AccountGroupMoveOutcome::Moved) })
+    }
+}
+
+/// 普通账号（不在降智组）带 state 的请求又返回 state：用返回的 state 做一次短确认；确认降智则放弃本次
+/// 响应（带“交给其他账号重放”的标记，换号由核心完成），并把账号移进降智组。上游执行工具的请求不能
+/// 重放，只记录并移组。没带 state 的请求（如首条）不做判定。
+#[tokio::test]
+async fn normal_account_degradation_is_confirmed_replayed_elsewhere_and_regrouped() {
+    const NORMAL_GROUP: &str = "grp_00000000000000000000000000000050";
+    const SPARE: &str = "acct_normal_spare";
+    for (tools, carries_state, expect_requests, expect_abort, expect_regroup) in [
+        // 带 state、可重放：真实请求 + 确认请求，放弃响应并标记换号重放，账号被移组。
+        (json!([]), true, 2, true, true),
+        // 上游执行工具：不能放弃响应，真实请求 + 确认请求，仍移组。
+        (json!([{"type":"web_search"}]), true, 2, false, true),
+        // 没带 state：不判定，不确认，不移组。
+        (json!([]), false, 1, false, false),
+    ] {
+        let upstream = MockServer::start().await;
+        let runtime = MockServer::start().await;
+        let store = Arc::new(MemoryAccountStore::default());
+        for (id, token, weight) in [(ACCOUNT, "token-a", 90), (SPARE, "token-b", 1)] {
+            store
+                .seed_oauth_credential(ImportCodexOAuthCredential {
+                    account_id: id.into(),
+                    name: id.into(),
+                    secret: secret(token),
+                    verified_account: profile(id),
+                    next_refresh_at: None,
+                    enabled: true,
+                })
+                .await;
+            store.set_scheduling(
+                id,
+                None,
+                gateway_core::account::AccountWeight::new(weight).unwrap(),
+            );
+            let account = store.account(id).unwrap();
+            let now = SystemTime::now();
+            store.compare_and_swap_quota(QuotaObservation {plan_type:None,account_id:account.id().clone(),expected_revision:account.revision(),observed_at:now,state:QuotaState::allowed(now),quota:OpaqueProviderData::new(json!({"rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{"used_percent":10,"reset_at":Utc::now().timestamp()+18000}}}).as_object().unwrap().clone())}).await.unwrap();
+        }
+        let results = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let recorded = Arc::clone(&results);
+        Mock::given(method("POST"))
+            .respond_with(move |input: &wiremock::Request| {
+                let data: Value = input.body_json().unwrap();
+                let value = match data["action"].as_str().unwrap() {
+                    "config" => json!({"enabled":true,"groupIds":[GROUP],"probeIntervalMs":50,"dynamicGroups":true,"normalGroupId":NORMAL_GROUP,"degradedGroupId":GROUP}),
+                    "regroup" => json!({"move":{"eventId":"0123456789abcdef0123456789abcdef","removeGroup":NORMAL_GROUP,"addGroup":GROUP}}),
+                    "regroupResult" => {
+                        recorded.lock().unwrap().push(data.clone());
+                        json!({"accepted":true})
+                    }
+                    _ => json!({"accepted":true}),
+                };
+                ResponseTemplate::new(200).set_body_json(value)
+            })
+            .mount(&runtime)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/codex/responses"))
+            .respond_with(|input: &wiremock::Request| {
+                let token = input.headers.get("authorization").unwrap().to_str().unwrap();
+                if token.ends_with("token-a") {
+                    // 降智账号：任何请求都返回 state，包括确认请求。
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .insert_header("x-codex-turn-state", "returned-state-a")
+                        .set_body_string("data: {\"type\":\"response.output_text.delta\",\"delta\":\"BAD ANSWER\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_bad\",\"status\":\"completed\",\"output\":[]}}\n\n")
+                } else {
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string("data: {\"type\":\"response.output_text.delta\",\"item_id\":\"item\",\"output_index\":0,\"content_index\":0,\"delta\":\"complete good answer\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_good\",\"status\":\"completed\",\"output\":[]}}\n\n")
+                }
+            })
+            .mount(&upstream)
+            .await;
+        let mut config = valid_config();
+        let key = config._runtime.path().join("pool.key");
+        std::fs::write(&key, "a".repeat(64)).unwrap();
+        config.config.api.base_url = upstream.uri();
+        config.config.gateway_pool = Some(provider_openai::gateway_pool::GatewayPoolConfig {
+            runtime_url: runtime.uri(),
+            key_file: key,
+            fallback_url: None,
+        });
+        let mover = Arc::new(RecordingMover::default());
+        let ports = provider_ports_with(store, Arc::new(TestOAuthPending::default()))
+            .with_group_mover(mover.clone());
+        let bundle = provider_openai::initialize(config.config.clone(), ports)
+            .await
+            .unwrap();
+        // 两个账号都在普通分组里，不属于降智组。
+        let group = AccountGroupId::new(NORMAL_GROUP).unwrap();
+        let provider = ProviderKind::new("openai").unwrap();
+        let account_scope = Arc::new(FrozenAccountScope::new(
+            Arc::new(RuntimeAccountDirectory::new(
+                [ACCOUNT, SPARE]
+                    .iter()
+                    .map(|id| {
+                        (
+                            ProviderAccountId::new(*id).unwrap(),
+                            RuntimeAccount::new(provider.clone(), BTreeSet::from([group.clone()])),
+                        )
+                    })
+                    .collect(),
+            )),
+            ClientRoutingScope::restricted(
+                vec![RoutingGroupSnapshot::new(group.clone(), "Normal".into())],
+                BTreeSet::from([group]),
+                BTreeSet::from([provider]),
+            )
+            .unwrap(),
+        ));
+        let result = bundle
+            .core_provider()
+            .execute(
+                request_with(tools, carries_state),
+                context_owned_by(account_scope, ACCOUNT),
+            )
+            .await;
+        let mut events = Vec::new();
+        let mut abort = None;
+        if let Ok(mut stream) = result {
+            while let Some(event) = stream.next().await {
+                match event {
+                    Ok(event) => {
+                        if let Some(wire) = event.wire_event() {
+                            events.push(wire.data().to_string());
+                        }
+                    }
+                    Err(error) => {
+                        events.push("failed".into());
+                        abort = Some(error);
+                        break;
+                    }
+                }
+            }
+        }
+        // 移组在后台完成，等它结束再检查。
+        for _ in 0..50 {
+            if results.lock().unwrap().len() == usize::from(expect_regroup)
+                && mover.calls.lock().unwrap().len() == usize::from(expect_regroup)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        let answer = events.join(" ");
+        let requests = upstream.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            expect_requests,
+            "{answer} {:?}",
+            requests.first().map(|r| r
+                .headers
+                .iter()
+                .map(|(k, _)| k.to_string())
+                .collect::<Vec<_>>())
+        );
+        // 兜底：不向客户端输出降智答案，错误带换号重放标记与原因码。
+        assert_eq!(abort.is_some(), expect_abort, "{answer}");
+        assert_eq!(answer.contains("BAD ANSWER"), !expect_abort, "{answer}");
+        if let Some(error) = &abort {
+            assert_eq!(
+                error.kind(),
+                gateway_core::error::ProviderErrorKind::Unavailable
+            );
+            assert!(error.pre_delivery_retry().is_some());
+            assert_eq!(
+                error.diagnostic().and_then(|d| d.code()),
+                Some("account_degraded")
+            );
+        }
+        let calls = mover.calls.lock().unwrap();
+        assert_eq!(calls.len(), usize::from(expect_regroup));
+        if expect_regroup {
+            // 确认请求带的是 A 刚返回的 state，而不是客户端原来的。
+            assert!(requests.iter().any(|input| {
+                input
+                    .headers
+                    .get("x-codex-turn-state")
+                    .and_then(|v| v.to_str().ok())
+                    == Some("returned-state-a")
+            }));
+            assert_eq!(calls[0].account.as_str(), ACCOUNT);
+            assert_eq!(calls[0].remove_group.as_deref(), Some(NORMAL_GROUP));
+            assert_eq!(calls[0].add_group, GROUP);
+            let reported = results.lock().unwrap();
+            assert_eq!(reported.len(), 1);
+            assert_eq!(reported[0]["status"], "moved");
+            assert_eq!(reported[0]["accountId"], ACCOUNT);
+        }
+    }
+}
+
+/// 降智分组里的账号：用已过 8 分钟的旧 state 重放仍满血，再连续两次全新检测都满血，才恢复并移回正常分组；
+/// 旧 state 重放返回新 state 则检测失败，不移组，只向控制面回报让它暂停检测。
+#[cfg(feature = "gateway-pool-experiment")]
+#[tokio::test]
+async fn degraded_group_account_recovers_after_old_state_and_fresh_checks_stay_full_power() {
+    const NORMAL_GROUP: &str = "grp_00000000000000000000000000000050";
+    for (old_state_returns_state, expect_recovered) in [(false, true), (true, false)] {
+        let upstream = MockServer::start().await;
+        let runtime = MockServer::start().await;
+        let store = Arc::new(MemoryAccountStore::default());
+        store
+            .seed_oauth_credential(ImportCodexOAuthCredential {
+                account_id: ACCOUNT.into(),
+                name: "Demo".into(),
+                secret: secret("demo-token"),
+                verified_account: profile("demo-upstream"),
+                next_refresh_at: None,
+                enabled: true,
+            })
+            .await;
+        let account = store.account(ACCOUNT).unwrap();
+        let now = SystemTime::now();
+        store.compare_and_swap_quota(QuotaObservation {plan_type:None,account_id:account.id().clone(),expected_revision:account.revision(),observed_at:now,state:QuotaState::allowed(now),quota:OpaqueProviderData::new(json!({"rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{"used_percent":10,"reset_at":Utc::now().timestamp()+18000}}}).as_object().unwrap().clone())}).await.unwrap();
+        let results = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let recorded = Arc::clone(&results);
+        let claimed = Arc::new(AtomicBool::new(false));
+        Mock::given(method("POST"))
+            .respond_with(move |input: &wiremock::Request| {
+                let data: Value = input.body_json().unwrap();
+                let value = match data["action"].as_str().unwrap() {
+                    "config" => json!({"enabled":true,"groupIds":[GROUP],"probeIntervalMs":50,"probeModel":"gpt-6-astra","dynamicGroups":true,"normalGroupId":NORMAL_GROUP,"degradedGroupId":GROUP}),
+                    // 同一代次只领取一次。
+                    "recoveryCheck" => {
+                        if claimed.swap(true, Ordering::SeqCst) {
+                            json!({"check":null})
+                        } else {
+                            json!({"check":{"generation":"g1","gateway":"unified-142","ageSeconds":500}})
+                        }
+                    }
+                    "material" => json!({"state":"old-s0","cookie":"__oailb=a; __cflb=b","expires":Utc::now().timestamp()+600}),
+                    "regroup" => json!({"move":{"eventId":"0123456789abcdef0123456789abcdef","removeGroup":GROUP,"addGroup":NORMAL_GROUP}}),
+                    "regroupResult" | "recoveryResult" => {
+                        recorded.lock().unwrap().push(data.clone());
+                        json!({"accepted":true})
+                    }
+                    _ => json!({"accepted":true}),
+                };
+                ResponseTemplate::new(200).set_body_json(value)
+            })
+            .mount(&runtime)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/codex/responses"))
+            .respond_with(move |input: &wiremock::Request| {
+                let state = input.headers.get("x-codex-turn-state").and_then(|v| v.to_str().ok());
+                let mut response = ResponseTemplate::new(200).insert_header("content-type", "text/event-stream");
+                match state {
+                    // 旧 state 重放。
+                    Some("old-s0") if old_state_returns_state => {
+                        response = response.insert_header("x-codex-turn-state", "new-state");
+                    }
+                    Some("old-s0") => {}
+                    // 带全新 state 的重放：满血。
+                    Some("fresh-state") => {}
+                    // bootstrap：返回 state。
+                    None => {
+                        response = response.insert_header("x-codex-turn-state", "fresh-state");
+                    }
+                    Some(other) => panic!("unexpected state {other}"),
+                }
+                response.set_body_string("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"status\":\"completed\",\"output\":[]}}\n\n")
+            })
+            .mount(&upstream)
+            .await;
+        let mut config = valid_config();
+        let key = config._runtime.path().join("pool.key");
+        std::fs::write(&key, "a".repeat(64)).unwrap();
+        config.config.api.base_url = upstream.uri();
+        config.config.gateway_pool = Some(provider_openai::gateway_pool::GatewayPoolConfig {
+            runtime_url: runtime.uri(),
+            key_file: key,
+            fallback_url: None,
+        });
+        let mover = Arc::new(RecordingMover::default());
+        let ports = provider_ports_with(store, Arc::new(TestOAuthPending::default()))
+            .with_group_mover(mover.clone());
+        let bundle = provider_openai::initialize(config.config.clone(), ports)
+            .await
+            .unwrap();
+        let runner = bundle.gateway_pool_experiment().unwrap();
+        let id = ProviderAccountId::new(ACCOUNT).unwrap();
+        runner.mark_recoverable(&id).await;
+        let cancel = CancellationToken::new();
+        assert!(runner.background(&cancel).await);
+        for _ in 0..100 {
+            let done = results
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|item| item["outcome"].is_string());
+            if done {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // 移组在恢复回报之后异步完成。
+        for _ in 0..50 {
+            if mover.calls.lock().unwrap().len() == usize::from(expect_recovered) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        let reported = results.lock().unwrap().clone();
+        let outcome = reported
+            .iter()
+            .find_map(|item| item["outcome"].as_str())
+            .unwrap_or("none");
+        assert_eq!(
+            outcome,
+            if expect_recovered {
+                "recovered"
+            } else {
+                "failed"
+            },
+            "{reported:?}"
+        );
+        let calls = mover.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), usize::from(expect_recovered));
+        let requests = upstream.received_requests().await.unwrap();
+        if expect_recovered {
+            // 旧 state 重放 1 次 + 两次（bootstrap 加重放）。
+            assert_eq!(requests.len(), 5);
+            assert_eq!(calls[0].remove_group.as_deref(), Some(GROUP));
+            assert_eq!(calls[0].add_group, NORMAL_GROUP);
+        } else {
+            // 旧 state 重放就返回了新 state：不再继续检测。
+            assert_eq!(requests.len(), 1);
+        }
+    }
 }
 
 /// 同一 Key 里别的账号持有窗口、原账号没有窗口时，带 previous_response_id 的续接请求

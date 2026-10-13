@@ -117,6 +117,94 @@ class GatewayPoolTests(unittest.TestCase):
         switch = self.pool.view(account='B')['switches'][0]
         self.assertEqual((switch['fromAccount'], switch['fromGateway']), (None, None))
 
+    def test_dynamic_group_settings_require_two_different_groups_inside_the_pool_scope(self):
+        base = {'groupIds': ['grp_degraded']}
+        for bad in [
+            {'dynamicGroups': True},
+            {'dynamicGroups': True, 'normalGroupId': 'grp_normal'},
+            {'dynamicGroups': True, 'normalGroupId': 'grp_degraded', 'degradedGroupId': 'grp_degraded'},
+            {'dynamicGroups': True, 'normalGroupId': 'grp_normal', 'degradedGroupId': 'grp_other'},
+            {'dynamicGroups': 'yes', 'normalGroupId': 'grp_normal', 'degradedGroupId': 'grp_degraded'},
+            {'normalGroupId': 'bad id'},
+        ]:
+            with self.assertRaises(ValueError):
+                self.pool.configure({**base, **bad})
+        saved = self.pool.configure({**base, 'dynamicGroups': True, 'normalGroupId': 'grp_normal', 'degradedGroupId': 'grp_degraded'})
+        self.assertTrue(saved['dynamicGroups'])
+
+    def test_regroup_records_one_event_per_direction_and_result_closes_it(self):
+        regroup = lambda **data: self.call('regroup', **{'model': 'gpt-6.1-sol', **data})
+        # 未开启：不产生记录。
+        self.assertEqual(regroup(direction='degraded'), {'move': None, 'reason': 'disabled'})
+        self.pool.configure({'groupIds': ['grp_degraded'], 'dynamicGroups': True, 'normalGroupId': 'grp_normal', 'degradedGroupId': 'grp_degraded'})
+        first = regroup(direction='degraded')['move']
+        self.assertEqual((first['removeGroup'], first['addGroup']), ('grp_normal', 'grp_degraded'))
+        # 刚发出还没回报：不重复。
+        self.assertEqual(regroup(direction='degraded')['reason'], 'recent')
+        self.call('regroupResult', eventId=first['eventId'], status='moved')
+        self.now += 100
+        self.assertEqual(regroup(direction='degraded')['reason'], 'recent')
+        # 恢复方向独立，且方向相反。
+        back = regroup(direction='recovered')['move']
+        self.assertEqual((back['removeGroup'], back['addGroup']), ('grp_degraded', 'grp_normal'))
+        # 10 分钟后同方向可以再次移动（账号被手动移回后又降智）。
+        self.now += 601
+        self.assertIsNotNone(regroup(direction='degraded')['move'])
+        events = self.pool.view()['groupEvents']
+        self.assertEqual([e['status'] for e in events if e['direction'] == 'degraded'], ['pending', 'moved'])
+        for bad in [{'direction': 'sideways'}, {'direction': 'degraded', 'model': 'bad model!'}]:
+            with self.assertRaises(ValueError):
+                regroup(**bad)
+        with self.assertRaises(ValueError):
+            self.call('regroupResult', eventId='nope', status='moved')
+        with self.assertRaises(ValueError):
+            self.call('regroupResult', eventId=first['eventId'], status='done')
+
+    def test_recovery_check_needs_eight_minutes_of_full_power_and_pauses_after_failure(self):
+        self.pool.configure({'groupIds': ['grp_degraded'], 'dynamicGroups': True, 'normalGroupId': 'grp_normal', 'degradedGroupId': 'grp_degraded'})
+        # 取一个 21 的窗口，并保存配套材料（Cookie 剩余时间足够长）。
+        claim = self.call('claim', demand=True)
+        self.call('sent', leaseId=claim['leaseId'])
+        self.call('probeResult', leaseId=claim['leaseId'], status=200, stateReturned=False, paired=True, gatewayMatches=True,
+                  material={'state': 's0', 'cookie': '__oailb=x; __cflb=y', 'expires': self.now + 3000})
+        self.call('finish', leaseId=claim['leaseId'])
+        check = lambda: self.call('recoveryCheck')['check']
+        # 不到 8 分钟：不检测。
+        self.now += 479
+        self.assertIsNone(check())
+        self.now += 2
+        first = check()
+        self.assertEqual(first['gateway'], claim['pair']['gateway'])
+        self.assertGreaterEqual(first['ageSeconds'], 480)
+        # 同一代次只领取一次。
+        self.assertIsNone(check())
+        # 检测失败：暂停 1 小时，期间不再领取。
+        paused = self.call('recoveryResult', outcome='failed')
+        self.assertEqual(paused['pausedUntil'], self.now + 3600)
+        self.now += 3599
+        self.assertIsNone(check())
+
+    def test_recovery_check_ignores_generations_with_degraded_signals_or_expired_material(self):
+        self.pool.configure({'groupIds': ['grp_degraded'], 'dynamicGroups': True, 'normalGroupId': 'grp_normal', 'degradedGroupId': 'grp_degraded'})
+        # 这一代出现过 29：不能作为恢复证据。
+        claim = self.call('claim', demand=True)
+        self.call('sent', leaseId=claim['leaseId'])
+        self.call('probeResult', leaseId=claim['leaseId'], status=200, stateReturned=False, paired=True, gatewayMatches=True,
+                  material={'state': 's0', 'cookie': '__oailb=x; __cflb=y', 'expires': self.now + 3000})
+        self.call('finish', leaseId=claim['leaseId'])
+        pair = claim['pair']
+        reserved = self.call('reserve', gateway=pair['gateway'], generation=pair['generation'], deadline=self.now + 100)
+        self.call('sent', leaseId=reserved['leaseId'])
+        self.call('businessResult', leaseId=reserved['leaseId'], status=200, stateReturned=True, paired=True, gatewayMatches=True)
+        self.call('finish', leaseId=reserved['leaseId'])
+        self.now += 600
+        self.assertIsNone(self.call('recoveryCheck')['check'])
+        # 未开启动态分组：始终不领取。
+        self.pool.configure({'dynamicGroups': False})
+        self.assertIsNone(self.call('recoveryCheck')['check'])
+        with self.assertRaises(ValueError):
+            self.call('recoveryResult', outcome='maybe')
+
     def pair(self, account='A', gateway='unified-142'):
         return next(p for p in self.pool.view()['pairs'] if p['accountId']==account and p['gateway']==gateway)
 

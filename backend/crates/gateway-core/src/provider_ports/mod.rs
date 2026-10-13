@@ -1248,6 +1248,33 @@ pub trait OAuthPendingFlowPort: Send + Sync {
     ) -> BoxFuture<'a, Result<OAuthPendingConsumeOutcome, ProviderStoreError>>;
 }
 
+/// 账号分组的自动调整：网关池按降智检测结果，把账号移进或移出降智组。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountGroupMove {
+    pub account: ProviderAccountId,
+    /// 要离开的分组；账号本来不在其中也不算错误。
+    pub remove_group: Option<String>,
+    /// 要加入的分组，必须已存在。
+    pub add_group: String,
+    /// 写入审计的简短原因，不含凭据或原始请求。
+    pub reason: String,
+}
+
+/// 分组调整的结果；成员关系本来就满足要求时不产生配置版本和审计。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountGroupMoveOutcome {
+    Moved,
+    Unchanged,
+}
+
+/// 自动调整账号分组的存储能力，仅改成员关系，不改账号的其他设置。
+pub trait ProviderGroupMovePort: Send + Sync {
+    fn move_account_group<'a>(
+        &'a self,
+        request: &'a AccountGroupMove,
+    ) -> BoxFuture<'a, Result<AccountGroupMoveOutcome, ProviderStoreError>>;
+}
+
 /// Provider 只能按能力取用端口，无法取得 Redis client 或 repository 集合。
 #[derive(Clone)]
 pub struct ProviderStorePorts {
@@ -1262,6 +1289,7 @@ pub struct ProviderStorePorts {
     cooldowns: Arc<dyn ProviderCooldownPort>,
     runtime_policy: Arc<dyn ProviderRuntimePolicyPort>,
     oauth_pending: Arc<dyn OAuthPendingFlowPort>,
+    group_mover: Option<Arc<dyn ProviderGroupMovePort>>,
 }
 
 impl ProviderStorePorts {
@@ -1292,7 +1320,20 @@ impl ProviderStorePorts {
             cooldowns,
             runtime_policy,
             oauth_pending,
+            group_mover: None,
         }
+    }
+
+    /// 启用分组自动调整；没有此端口的部署（含测试）不会移动账号。
+    #[must_use]
+    pub fn with_group_mover(mut self, port: Arc<dyn ProviderGroupMovePort>) -> Self {
+        self.group_mover = Some(port);
+        self
+    }
+
+    #[must_use]
+    pub fn group_mover(&self) -> Option<Arc<dyn ProviderGroupMovePort>> {
+        self.group_mover.as_ref().map(Arc::clone)
     }
 
     #[must_use]

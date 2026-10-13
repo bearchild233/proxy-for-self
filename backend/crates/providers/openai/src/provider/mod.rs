@@ -783,6 +783,8 @@ impl Provider for CodexProvider {
             stream_max_retries: self.stream_max_retries,
             session_capture,
             gateway_pool: pool_enabled.then(|| self.gateway_pool.clone()).flatten(),
+            // 普通账号：HTTP 响应上做降智检测，必要时兜底并自动调整分组。
+            degradation_watch: (!pool_enabled).then(|| self.gateway_pool.clone()).flatten(),
         });
         let stream = ProviderStream::new(metadata, events, lease);
         Ok(if allows_account_state_mutation {

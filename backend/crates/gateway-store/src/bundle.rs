@@ -95,6 +95,8 @@ pub async fn initialize(mut config: StoreConfig) -> StoreResult<StoreBundle> {
         redis_connection.clone(),
         REDIS_NAMESPACE,
     )?);
+    let group_mover: Arc<dyn gateway_core::provider_ports::ProviderGroupMovePort> =
+        provider_accounts.clone();
     let account_store: Arc<dyn ProviderAccountStore> = provider_accounts;
 
     let credential_leases =
@@ -218,7 +220,8 @@ pub async fn initialize(mut config: StoreConfig) -> StoreResult<StoreBundle> {
         cooldowns,
         runtime_policy,
         oauth_pending,
-    );
+    )
+    .with_group_mover(group_mover);
     let worker_leader_lease = Arc::new(redis::worker_lease::RedisWorkerLeaderLeasePort::new(
         credential_leases,
     ));
