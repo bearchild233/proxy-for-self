@@ -61,7 +61,7 @@ def run_policy(root, data, plugin):
     worker = release / entry
     if worker.is_symlink() or hashlib.sha256(worker.read_bytes()).hexdigest() != manifest['resources'][entry]:
         raise ValueError('invalid policy digest')
-    result = subprocess.run([sys.executable, '-I', str(worker)], input=json.dumps(data),
+    result = subprocess.run([sys.executable, '-I', '-B', str(worker)], input=json.dumps(data),
                             capture_output=True, text=True, encoding='utf-8', timeout=3,
                             env={'LANG':'C.UTF-8'}, cwd=release)
     if result.returncode or len(result.stdout) > 131072:

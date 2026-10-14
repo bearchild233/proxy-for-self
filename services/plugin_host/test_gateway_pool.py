@@ -1,8 +1,10 @@
 import hashlib
 import json
 from pathlib import Path
+import sys
 import tempfile
 import unittest
+from unittest import mock
 from concurrent.futures import ThreadPoolExecutor
 
 from gateway_pool import GatewayPool
@@ -46,6 +48,15 @@ class GatewayPoolTests(unittest.TestCase):
         result = self.call('probeResult', leaseId=lease, status=200, stateReturned=state, paired=True, gatewayMatches=True, **data)
         self.call('finish', leaseId=lease)
         return claim['pair'], result
+
+    def test_loading_policy_leaves_no_bytecode_cache_in_release(self):
+        # updater 拒绝激活含未声明文件的版本目录，加载策略不能写 __pycache__。
+        # 按生产默认（未设 PYTHONDONTWRITEBYTECODE）重新加载，避免开发环境变量掩盖问题。
+        self.pool.cached_policy = None
+        with mock.patch.object(sys, 'dont_write_bytecode', False):
+            self.pool.policy()
+        release = self.store.path / 'releases' / ('a'*64)
+        self.assertEqual([], [p.relative_to(release).as_posix() for p in release.rglob('*') if p.is_file() and p.relative_to(release).as_posix() != 'worker/policy.py'])
 
     def test_model_ticket_shares_window_and_expires_with_generation(self):
         self.assertEqual(self.pool.settings_for_ui()['probeModel'], 'gpt-6.1-sol')

@@ -59,7 +59,7 @@ class Jobs:
             worker = self.platform.store.directory(record['pluginId'])/'releases'/record['version']/manifest['worker']
             # 不继承凭据环境。插件属于管理员安装的受信任代码；生产服务另由 systemd 隔离。
             env = {key:os.environ[key] for key in ('SYSTEMROOT','WINDIR','LANG') if key in os.environ}
-            process = subprocess.Popen([sys.executable,'-I','-u',str(worker)],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,cwd=worker.parent,env=env,text=True,encoding='utf-8')
+            process = subprocess.Popen([sys.executable,'-I','-B','-u',str(worker)],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,cwd=worker.parent,env=env,text=True,encoding='utf-8')
             lines = queue.Queue(maxsize=16)
             def read():
                 try:

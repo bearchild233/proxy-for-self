@@ -1,12 +1,12 @@
 """持久化网关池事实与统计。SQLite 事务同时保护线程及 A/B 网关进程。"""
 from contextlib import contextmanager
 import hashlib
-import importlib.util
 import json
 from pathlib import Path
 import re
 import sqlite3
 import time
+import types
 from urllib.parse import urlsplit
 import uuid
 import gateway_pool_history as history
@@ -80,11 +80,14 @@ class GatewayPool:
         manifest = self.store.manifest('gateway-pool', version)
         entry = 'worker/policy.py'
         path = self.store.directory('gateway-pool') / 'releases' / version / entry
-        if manifest.get('policyWorker') != entry or path.is_symlink() or hashlib.sha256(path.read_bytes()).hexdigest() != manifest['resources'][entry]:
+        source = None if path.is_symlink() else path.read_bytes()
+        if manifest.get('policyWorker') != entry or source is None or hashlib.sha256(source).hexdigest() != manifest['resources'][entry]:
             raise ValueError('网关池策略校验失败')
-        spec = importlib.util.spec_from_file_location('gateway_pool_policy_' + version, path)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        # 直接执行已校验的字节，不经 import 机制：既不在版本目录写 __pycache__
+        # （updater 会以未声明文件拒绝激活），也不会在校验后重新读到被替换的文件。
+        module = types.ModuleType('gateway_pool_policy_' + version)
+        module.__file__ = str(path)
+        exec(compile(source, str(path), 'exec'), module.__dict__)
         self.cached_policy = version, module
         return module
 
