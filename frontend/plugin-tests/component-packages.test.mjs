@@ -11,6 +11,7 @@ import * as columns from '../src/components/base/BaseTable/columns.ts'
 test('actual component packages share Vue and prepare without business calls', async () => {
   const root = new URL('../../.build/plugins/', import.meta.url)
   let checked = 0
+  let serviceOnly = 0
   const ids = process.env.PLUGIN_ID
     ? [process.env.PLUGIN_ID]
     : await readdir(root)
@@ -24,8 +25,12 @@ test('actual component packages share Vue and prepare without business calls', a
     catch {
       continue
     }
-    if (manifest.runtime !== 'vue-component')
+    if (manifest.runtime !== 'vue-component') {
+      // 纯服务插件没有界面组件包，单插件检查时计为已处理。
+      if (process.env.PLUGIN_ID && manifest.service)
+        serviceOnly++
       continue
+    }
     const source = await readFile(
       new URL(`${id}/package/ui/module.js`, root),
       'utf8',
@@ -92,5 +97,5 @@ test('actual component packages share Vue and prepare without business calls', a
     assert.equal(calls, 0, `${id} must not fetch business data before opening`)
     checked++
   }
-  assert.equal(checked, process.env.PLUGIN_ID ? 1 : 12)
+  assert.equal(checked + serviceOnly, process.env.PLUGIN_ID ? 1 : 12)
 })
