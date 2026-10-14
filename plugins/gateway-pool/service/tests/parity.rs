@@ -134,7 +134,11 @@ fn python_expectations_match_rust_plugin() {
     let fresh =
         Store::open(scratch.path(), ManualClock::new(10_000.0).clock()).expect("open fresh store");
     drop(fresh);
-    let rust_schema = schema_of(&scratch.path().join(gateway_pool::DB_FILE));
+    let mut rust_schema = schema_of(&scratch.path().join(gateway_pool::DB_FILE));
+    // gp_hook_leases 是 011 新增、只属于 Rust 插件的接管事实表，Python 实现没有对应的表；其结构由 storage 测试核对。
+    if let Some(entries) = rust_schema.as_array_mut() {
+        entries.retain(|entry| entry["name"] != "gp_hook_leases");
+    }
     total += 1;
     let schema_match = rust_schema == document["schema"];
     if !schema_match {
