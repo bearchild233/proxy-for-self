@@ -23,3 +23,7 @@ python3.10 plugins/gateway-pool/service/tests/parity/gen_runtime.py verify-rust 
 `gen_python.py` 用法相同（对应 `--test parity`）。第一步用 Python 写出期望，第二步 Rust 重放并写出自己的数据库，
 第三步 Python 读取 Rust 写出的数据库再比较一次。请求路径钩子（010）不在对照范围内：
 钩子是新增的编排，没有 Python 对应物，其行为由 `tests/hooks_*.rs` 和内核侧端到端测试覆盖。
+
+`runtime_parity` 唯一承认的有意差异是 012 加入的“恢复检测领取超过 5 分钟没有结果可重新领取”（Python 同一代次只领取一次）：
+只有 `recoveryCheck` 步骤满足全部判据时才算，序列末尾的数据库差异只限这些账号的 `recovery_checks.claimed_at`。
+判据见 `tests/runtime_parity.rs` 文件头；每次放过的步骤与字段写进产物目录的 `runtime-parity-intentional.json`。
