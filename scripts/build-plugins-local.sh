@@ -28,8 +28,10 @@ echo $$ > "$group/cgroup.procs"
 # backend 镜像复用既有入口，但不构建其余 backend 成员。
 mkdir -p /work/proxy-for-self/backend /work/proxy-for-self/plugins /work/proxy-for-self/plugins-target
 rsync -a --delete --exclude /target --chown=builder:builder "$src/backend/" /work/proxy-for-self/backend/
+# 只同步 workspace 成员：sdk/ 与各插件的 service/ 服务 crate（约定位置 plugins/<插件ID>/service/）。
 rsync -a --delete --exclude target --exclude node_modules \
-    --include /Cargo.toml --include /Cargo.lock --include /sdk/ --include '/sdk/***' --exclude '*' \
+    --include /Cargo.toml --include /Cargo.lock --include /sdk/ --include '/sdk/***' \
+    --include '/*/' --include '/*/service/' --include '/*/service/***' --exclude '*' \
     --chown=builder:builder "$src/plugins/" /work/proxy-for-self/plugins/
 chown builder:builder /work/proxy-for-self/plugins-target
 cd /work/proxy-for-self/plugins

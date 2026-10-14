@@ -1,4 +1,6 @@
 import { createHash } from 'node:crypto'
+import { execFileSync } from 'node:child_process'
+import { existsSync } from 'node:fs'
 import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -13,9 +15,59 @@ const pluginRoot = path.join(root, 'plugins', id)
 const manifest = JSON.parse(await readFile(path.join(pluginRoot, 'plugin.json'), 'utf8'))
 if (manifest.id !== id || manifest.protocol !== 2 || manifest.kind !== 'ui')
   throw new Error('Unsupported plugin manifest')
+const output = path.join(root, '.build', 'plugins', id)
+const packageDir = path.resolve(output, 'package')
+if (!packageDir.startsWith(path.resolve(root, '.build/plugins') + path.sep)) throw new Error('Invalid package path')
+
+// 服务插件的 Rust crate 约定位于 plugins/<插件ID>/service/Cargo.toml，并由 plugins/Cargo.toml workspace 管理。
+const serviceCrate = path.join(pluginRoot, 'service', 'Cargo.toml')
+if (existsSync(serviceCrate) !== Boolean(manifest.service))
+  throw new Error('服务 crate 与 plugin.json 的 service 段必须同时存在或同时缺失')
+const wslDistribution = process.env.CPR_WSL_DISTRO || 'ApiHubBuild-20260928'
+
+// Windows 路径转为 WSL 挂载路径（例如 D:\\a\\b -> /mnt/d/a/b）。
+function toWsl(value) {
+  const match = /^([A-Za-z]):[\\/](.*)$/.exec(value)
+  return match ? `/mnt/${match[1].toLowerCase()}/${match[2].replaceAll('\\', '/')}` : value.replaceAll('\\', '/')
+}
+
+// 按本机 WSL 入口构建服务二进制（release），再把 WSL target 中的文件取到包目录并写入哈希。
+// 只校验文件头格式；内核与 updater 会各自重新校验，不信任这里的结果。
+async function addServiceBinary(serviceManifest, destination) {
+  const binary = serviceManifest.service.binary
+  if (!/^service\/[a-z][a-z0-9_-]*$/.test(binary)) throw new Error('Invalid service binary path')
+  const name = binary.slice('service/'.length)
+  const crate = await readFile(serviceCrate, 'utf8')
+  const declared = /^name\s*=\s*"([^"]+)"/m.exec(crate)?.[1]
+  if (declared !== name) throw new Error('服务 crate 的包名必须与 service.binary 的文件名一致')
+  const linuxRoot = toWsl(root)
+  const script = `${linuxRoot}/scripts/build-plugins-local.sh`
+  execFileSync('wsl.exe', ['-d', wslDistribution, '-u', 'root', '--', 'bash', script, linuxRoot, '4096', '3', 'release', name], { stdio: 'inherit' })
+  const built = `/work/proxy-for-self/plugins-target/release/${name}`
+  const target = path.join(destination, binary)
+  await mkdir(path.dirname(target), { recursive: true })
+  execFileSync('wsl.exe', ['-d', wslDistribution, '-u', 'root', '--', 'cp', built, toWsl(target)], { stdio: 'inherit' })
+  const data = await readFile(target)
+  const elf = data.length >= 20 && data.readUInt32BE(0) === 0x7f454c46 && data[4] === 2 && data[5] === 1
+    && [2, 3].includes(data.readUInt16LE(16)) && data.readUInt16LE(18) === 62
+  if (!elf) throw new Error('构建产物不是 x86-64 ELF 可执行文件')
+  return createHash('sha256').update(data).digest('hex')
+}
+
+if (!existsSync(path.join(pluginRoot, 'ui/entries.json'))) {
+  // 纯服务插件：没有界面代码，包只含清单、许可证与服务二进制。
+  await rm(packageDir, { recursive: true, force: true })
+  await mkdir(packageDir, { recursive: true })
+  manifest.resources = {}
+  const license = await readFile(path.join(root, 'LICENSE'), 'utf8')
+  await writeFile(path.join(packageDir, 'LICENSE'), license)
+  manifest.resources.LICENSE = createHash('sha256').update(license).digest('hex')
+  manifest.resources[manifest.service.binary] = await addServiceBinary(manifest, packageDir)
+  await writeFile(path.join(packageDir, 'plugin.json'), `${JSON.stringify(manifest, null, 2)}\n`)
+  process.stdout.write(`${JSON.stringify({ id, version: manifest.version, directory: packageDir, bytes: 0, runtime: 'service', gatewayBuild: false })}\n`)
+} else {
 const component = manifest.runtime === 'vue-component'
 const entries = JSON.parse(await readFile(path.join(pluginRoot, 'ui/entries.json'), 'utf8'))
-const output = path.join(root, '.build', 'plugins', id)
 const frontend = path.join(root, 'frontend')
 const require = createRequire(path.join(frontend, 'package.json'))
 const sdk = path.join(root, 'packages/plugin-sdk')
@@ -80,8 +132,6 @@ const files = await readdir(compiled)
 const css = (await Promise.all(files.filter(file => file.endsWith('.css')).map(file => readFile(path.join(compiled, file), 'utf8')))).join('\n')
 const js = await readFile(path.join(compiled, 'main.js'), 'utf8')
 const html = `<!doctype html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>${css.replaceAll('</style', '<\\/style')}</style></head><body><div id="app"></div><script>${js.replaceAll('</script', '<\\/script')}</script></body></html>`
-const packageDir = path.resolve(output, 'package')
-if (!packageDir.startsWith(path.resolve(root, '.build/plugins') + path.sep)) throw new Error('Invalid package path')
 await rm(packageDir, { recursive: true, force: true })
 await mkdir(path.join(packageDir, 'ui'), { recursive: true })
 // Component packages export a factory; preloading does not mount pages or run their API calls.
@@ -116,5 +166,7 @@ for (const entry of [manifest.worker, manifest.policyWorker].filter(Boolean)) {
   await writeFile(path.join(output, 'package', entry), worker)
   manifest.resources[entry] = createHash('sha256').update(worker).digest('hex')
 }
+if (manifest.service) manifest.resources[manifest.service.binary] = await addServiceBinary(manifest, packageDir)
 await writeFile(path.join(output, 'package/plugin.json'), `${JSON.stringify(manifest, null, 2)}\n`)
 process.stdout.write(`${JSON.stringify({ id, version: manifest.version, directory: path.join(output, 'package'), bytes: Buffer.byteLength(content), runtime: manifest.runtime || 'iframe', gatewayBuild: false })}\n`)
+}

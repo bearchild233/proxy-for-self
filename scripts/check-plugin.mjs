@@ -1,4 +1,5 @@
 import { mkdir, readFile, writeFile, unlink } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 import { spawnSync } from 'node:child_process'
@@ -8,6 +9,10 @@ const id = process.argv[2]
 if (!/^[a-z][a-z0-9-]{0,63}$/.test(id || '')) throw new Error('Invalid plugin ID')
 const manifest = JSON.parse(await readFile(path.join(root, 'plugins', id, 'plugin.json'), 'utf8'))
 if (manifest.id !== id) throw new Error('Plugin ID mismatch')
+if (!existsSync(path.join(root, 'plugins', id, 'ui/entries.json'))) {
+  // 纯服务插件没有界面代码，类型检查不适用；服务 crate 由 cargo 检查。
+  process.stdout.write(`${id}: no UI sources, skipped vue-tsc\n`)
+} else {
 await mkdir(path.join(root, '.build'), { recursive: true })
 const config = path.join(root, '.build', `check-${id}.json`)
 await writeFile(config, JSON.stringify({
@@ -20,3 +25,4 @@ try {
   process.exitCode = result.status || (result.error ? 1 : 0)
 }
 finally { await unlink(config) }
+}

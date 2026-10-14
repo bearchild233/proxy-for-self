@@ -1,0 +1,18 @@
+{
+  "id": "example-echo",
+  "name": "TODO(design): 示例回显服务",
+  "description": "TODO(design): 服务插件打包与监督的示例，不进入生产预装列表。",
+  "version": "0.1.0",
+  "protocol": 2,
+  "kind": "ui",
+  "pages": [],
+  "capabilities": ["example-echo.echo"],
+  "service": {
+    "binary": "service/example-echo",
+    "kernelApi": {"major": 0, "minMinor": 5},
+    "capabilities": ["log"],
+    "fetchHosts": [],
+    "memoryMax": "64M",
+    "shutdownSeconds": 30
+  }
+}

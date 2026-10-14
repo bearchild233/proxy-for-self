@@ -58,7 +58,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         kernel_api: PluginApi {
             major: KERNEL_API.0,
-            min_minor: 4,
+            // 管理连接（hello.role = admin）自 0.5 起存在；清单 kernelApi.minMinor 与此保持一致。
+            min_minor: 5,
         },
         hooks: vec![
             "route.select".into(),

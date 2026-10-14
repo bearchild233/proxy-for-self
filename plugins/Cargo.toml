@@ -1,5 +1,5 @@
 [workspace]
-members = ["sdk/plugin-sdk", "sdk/example-echo", "sdk/plugin-bench"]
+members = ["sdk/plugin-sdk", "example-echo/service", "sdk/plugin-bench"]
 resolver = "3"
 
 [workspace.package]

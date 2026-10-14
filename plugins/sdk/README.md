@@ -7,7 +7,7 @@ workspace 继承，不从消费它的 plugins workspace 继承。两个 workspac
 
 ## 编写插件
 
-实现 `Plugin`，参照 `example-echo/src/main.rs`。方法返回 `Send` future，可以用 `async fn`
+实现 `Plugin`，参照 `example-echo/service/src/main.rs`（服务插件的 crate 位于 `plugins/<插件ID>/service/`）。方法返回 `Send` future，可以用 `async fn`
 实现。默认 `health` 返回 ready，`response.observe` 返回 accept；其他 hook 默认返回 `not_supported`。`request.finish` 是
 通知，其处理错误不会产生响应。通用请求错误使用协议的六个标准码。
 
