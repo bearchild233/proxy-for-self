@@ -1,5 +1,11 @@
 # proxy-for-self 维护约定
 
+proxy-for-self 是自用的 OpenAI/xAI 推理网关：Rust 主网关（`backend/`）、Vue 管理主壳（`frontend/`）、Python 插件控制面与更新器（`services/`）、按包热更新的插件（`plugins/`）。正在按 [微内核设计](docs/microkernel.md) 把业务功能迁到插件。和用户交流使用中文。
+
+提交：只 `git add` 具体文件，不用 `git add -A`/`.`；提交信息沿用 `type(scope): 英文说明`；不加 AI 署名。不 push，不做生产部署或 VPS 操作，除非用户在对话中明确授权。
+
+验证节奏：一批改动做完验证一次，只验证改动涉及的部分；没改 Rust 不编译 Rust，没改行为不跑测试；全量测试、clippy、fmt 只在阶段收尾运行。等待后台构建或测试时不用 sleep 轮询。
+
 - 从仓库根目录工作。开始修改前核对分支、工作区、worktree 和正在运行的维护任务。
 - 本目录是独立主仓库；不要依赖旧 excel-bridge/research 布局或开发者绝对路径。
 - 保持 API → Admin/Core → Store 分层；先读 docs/architecture.md 和 CONTRIBUTING.md。
@@ -15,7 +21,7 @@
 - VPS 有独立管理 bot。生产变更后同步 `/root/维护手册/`：README 作入口、07 章记协同操作、10 章记当前配置、08 章记恢复材料。文档直接陈述当前事实和操作步骤，过时内容删除，省略修改经过及纠错对比。写操作先检查运行中的更新/恢复任务，按同一维护流程协调。
 
 - 修改共享数据库行解析字段时，逐一核对所有 SELECT 调用方，并运行受影响模块已有的真实数据库测试（含分组成员等间接入口）。
-- Windows 本地 Rust 检查与编译优先使用 `scripts/build-local.ps1`，复用 WSL Linux 磁盘里的源码镜像和 target；按改动选择包。不要复用 `.build` 中旧的一次性构建脚本或关闭开发增量缓存。该入口不部署；正式发布仍走发布流程。
+- Windows 本地 Rust 检查与编译优先使用 `scripts/build-local.ps1`，复用 WSL Linux 磁盘里的源码镜像和 target；按改动选择包。PowerShell 执行策略拦截该入口时，用 `wsl.exe -d ApiHubBuild-20260928` 直接调用 `scripts/build-local.sh <仓库路径> 4096 3 <任务> <包...>`。不要复用 `.build` 中旧的一次性构建脚本或关闭开发增量缓存。该入口不部署；正式发布仍走发布流程。
 
 - 小幅界面文案及已有布局的显示细节修正，完成轻量验证后可直接热更新上线。较大布局或交互修改先展示具体预览并取得确认；后端实现和轻量验证可继续推进。部署或预览确认不代表 GitHub push 授权。
 - 全面插件化迁移先在独立端口、独立数据的测试环境部署验证，再供用户查看；只有用户确认测试结果后才能上线生产。不得把方案或外观确认当成生产部署授权。
@@ -26,6 +32,8 @@
 | 文档 | 内容 |
 | --- | --- |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | 工具链、本地构建与检查入口 |
+| [docs/microkernel.md](docs/microkernel.md) | 微内核插件架构、钩子与能力、插件生命周期、分期计划 |
+| [docs/gateway-pool.md](docs/gateway-pool.md) | 网关池规则、术语与判据 |
 | [docs/architecture.md](docs/architecture.md) | Rust 分层、冷流执行、调度与数据约束 |
 | [docs/api.md](docs/api.md) | 管理接口、字段、权限与账号生命周期 |
 | [docs/plugin-migration.md](docs/plugin-migration.md) | 插件 UI 包、能力授权、租约和热更新 |

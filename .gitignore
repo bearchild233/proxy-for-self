@@ -56,3 +56,6 @@ __pycache__/
 *.tar.gz
 plugins/excel-bridge/build/
 plugins/excel-bridge/dist/
+
+# Codex 派发记录
+.codex-runs/
