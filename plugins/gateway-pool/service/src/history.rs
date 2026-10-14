@@ -80,6 +80,68 @@ pub fn write_window(db: &Connection, item: &Object) -> Result<(), Failure> {
     Ok(())
 }
 
+/// `begin`：探测开始时登记窗口；账号没有进行中的批次时开启新批次（批次号递增）。
+pub fn begin(db: &Connection, pair: &Object, gateways: &[String], now: Num) -> Result<(), Failure> {
+    let account = str_field(pair, "accountId").unwrap_or_default();
+    let generation = str_field(pair, "generation").unwrap_or_default();
+    let previous = one(
+        db,
+        "SELECT * FROM gp_batches WHERE account=? ORDER BY number DESC LIMIT 1",
+        vec![text(account)],
+    )?;
+    let (batch_id, number) = match previous {
+        Some(row) if str_field(&row, "status") == Some("active") => (
+            string_of(&row, "id"),
+            num_field(&row, "number").unwrap_or(Num::Int(0)),
+        ),
+        previous => {
+            let number = previous
+                .as_ref()
+                .and_then(|row| num_field(row, "number"))
+                .map_or(Num::Int(1), |number| number.plus(Num::Int(1)));
+            let candidates: std::collections::BTreeSet<&String> = gateways.iter().collect();
+            exec(
+                db,
+                "INSERT INTO gp_batches VALUES (?,?,?,?,NULL,?,?,?,NULL)",
+                vec![
+                    text(generation),
+                    text(account),
+                    sql_of_num(number),
+                    sql_of_num(now),
+                    text("active"),
+                    text(&encode(&json!(candidates))),
+                    text("{}"),
+                ],
+            )?;
+            (generation.to_owned(), number)
+        }
+    };
+    let mut window = Object::new();
+    for (key, value) in [
+        ("id", json!(generation)),
+        ("accountId", json!(account)),
+        (
+            "gateway",
+            pair.get("gateway").cloned().unwrap_or(Value::Null),
+        ),
+        ("batchId", json!(batch_id)),
+        ("batchNumber", number.to_json()),
+        ("preparationStartedAt", now.to_json()),
+        ("probeEndedAt", Value::Null),
+        ("probeResult", Value::Null),
+        ("firstContactAt", Value::Null),
+        ("verifiedAt", Value::Null),
+        ("retiredAt", Value::Null),
+        ("drainedAt", Value::Null),
+        ("state", json!("preparing")),
+        ("reason", Value::Null),
+        ("incomplete", json!(false)),
+    ] {
+        set(&mut window, key, value);
+    }
+    write_window(db, &window)
+}
+
 pub fn interrupt(db: &Connection, now: Num, reason: &str) -> Result<(), Failure> {
     exec(
         db,
@@ -374,6 +436,332 @@ fn sync_cooling(db: &Connection, pair: &Object, item: &Object) -> Result<(), Fai
             )?
         }
     };
+    Ok(())
+}
+
+/// `sent`：记录一次实际发出的访问；缺少新版计时标识的旧调用按 legacy 处理（缺口、不计时长）。
+pub fn sent(db: &Connection, lease: &Object, payload: &Object, now: Num) -> Result<(), Failure> {
+    let mut kind = match payload.get("purpose") {
+        Some(Value::String(purpose))
+            if matches!(
+                purpose.as_str(),
+                "business" | "ticket" | "bootstrap" | "replay"
+            ) =>
+        {
+            purpose.clone()
+        }
+        // Python 用集合判断成员，不可哈希的列表与对象会抛出 TypeError，由 `record` 记为缺口。
+        Some(Value::Array(_) | Value::Object(_)) => {
+            return Err(Failure::Internal("unhashable type".to_owned()));
+        }
+        _ => "legacy".to_owned(),
+    };
+    let timing_v2 = matches!(payload.get("timingVersion"), Some(Value::Number(number)) if number.as_f64() == Some(2.0));
+    let access_id = match payload.get("accessId") {
+        Some(Value::String(id)) if timing_v2 && (1..=80).contains(&id.chars().count()) => {
+            id.clone()
+        }
+        _ => {
+            kind = "legacy".to_owned();
+            format!("legacy:{}", string_of(lease, "id"))
+        }
+    };
+    close_idle(db, now, str_field(lease, "generation"))?;
+    exec(
+        db,
+        "INSERT OR IGNORE INTO gp_accesses(id,lease,generation,kind,observed,incomplete) VALUES (?,?,?,?,?,?)",
+        vec![
+            text(&access_id),
+            text(&string_of(lease, "id")),
+            text(&string_of(lease, "generation")),
+            text(&kind),
+            sql_of_num(now),
+            rusqlite::types::Value::Integer(i64::from(kind == "legacy")),
+        ],
+    )?;
+    Ok(())
+}
+
+/// 当前周期（未恢复）的最新记录。
+fn open_cycle(db: &Connection, account: &str, gateway: &str) -> Result<Option<Object>, Failure> {
+    one(
+        db,
+        "SELECT * FROM gp_cooling WHERE account=? AND gateway=? AND recovered IS NULL ORDER BY id DESC LIMIT 1",
+        vec![text(account), text(gateway)],
+    )
+}
+
+fn window_item(db: &Connection, generation: &str) -> Result<Option<Object>, Failure> {
+    match one(
+        db,
+        "SELECT data FROM gp_windows WHERE id=?",
+        vec![text(generation)],
+    )? {
+        Some(row) => Ok(Some(decode_object(&string_of(&row, "data"))?)),
+        None => Ok(None),
+    }
+}
+
+/// `report`：用网关回报的计时补全访问事实（起止时间、分段、窗口首次接触与静置步骤的探测时间）。
+pub fn report(db: &Connection, lease: &Object, payload: &Object, now: Num) -> Result<(), Failure> {
+    let Some(Value::Object(access)) = payload.get("access") else {
+        return Ok(());
+    };
+    let Some(row) = one(
+        db,
+        "SELECT * FROM gp_accesses WHERE id=? AND lease=?",
+        vec![
+            sql_of(access.get("id").unwrap_or(&Value::Null)),
+            text(&string_of(lease, "id")),
+        ],
+    )?
+    else {
+        return Ok(());
+    };
+    if !is_null_or_missing(&row, "ended") {
+        return Ok(());
+    }
+    let (Some(start), Some(elapsed)) = (
+        num_field(access, "startedAt"),
+        num_field(access, "elapsedMs"),
+    ) else {
+        return Failure::invalid("访问计时无效");
+    };
+    let observed = num_field(&row, "observed").map_or(0.0, Num::as_f64);
+    let (start_f, elapsed_f, now_f) = (start.as_f64(), elapsed.as_f64(), now.as_f64());
+    if !(0.0..=86_400_000.0).contains(&elapsed_f)
+        || !(observed - 5.0 <= start_f && start_f <= now_f + 5.0)
+        || start_f + elapsed_f / 1000.0 > now_f + 5.0
+    {
+        return Failure::invalid("访问计时超出范围");
+    }
+    let end = (access.get("ended") == Some(&Value::Bool(true)))
+        .then(|| Num::Float(start_f + elapsed_f / 1000.0));
+    let outcome = match access.get("outcome") {
+        Some(Value::String(outcome))
+            if matches!(
+                outcome.as_str(),
+                "completed" | "failed" | "cancelled" | "interrupted" | "rejected" | "headers"
+            ) =>
+        {
+            outcome.clone()
+        }
+        Some(Value::Array(_) | Value::Object(_)) => {
+            return Err(Failure::Internal("unhashable type".to_owned()));
+        }
+        _ => "interrupted".to_owned(),
+    };
+    let generation = string_of(lease, "generation");
+    let mut segment = str_field(&row, "segment")
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_owned);
+    if str_field(&row, "kind") == Some("business") && segment.is_none() {
+        let previous = one(
+            db,
+            "SELECT * FROM gp_segments WHERE generation=? AND (closed IS NULL OR closed>?) ORDER BY started DESC LIMIT 1",
+            vec![text(&generation), sql_of_num(start)],
+        )?;
+        if let Some(previous) = previous {
+            let id = string_of(&previous, "id");
+            exec(
+                db,
+                "UPDATE gp_segments SET started=MIN(started,?) WHERE id=?",
+                vec![sql_of_num(start), text(&id)],
+            )?;
+            segment = Some(id);
+        } else {
+            let id = string_of(&row, "id");
+            let item = window_item(db, &generation)?.unwrap_or_default();
+            exec(
+                db,
+                "INSERT INTO gp_segments VALUES (?,?,?,NULL,?,?)",
+                vec![
+                    text(&id),
+                    text(&generation),
+                    sql_of_num(start),
+                    sql_of(item.get("retiredAt").unwrap_or(&Value::Null)),
+                    sql_of(item.get("reason").unwrap_or(&Value::Null)),
+                ],
+            )?;
+            segment = Some(id);
+        }
+    }
+    exec(
+        db,
+        "UPDATE gp_accesses SET started=?,ended=?,elapsed=?,segment=?,outcome=?,status=COALESCE(?,status),classification=COALESCE(?,classification) WHERE id=?",
+        vec![
+            sql_of_num(start),
+            end.map_or(rusqlite::types::Value::Null, sql_of_num),
+            rusqlite::types::Value::Real(elapsed_f / 1000.0),
+            segment
+                .as_deref()
+                .map_or(rusqlite::types::Value::Null, text),
+            text(&outcome),
+            sql_of(payload.get("status").unwrap_or(&Value::Null)),
+            sql_of(payload.get("classification").unwrap_or(&Value::Null)),
+            text(&string_of(&row, "id")),
+        ],
+    )?;
+    if let (Some(segment), Some(end)) = (&segment, end) {
+        exec(
+            db,
+            "UPDATE gp_segments SET last_end=MAX(COALESCE(last_end,0),?) WHERE id=?",
+            vec![sql_of_num(end), text(segment)],
+        )?;
+    }
+    if let Some(mut item) = window_item(db, &generation)? {
+        let first = match num_field(&item, "firstContactAt") {
+            Some(first) => first.min(start),
+            None => start,
+        };
+        set(&mut item, "firstContactAt", first.to_json());
+        write_window(db, &item)?;
+    }
+    if str_field(lease, "kind") == Some("probe") {
+        let account = string_of(lease, "account");
+        let gateway = string_of(lease, "gateway");
+        if let Some(cycle) = open_cycle(db, &account, &gateway)? {
+            let mut data = decode_object(&string_of(&cycle, "data"))?;
+            let step = last_step(&mut data)?;
+            if is_null_or_missing(step, "probeAt") {
+                set(step, "probeAt", start.to_json());
+                set(step, "generation", json!(generation));
+                exec(
+                    db,
+                    "UPDATE gp_cooling SET data=? WHERE id=?",
+                    vec![
+                        text(&encode(&Value::Object(data))),
+                        sql_of(cycle.get("id").unwrap_or(&Value::Null)),
+                    ],
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 静置周期的最后一步；周期没有步骤时对应 Python 的 `IndexError`。
+fn last_step(data: &mut Object) -> Result<&mut Object, Failure> {
+    data.get_mut("steps")
+        .and_then(Value::as_array_mut)
+        .and_then(|steps| steps.last_mut())
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| Failure::Internal("静置周期缺少步骤".to_owned()))
+}
+
+/// `finish`：租约结束时补全最后一次回报；没有收到结束回报的访问标为缺口（不伪造时长）。
+pub fn finish(
+    db: &Connection,
+    lease: &Object,
+    payload: &Object,
+    now: Num,
+    incomplete: bool,
+) -> Result<(), Failure> {
+    report(db, lease, payload, now)?;
+    let lease_id = string_of(lease, "id");
+    exec(
+        db,
+        "UPDATE gp_accesses SET incomplete=1,outcome=COALESCE(outcome,?) WHERE lease=? AND ended IS NULL",
+        vec![text("interrupted"), text(&lease_id)],
+    )?;
+    let missing = incomplete
+        || one(
+            db,
+            "SELECT 1 FROM gp_accesses WHERE lease=? AND incomplete=1 LIMIT 1",
+            vec![text(&lease_id)],
+        )?
+        .is_some();
+    if missing && let Some(mut item) = window_item(db, &string_of(lease, "generation"))? {
+        set(&mut item, "incomplete", json!(true));
+        write_window(db, &item)?;
+    }
+    Ok(())
+}
+
+/// `result`：探测结果写入窗口与静置步骤。`verdict` 为 None 表示检测失败。
+pub fn result(
+    db: &Connection,
+    lease: &Object,
+    payload: &Object,
+    verdict: Option<&str>,
+    now: Num,
+) -> Result<(), Failure> {
+    let mut reported = payload.clone();
+    set(
+        &mut reported,
+        "classification",
+        verdict.map_or(Value::Null, |verdict| json!(verdict)),
+    );
+    report(db, lease, &reported, now)?;
+    if str_field(lease, "kind") != Some("probe") {
+        return Ok(());
+    }
+    let generation = string_of(lease, "generation");
+    if let Some(mut item) = window_item(db, &generation)? {
+        set(&mut item, "probeEndedAt", now.to_json());
+        set(&mut item, "probeResult", json!(verdict.unwrap_or("failed")));
+        if let Some(duration) = num_field(payload, "durationMs")
+            && (0.0..=60_000.0).contains(&duration.as_f64())
+        {
+            let seconds = duration.as_f64() / 1000.0;
+            set(&mut item, "preparationSeconds", json!(seconds));
+            let started = num_field(&item, "preparationStartedAt").map_or(0.0, Num::as_f64);
+            if let Some(measured) = num_field(payload, "preparationStartedAt")
+                && started - 5.0 <= measured.as_f64()
+                && measured.as_f64() <= now.as_f64()
+            {
+                set(&mut item, "preparationMeasuredAt", measured.to_json());
+                set(
+                    &mut item,
+                    "probeEndedAt",
+                    json!(measured.as_f64() + seconds),
+                );
+            }
+        }
+        // 旧网关仅掌握许可时间，历史窗口保留缺口，不伪造实际访问时间。
+        if truthy(lease.get("sent")) && is_null_or_missing(&item, "firstContactAt") {
+            set(&mut item, "incomplete", json!(true));
+        }
+        write_window(db, &item)?;
+    }
+    let account = string_of(lease, "account");
+    let gateway = string_of(lease, "gateway");
+    if let Some(cycle) = open_cycle(db, &account, &gateway)?
+        && truthy(lease.get("sent"))
+    {
+        let mut data = decode_object(&string_of(&cycle, "data"))?;
+        let step = last_step(&mut data)?;
+        if is_null_or_missing(step, "resultAt") {
+            let last = one(
+                db,
+                "SELECT MAX(ended) AS ended FROM gp_accesses WHERE generation=?",
+                vec![text(&generation)],
+            )?
+            .and_then(|row| row.get("ended").cloned())
+            .unwrap_or(Value::Null);
+            let observed = if last.is_null() { now.to_json() } else { last };
+            set(step, "resultAt", observed.clone());
+            set(step, "result", json!(verdict.unwrap_or("failed")));
+            set(
+                step,
+                "status",
+                payload.get("status").cloned().unwrap_or(Value::Null),
+            );
+            exec(
+                db,
+                "UPDATE gp_cooling SET data=?,recovered=? WHERE id=?",
+                vec![
+                    text(&encode(&Value::Object(data))),
+                    if verdict == Some("21") {
+                        sql_of(&observed)
+                    } else {
+                        rusqlite::types::Value::Null
+                    },
+                    sql_of(cycle.get("id").unwrap_or(&Value::Null)),
+                ],
+            )?;
+        }
+    }
     Ok(())
 }
 

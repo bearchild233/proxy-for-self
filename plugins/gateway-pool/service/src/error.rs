@@ -2,12 +2,14 @@
 
 use std::fmt;
 
-use plugin_sdk::protocol::{INTERNAL, INVALID_PARAMS, NOT_SUPPORTED, RpcError};
+use plugin_sdk::protocol::{FORBIDDEN, INTERNAL, INVALID_PARAMS, NOT_SUPPORTED, RpcError};
 
 #[derive(Debug)]
 pub enum Failure {
     /// 参数或状态不符合规则；消息与 Python 实现一致。
     Invalid(String),
+    /// 对应 Python 的 `PermissionError`（例如插件未启用）；消息与 Python 实现一致。
+    Forbidden(String),
     /// 未注册的管理方法。
     NotSupported(String),
     /// 数据库、序列化等内部故障。
@@ -23,9 +25,10 @@ impl Failure {
 impl fmt::Display for Failure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Invalid(message) | Self::NotSupported(message) | Self::Internal(message) => {
-                formatter.write_str(message)
-            }
+            Self::Invalid(message)
+            | Self::Forbidden(message)
+            | Self::NotSupported(message)
+            | Self::Internal(message) => formatter.write_str(message),
         }
     }
 }
@@ -54,6 +57,7 @@ impl From<Failure> for RpcError {
     fn from(failure: Failure) -> Self {
         match failure {
             Failure::Invalid(message) => RpcError::new(INVALID_PARAMS, message),
+            Failure::Forbidden(message) => RpcError::new(FORBIDDEN, message),
             Failure::NotSupported(method) => RpcError::new(NOT_SUPPORTED, method),
             Failure::Internal(message) => RpcError::new(INTERNAL, message),
         }

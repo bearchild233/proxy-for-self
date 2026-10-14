@@ -128,7 +128,7 @@ pub fn account_id(text: &str) -> bool {
 }
 
 /// `unified-[0-9]{1,6}`
-fn gateway_id(text: &str) -> bool {
+pub fn gateway_id(text: &str) -> bool {
     text.strip_prefix("unified-").is_some_and(|digits| {
         (1..=6).contains(&digits.len()) && digits.bytes().all(|b| b.is_ascii_digit())
     })

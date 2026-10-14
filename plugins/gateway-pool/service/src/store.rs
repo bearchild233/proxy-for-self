@@ -3,7 +3,10 @@
 
 use std::{
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -13,6 +16,7 @@ use serde_json::{Value, json};
 use crate::{
     error::Failure,
     history, history_query,
+    ids::{IdSource, random_ids},
     num::Num,
     policy, queue, settings,
     util::{
@@ -106,12 +110,21 @@ const SCHEMA: &str = "
 
 pub struct Store {
     path: PathBuf,
-    clock: Clock,
+    pub(crate) clock: Clock,
+    /// 租约、代次与分组事件标识的来源；测试与对照可以替换为确定的序列。
+    pub(crate) ids: IdSource,
+    /// 插件是否启用。宿主停用插件后，旧在途请求仍可归还租约（`finish`），其余运行动作被拒绝。
+    enabled: AtomicBool,
 }
 
 impl Store {
     /// 打开（必要时创建）`data_dir/state.sqlite3`，并完成与 Python 相同的表结构初始化。
     pub fn open(data_dir: &Path, clock: Clock) -> Result<Self, Failure> {
+        Self::open_with_ids(data_dir, clock, random_ids())
+    }
+
+    /// 同 `open`，但指定标识来源。
+    pub fn open_with_ids(data_dir: &Path, clock: Clock, ids: IdSource) -> Result<Self, Failure> {
         std::fs::create_dir_all(data_dir)?;
         let path = data_dir.join(DB_FILE);
         {
@@ -119,7 +132,12 @@ impl Store {
             connection.busy_timeout(Duration::from_secs(5))?;
             connection.pragma_update(None, "journal_mode", "WAL")?;
         }
-        let store = Self { path, clock };
+        let store = Self {
+            path,
+            clock,
+            ids,
+            enabled: AtomicBool::new(true),
+        };
         let now = store.now_num();
         store.write(|db| {
             db.execute_batch(SCHEMA)?;
@@ -137,7 +155,10 @@ impl Store {
     }
 
     /// 写事务：`BEGIN IMMEDIATE`；出错时事务丢弃即回滚。
-    fn write<T>(&self, work: impl FnOnce(&Connection) -> Result<T, Failure>) -> Result<T, Failure> {
+    pub(crate) fn write<T>(
+        &self,
+        work: impl FnOnce(&Connection) -> Result<T, Failure>,
+    ) -> Result<T, Failure> {
         let mut connection = self.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let value = work(&transaction)?;
@@ -156,8 +177,17 @@ impl Store {
         Ok(value)
     }
 
-    fn now_num(&self) -> Num {
+    pub(crate) fn now_num(&self) -> Num {
         Num::Float((self.clock)())
+    }
+
+    /// 插件是否启用（默认启用；宿主停用时置为 false）。
+    pub fn enabled(&self) -> bool {
+        self.enabled.load(Ordering::SeqCst)
+    }
+
+    pub fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::SeqCst);
     }
 
     /// 当前有效的归属（启动时用于声明插件描述）。
@@ -221,7 +251,7 @@ impl Store {
         })
     }
 
-    fn retire_account(
+    pub(crate) fn retire_account(
         &self,
         db: &Connection,
         account: &str,
@@ -243,7 +273,7 @@ impl Store {
     }
 
     /// 保存组合并同步历史；保存前后的状态变化决定是否从本轮剩余网关中移除。
-    fn save(&self, db: &Connection, pair: &Object) -> Result<(), Failure> {
+    pub(crate) fn save(&self, db: &Connection, pair: &Object) -> Result<(), Failure> {
         let account = string_of(pair, "accountId");
         let gateway = string_of(pair, "gateway");
         let previous = stored_state(db, &account, &gateway)?;
@@ -427,7 +457,7 @@ fn set_file_mode(_path: &Path) -> Result<(), Failure> {
 }
 
 /// 已保存设置与默认值合并；对外隐藏凭据，只暴露是否已配置。
-fn effective_settings(db: &Connection, private: bool) -> Result<Object, Failure> {
+pub(crate) fn effective_settings(db: &Connection, private: bool) -> Result<Object, Failure> {
     let mut settings = merged(policy::defaults(), stored_settings(db)?.unwrap_or_default());
     if !private {
         let token = settings.remove("poolToken");
@@ -440,7 +470,7 @@ fn effective_settings(db: &Connection, private: bool) -> Result<Object, Failure>
     Ok(settings)
 }
 
-fn stored_settings(db: &Connection) -> Result<Option<Object>, Failure> {
+pub(crate) fn stored_settings(db: &Connection) -> Result<Option<Object>, Failure> {
     match one(db, "SELECT data FROM settings WHERE id=1", vec![])? {
         Some(row) => Ok(Some(decode_object(&string_of(&row, "data"))?)),
         None => Ok(None),

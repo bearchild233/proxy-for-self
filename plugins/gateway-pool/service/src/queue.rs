@@ -175,6 +175,44 @@ pub fn remaining(db: &Connection, account: &str) -> Result<Option<Vec<String>>, 
     }
 }
 
+/// `quota`：记录额度耗尽状态；状态变化才修改队列，首次耗尽时账号移到队尾。
+pub fn quota(db: &Connection, account: &str, exhausted: bool) -> Result<(), Failure> {
+    register(db, std::slice::from_ref(&account.to_owned()))?;
+    let row = one(
+        db,
+        "SELECT quota_exhausted FROM gp_account_queue WHERE account=?",
+        vec![text(account)],
+    )?;
+    let current = truthy(row.as_ref().and_then(|row| row.get("quota_exhausted")));
+    if current != exhausted {
+        exec(
+            db,
+            "UPDATE gp_account_queue SET quota_exhausted=? WHERE account=?",
+            vec![
+                rusqlite::types::Value::Integer(i64::from(exhausted)),
+                text(account),
+            ],
+        )?;
+        if exhausted {
+            move_last(db, account, "quota")?;
+        } else {
+            changed(db)?;
+        }
+    }
+    Ok(())
+}
+
+/// `begin`：账号开始一轮探测时记录本轮要走完的网关（已有剩余列表则保持不变）。
+pub fn begin(db: &Connection, account: &str, gateways: &[String]) -> Result<(), Failure> {
+    register(db, std::slice::from_ref(&account.to_owned()))?;
+    exec(
+        db,
+        "UPDATE gp_account_queue SET remaining=? WHERE account=? AND remaining IS NULL",
+        vec![text(&serde_json::to_string(gateways)?), text(account)],
+    )?;
+    Ok(())
+}
+
 /// `move_last`：账号移到队尾，并清空本轮剩余网关。
 pub fn move_last(db: &Connection, account: &str, reason: &str) -> Result<(), Failure> {
     exec(
