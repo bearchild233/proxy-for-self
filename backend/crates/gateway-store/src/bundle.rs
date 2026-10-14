@@ -18,6 +18,14 @@ pub struct StoreBundle {
 }
 
 impl StoreBundle {
+    #[must_use]
+    pub fn plugin_accounts(&self) -> Arc<dyn gateway_core::plugin::PluginAccounts> {
+        Arc::new(crate::plugin::PluginAccountDirectory {
+            accounts: self.provider_ports.accounts(),
+            admin: self.admin_ports.clone(),
+        })
+    }
+
     /// 必须在 Core 已完成恢复后、监听端口前调用。
     pub async fn complete_startup(&mut self) -> StoreResult<()> {
         if let Some(guard) = &mut self.slot_guard {

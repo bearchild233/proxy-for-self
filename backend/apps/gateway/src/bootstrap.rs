@@ -67,6 +67,11 @@ pub async fn run() -> Result<(), BootstrapError> {
         plugins,
     } = config;
 
+    let kernel_slot = match store.deployment_slot() {
+        Some("a") => Some(gateway_host::plugin::KernelSlot::A),
+        Some("b") => Some(gateway_host::plugin::KernelSlot::B),
+        _ => None,
+    };
     let kernel_version = host.system_update.version.clone();
     let mut host = gateway_host::initialize(host).await?;
     host.report_startup_ready("Host");
@@ -125,10 +130,17 @@ pub async fn run() -> Result<(), BootstrapError> {
         plugins,
         gateway_host::plugin::KernelInfo {
             version: kernel_version,
-            // TODO(design): Store 的槽标识尚无公开读取端口，握手暂不报告槽。
-            slot: None,
+            slot: kernel_slot,
         },
-        std::sync::Arc::new(gateway_host::plugin::LogCapabilities),
+        std::sync::Arc::new(gateway_core::plugin::KernelCapabilities {
+            accounts: store.plugin_accounts(),
+            upstream: openai.plugin_upstream(),
+            groups: store
+                .provider_ports()
+                .group_mover()
+                .expect("Store group move port"),
+            log: std::sync::Arc::new(gateway_host::plugin::LogCapabilities),
+        }),
     )
     .map_err(gateway_host::HostError::Plugin)?;
     host.set_plugin_runtime(runtime);

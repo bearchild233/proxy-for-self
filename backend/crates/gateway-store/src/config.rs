@@ -76,6 +76,11 @@ impl StorePoolConfig {
 }
 
 impl StoreConfig {
+    #[must_use]
+    pub fn deployment_slot(&self) -> Option<&str> {
+        self.deployment_slot.as_deref()
+    }
+
     pub fn resolve_and_validate(&mut self, runtime_data_dir: &Path) -> StoreResult<()> {
         if runtime_data_dir.as_os_str().is_empty() {
             return Err(StoreError::InvalidData {

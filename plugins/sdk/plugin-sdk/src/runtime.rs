@@ -95,7 +95,10 @@ impl<P: Plugin> Server<P> {
         let listener = UnixListener::bind(&settings.socket)?;
         std::fs::set_permissions(&settings.socket, std::fs::Permissions::from_mode(0o660))?;
         let kernel = Kernel {
-            owned_groups: Arc::new(tokio::sync::Mutex::new(descriptor.owned_groups.clone())),
+            ownership: Arc::new(tokio::sync::Mutex::new(OwnershipChangedParams {
+                owned_groups: descriptor.owned_groups.clone(),
+                watched_groups: descriptor.watched_groups.clone(),
+            })),
             ..Kernel::default()
         };
         Ok(Self {
@@ -173,6 +176,10 @@ async fn dispatch<P: Plugin>(
         "route.prepare" => {
             serde_json::to_value(plugin.route_prepare(ctx, params(value)?).await?).map_err(internal)
         }
+        "response.observe" => {
+            serde_json::to_value(plugin.response_observe(ctx, params(value)?).await?)
+                .map_err(internal)
+        }
         "response.head" => {
             serde_json::to_value(plugin.response_head(ctx, params(value)?).await?).map_err(internal)
         }
@@ -206,9 +213,10 @@ async fn connection<P: Plugin>(
     if !is_compatible(hello.kernel_api, descriptor.kernel_api) {
         return;
     }
-    let groups = kernel.owned_groups.lock().await;
+    let groups = kernel.ownership.lock().await;
     let mut hello_result = descriptor.hello();
-    hello_result.owned_groups = groups.clone();
+    hello_result.owned_groups = groups.owned_groups.clone();
+    hello_result.watched_groups = groups.watched_groups.clone();
     let response = Message::Response {
         id,
         payload: ResponsePayload::Result(

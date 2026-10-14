@@ -49,3 +49,19 @@ fn every_hook_and_action_matches_wire_contract() {
         json!({"method":"echo","params":{"text":"test"},"actor":{"role":"admin"}}),
     );
 }
+
+#[test]
+fn response_observe_wire_contract() {
+    let wire = serde_json::json!({"requestId":"r","accountId":"a","attempt":1,"model":"m","requestHadTurnState":false,"status":null,"errorKind":"connect","stateReturned":false,"turnState":null,"setCookies":[],"replaySafe":true});
+    let params: kernel_protocol::ResponseObserveParams =
+        serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(serde_json::to_value(params).unwrap(), wire);
+    for wire in [
+        serde_json::json!({"action":"accept"}),
+        serde_json::json!({"action":"switchAccount","reason":{"code":"test","message":"fixture"}}),
+    ] {
+        let result: kernel_protocol::ResponseObserveResult =
+            serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(result).unwrap(), wire);
+    }
+}

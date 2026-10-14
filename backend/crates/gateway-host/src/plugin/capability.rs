@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use gateway_core::plugin::PluginCapabilities;
+use gateway_core::plugin::{PluginAccess, PluginCapabilities};
 use kernel_protocol::{INVALID_PARAMS, LogParams, NOT_SUPPORTED, RpcError};
 use serde_json::Value;
 
@@ -7,7 +7,13 @@ pub struct LogCapabilities;
 
 #[async_trait]
 impl PluginCapabilities for LogCapabilities {
-    async fn call(&self, plugin: &str, method: &str, params: Value) -> Result<Value, RpcError> {
+    async fn call(
+        &self,
+        access: &dyn PluginAccess,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, RpcError> {
+        let plugin = access.id();
         if method != "log" {
             return Err(RpcError::new(NOT_SUPPORTED, method));
         }

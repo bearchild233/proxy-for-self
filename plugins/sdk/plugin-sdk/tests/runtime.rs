@@ -154,6 +154,7 @@ impl Fixture {
             hooks: vec!["admin.call".into()],
             capabilities: vec!["quota.read".into(), "log".into()],
             owned_groups: vec!["initial".into()],
+            watched_groups: vec![],
             shutdown_timeout,
         };
         let server = Server::bind(
@@ -733,4 +734,47 @@ async fn shutdown_keeps_capability_response_channel_for_existing_hook() {
         .unwrap()
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+async fn watched_groups_broadcast_and_observe_accepts_by_default() {
+    let f = Fixture::start();
+    let a = f.connect(Some(KernelSlot::A)).await;
+    let b = f.connect(Some(KernelSlot::B)).await;
+    f.kernel
+        .set_ownership(vec!["own".into()], vec!["watch".into()])
+        .await
+        .unwrap();
+    tokio::time::timeout(BUDGET, async {
+        while a.watched_groups() != vec!["watch"] || b.watched_groups() != vec!["watch"] {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    f.kernel.set_owned_groups(vec!["new".into()]).await.unwrap();
+    let new = f.connect(None).await;
+    assert_eq!(new.hello.owned_groups, vec!["new"]);
+    assert_eq!(new.hello.watched_groups, vec!["watch"]);
+    let result: ResponseObserveResult = a
+        .call(
+            "response.observe",
+            &ResponseObserveParams {
+                request_id: "r".into(),
+                account_id: "a".into(),
+                attempt: 1,
+                model: "m".into(),
+                request_had_turn_state: false,
+                status: Some(200),
+                error_kind: None,
+                state_returned: false,
+                turn_state: None,
+                set_cookies: vec![],
+                replay_safe: true,
+            },
+            BUDGET,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result, ResponseObserveResult::Accept);
 }

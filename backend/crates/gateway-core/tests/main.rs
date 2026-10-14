@@ -14,3 +14,5 @@ mod routing;
 mod runtime;
 mod task;
 mod upstream;
+
+mod plugin;

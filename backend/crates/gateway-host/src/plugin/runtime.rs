@@ -44,6 +44,7 @@ impl PluginRuntime {
         };
         let mut initial = State {
             entries: BTreeMap::new(),
+            cache_error: None,
             registry_error: None,
             registry_error_at: None,
             cache,
@@ -51,7 +52,14 @@ impl PluginRuntime {
         // 返回端口前恢复缓存，调用方不能在监督任务首次调度前看到错误的 NotOwned。
         match PluginRegistry::load(&path) {
             Ok(registry) => {
-                let cache = read_cache(&initial.cache)?;
+                let cache = match read_cache(&initial.cache) {
+                    Ok(cache) => cache,
+                    Err(error) => {
+                        initial.cache_error = Some(format!("ownership cache: {error}"));
+                        tracing::error!(%error, "plugin ownership cache unavailable; using empty cache");
+                        Default::default()
+                    }
+                };
                 for registration in registry.plugins {
                     let id = registration.id.clone();
                     let groups = cache.plugins.get(&id).cloned().unwrap_or_default();
@@ -60,7 +68,11 @@ impl PluginRuntime {
                         .entries
                         .insert(id.clone(), Entry::new(registration, vec![]));
                     if enabled {
-                        initial.ownership(&id, groups);
+                        initial.ownership(
+                            &id,
+                            groups,
+                            cache.watched_groups.get(&id).cloned().unwrap_or_default(),
+                        );
                     }
                 }
             }
@@ -90,6 +102,7 @@ impl PluginRuntime {
                 .values()
                 .map(|entry| entry.snapshot.clone())
                 .collect(),
+            cache_error: state.cache_error.clone(),
             registry_error: state.registry_error.clone(),
             registry_error_at: state.registry_error_at,
         }
@@ -159,24 +172,39 @@ impl Drop for PluginRuntime {
 #[async_trait]
 impl PluginHooks for PluginRuntime {
     fn ownership(&self, group: &str) -> Ownership {
-        self.state
-            .lock()
-            .expect("plugin state")
-            .entries
-            .values()
-            .find(|entry| {
-                entry
-                    .snapshot
-                    .owned_groups
-                    .iter()
-                    .any(|owned| owned == group)
-            })
-            .map_or(Ownership::NotOwned, |entry| Ownership::Owned {
+        let state = self.state.lock().expect("plugin state");
+        if let Some(entry) = state.entries.values().find(|entry| {
+            entry
+                .snapshot
+                .owned_groups
+                .iter()
+                .any(|owned| owned == group)
+        }) {
+            return Ownership::Owned {
                 plugin: entry.registration.id.clone(),
                 available: entry.snapshot.state == ConnectionState::Available
                     && entry.peer.as_ref().is_some_and(|peer| peer.is_open()),
+            };
+        }
+        let plugins: Vec<_> = state
+            .entries
+            .values()
+            .filter(|entry| {
+                entry
+                    .snapshot
+                    .watched_groups
+                    .iter()
+                    .any(|watched| watched == group)
             })
+            .map(|entry| entry.registration.id.clone())
+            .collect();
+        if plugins.is_empty() {
+            Ownership::NotOwned
+        } else {
+            Ownership::Watched { plugins }
+        }
     }
+
     async fn route_prepare(
         &self,
         plugin: &str,
@@ -266,11 +294,9 @@ async fn supervise(
             let cache = match read_cache(&state.cache) {
                 Ok(cache) => cache,
                 Err(error) => {
-                    // TODO(design): 缓存损坏时无法恢复未知分组；需要定义全局启动失败策略。
-                    state.registry_error(format!("ownership cache: {error}"));
-                    // 保持旧表且不发布未保护的账号归属；下次检查重试。
-                    stamp = None;
-                    continue;
+                    state.cache_error = Some(format!("ownership cache: {error}"));
+                    tracing::error!(%error, "plugin ownership cache unavailable; using empty cache");
+                    Default::default()
                 }
             };
             let enabled: Vec<_> = registry
@@ -280,7 +306,8 @@ async fn supervise(
                 .map(|p| p.id.clone())
                 .collect();
             if let Err(error) = update_cache(&state.cache, |cache| {
-                cache.plugins.retain(|id, _| enabled.contains(id))
+                cache.plugins.retain(|id, _| enabled.contains(id));
+                cache.watched_groups.retain(|id, _| enabled.contains(id));
             }) {
                 state.registry_error(format!("ownership cache: {error}"));
             }
@@ -305,12 +332,22 @@ async fn supervise(
                 } else {
                     vec![]
                 };
+                let watched = if registration.enabled {
+                    state
+                        .entries
+                        .get(&registration.id)
+                        .map(|entry| entry.snapshot.watched_groups.clone())
+                        .or_else(|| cache.watched_groups.get(&registration.id).cloned())
+                        .unwrap_or_default()
+                } else {
+                    vec![]
+                };
                 state.entries.insert(
                     registration.id.clone(),
                     Entry::new(registration.clone(), vec![]),
                 );
                 if registration.enabled {
-                    state.ownership(&registration.id, groups);
+                    state.ownership(&registration.id, groups, watched);
                 }
             }
         }

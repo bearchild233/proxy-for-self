@@ -115,6 +115,7 @@ fn descriptor(id: &str, groups: &[&str]) -> Descriptor {
         ],
         capabilities: vec!["log".into(), "quota.read".into()],
         owned_groups: groups.iter().map(|g| (*g).into()).collect(),
+        watched_groups: vec![],
         shutdown_timeout: Duration::from_secs(1),
     }
 }
@@ -711,7 +712,7 @@ async fn log_truncates_utf8_and_normalizes_level_and_other_capabilities_are_unsu
     let _guard = tracing::subscriber::set_default(subscriber);
     LogCapabilities
         .call(
-            "fixture",
+            &TestAccess,
             "log",
             json!({"level":"unknown","message":"中".repeat(2000),"fields":{"key":"value"}}),
         )
@@ -723,7 +724,7 @@ async fn log_truncates_utf8_and_normalizes_level_and_other_capabilities_are_unsu
     assert_eq!(event["fields"]["message"].as_str().unwrap().len(), 4095);
     assert_eq!(
         LogCapabilities
-            .call("fixture", "quota.read", json!({}))
+            .call(&TestAccess, "quota.read", json!({}))
             .await
             .unwrap_err()
             .code,
@@ -731,7 +732,7 @@ async fn log_truncates_utf8_and_normalizes_level_and_other_capabilities_are_unsu
     );
     assert_eq!(
         LogCapabilities
-            .call("fixture", "log", json!({}))
+            .call(&TestAccess, "log", json!({}))
             .await
             .unwrap_err()
             .code,
@@ -858,4 +859,248 @@ async fn sdk_log_notification_is_authorized_without_fabricating_a_response() {
     );
     runtime.shutdown().await;
     f.stop().await;
+}
+
+struct TestAccess;
+impl gateway_core::plugin::PluginAccess for TestAccess {
+    fn id(&self) -> &str {
+        "fixture"
+    }
+    fn groups(&self) -> Vec<String> {
+        vec![]
+    }
+    fn fetch_hosts(&self) -> Vec<String> {
+        vec![]
+    }
+}
+
+#[tokio::test]
+async fn uid_mismatch_rejects_before_hello_and_records_health() {
+    let root = tempfile::tempdir().unwrap();
+    let listener = tokio::net::UnixListener::bind(root.path().join("test.sock")).unwrap();
+    let mut entry = registration(root.path(), "test", true, &[]);
+    entry["uid"] = json!(u32::MAX);
+    registry(root.path(), vec![entry]);
+    let runtime = start(root.path());
+    let (mut stream, _) = listener.accept().await.unwrap();
+    use tokio::io::AsyncReadExt;
+    let mut byte = [0];
+    assert_eq!(stream.read(&mut byte).await.unwrap(), 0);
+    until(|| {
+        runtime.snapshot().plugins[0]
+            .last_error
+            .as_ref()
+            .is_some_and(|error| error.contains("UID mismatch"))
+    })
+    .await;
+    assert_ne!(
+        runtime.snapshot().plugins[0].state,
+        ConnectionState::Available
+    );
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn corrupt_or_unreadable_cache_does_not_block_connection() {
+    for unreadable in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let f = Fixture::start(root.path(), "test", &["group"]);
+        let cache = root.path().join("plugin-ownership.json");
+        if unreadable {
+            fs::create_dir(&cache).unwrap();
+        } else {
+            fs::write(&cache, b"broken json").unwrap();
+        }
+        registry(
+            root.path(),
+            vec![registration(root.path(), "test", true, &[])],
+        );
+        let runtime = start(root.path());
+        assert!(runtime.snapshot().cache_error.is_some());
+        available(&runtime, "test").await;
+        assert_eq!(runtime.ownership("group"), owned("test", true));
+        assert!(
+            runtime.snapshot().plugins[0]
+                .last_error
+                .as_ref()
+                .is_some_and(|error| error.contains("ownership cache"))
+        );
+        runtime.shutdown().await;
+        f.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn owned_and_watched_conflicts_follow_declaration_order_and_cache_watchers() {
+    let root = tempfile::tempdir().unwrap();
+    let a = Fixture::start(root.path(), "a", &[]);
+    let b = Fixture::start(root.path(), "b", &[]);
+    registry(
+        root.path(),
+        vec![
+            registration(root.path(), "a", true, &[]),
+            registration(root.path(), "b", true, &[]),
+        ],
+    );
+    let runtime = start(root.path());
+    available(&runtime, "a").await;
+    available(&runtime, "b").await;
+    a.kernel
+        .set_ownership(vec![], vec!["g".into()])
+        .await
+        .unwrap();
+    until(|| {
+        runtime.ownership("g")
+            == Ownership::Watched {
+                plugins: vec!["a".into()],
+            }
+    })
+    .await;
+    b.kernel
+        .set_ownership(vec!["g".into()], vec![])
+        .await
+        .unwrap();
+    until(|| runtime.snapshot().plugins[1].last_error.is_some()).await;
+    assert_eq!(
+        runtime.ownership("g"),
+        Ownership::Watched {
+            plugins: vec!["a".into()]
+        }
+    );
+    b.kernel
+        .set_ownership(vec![], vec!["g".into()])
+        .await
+        .unwrap();
+    until(|| {
+        runtime.ownership("g")
+            == Ownership::Watched {
+                plugins: vec!["a".into(), "b".into()],
+            }
+    })
+    .await;
+    a.kernel
+        .set_ownership(vec!["g".into()], vec![])
+        .await
+        .unwrap();
+    until(|| runtime.snapshot().plugins[0].last_error.is_some()).await;
+    assert_eq!(
+        runtime.ownership("g"),
+        Ownership::Watched {
+            plugins: vec!["b".into()]
+        }
+    );
+    b.kernel
+        .set_ownership(vec!["g".into()], vec![])
+        .await
+        .unwrap();
+    until(|| runtime.ownership("g") == owned("b", true)).await;
+    a.kernel
+        .set_ownership(vec![], vec!["g".into(), "other".into()])
+        .await
+        .unwrap();
+    until(|| {
+        runtime.ownership("other")
+            == Ownership::Watched {
+                plugins: vec!["a".into()],
+            }
+    })
+    .await;
+    assert_eq!(runtime.ownership("g"), owned("b", true));
+    runtime.shutdown().await;
+    a.stop().await;
+    b.stop().await;
+    let restarted = start(root.path());
+    assert_eq!(
+        restarted.ownership("other"),
+        Ownership::Watched {
+            plugins: vec!["a".into()]
+        }
+    );
+    assert_eq!(restarted.ownership("g"), owned("b", false));
+    restarted.shutdown().await;
+}
+
+#[tokio::test]
+async fn all_capabilities_require_request_and_registry_intersection() {
+    let methods = [
+        "accounts.read",
+        "quota.read",
+        "groups.move",
+        "upstream.probe",
+        "http.fetch",
+    ];
+    for requested in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let mut desc = descriptor("test", &[]);
+        desc.capabilities = if requested {
+            methods.iter().map(|method| (*method).into()).collect()
+        } else {
+            vec![]
+        };
+        let f = Fixture::with_descriptor(root.path(), "test", desc);
+        registry(
+            root.path(),
+            vec![registration(
+                root.path(),
+                "test",
+                true,
+                if requested { &[] } else { &methods },
+            )],
+        );
+        let runtime = start(root.path());
+        available(&runtime, "test").await;
+        for method in methods {
+            let error = runtime
+                .admin_call(
+                    "test",
+                    admin("capability", json!({"method": method, "params": {}})),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, FORBIDDEN, "{method}");
+        }
+        runtime.shutdown().await;
+        f.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn configured_slot_is_sent_in_hello() {
+    let root = tempfile::tempdir().unwrap();
+    let listener = tokio::net::UnixListener::bind(root.path().join("test.sock")).unwrap();
+    registry(
+        root.path(),
+        vec![registration(root.path(), "test", true, &[])],
+    );
+    let runtime = start(root.path());
+    let (mut stream, _) = listener.accept().await.unwrap();
+    let Message::Request { method, params, .. } = read_frame(&mut stream).await.unwrap() else {
+        panic!("hello request")
+    };
+    assert_eq!(method, "hello");
+    assert_eq!(params["kernel"]["slot"], "b");
+    runtime.shutdown().await;
+}
+
+#[test]
+fn both_partial_runtime_configurations_are_rejected() {
+    let root = tempfile::tempdir().unwrap();
+    for registry_only in [false, true] {
+        let mut config = PluginRuntimeConfig {
+            registry_path: registry_only.then(|| root.path().join("registry.json")),
+            ownership_cache_path: (!registry_only).then(|| root.path().join("cache.json")),
+        };
+        assert!(config.resolve_and_validate(root.path()).is_err());
+        assert!(
+            PluginRuntime::start(
+                config,
+                KernelInfo {
+                    version: "fixture".into(),
+                    slot: None
+                },
+                Arc::new(LogCapabilities)
+            )
+            .is_err()
+        );
+    }
 }

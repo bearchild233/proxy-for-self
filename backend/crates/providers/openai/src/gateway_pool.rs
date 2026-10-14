@@ -102,7 +102,7 @@ fn default_pool_direct() -> bool {
 fn default_probe_model() -> String {
     "gpt-6.1-sol".into()
 }
-fn hi_request(model: &str) -> Option<CodexResponsesRequest> {
+pub(crate) fn hi_request(model: &str) -> Option<CodexResponsesRequest> {
     Some(CodexResponsesRequest::from_body(json!({"model":model,"input":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}],"instructions":"Do not use external tools.","tools":[],"stream":true,"store":false,"reasoning":{"effort":"low"}}).as_object().cloned()?))
 }
 

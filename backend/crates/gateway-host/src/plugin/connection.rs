@@ -3,7 +3,10 @@ use super::{
     state::{ConnectionState, State},
     transport::{Peer, internal, writer},
 };
-use gateway_core::{lifecycle::CancellationToken, plugin::PluginCapabilities};
+use gateway_core::{
+    lifecycle::CancellationToken,
+    plugin::{PluginAccess, PluginCapabilities},
+};
 use kernel_protocol::*;
 use std::{
     sync::{Arc, Mutex},
@@ -79,7 +82,9 @@ async fn connect(
             .await
             .map_err(internal)?;
         let uid = stream.peer_cred().map_err(internal)?.uid();
-        // TODO(design): 注册表尚无期望 UID / 用户映射；只能记录 SO_PEERCRED，不能自行指定允许用户。
+        if registration.uid.is_some_and(|expected| expected != uid) {
+            return Err(internal("plugin UID mismatch"));
+        }
         write_frame(
             &mut stream,
             &Message::Request {
@@ -142,7 +147,7 @@ async fn session(
         entry.snapshot.kernel_api = Some(hello.kernel_api);
         entry.snapshot.granted_capabilities = grants.clone();
         entry.snapshot.peer_uid = Some(uid);
-        state.ownership(&registration.id, hello.owned_groups);
+        state.ownership(&registration.id, hello.owned_groups, hello.watched_groups);
     }
     let (mut reader, write_half) = stream.into_split();
     let write_loop = writer(write_half, rx);
@@ -170,10 +175,11 @@ async fn session(
             Message::Notify { method, params } if method == "ownership.changed" => {
                 let params: OwnershipChangedParams =
                     serde_json::from_value(params).map_err(internal)?;
-                state
-                    .lock()
-                    .expect("plugin state")
-                    .ownership(&registration.id, params.owned_groups);
+                state.lock().expect("plugin state").ownership(
+                    &registration.id,
+                    params.owned_groups,
+                    params.watched_groups,
+                );
             }
             Message::Request { id, method, params } => {
                 if id <= last_id {
@@ -183,7 +189,10 @@ async fn session(
                 let allowed = grants.contains(&method);
                 let peer = peer.clone();
                 let capabilities = capabilities.clone();
-                let plugin = registration.id.clone();
+                let plugin = Access {
+                    id: registration.id.clone(),
+                    state: state.clone(),
+                };
                 calls.spawn(async move {
                     let result = if allowed {
                         capabilities.call(&plugin, &method, params).await
@@ -198,7 +207,10 @@ async fn session(
                 let allowed = grants.contains(&method);
                 let capabilities = capabilities.clone();
                 let state = state.clone();
-                let plugin = registration.id.clone();
+                let plugin = Access {
+                    id: registration.id.clone(),
+                    state: state.clone(),
+                };
                 calls.spawn(async move {
                     let result = if allowed {
                         capabilities.call(&plugin, &method, params).await
@@ -206,8 +218,11 @@ async fn session(
                         Err(RpcError::new(FORBIDDEN, method))
                     };
                     if let Err(error) = result
-                        && let Some(entry) =
-                            state.lock().expect("plugin state").entries.get_mut(&plugin)
+                        && let Some(entry) = state
+                            .lock()
+                            .expect("plugin state")
+                            .entries
+                            .get_mut(plugin.id())
                     {
                         entry.error(error);
                     }
@@ -246,5 +261,43 @@ struct ClosePeer(Arc<Peer>);
 impl Drop for ClosePeer {
     fn drop(&mut self) {
         self.0.close();
+    }
+}
+
+struct Access {
+    id: String,
+    state: Arc<Mutex<State>>,
+}
+impl PluginAccess for Access {
+    fn id(&self) -> &str {
+        &self.id
+    }
+    fn groups(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .expect("plugin state")
+            .entries
+            .get(&self.id)
+            .filter(|entry| entry.registration.enabled)
+            .map(|entry| {
+                entry
+                    .snapshot
+                    .owned_groups
+                    .iter()
+                    .chain(&entry.snapshot.watched_groups)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    fn fetch_hosts(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .expect("plugin state")
+            .entries
+            .get(&self.id)
+            .filter(|entry| entry.registration.enabled)
+            .map(|entry| entry.registration.fetch_hosts.clone())
+            .unwrap_or_default()
     }
 }

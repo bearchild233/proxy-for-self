@@ -1190,7 +1190,7 @@ pub(super) fn validate_batch_update_group_ids(group_ids: &[AccountGroupId]) -> S
     Ok(())
 }
 
-/// 网关池自动调整账号分组：只增删指定分组的成员关系，同一事务提升配置版本并写审计。
+/// 网关池或插件调整账号分组：只增删指定成员关系，同一事务提升配置版本并写审计。
 pub(crate) async fn move_account_group_in_pool(
     pool: &PgPool,
     request: &gateway_core::provider_ports::AccountGroupMove,
@@ -1293,7 +1293,12 @@ pub(crate) async fn move_account_group_in_pool(
             id: format!("audit_{}", uuid::Uuid::now_v7().simple()),
             actor_kind: crate::postgres::AdminAuditActorKind::System,
             actor_admin_user_id: None,
-            actor_ref: "gateway_pool".to_owned(),
+            // 插件身份与原因由内核能力端口构造；旧网关池仍沿用原审计操作者。
+            actor_ref: if request.reason.starts_with("plugin:") {
+                request.reason.clone()
+            } else {
+                "gateway_pool".to_owned()
+            },
             admin_request_id: None,
             action: "regroup".to_owned(),
             entity_kind: "provider_account".to_owned(),

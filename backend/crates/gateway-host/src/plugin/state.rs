@@ -30,6 +30,7 @@ pub struct PluginSnapshot {
     pub kernel_api: Option<PluginApi>,
     pub granted_capabilities: Vec<String>,
     pub owned_groups: Vec<String>,
+    pub watched_groups: Vec<String>,
     pub peer_uid: Option<u32>,
     pub last_error: Option<String>,
     pub last_error_at: Option<SystemTime>,
@@ -38,6 +39,7 @@ pub struct PluginSnapshot {
 #[derive(Debug, Clone)]
 pub struct RuntimeSnapshot {
     pub plugins: Vec<PluginSnapshot>,
+    pub cache_error: Option<String>,
     pub registry_error: Option<String>,
     pub registry_error_at: Option<SystemTime>,
 }
@@ -62,6 +64,7 @@ impl Entry {
                 kernel_api: None,
                 granted_capabilities: vec![],
                 owned_groups,
+                watched_groups: vec![],
                 peer_uid: None,
                 last_error: None,
                 last_error_at: None,
@@ -84,6 +87,7 @@ impl Entry {
 
 pub(super) struct State {
     pub entries: BTreeMap<String, Entry>,
+    pub cache_error: Option<String>,
     pub registry_error: Option<String>,
     pub registry_error_at: Option<SystemTime>,
     pub cache: PathBuf,
@@ -96,28 +100,46 @@ impl State {
         self.registry_error_at = Some(SystemTime::now());
     }
 
-    pub fn ownership(&mut self, id: &str, groups: Vec<String>) {
-        let occupied: BTreeSet<_> = self
+    pub fn ownership(&mut self, id: &str, groups: Vec<String>, watched: Vec<String>) {
+        let others: Vec<_> = self
             .entries
             .iter()
             .filter(|(other, _)| other.as_str() != id)
+            .collect();
+        let owned: BTreeSet<_> = others
+            .iter()
             .flat_map(|(_, entry)| entry.snapshot.owned_groups.iter().cloned())
+            .collect();
+        let observed: BTreeSet<_> = others
+            .iter()
+            .flat_map(|(_, entry)| entry.snapshot.watched_groups.iter().cloned())
             .collect();
         let Some(entry) = self.entries.get_mut(id) else {
             return;
         };
         let mut accepted = BTreeSet::new();
         for group in groups {
-            if occupied.contains(&group) {
+            if owned.contains(&group) || observed.contains(&group) {
                 entry.error(format!("group ownership conflict: {group}"));
             } else {
                 accepted.insert(group);
             }
         }
         entry.snapshot.owned_groups = accepted.into_iter().collect();
+        let mut accepted = BTreeSet::new();
+        for group in watched {
+            if owned.contains(&group) {
+                entry.error(format!("group ownership conflict: {group}"));
+            } else {
+                accepted.insert(group);
+            }
+        }
+        entry.snapshot.watched_groups = accepted.into_iter().collect();
         let groups = entry.snapshot.owned_groups.clone();
+        let watched = entry.snapshot.watched_groups.clone();
         if let Err(error) = update_cache(&self.cache, |cache| {
             cache.plugins.insert(id.into(), groups);
+            cache.watched_groups.insert(id.into(), watched);
         }) {
             self.entries
                 .get_mut(id)
@@ -130,6 +152,8 @@ impl State {
 #[derive(Default, Serialize, Deserialize)]
 pub(super) struct OwnershipCache {
     pub plugins: BTreeMap<String, Vec<String>>,
+    #[serde(default, rename = "watchedGroups")]
+    pub watched_groups: BTreeMap<String, Vec<String>>,
 }
 
 pub(super) fn read_cache(path: &Path) -> io::Result<OwnershipCache> {

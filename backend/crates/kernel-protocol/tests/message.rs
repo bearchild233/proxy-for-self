@@ -39,7 +39,7 @@ fn handshake_lifecycle_examples_and_compatibility() {
         json!({"kernelApi":{"major":0,"minor":1},"kernel":{"version":"test","slot":null}}),
     );
     example::<HelloResult>(
-        json!({"plugin":{"id":"echo","version":"0.0.0"},"sdk":{"version":"0.0.0"},"kernelApi":{"major":0,"minMinor":1},"hooks":["route.prepare"],"capabilities":["log"],"ownedGroups":[]}),
+        json!({"plugin":{"id":"echo","version":"0.0.0"},"sdk":{"version":"0.0.0"},"kernelApi":{"major":0,"minMinor":1},"hooks":["route.prepare"],"capabilities":["log"],"ownedGroups":[],"watchedGroups":[]}),
     );
     example::<HealthResult>(json!({"ready":true}));
     example::<HealthResult>(json!({"ready":false,"detail":"test"}));
@@ -70,7 +70,7 @@ fn handshake_lifecycle_examples_and_compatibility() {
         KernelApi::default(),
         PluginApi {
             major: 0,
-            min_minor: 3
+            min_minor: 4
         }
     ));
     assert_eq!(
@@ -101,6 +101,18 @@ fn old_hello_defaults_ownership_and_new_notification_roundtrips() {
     }))
     .unwrap();
     assert!(hello.owned_groups.is_empty());
-    example::<OwnershipChangedParams>(json!({"ownedGroups":["group"]}));
-    assert_eq!(KERNEL_API, (0, 2));
+    example::<OwnershipChangedParams>(json!({"ownedGroups":["group"],"watchedGroups":["watch"]}));
+    assert_eq!(KERNEL_API, (0, 3));
+    assert!(hello.watched_groups.is_empty());
+    for min_minor in [1, 2, 3] {
+        assert!(is_compatible(
+            KernelApi::default(),
+            PluginApi {
+                major: 0,
+                min_minor
+            }
+        ));
+    }
+    let old: OwnershipChangedParams = serde_json::from_value(json!({"ownedGroups":[]})).unwrap();
+    assert!(old.watched_groups.is_empty());
 }

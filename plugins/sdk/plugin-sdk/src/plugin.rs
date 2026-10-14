@@ -10,6 +10,7 @@ pub struct Descriptor {
     pub hooks: Vec<String>,
     pub capabilities: Vec<String>,
     pub owned_groups: Vec<String>,
+    pub watched_groups: Vec<String>,
     pub shutdown_timeout: Duration,
 }
 
@@ -24,6 +25,7 @@ impl Descriptor {
             hooks: self.hooks.clone(),
             capabilities: self.capabilities.clone(),
             owned_groups: self.owned_groups.clone(),
+            watched_groups: self.watched_groups.clone(),
         }
     }
 }
@@ -73,6 +75,14 @@ pub trait Plugin: Send + Sync + 'static {
         _params: ResponseHeadParams,
     ) -> impl Future<Output = RpcResult<ResponseHeadResult>> + Send {
         async { Err(RpcError::new(NOT_SUPPORTED, "response.head")) }
+    }
+
+    fn response_observe(
+        &self,
+        _ctx: Context,
+        _params: ResponseObserveParams,
+    ) -> impl Future<Output = RpcResult<ResponseObserveResult>> + Send {
+        async { Ok(ResponseObserveResult::Accept) }
     }
 
     fn request_finish(

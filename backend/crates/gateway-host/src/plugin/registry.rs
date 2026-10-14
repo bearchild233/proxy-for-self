@@ -15,7 +15,7 @@ pub struct PluginRuntimeConfig {
 
 impl PluginRuntimeConfig {
     pub fn resolve_and_validate(&mut self, directory: &Path) -> Result<(), ConfigError> {
-        // TODO(design): 只配置一个路径时的补齐规则未定义；暂拒绝半配置，不猜测落盘位置。
+        // 两个路径构成完整运行时配置，不推断缺失路径。
         match (&mut self.registry_path, &mut self.ownership_cache_path) {
             (None, None) => Ok(()),
             (Some(registry), Some(cache)) => {
@@ -40,6 +40,10 @@ pub struct PluginRegistration {
     pub enabled: bool,
     pub socket: PathBuf,
     pub grants: Vec<String>,
+    #[serde(default)]
+    pub uid: Option<u32>,
+    #[serde(default, rename = "fetchHosts")]
+    pub fetch_hosts: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

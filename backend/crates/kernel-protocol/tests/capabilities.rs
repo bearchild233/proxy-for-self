@@ -47,3 +47,10 @@ fn every_capability_matches_wire_contract() {
     example::<QuotaReadResult>(json!({"snapshot":{"remaining":1}}));
     example::<LogParams>(json!({"level":"info","message":"test","fields":{"key":"value"}}));
 }
+
+#[test]
+fn fetch_truncation_is_optional() {
+    example::<HttpFetchResult>(
+        json!({"status":200,"headers":[],"body":"partial","truncated":true}),
+    );
+}

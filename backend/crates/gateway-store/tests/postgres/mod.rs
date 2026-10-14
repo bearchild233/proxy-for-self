@@ -37,7 +37,7 @@ static TEST_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations
 pub(super) struct TestDatabase {
     admin: PgPool,
     pub(super) pool: PgPool,
-    schema: String,
+    pub(super) schema: String,
 }
 
 pub(super) fn observability_query_budget() -> ObservabilityQueryBudget {

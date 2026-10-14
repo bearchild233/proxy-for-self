@@ -3,7 +3,9 @@
 mod admin;
 pub mod config;
 pub mod gateway_pool;
+mod plugin;
 mod provider;
+pub use plugin::OpenAiPluginUpstream;
 mod session_transport;
 
 use std::sync::Arc;
@@ -47,6 +49,7 @@ pub use transport::{
 pub struct ProviderBundle {
     #[cfg(feature = "gateway-pool-experiment")]
     gateway_pool_experiment: Option<gateway_pool::GatewayPoolExperiment>,
+    plugin_upstream: Arc<dyn gateway_core::plugin::PluginUpstream>,
     core_provider: Arc<dyn Provider>,
     admin_provider: Arc<dyn ProviderAdmin>,
     worker_contributions: Vec<WorkerContribution>,
@@ -186,6 +189,16 @@ pub async fn initialize(
             profile.clone(),
         ),
     ));
+    let plugin_upstream = Arc::new(OpenAiPluginUpstream::new(
+        accounts.clone(),
+        repository.clone(),
+        quota.clone(),
+        transport::CodexBackendClient::new(
+            http.clone(),
+            config.base_url().to_owned(),
+            profile.clone(),
+        ),
+    ));
     let gateway_pool = if let Some(configuration) = config.gateway_pool.as_ref() {
         Some(
             gateway_pool::GatewayPoolService::new(
@@ -312,6 +325,7 @@ pub async fn initialize(
     Ok(ProviderBundle {
         #[cfg(feature = "gateway-pool-experiment")]
         gateway_pool_experiment,
+        plugin_upstream,
         core_provider,
         admin_provider,
         worker_contributions,
@@ -319,6 +333,11 @@ pub async fn initialize(
 }
 
 impl ProviderBundle {
+    #[must_use]
+    pub fn plugin_upstream(&self) -> Arc<dyn gateway_core::plugin::PluginUpstream> {
+        self.plugin_upstream.clone()
+    }
+
     #[cfg(feature = "gateway-pool-experiment")]
     pub fn gateway_pool_experiment(&self) -> Option<gateway_pool::GatewayPoolExperiment> {
         self.gateway_pool_experiment.clone()

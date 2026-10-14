@@ -58,6 +58,8 @@ pub struct HttpFetchResult {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

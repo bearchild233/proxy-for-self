@@ -71,3 +71,4 @@ pub use self::{
         CodexWebSocketPool, CodexWebSocketPoolConfig, CodexWebSocketPoolKey, WebSocketPoolDecision,
     },
 };
+pub use probe::ProbeObservation;

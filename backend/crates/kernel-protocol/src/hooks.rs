@@ -108,3 +108,26 @@ pub struct AdminCallParams {
     pub params: Value,
     pub actor: Actor,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResponseObserveParams {
+    pub request_id: String,
+    pub account_id: String,
+    pub attempt: u32,
+    pub model: String,
+    pub request_had_turn_state: bool,
+    pub status: Option<u16>,
+    pub error_kind: Option<String>,
+    pub state_returned: bool,
+    pub turn_state: Option<String>,
+    pub set_cookies: Vec<String>,
+    pub replay_safe: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "camelCase")]
+pub enum ResponseObserveResult {
+    Accept,
+    SwitchAccount { reason: Reason },
+}

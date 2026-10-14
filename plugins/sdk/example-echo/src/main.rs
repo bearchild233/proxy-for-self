@@ -55,6 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ],
         capabilities: vec!["log".into()],
         owned_groups: vec![],
+        watched_groups: vec![],
         shutdown_timeout: Duration::from_millis(shutdown_ms),
     };
     Server::bind(Settings::from_env()?, descriptor, Echo)?

@@ -85,3 +85,13 @@ fn valid_config() -> StoreConfig {
     }))
     .expect("test Store configuration")
 }
+
+#[test]
+fn deployment_slot_is_available_for_kernel_hello() {
+    for slot in [Some("a"), Some("b"), None] {
+        let config: StoreConfig = serde_json::from_value(serde_json::json!({
+            "deployment_slot":slot, "database":{"url":"postgres://fixture@127.0.0.1/test","password":PASSWORD}, "redis":{"url":"redis://127.0.0.1/","password":PASSWORD}
+        })).unwrap();
+        assert_eq!(config.deployment_slot(), slot);
+    }
+}
