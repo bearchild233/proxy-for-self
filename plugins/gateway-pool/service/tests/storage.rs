@@ -263,3 +263,33 @@ fn a_failed_report_rolls_back_alone_and_the_finish_still_runs() {
     // 保存点已释放，常驻写连接可以继续开启下一个事务。
     assert!(harness.store.runtime(&json!({"action": "config"})).is_ok());
 }
+
+#[test]
+fn the_finish_follows_the_report_only_when_asked_to() {
+    let harness = Harness::new("storage-conditional-finish", 10_000.0);
+    let report = json!({"action": "businessResult", "accountId": "A", "leaseId": "missing"});
+    let finish = json!({"action": "finish", "accountId": "A", "leaseId": "missing"});
+    // 判断在事务内按回报的结果进行；不需要归还时第二步不执行。
+    let (first, second) = harness
+        .store
+        .runtime_then_finish_if(&report, &finish, &|first| {
+            assert!(first.is_ok());
+            false
+        })
+        .unwrap();
+    assert_eq!(first.unwrap(), json!({"accepted": false}));
+    assert!(second.is_none());
+    let (_, second) = harness
+        .store
+        .runtime_then_finish_if(&report, &finish, &|_| true)
+        .unwrap();
+    assert_eq!(second.unwrap().unwrap(), json!({"accepted": false}));
+    // 第一步只接受结果回报类动作。
+    let other = json!({"action": "plan", "accountId": "A"});
+    assert!(
+        harness
+            .store
+            .runtime_then_finish_if(&other, &finish, &|_| true)
+            .is_err()
+    );
+}

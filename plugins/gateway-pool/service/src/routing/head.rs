@@ -4,10 +4,63 @@
 use std::sync::Arc;
 
 use plugin_sdk::{RpcResult, protocol::*};
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::{Pool, PoolFailure};
-use crate::cookie::{cookie_gateway, merge_cookie};
+use crate::{
+    cookie::{cookie_gateway, merge_cookie},
+    error::Failure,
+};
+
+/// `businessResult` 落库之后租约的去留，以及对内核的答复。
+enum Next {
+    /// 租约保持到整个客户流结束；没有响应时还要把接管事实落库。
+    Keep { persist: bool },
+    /// 租约在同一事务内归还，并按此答复内核。
+    Finish(ResponseHeadResult),
+}
+
+/// 由响应头事实和 `businessResult` 的返回值决定去留。这个函数同时在事务内（决定是否归还）和事务后
+/// （决定答复）使用，两处必须得到同一个结论，所以只此一份。
+fn next_step(
+    status: Option<u16>,
+    errored: bool,
+    matches: bool,
+    result: &Result<Value, Failure>,
+) -> Next {
+    let fail = |failure: PoolFailure| {
+        Next::Finish(ResponseHeadResult::Fail {
+            reason: failure.reason(),
+        })
+    };
+    if status.is_some_and(|status| status != 200) {
+        // 错误内容与原有反馈/重试策略由内核处理，不能用插件错误覆盖上游错误。
+        return Next::Finish(ResponseHeadResult::Accept);
+    }
+    let classification = match result {
+        Ok(value) => value["classification"].as_str(),
+        Err(_) => return fail(PoolFailure::control_plane()),
+    };
+    match classification {
+        // 21：满血，继续交付；租约保持到整个客户流结束。
+        Some("21") if matches => return Next::Keep { persist: false },
+        // 29：降智。关闭当前租约，是否在同账号的其他网关上重发由内核按可重放与尝试上限决定。
+        Some("29") if matches => return Next::Finish(ResponseHeadResult::Switch),
+        _ => {}
+    }
+    // 没有响应（连接失败、超时、取消）：交回内核按原有错误处理，租约在请求结束时归还。
+    if status.is_none() && errored {
+        return Next::Keep { persist: true };
+    }
+    fail(if matches {
+        PoolFailure::new("window_retired", "该窗口已被退役，无法判定响应")
+    } else {
+        PoolFailure::new(
+            "gateway_mismatch",
+            "上游响应的路由 Cookie 指向了别的网关，已放弃该窗口",
+        )
+    })
+}
 
 impl Pool {
     pub(crate) async fn response_head(
@@ -35,9 +88,14 @@ impl Pool {
                     lease.gateway.clone(),
                     lease.cookie.clone(),
                     lease.timing.as_ref().map(|timing| timing.value()),
+                    // 归还租约时的访问值：未固定终态的标为 `interrupted`，与 `finish_now` 一致。
+                    lease
+                        .timing
+                        .as_ref()
+                        .map(|timing| timing.closed_value("interrupted")),
                 )
             });
-        let Some((account, model, gateway, cookie, access)) = known else {
+        let Some((account, model, gateway, cookie, access, closed_access)) = known else {
             // 数据库也不存在有效租约事实时，无法判断网关是否一致。
             return Ok(ResponseHeadResult::Fail {
                 reason: PoolFailure::new(
@@ -62,48 +120,39 @@ impl Pool {
             merged.as_deref().and_then(cookie_gateway).as_deref() == Some(gateway.as_str());
         // 与旧路径一致：只有 200 响应才带 state 事实，错误响应按未返回 state 记录。
         let reported_state = status == 200 && params.state_returned;
-        let result = self
-            .runtime(
-                json!({"action": "businessResult", "accountId": account, "leaseId": params.lease_id,
-                "model": model, "status": status, "stateReturned": reported_state, "paired": true,
-                "gatewayMatches": matches, "durationMs": params.duration_ms, "access": access}),
-            )
+        // 业务结果与租约归还放在同一事务：结果让窗口退役之后、租约归还之前，
+        // 并发的 `plan` 会看到“退役中、租约未还”的中间态而误报 no_candidate。
+        // 归还与否由事务内的结果决定（21 保持租约），事务后按同一结论答复内核。
+        let report = json!({"action": "businessResult", "accountId": account, "leaseId": params.lease_id,
+            "model": model, "status": status, "stateReturned": reported_state, "paired": true,
+            "gatewayMatches": matches, "durationMs": params.duration_ms, "access": access});
+        let finish = json!({"action": "finish", "accountId": account, "leaseId": params.lease_id,
+            "access": closed_access});
+        let (reported, errored) = (params.status, params.error_kind.is_some());
+        let (result, _released) = self
+            .business_result_then_finish(report, finish, &params.lease_id, move |result| {
+                matches!(
+                    next_step(reported, errored, matches, result),
+                    Next::Finish(_)
+                )
+            })
             .await;
-        if params.status.is_some_and(|status| status != 200) {
-            // 错误内容与原有反馈/重试策略由内核处理，不能用插件错误覆盖上游错误。
-            self.finish_now(&params.lease_id, &account).await;
-            return Ok(ResponseHeadResult::Accept);
-        }
-        let classification = match &result {
-            Ok(value) => value["classification"].as_str().map(str::to_owned),
-            Err(_) => {
-                self.finish_now(&params.lease_id, &account).await;
-                return Ok(fail(PoolFailure::control_plane()));
+        match next_step(reported, errored, matches, &result) {
+            Next::Keep { persist } => {
+                if persist {
+                    self.persist_current(&params.lease_id).await?;
+                }
+                Ok(ResponseHeadResult::Accept)
             }
-        };
-        match classification.as_deref() {
-            // 21：满血，继续交付；租约保持到整个客户流结束。
-            Some("21") if matches => return Ok(ResponseHeadResult::Accept),
-            // 29：降智。关闭当前租约，是否在同账号的其他网关上重发由内核按可重放与尝试上限决定。
-            Some("29") if matches => {
-                self.finish_now(&params.lease_id, &account).await;
-                return Ok(ResponseHeadResult::Switch);
+            Next::Finish(answer) => {
+                // 忘掉内存里的租约状态；归还没成功时由租约超时回收兜底。
+                self.leases
+                    .lock()
+                    .expect("leases lock")
+                    .remove(&params.lease_id);
+                Ok(answer)
             }
-            _ => {}
         }
-        // 没有响应（连接失败、超时、取消）：交回内核按原有错误处理，租约在请求结束时归还。
-        if params.status.is_none() && params.error_kind.is_some() {
-            self.persist_current(&params.lease_id).await?;
-            return Ok(ResponseHeadResult::Accept);
-        }
-        self.finish_now(&params.lease_id, &account).await;
-        Ok(fail(match params.status {
-            _ if !matches => PoolFailure::new(
-                "gateway_mismatch",
-                "上游响应的路由 Cookie 指向了别的网关，已放弃该窗口",
-            ),
-            _ => PoolFailure::new("window_retired", "该窗口已被退役，无法判定响应"),
-        }))
     }
 
     /// 立即归还租约并忘掉它的内存状态；访问计时在未固定终态时标为 `interrupted`。

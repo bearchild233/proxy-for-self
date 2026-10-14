@@ -352,6 +352,9 @@ fn candidate_gateways(catalog: Option<&Vec<Object>>, settings: &Object) -> Vec<S
 /// `runtime_then_finish` 两步各自的结果。
 pub type StepPair = (Result<Value, Failure>, Result<Value, Failure>);
 
+/// `runtime_then_finish_if` 两步各自的结果；第二步（归还租约）按条件执行，没有执行时为 `None`。
+pub type ConditionalStepPair = (Result<Value, Failure>, Option<Result<Value, Failure>>);
+
 impl Store {
     /// 运行状态机入口：与 `GatewayPool.runtime(message)` 接受并返回相同的 JSON。
     pub fn runtime(&self, message: &Value) -> Result<Value, Failure> {
@@ -388,8 +391,32 @@ impl Store {
     /// 此时并发的 `plan` 会误报没有候选网关。各步结果与分别调用一致，某一步失败只回滚该步（保存点），
     /// 另一步照常执行，与原先两次独立调用互不影响的行为相同。
     pub fn runtime_then_finish(&self, report: &Value, finish: &Value) -> Result<StepPair, Failure> {
+        let (first, second) = self.runtime_then_finish_if(report, finish, &|_| true)?;
+        Ok((
+            first,
+            second.unwrap_or_else(|| Err(Failure::Internal("租约归还未执行".to_owned()))),
+        ))
+    }
+
+    /// 结果回报（`probeResult` 或 `businessResult`）与租约归还的同事务版本。归还是否执行由 `needed`
+    /// 根据回报的结果决定，且在同一事务里判断：业务响应头判定为 21 时租约要保持到请求结束，
+    /// 其余结果都要立即归还。事务、保存点与各步结果的语义同 `runtime_then_finish`。
+    pub fn runtime_then_finish_if(
+        &self,
+        report: &Value,
+        finish: &Value,
+        needed: &dyn Fn(&Result<Value, Failure>) -> bool,
+    ) -> Result<ConditionalStepPair, Failure> {
         let (Value::Object(report), Value::Object(finish)) = (report, finish) else {
             return Failure::invalid("本机消息必须为对象");
+        };
+        let action = match report.get("action") {
+            Some(Value::String(action))
+                if matches!(action.as_str(), "probeResult" | "businessResult") =>
+            {
+                action.as_str()
+            }
+            _ => return Failure::invalid("运行操作无效"),
         };
         let step = |db: &Connection, work: &dyn Fn(&Connection) -> Result<Value, Failure>| {
             db.execute_batch("SAVEPOINT runtime_step")?;
@@ -404,13 +431,15 @@ impl Store {
         self.write(|db| {
             let first = if self.enabled() {
                 let now = self.now_num();
-                step(db, &|db| {
-                    self.dispatch_action(db, report, "probeResult", now)
-                })?
+                step(db, &|db| self.dispatch_action(db, report, action, now))?
             } else {
                 Err(Failure::Forbidden("网关池插件未启用".to_owned()))
             };
-            let second = step(db, &|db| self.finish_lease(db, finish))?;
+            let second = if needed(&first) {
+                Some(step(db, &|db| self.finish_lease(db, finish))?)
+            } else {
+                None
+            };
             Ok((first, second))
         })
     }

@@ -681,6 +681,80 @@ async fn response_head_decisions() {
     assert_eq!(reason.code, "lease_unknown");
 }
 
+/// 29 的业务结果与租约归还在同一事务内完成：另一请求反复 `plan` 时，不能看到“窗口已退役、租约还没归还”
+/// 的中间态（那会让 route.prepare 误报 no_candidate，而此时账号只是进入静置）。
+/// 只有一个候选网关，29 退役它之后唯一合法的 plan 结果是“仍可用”或“全部静置”。
+#[tokio::test]
+async fn concurrent_plan_never_sees_a_retired_window_with_its_lease_unreturned() {
+    use std::sync::atomic::AtomicBool;
+
+    const ROUNDS: usize = 20;
+    let rig = Rig::start("head-29-atomic", json!({"gateways": ["unified-142"]})).await;
+    *rig.fake.gateways.lock().expect("gateways") = vec!["unified-142".into()];
+    let data = rig.dir.path().join("data");
+    let observer = Arc::new(
+        gateway_pool::Store::open(&data, gateway_pool::system_clock()).expect("observer store"),
+    );
+    let (mut samples, mut retired_seen) = (0_usize, 0_usize);
+    for round in 0..ROUNDS {
+        // 每轮重新播种一个持有窗口且没有租约的组合。
+        rig.connection()
+            .execute_batch("DELETE FROM pairs; DELETE FROM materials")
+            .expect("reset");
+        rig.seed_ready(ACCOUNT, "unified-142", &format!("generation-{round}"));
+        let request = format!("req_atomic_{round}");
+        let (lease_id, _) = lease(&rig, &request, "gpt-6-astra").await;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let counted = Arc::new(AtomicUsize::new(0));
+        let spinner = {
+            let (observer, stop, counted) = (
+                Arc::clone(&observer),
+                Arc::clone(&stop),
+                Arc::clone(&counted),
+            );
+            std::thread::spawn(move || {
+                let mut intermediate = 0_usize;
+                while !stop.load(Ordering::SeqCst) {
+                    let plan = observer
+                        .runtime(&json!({"action": "plan", "accountId": ACCOUNT, "demand": true}))
+                        .expect("plan");
+                    // route.prepare 把这种结果（没有窗口、没有探测、没有等待、没有阻塞原因）报成 no_candidate。
+                    if plan["ready"].is_null()
+                        && plan["probe"].is_null()
+                        && plan["preparing"] != true
+                        && plan["blocked"].is_null()
+                    {
+                        intermediate += 1;
+                    }
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    // SQLite 写锁不公平：不让出的紧凑循环会饿死被测请求。
+                    std::thread::sleep(Duration::from_micros(300));
+                }
+                intermediate
+            })
+        };
+        // 确认观察者已经在反复 plan 之后再判定 29。
+        while counted.load(Ordering::SeqCst) < 3 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let verdict = rig.head(&request, &lease_id, Some(200), true, vec![]).await;
+        stop.store(true, Ordering::SeqCst);
+        let intermediate = spinner.join().expect("observer thread");
+        samples += counted.load(Ordering::SeqCst);
+        retired_seen += intermediate;
+
+        assert_eq!(verdict, ResponseHeadResult::Switch);
+        assert_eq!(rig.lease_count(&lease_id), 0);
+        assert_eq!(rig.pair(ACCOUNT, "unified-142")["state"], "cooling");
+    }
+    assert!(samples > ROUNDS * 3, "observer barely ran: {samples}");
+    assert_eq!(
+        retired_seen, 0,
+        "plan saw a retired window whose lease was still unreturned ({retired_seen} of {samples} plans)"
+    );
+}
+
 /// 请求结束带访问计时和结果；插件重启后接管的租约（没有内存状态）也能归还。
 #[tokio::test]
 async fn request_finish_records_the_access_and_releases_adopted_leases() {

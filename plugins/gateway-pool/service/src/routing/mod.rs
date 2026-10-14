@@ -250,6 +250,15 @@ impl AccessTiming {
             .unwrap_or_else(|| (self.elapsed_before + self.started.elapsed(), "headers"));
         json!({"id": self.id, "startedAt": self.at, "elapsedMs": elapsed.as_millis(), "ended": self.ended.is_some(), "outcome": outcome})
     }
+
+    /// 如果此刻以 `outcome` 结束，`value` 会给出的样子；不改变计时本身。
+    /// 业务结果与租约归还同事务提交时，归还用的访问值要在知道是否归还之前备好。
+    pub fn closed_value(&self, outcome: &'static str) -> Value {
+        let (elapsed, outcome) = self
+            .ended
+            .unwrap_or_else(|| (self.elapsed_before + self.started.elapsed(), outcome));
+        json!({"id": self.id, "startedAt": self.at, "elapsedMs": elapsed.as_millis(), "ended": true, "outcome": outcome})
+    }
 }
 
 /// 已预约、尚未交给内核的窗口：等待其他模型的票时在多次 `route.prepare` 之间保留。
@@ -385,6 +394,39 @@ impl Pool {
                 Err(Failure::Internal(error.to_string())),
             ),
         }
+    }
+
+    /// 业务结果与租约归还在同一事务内完成，见 `Store::runtime_then_finish_if`。
+    /// `needed` 在事务内按业务结果的返回值判断是否归还；归还成功时同时清掉租约的接管事实。
+    pub(super) async fn business_result_then_finish(
+        &self,
+        report: Value,
+        finish: Value,
+        lease: &str,
+        needed: impl Fn(&Result<Value, Failure>) -> bool + Send + 'static,
+    ) -> (Result<Value, Failure>, Option<Result<Value, Failure>>) {
+        let store = Arc::clone(&self.store);
+        let joined = tokio::task::spawn_blocking(move || {
+            store.runtime_then_finish_if(&report, &finish, &needed)
+        })
+        .await;
+        let (first, second) = match joined {
+            Ok(Ok(results)) => results,
+            Ok(Err(error)) => (
+                Err(Failure::Internal(error.to_string())),
+                Some(Err(Failure::Internal(error.to_string()))),
+            ),
+            Err(error) => (
+                Err(Failure::Internal(error.to_string())),
+                Some(Err(Failure::Internal(error.to_string()))),
+            ),
+        };
+        if matches!(second, Some(Ok(_))) {
+            let store = self.store.clone();
+            let lease = lease.to_owned();
+            let _ = tokio::task::spawn_blocking(move || store.delete_hook_lease(&lease)).await;
+        }
+        (first, second)
     }
 
     pub(super) async fn settings(&self) -> Result<Arc<PoolSettings>, Failure> {
