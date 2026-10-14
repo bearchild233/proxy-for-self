@@ -1,0 +1,21 @@
+[package]
+name = "gateway-pool"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+plugin-sdk.workspace = true
+kernel-protocol.workspace = true
+rusqlite = { version = "0.39", features = ["bundled"] }
+# float_roundtrip：时间戳以 JSON 文本存储，默认解析器可能偏差 1 ULP，写回后会逐次漂移。
+serde_json = { workspace = true, features = ["float_roundtrip"] }
+tokio.workspace = true
+
+[dev-dependencies]
+plugin-sdk = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true
