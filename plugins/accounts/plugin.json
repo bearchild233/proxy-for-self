@@ -1,6 +1,6 @@
 {
   "id": "accounts",
-  "version": "0.3.9",
+  "version": "0.3.10",
   "protocol": 2,
   "kind": "ui",
   "sdk": 1,
@@ -52,11 +52,10 @@
     "settings.get.admin.settings.client-downloads.codex-desktop.windows",
     "accounts.avatar"
   ],
-  "releasedAt": "2026-10-10T09:00:00Z",
+  "releasedAt": "2026-10-14T12:00:00Z",
   "releaseNotes": [
-    "账号未修改时直接关闭编辑窗口，不发起保存或刷新请求。",
-    "仅修改分组时只提交分组，保留后台或其他管理员同时修改的账号设置。",
-    "保存完成立即解除忙碌状态，列表在后台同步。"
+    "已归档账号可重新授权（成功后自动启用并回到主列表）、恢复到主列表或删除，支持批量恢复与批量删除。",
+    "归档视图的恢复操作失败时不再导致整页显示插件运行失败。"
   ],
   "runtime": "vue-component",
   "hostApi": 1

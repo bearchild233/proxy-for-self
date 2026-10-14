@@ -1,11 +1,9 @@
 <script setup lang="ts">
-import type { Account } from '@/api'
 import { ChevronDown, RefreshCw } from '@lucide/vue'
 import { enabled } from '@sdk/catalog'
 import { host } from '@sdk/ui'
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 
-import { batchUpdateAccounts } from '@/api'
 import AccountGroupMarks from '@/components/AccountGroupMarks.vue'
 import BaseButton from '@/components/base/BaseButton.vue'
 import BaseCard from '@/components/base/BaseCard.vue'
@@ -16,10 +14,10 @@ import BaseTableColumnSettings from '@/components/base/BaseTable/BaseTableColumn
 import BaseTablePagination from '@/components/base/BaseTable/BaseTablePagination.vue'
 import BaseTable from '@/components/base/BaseTable/index.vue'
 import { useTableColumns } from '@/components/base/BaseTable/useTableColumns'
-import { toast } from '@/components/base/BaseToast'
 import LastUsedAtCell from '@/components/LastUsedAtCell.vue'
 import { useAccountGroupCatalog } from '@/composables/useAccountGroupCatalog'
 import { useSharedOrder } from '@/composables/useSharedOrder'
+import AccountArchivedActions from './components/AccountArchivedActions.vue'
 import AccountBatchEditModal from './components/AccountBatchEditModal.vue'
 import AccountCreateModal from './components/AccountCreateModal/index.vue'
 import AccountEditModal from './components/AccountEditModal.vue'
@@ -37,6 +35,7 @@ import { useAccountBatchEditor } from './composables/useAccountBatchEditor'
 
 import { useAccountEditor } from './composables/useAccountEditor'
 import { useAccountImportTasks } from './composables/useAccountImportTasks'
+import { useAccountLifecycle } from './composables/useAccountLifecycle'
 import { useAccountMutations } from './composables/useAccountMutations'
 import { useAccountOAuthExport } from './composables/useAccountOAuthExport'
 import { useAccountsQuery } from './composables/useAccountsQuery'
@@ -189,16 +188,21 @@ const {
   reloadGroups: loadGroups,
 })
 const { savingOrder, saveOrder } = useSharedOrder('accounts', loadAccounts, accounts)
-const lifecycleSaving = ref(new Set<string>())
-async function updateLifecycle(account: Account, changes: { expiryPriority?: boolean, restoreArchived?: boolean }) {
-  lifecycleSaving.value.add(account.id)
-  try {
-    await batchUpdateAccounts({ accountIds: [account.id], ...changes })
-    toast.success(changes.restoreArchived ? '已恢复到主列表，重新授权后可启用' : '临期优先已保存')
-    await loadAccounts()
-  }
-  finally { lifecycleSaving.value.delete(account.id) }
-}
+const {
+  saving: lifecycleSaving,
+  batchRestoring,
+  update: updateLifecycle,
+  restoreSelected: restoreSelectedArchived,
+} = useAccountLifecycle({ selectedIds, reload: loadAccounts })
+
+// 归档账号的删除提示必须写明不可恢复；主列表沿用原有文案。
+const archivedDeleteDescription = '删除后无法恢复，账号凭据与分组绑定将被永久移除'
+const batchDeleteDescription = computed(() => archivedQuery.value
+  ? archivedDeleteDescription
+  : '删除后该账号将不再参与调度，此操作不可撤销')
+const singleDeleteDescription = computed(() => pendingDeleteAccount.value?.lifecycle.archived
+  ? archivedDeleteDescription
+  : '删除后该账号将不再参与调度，此操作不可撤销')
 </script>
 
 <template>
@@ -235,12 +239,15 @@ async function updateLifecycle(account: Account, changes: { expiryPriority?: boo
           :groups="groups"
           :groups-loading="groupsLoading"
           :selected-count="selectedIds.size"
+          :archived="archivedQuery"
+          :batch-restoring="batchRestoring"
           :batch-deleting="batchDeleting"
           :exporting-accounts="exportingAccounts"
           :has-import-tasks="recentImportTasks.length > 0"
           :active-import-count="activeImportCount"
           @import-tasks="showImportTasks = true"
           @delete-selected="showDeleteModal = true"
+          @restore-selected="restoreSelectedArchived"
           @export-selected="handleExportAccounts"
           @create="openCreateAccount"
           @edit-selected="openBatchEdit"
@@ -261,7 +268,7 @@ async function updateLifecycle(account: Account, changes: { expiryPriority?: boo
           </template>
         </AccountFilters>
         <p v-if="archivedQuery" class="mt-2 mb-0 text-cp-xs text-cp-text-secondary">
-          已归档账号不参与调度，资料和使用记录保留。恢复后保持停用。
+          已归档账号不参与调度，资料和使用记录保留。可重新授权（成功后自动启用并回到主列表）、恢复到主列表（保持停用）或删除（不可恢复）。
         </p>
         <p v-if="attentionQuery && attentionNote" role="status" class="mt-2 mb-0 text-cp-xs leading-normal text-cp-text-secondary">
           {{ attentionNote }}
@@ -356,9 +363,15 @@ async function updateLifecycle(account: Account, changes: { expiryPriority?: boo
             </template>
 
             <template #actions="{ row }">
-              <BaseButton v-if="row.lifecycle.archived" size="sm" :disabled="lifecycleSaving.has(row.id)" @click="updateLifecycle(row, { restoreArchived: true })">
-                恢复到主列表
-              </BaseButton>
+              <AccountArchivedActions
+                v-if="row.lifecycle.archived"
+                :account="row"
+                :restoring="lifecycleSaving.has(row.id)"
+                :deleting="deletingAccount"
+                @reauthorize="openReauthorizeAccount"
+                @restore="updateLifecycle($event, { restoreArchived: true })"
+                @delete="requestDeleteAccount"
+              />
               <AccountTableActions
                 v-else
                 :account="row"
@@ -474,7 +487,7 @@ async function updateLifecycle(account: Account, changes: { expiryPriority?: boo
     <BaseConfirmModal
       v-model="showDeleteModal"
       title="确认删除"
-      description="删除后该账号将不再参与调度，此操作不可撤销"
+      :description="batchDeleteDescription"
       destructive
       confirm-text="确认删除"
       :loading="batchDeleting"
@@ -488,7 +501,7 @@ async function updateLifecycle(account: Account, changes: { expiryPriority?: boo
     <BaseConfirmModal
       v-model="showSingleDeleteModal"
       title="删除账号"
-      description="删除后该账号将不再参与调度，此操作不可撤销"
+      :description="singleDeleteDescription"
       destructive
       confirm-text="确认删除"
       :loading="deletingAccount"

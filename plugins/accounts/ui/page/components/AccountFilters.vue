@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import type { AccountAttention } from '../utils/accountAttention'
 import type { AccountGroup } from '@/api'
-import { Download, ListTodo, Pencil, Trash2, Upload } from '@lucide/vue'
+import { ArchiveRestore, Download, ListTodo, Pencil, Trash2, Upload } from '@lucide/vue'
 import { computed } from 'vue'
 
 import BaseButton from '@/components/base/BaseButton.vue'
@@ -18,10 +18,14 @@ const props = defineProps<{
   exportingAccounts: boolean
   groups: AccountGroup[]
   groupsLoading: boolean
+  /** 归档视图：批量操作改为“恢复选中 / 删除选中”，不提供批量编辑。 */
+  archived?: boolean
+  batchRestoring?: boolean
 }>()
 
 const emit = defineEmits<{
   deleteSelected: []
+  restoreSelected: []
   exportSelected: []
   importTasks: []
   create: []
@@ -91,13 +95,25 @@ const groupOptions = computed(() => [
       class="grid w-full grid-cols-2 gap-2 xl:flex xl:w-auto xl:flex-wrap xl:shrink-0 xl:self-end xl:items-center xl:justify-end xl:ml-auto"
     >
       <BaseButton
-        v-if="selectedCount > 0"
+        v-if="selectedCount > 0 && !archived"
         variant="secondary"
         class="w-full whitespace-nowrap xl:w-auto"
         @click="emit('editSelected')"
       >
         <Pencil class="size-4 text-cp-link" />
         批量编辑账号
+      </BaseButton>
+      <BaseButton
+        v-if="selectedCount > 0 && archived"
+        variant="secondary"
+        class="w-full whitespace-nowrap xl:w-auto"
+        :loading="batchRestoring"
+        @click="emit('restoreSelected')"
+      >
+        <template #icon>
+          <ArchiveRestore class="size-4 text-cp-link" />
+        </template>
+        恢复选中 ({{ selectedCount }})
       </BaseButton>
       <BaseButton
         v-if="selectedCount > 0"

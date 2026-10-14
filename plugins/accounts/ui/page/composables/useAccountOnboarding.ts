@@ -165,7 +165,8 @@ export function useAccountOnboarding(options: {
         })
         await finishCreate(
           reauthorizingAccount.value
-            ? '账号重新授权成功'
+            // 后端在授权成功的同一事务里让归档账号离开归档并启用。
+            ? reauthorizingAccount.value.lifecycle.archived ? '账号重新授权成功，已启用并回到主列表' : '账号重新授权成功'
             : createForm.value.provider === 'xai'
               ? 'xAI OAuth 账号已添加'
               : 'OpenAI OAuth 账号已添加',
