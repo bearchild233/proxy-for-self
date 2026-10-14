@@ -1,5 +1,4 @@
-//! 网关池历史只读投影，逐项对应 `gateway_pool_history_query.py`。
-//! 完整范围聚合与当前页分开；未知时间不补零；查询过程不访问上游。
+//! 网关池历史只读投影：完整范围聚合与当前页分开；未知时间不补零；查询过程不访问上游。
 
 use std::collections::HashMap;
 
@@ -34,6 +33,8 @@ struct Span {
 
 struct Access {
     kind: String,
+    /// 判定（`21`/`29`），业务访问回报时写入。
+    classification: Option<String>,
     observed: Num,
     started: Option<Num>,
     ended: Option<Num>,
@@ -47,6 +48,7 @@ impl Access {
     fn from_row(row: &Object) -> Self {
         Self {
             kind: str_field(row, "kind").unwrap_or_default().to_owned(),
+            classification: str_field(row, "classification").map(str::to_owned),
             observed: num_field(row, "observed").unwrap_or(Num::Int(0)),
             started: num_field(row, "started"),
             ended: num_field(row, "ended"),
@@ -176,12 +178,116 @@ fn known_business_total(rows: &[&Object]) -> Num {
     )
 }
 
+/// 业务访问给出的使用事实：窗口时长按“最后一次确认可用”计，不再按查询时刻无限增长。
+struct Usage {
+    /// 最后一个判定为 21 的业务访问的结束时刻。
+    confirmed: Option<Num>,
+    /// 有结束时间未知但仍在途的业务访问（租约有效）。
+    in_flight: bool,
+    /// 有结束时间未知且无法确认还在途的业务访问（失联、旧数据）。
+    unknown_end: bool,
+    /// 最近一次使用（结束时刻，在途或未知时取起点）。
+    latest_use: Option<Num>,
+}
+
+fn later(current: Option<Num>, value: Num) -> Option<Num> {
+    Some(current.map_or(value, |known| known.max(value)))
+}
+
+fn usage_of(accesses: &[Access]) -> Usage {
+    let mut usage = Usage {
+        confirmed: None,
+        in_flight: false,
+        unknown_end: false,
+        latest_use: None,
+    };
+    for access in accesses.iter().filter(|access| access.kind == "business") {
+        match access.ended {
+            Some(ended) => {
+                usage.latest_use = later(usage.latest_use, ended);
+                if access.classification.as_deref() == Some("21") {
+                    usage.confirmed = later(usage.confirmed, ended);
+                }
+            }
+            None => {
+                usage.latest_use = later(usage.latest_use, access.anchor());
+                if access.missing {
+                    usage.unknown_end = true;
+                } else {
+                    usage.in_flight = true;
+                }
+            }
+        }
+    }
+    usage
+}
+
+/// 窗口时长的口径（016）：从窗口计时起点算到“最后一次确认可用”。
+/// - 窗口计时起点：备用票转正的窗口取第一次业务访问，其余取首次接触。
+/// - 进行中且窗口未超过 `windowSeconds`、有在途请求、或最近 `windowSeconds` 内有使用：算到查询时刻。
+/// - 否则止于最后一次 21 业务访问的结束（没有业务访问时为验证时刻）；已退役的窗口再不晚于退役时刻。
+/// - 备用票从未转正：时长为 0；转正后还没有业务访问：时长为 0。
+///
+/// 返回（计时起点，结束时刻或 None 表示算到查询时刻，最后确认可用时刻，窗口时长）。
+fn window_figures(
+    item: &Object,
+    usage: &Usage,
+    span: Span,
+    window: Num,
+) -> (Option<Num>, Option<Num>, Option<Num>, Option<Num>) {
+    let Span { lower, upper, now } = span;
+    let standby = truthy(item.get("standby"));
+    let start = if standby {
+        num_field(item, "windowStartedAt")
+    } else {
+        num_field(item, "firstContactAt")
+    };
+    let verified = num_field(item, "verifiedAt");
+    let served = verified.is_some() && (!standby || !is_null_or_missing(item, "activatedAt"));
+    let confirmed = match (verified, usage.confirmed) {
+        (Some(verified), Some(ok)) => Some(verified.max(ok)),
+        (verified, ok) => verified.or(ok),
+    };
+    if !served {
+        return (
+            start,
+            None,
+            None,
+            (standby && verified.is_some()).then_some(Num::Int(0)),
+        );
+    }
+    let Some(start) = start else {
+        return (None, None, confirmed, standby.then_some(Num::Int(0)));
+    };
+    let retired = num_field(item, "retiredAt");
+    let end = match retired {
+        None => {
+            let fresh = now.minus(start).le(window);
+            let recent = usage
+                .latest_use
+                .is_some_and(|used| used.ge(now.minus(window)));
+            if fresh || recent || usage.in_flight || usage.unknown_end {
+                None
+            } else {
+                Some(confirmed.map_or(now, |confirmed| confirmed.min(now)))
+            }
+        }
+        Some(retired) => Some(match confirmed {
+            Some(confirmed) if !usage.unknown_end => confirmed.min(retired),
+            _ => retired,
+        }),
+    };
+    let seconds = clip(Some(start), Some(end.unwrap_or(now)), lower, upper);
+    (Some(start), end, confirmed, seconds)
+}
+
 /// 投影单个窗口：计时、访问区间与分段，全部限定在查询范围内。
 fn window_row(
     mut item: Object,
     mut accesses: Vec<Access>,
     segments: &[Segment],
     span: Span,
+    window_setting: Num,
 ) -> Object {
     let Span { lower, upper, now } = span;
     for access in &mut accesses {
@@ -189,6 +295,8 @@ fn window_row(
             || access.started.is_none()
             || (access.ended.is_none() && access.expires.is_none_or(|expires| expires.le(now)));
     }
+    // 最后确认可用要看窗口的全部访问，不受查询范围裁剪；时长再按范围取交集。
+    let usage = usage_of(&accesses);
     // 确定在范围外的缺失访问不污染本次计时；结束未知仍保守保留。
     let accesses: Vec<Access> = accesses
         .into_iter()
@@ -217,16 +325,8 @@ fn window_row(
     let preparation_end = num_field(&item, "probeEndedAt")
         .or_else(|| (str_field(&item, "state") == Some("preparing")).then_some(now));
     let preparation = clip(preparation_start, preparation_end, lower, upper);
-    let window = if is_null_or_missing(&item, "verifiedAt") {
-        None
-    } else {
-        clip(
-            num_field(&item, "firstContactAt"),
-            Some(num_field(&item, "retiredAt").unwrap_or(now)),
-            lower,
-            upper,
-        )
-    };
+    let (window_start, window_end, confirmed, window) =
+        window_figures(&item, &usage, span, window_setting);
     let requests = business
         .iter()
         .filter(|access| lower.le(access.anchor()) && access.anchor().lt(upper))
@@ -237,6 +337,9 @@ fn window_row(
 
     set(&mut item, "preparationSeconds", opt_json(preparation));
     set(&mut item, "windowSeconds", opt_json(window));
+    set(&mut item, "windowStartAt", opt_json(window_start));
+    set(&mut item, "windowEndAt", opt_json(window_end));
+    set(&mut item, "lastConfirmedAt", opt_json(confirmed));
     set(
         &mut item,
         "businessSeconds",
@@ -303,6 +406,107 @@ fn window_row(
     }
     set(&mut item, "segments", Value::Array(projected));
     item
+}
+
+/// 读取并投影满足条件的窗口：访问与分段只取这些窗口的，全部按 `span` 取交集。
+fn project(
+    db: &Connection,
+    span: Span,
+    window_setting: Num,
+    condition: &str,
+    args: &[rusqlite::types::Value],
+) -> Result<Vec<Object>, Failure> {
+    let windows = bounded(
+        db,
+        &format!(
+            "SELECT w.* FROM gp_windows w WHERE {condition} ORDER BY w.started DESC,w.id DESC"
+        ),
+        args.to_vec(),
+        MAX_WINDOWS,
+        OVERFLOW,
+    )?;
+    let mut accesses: HashMap<String, Vec<Access>> = HashMap::new();
+    let mut segments: HashMap<String, Vec<Segment>> = HashMap::new();
+    if !windows.is_empty() {
+        let access_sql = format!(
+            "SELECT a.*,l.expires FROM gp_accesses a JOIN gp_windows w ON w.id=a.generation LEFT JOIN leases l ON l.id=a.lease WHERE {condition}"
+        );
+        for row in bounded(db, &access_sql, args.to_vec(), MAX_ACCESSES, OVERFLOW)? {
+            accesses
+                .entry(string_of(&row, "generation"))
+                .or_default()
+                .push(Access::from_row(&row));
+        }
+        let segment_sql = format!(
+            "SELECT s.* FROM gp_segments s JOIN gp_windows w ON w.id=s.generation WHERE {condition} ORDER BY s.started"
+        );
+        for row in bounded(db, &segment_sql, args.to_vec(), MAX_ACCESSES, OVERFLOW)? {
+            segments
+                .entry(string_of(&row, "generation"))
+                .or_default()
+                .push(Segment::from_row(&row));
+        }
+    }
+    let mut records: Vec<Object> = Vec::with_capacity(windows.len());
+    for window in &windows {
+        let id = string_of(window, "id");
+        let item = decode_object(&string_of(window, "data"))?;
+        let window_accesses = accesses.remove(&id).unwrap_or_default();
+        let window_segments = segments.get(&id).map_or(&[][..], Vec::as_slice);
+        records.push(window_row(
+            item,
+            window_accesses,
+            window_segments,
+            span,
+            window_setting,
+        ));
+    }
+    Ok(records)
+}
+
+/// 最近 24 小时每个账号各网关的窗口时长（与窗口时长同一口径，不受页面筛选影响）。
+fn recent_windows(db: &Connection, now: Num, window_setting: Num) -> Result<Vec<Value>, Failure> {
+    let lower = now.minus(Num::Int(86400)).max(Num::Int(0));
+    let span = Span {
+        lower,
+        upper: now,
+        now,
+    };
+    let condition = "w.started<=? AND (w.ended IS NULL OR w.ended>=?)";
+    let args = vec![sql_of_num(now), sql_of_num(lower)];
+    let records = project(db, span, window_setting, condition, &args)?;
+    let mut totals: Vec<(String, String, Num, usize)> = Vec::new();
+    for record in &records {
+        let Some(seconds) =
+            num_field(record, "windowSeconds").filter(|seconds| seconds.gt(Num::Int(0)))
+        else {
+            continue;
+        };
+        let account = string_of(record, "accountId");
+        let gateway = string_of(record, "gateway");
+        match totals
+            .iter_mut()
+            .find(|(known_account, known_gateway, _, _)| {
+                *known_account == account && *known_gateway == gateway
+            }) {
+            Some((_, _, total, windows)) => {
+                *total = total.plus(seconds);
+                *windows += 1;
+            }
+            None => totals.push((account, gateway, seconds, 1)),
+        }
+    }
+    totals.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then(b.2.as_f64().total_cmp(&a.2.as_f64()))
+            .then(a.1.cmp(&b.1))
+    });
+    Ok(totals
+        .into_iter()
+        .map(|(account, gateway, seconds, windows)| {
+            json!({"accountId": account, "gateway": gateway, "windowSeconds": seconds.to_json(), "windows": windows})
+        })
+        .collect())
 }
 
 /// 按第一次出现的顺序分组，保证网关列表的顺序与原实现一致。
@@ -569,49 +773,15 @@ pub fn read(db: &Connection, now: Num, query: &Object) -> Result<Value, Failure>
     let condition = conditions.join(" AND ");
     let span = Span { lower, upper, now };
 
-    let windows = if view == "cooling" {
+    let window_setting = crate::store::effective_settings(db, false)?
+        .get("windowSeconds")
+        .and_then(|value| num_of(Some(value)))
+        .unwrap_or(Num::Int(180));
+    let records: Vec<Object> = if view == "cooling" {
         Vec::new()
     } else {
-        bounded(
-            db,
-            &format!(
-                "SELECT w.* FROM gp_windows w WHERE {condition} ORDER BY w.started DESC,w.id DESC"
-            ),
-            args.clone(),
-            MAX_WINDOWS,
-            OVERFLOW,
-        )?
+        project(db, span, window_setting, &condition, &args)?
     };
-    let mut accesses: HashMap<String, Vec<Access>> = HashMap::new();
-    let mut segments: HashMap<String, Vec<Segment>> = HashMap::new();
-    if !windows.is_empty() {
-        let access_sql = format!(
-            "SELECT a.*,l.expires FROM gp_accesses a JOIN gp_windows w ON w.id=a.generation LEFT JOIN leases l ON l.id=a.lease WHERE {condition}"
-        );
-        for row in bounded(db, &access_sql, args.clone(), MAX_ACCESSES, OVERFLOW)? {
-            accesses
-                .entry(string_of(&row, "generation"))
-                .or_default()
-                .push(Access::from_row(&row));
-        }
-        let segment_sql = format!(
-            "SELECT s.* FROM gp_segments s JOIN gp_windows w ON w.id=s.generation WHERE {condition} ORDER BY s.started"
-        );
-        for row in bounded(db, &segment_sql, args.clone(), MAX_ACCESSES, OVERFLOW)? {
-            segments
-                .entry(string_of(&row, "generation"))
-                .or_default()
-                .push(Segment::from_row(&row));
-        }
-    }
-    let mut records: Vec<Object> = Vec::with_capacity(windows.len());
-    for window in &windows {
-        let id = string_of(window, "id");
-        let item = decode_object(&string_of(window, "data"))?;
-        let window_accesses = accesses.remove(&id).unwrap_or_default();
-        let window_segments = segments.get(&id).map_or(&[][..], Vec::as_slice);
-        records.push(window_row(item, window_accesses, window_segments, span));
-    }
 
     let record_refs: Vec<&Object> = records.iter().collect();
     let mut summary = aggregate(&record_refs);
@@ -928,6 +1098,12 @@ pub fn read(db: &Connection, now: Num, query: &Object) -> Result<Value, Failure>
         Value::Null
     };
     set(&mut result, "coolingAnalysis", cooling);
+    let recent = if view == "summary" {
+        recent_windows(db, now, window_setting)?
+    } else {
+        Vec::new()
+    };
+    set(&mut result, "recentWindows", Value::Array(recent));
     let (records_out, batches_out, recoveries_out) = match view.as_str() {
         "records" => (selected, Vec::new(), Vec::new()),
         "summary" => (Vec::new(), selected, Vec::new()),

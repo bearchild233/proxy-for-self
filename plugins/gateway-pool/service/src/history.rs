@@ -1,4 +1,4 @@
-//! 网关池历史事实的表结构与写入辅助，逐项对应 `gateway_pool_history.py` 中本步骤需要的部分。
+//! 网关池历史事实的表结构与写入辅助：窗口、访问、分段、批次与静置周期。
 //! 历史失败不得回滚调度事实：`record` 使用保存点，失败只记为收集缺口。
 
 use rusqlite::Connection;
@@ -151,6 +151,19 @@ pub fn interrupt(db: &Connection, now: Num, reason: &str) -> Result<(), Failure>
     Ok(())
 }
 
+/// 进程启动时清理上一个进程留下的业务访问：没有结束时间、也不属于任何仍有效的在途租约的记录标为中断。
+/// 只改 `outcome`；是否计入时长仍由统计按“结束未知”处理，不改动其他事实。
+pub fn interrupt_orphans(db: &Connection, now: Num) -> Result<(), Failure> {
+    exec(
+        db,
+        "UPDATE gp_accesses SET outcome='interrupted'
+         WHERE ended IS NULL AND kind='business' AND COALESCE(outcome,'')<>'interrupted'
+           AND NOT EXISTS (SELECT 1 FROM leases l WHERE l.id=gp_accesses.lease AND l.expires>?)",
+        vec![sql_of_num(now)],
+    )?;
+    Ok(())
+}
+
 /// 关闭空闲超过两小时、且没有未结束业务访问的分段；`generation` 给出时只处理该代次。
 pub fn close_idle(db: &Connection, now: Num, generation: Option<&str>) -> Result<(), Failure> {
     let mut sql = String::from(
@@ -191,7 +204,7 @@ pub fn sync(db: &Connection, pair: &Object, now: Num) -> Result<(), Failure> {
     let previous = str_field(&item, "state").unwrap_or_default().to_owned();
     let state = str_field(pair, "state").unwrap_or_default().to_owned();
     set(&mut item, "state", json!(state));
-    if state == "ready" && is_null_or_missing(&item, "verifiedAt") {
+    if matches!(state.as_str(), "ready" | "standby") && is_null_or_missing(&item, "verifiedAt") {
         let verified = pair
             .get("verifiedAt")
             .cloned()
@@ -199,10 +212,28 @@ pub fn sync(db: &Connection, pair: &Object, now: Num) -> Result<(), Failure> {
         set(&mut item, "verifiedAt", verified);
         sync_learned_rest(db, pair, &item)?;
     }
+    // 备用票：拿到时间、启用时间与转正后窗口的计时起点，页面据此区分“备用期间”与窗口。
+    if state == "standby" {
+        set(&mut item, "standby", json!(true));
+    }
+    for key in ["standbyAt", "activatedAt", "windowStartedAt"] {
+        if is_null_or_missing(&item, key) && !is_null_or_missing(pair, key) {
+            set(
+                &mut item,
+                key,
+                pair.get(key).cloned().unwrap_or(Value::Null),
+            );
+        }
+    }
     if matches!(state.as_str(), "draining" | "cooling" | "unknown")
         && is_null_or_missing(&item, "retiredAt")
     {
-        set(&mut item, "retiredAt", now.to_json());
+        // 备用票到期是惰性丢弃的：结束时间记为它应当到期的时刻，而不是实际处理的时刻。
+        let expiry = (str_field(pair, "retiredReason") == Some("standby_expired"))
+            .then(|| num_field(pair, "standbyAt"))
+            .flatten()
+            .map(|at| at.plus(Num::Int(crate::policy::STANDBY_LIFETIME_SECONDS)));
+        set(&mut item, "retiredAt", expiry.unwrap_or(now).to_json());
         let reason = pair
             .get("retiredReason")
             .cloned()
@@ -309,7 +340,9 @@ fn sync_batch(db: &Connection, item: &Object, now: Num) -> Result<(), Failure> {
         return Err(Failure::Internal("窗口所属批次不存在".to_owned()));
     };
     let mut processed = decode_object(&string_of(&batch, "processed"))?;
-    if !is_null_or_missing(item, "firstContactAt") {
+    // 从未启用的备用票没有服务过，不算遍历（与队列的待完成清单一致）。
+    let unserved_standby = truthy(item.get("standby")) && is_null_or_missing(item, "activatedAt");
+    if !is_null_or_missing(item, "firstContactAt") && !unserved_standby {
         // 未触及上游的 Cookie/目录失败不算遍历，重复候选仍留在当前批次。
         let outcome = if !is_null_or_missing(item, "verifiedAt") {
             json!("served")
@@ -408,6 +441,11 @@ fn sync_cooling(db: &Connection, pair: &Object, item: &Object) -> Result<(), Fai
         "result": null,
         "status": null,
         "learnedRestSeconds": pair.get("learnedRestSeconds").cloned().unwrap_or(Value::Null),
+        // 这一轮静置的原因、所在的档与当时的起始档；复测失败的原因在 `failure`。
+        "reason": pair.get("retiredReason").cloned().unwrap_or(Value::Null),
+        "tierSeconds": pair.get("tierSeconds").or_else(|| pair.get("restSeconds")).cloned().unwrap_or(Value::Null),
+        "startTierSeconds": pair.get("startTierSeconds").cloned().unwrap_or(Value::Null),
+        "failure": null,
     }));
     match cycle {
         Some(row) => exec(
@@ -742,6 +780,16 @@ pub fn result(
             let observed = if last.is_null() { now.to_json() } else { last };
             set(step, "resultAt", observed.clone());
             set(step, "result", json!(verdict.unwrap_or("failed")));
+            // 检测失败的类别（超时、无响应、缺材料、Cookie host 不符等），状态码记在 `status`。
+            set(
+                step,
+                "failure",
+                if verdict.is_none() {
+                    payload.get("failure").cloned().unwrap_or(Value::Null)
+                } else {
+                    Value::Null
+                },
+            );
             set(
                 step,
                 "status",

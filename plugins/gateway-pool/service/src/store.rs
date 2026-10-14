@@ -1,5 +1,5 @@
-//! 网关池持久化入口，对应 `gateway_pool.py` 中的存储、设置、队列与管理读取部分。
-//! 写入复用连接并逐次开启 `BEGIN IMMEDIATE`；报表用独立只读快照，与 Python 的事务语义一致。
+//! 网关池持久化入口：存储、设置、队列与管理读取。
+//! 写入复用连接并逐次开启 `BEGIN IMMEDIATE`；报表用独立只读快照。
 
 use std::{
     path::{Path, PathBuf},
@@ -21,8 +21,8 @@ use crate::{
     num::Num,
     policy, queue, settings,
     util::{
-        Object, decode_object, decode_value, exec, merged, one, python_int, rows, set, sql_of,
-        sql_of_num, str_field, text, truthy, where_clause,
+        Object, decode_object, decode_value, exec, merged, num_field, one, python_int, rows, set,
+        sql_of, sql_of_num, str_field, text, truthy, where_clause,
     },
 };
 
@@ -161,7 +161,9 @@ impl Store {
         store.write(|db| {
             db.execute_batch(SCHEMA)?;
             history::install(db, now)?;
-            queue::install(db)
+            queue::install(db)?;
+            // 上一个进程留下的、不属于任何在途租约的业务访问记录标为中断。
+            history::record(db, |db| history::interrupt_orphans(db, now))
         })?;
         set_file_mode(&store.path)?;
         Ok(store)
@@ -274,16 +276,35 @@ impl Store {
                         .collect()
                 })
                 .unwrap_or_default();
-            // 限定网关时，被移出的候选立即退役；已发送的租约仍可排空，未发送的旧预约会被 sent 拒绝。
+            // 限定网关时，被移出的候选立即退役（包括备用票）；已发送的租约仍可排空，未发送的旧预约会被 sent 拒绝。
+            // 服务中的窗口被移出时，仍在范围内的备用票立即接手。
+            let mut replaced = Vec::new();
             for row in rows(db, "SELECT data FROM pairs", vec![])? {
                 let mut pair = decode_object(&string_of(&row, "data"))?;
                 let gateway = string_of(&pair, "gateway");
                 if !gateways.is_empty() && !gateways.contains(&gateway) && policy::is_serving(&pair)
                 {
-                    policy::retire(&mut pair, &settings, false, false);
+                    if str_field(&pair, "state") == Some("ready") {
+                        replaced.push(string_of(&pair, "accountId"));
+                    }
+                    policy::retire(
+                        &mut pair,
+                        &settings,
+                        policy::Cause::Planned("configuration"),
+                    );
                     policy::settle(&mut pair);
                     self.save(db, &pair)?;
                 }
+            }
+            for account in replaced {
+                self.promote_standby(
+                    db,
+                    &settings,
+                    &account,
+                    self.now_num(),
+                    None,
+                    "configuration",
+                )?;
             }
             let ownership = ownership_of(&settings);
             exec(
@@ -301,17 +322,19 @@ impl Store {
             let result = queue::update(db, data)?;
             if data.get("enabled") == Some(&Value::Bool(false)) {
                 let settings = effective_settings(db, false)?;
-                self.retire_account(db, &string_of(data, "accountId"), &settings)?;
+                self.retire_account(db, &string_of(data, "accountId"), &settings, "account_left")?;
             }
             Ok(result)
         })
     }
 
+    /// 账号退出调度（停用、额度耗尽）：服务中、准备中的组合和备用票一起退役并静置。
     pub(crate) fn retire_account(
         &self,
         db: &Connection,
         account: &str,
         settings: &Object,
+        reason: &'static str,
     ) -> Result<(), Failure> {
         for row in rows(
             db,
@@ -320,7 +343,7 @@ impl Store {
         )? {
             let mut pair = decode_object(&string_of(&row, "data"))?;
             if policy::is_serving(&pair) {
-                policy::retire(&mut pair, settings, false, false);
+                policy::retire(&mut pair, settings, policy::Cause::Planned(reason));
                 policy::settle(&mut pair);
                 self.save(db, &pair)?;
             }
@@ -396,6 +419,16 @@ impl Store {
                     Vec::new()
                 };
                 set(&mut pair, "ticketModels", Value::Array(models));
+                // 备用票的丢弃时刻，页面据此显示剩余时间；到期后由下一次调度动作丢弃。
+                if let Some(at) = num_field(&pair, "standbyAt")
+                    && str_field(&pair, "state") == Some("standby")
+                {
+                    set(
+                        &mut pair,
+                        "standbyExpiresAt",
+                        at.plus(Num::Int(policy::STANDBY_LIFETIME_SECONDS)).to_json(),
+                    );
+                }
                 pairs.push(Value::Object(pair));
             }
 

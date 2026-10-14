@@ -174,7 +174,7 @@ fn removing_a_gateway_retires_serving_pairs_outside_the_new_scope() {
         .find(|pair| pair["gateway"] == json!("unified-143"))
         .expect("removed pair stays stored");
     assert_eq!(removed["state"], json!("cooling"));
-    assert_eq!(removed["retiredReason"], json!("rotation"));
+    assert_eq!(removed["retiredReason"], json!("configuration"));
     let kept = pairs
         .iter()
         .find(|pair| pair["gateway"] == json!("unified-142"))
@@ -211,4 +211,40 @@ fn ownership_follows_group_scope_and_the_dynamic_normal_group() {
         gateway_pool::dispatch(&harness.store, "read", &common::object_of(json!({})))
             .expect("read");
     assert!(ownership.is_none(), "reads never change ownership");
+}
+
+/// 退避设置：默认加性、步长 3600 秒；方式只接受两种，步长是 60–86400 的整数秒。
+#[test]
+fn backoff_settings_default_to_additive_and_validate_mode_and_step() {
+    let harness = Harness::new("backoff-settings", 10_000.0);
+    let settings = harness.view(json!({}))["settings"].clone();
+    assert_eq!(settings["backoffMode"], json!("additive"));
+    assert_eq!(settings["backoffStepSeconds"], json!(3600));
+    let saved = harness.call_ok(
+        "configure",
+        json!({"backoffMode": "multiplicative", "backoffStepSeconds": 600.0}),
+    );
+    assert_eq!(saved["backoffMode"], json!("multiplicative"));
+    assert_eq!(saved["backoffStepSeconds"], json!(600));
+    assert_eq!(
+        message(harness.call("configure", json!({"backoffMode": "linear"}))),
+        "退避方式无效"
+    );
+    for bad in [
+        json!(59),
+        json!(86401),
+        json!(90.5),
+        json!("3600"),
+        json!(true),
+        json!(null),
+    ] {
+        assert_eq!(
+            message(harness.call("configure", json!({"backoffStepSeconds": bad}))),
+            "退避步长必须是 60 到 86400 的整数秒"
+        );
+    }
+    // 边界值。
+    for ok in [60, 86400] {
+        harness.call_ok("configure", json!({"backoffStepSeconds": ok}));
+    }
 }

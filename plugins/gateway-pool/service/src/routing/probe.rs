@@ -188,11 +188,19 @@ impl Pool {
         let pair = Pair::from_value(&claim["pair"]).ok_or(())?;
         let started = Instant::now();
         let preparation_started_at = self.now();
-        let result = tokio::select! {
+        // 失败类别随结果回报，历史里区分超时、无响应、缺材料、Cookie host 不符等；HTTP 状态码另记在 status。
+        let outcome: Result<(Option<Material>, u16, bool), &'static str> = tokio::select! {
             biased;
-            _ = self.until(until) => None,
-            result = tokio::time::timeout(PREPARE_TIMEOUT, self.prepare_material(caps, account, &pair, &lease, settings)) => result.ok().and_then(Result::ok),
+            _ = self.until(until) => Err("timeout"),
+            result = tokio::time::timeout(PREPARE_TIMEOUT, self.prepare_material(caps, account, &pair, &lease, settings)) => result.unwrap_or(Err("timeout")),
         };
+        let failure: Option<&'static str> = match &outcome {
+            Err(kind) => Some(*kind),
+            Ok((_, status, _)) if *status != 200 => Some("http_status"),
+            Ok((None, _, _)) => Some("cookie_host"),
+            Ok(_) => None,
+        };
+        let result = outcome.ok();
         let observation = result
             .as_ref()
             .map(|(material, status, returned)| {
@@ -223,7 +231,7 @@ impl Pool {
                     "durationMs": started.elapsed().as_millis() as u64, "preparationStartedAt": preparation_started_at,
                     "status": observation["status"], "stateReturned": observation["stateReturned"],
                     "paired": observation["paired"], "gatewayMatches": observation["gatewayMatches"],
-                    "failed": observation["failed"], "material": private_material}),
+                    "failed": observation["failed"], "failure": failure, "material": private_material}),
                 json!({"action": "finish", "accountId": account, "leaseId": lease}),
             )
             .await;
@@ -240,16 +248,16 @@ impl Pool {
         pair: &Pair,
         lease: &str,
         settings: &PoolSettings,
-    ) -> Result<(Option<Material>, u16, bool), ()> {
+    ) -> Result<(Option<Material>, u16, bool), &'static str> {
         let row = self
             .load_account(caps, account)
             .await
             .ok()
             .flatten()
-            .ok_or(())?;
-        self.eligible(caps, &row).await.map_err(|_| ())?;
+            .ok_or("account")?;
+        self.eligible(caps, &row).await.map_err(|_| "account")?;
         if self.is_stopped() {
-            return Err(());
+            return Err("stopped");
         }
         let identity = settings
             .member_id(
@@ -257,16 +265,18 @@ impl Pool {
                 row.upstream_account_id.as_deref(),
                 row.user_id.as_deref(),
             )
-            .ok_or(())?;
-        let value = pool_service::cookie(caps, settings, account, &identity, &pair.gateway).await?;
-        let cookie = routing_cookie(&value).ok_or(())?;
+            .ok_or("account")?;
+        let value = pool_service::cookie(caps, settings, account, &identity, &pair.gateway)
+            .await
+            .map_err(|()| "pool_service")?;
+        let cookie = routing_cookie(&value).ok_or("cookie_missing")?;
         // 池服务给出的剩余有效期与 Cookie 自身 exp 取较早者。
         let pool_deadline = value["valid_for_s"]
             .as_f64()
             .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
             .map(|seconds| self.now() + seconds);
         if cookie_gateway(&cookie).as_deref() != Some(pair.gateway.as_str()) {
-            return Err(());
+            return Err("cookie_host");
         }
         let first = self
             .probe_headers(
@@ -285,8 +295,8 @@ impl Pool {
         let state = first
             .state
             .filter(|state| !state.is_empty() && state.len() <= 16384)
-            .ok_or(())?;
-        let paired_cookie = merge_cookie(&cookie, &first.cookies).ok_or(())?;
+            .ok_or("state_missing")?;
+        let paired_cookie = merge_cookie(&cookie, &first.cookies).ok_or("cookie_missing")?;
         if cookie_gateway(&paired_cookie).as_deref() != Some(pair.gateway.as_str()) {
             return Ok((None, 200, false));
         }
@@ -301,11 +311,11 @@ impl Pool {
                 &paired_cookie,
             )
             .await?;
-        let resulting = merge_cookie(&paired_cookie, &second.cookies).ok_or(())?;
+        let resulting = merge_cookie(&paired_cookie, &second.cookies).ok_or("cookie_missing")?;
         if cookie_gateway(&resulting).as_deref() != Some(pair.gateway.as_str()) {
             return Ok((None, second.status, second.state_returned));
         }
-        let expires = cookie_expiry(&resulting, self.now()).ok_or(())?;
+        let expires = cookie_expiry(&resulting, self.now()).ok_or("cookie_missing")?;
         let expires = pool_deadline.map_or(expires, |deadline| expires.min(deadline));
         Ok((
             Some(Material {
@@ -331,7 +341,7 @@ impl Pool {
         model: &str,
         state: Option<&str>,
         cookie: &str,
-    ) -> Result<Observation, ()> {
+    ) -> Result<Observation, &'static str> {
         let phase = if state.is_some() {
             "replay"
         } else {
@@ -343,16 +353,16 @@ impl Pool {
                 .await
                 .ok()
                 .flatten()
-                .ok_or(())?;
-            self.eligible(caps, &current).await.map_err(|_| ())?;
+                .ok_or("account")?;
+            self.eligible(caps, &current).await.map_err(|_| "account")?;
             let access_id = self.new_id();
             let sent = self
                 .runtime(json!({"action": "sent", "accountId": row.id, "leaseId": lease, "timingVersion": 2,
                     "accessId": access_id, "purpose": phase}))
                 .await
-                .map_err(|_| ())?;
+                .map_err(|_| "internal")?;
             if sent["accepted"] != true {
-                return Err(());
+                return Err("internal");
             }
             let started = Instant::now();
             let mut timing = AccessTiming::new(access_id, self.now());
@@ -371,7 +381,7 @@ impl Pool {
                 "durationMs": started.elapsed().as_millis() as u64, "gateway": pair.gateway,
                 "access": timing.value()}))
                 .await
-                .map_err(|_| ())?;
+                .map_err(|_| "internal")?;
             if let Some(observation) = observed {
                 if observation.status == 200 || attempt == 1 {
                     return Ok(observation);
@@ -388,6 +398,6 @@ impl Pool {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         }
-        Err(())
+        Err("no_response")
     }
 }

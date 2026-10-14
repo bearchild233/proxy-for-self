@@ -31,7 +31,7 @@ async fn continuous_ticks_rotate_active_accounts_but_lazy_expired_and_drained_do
                 .await
                 .unwrap();
         }
-        // 令当前窗口需要轮换；active 过期则不应再读取目录或打票。
+        // 令当前窗口用满；active 过期则不应再读取目录或打票。
         let mut pair = rig.pair(ACCOUNT, "unified-142");
         pair["firstContactAt"] = json!((clock.clock())() - 200.0);
         rig.seed_pair(ACCOUNT, "unified-142", pair);
@@ -39,8 +39,10 @@ async fn continuous_ticks_rotate_active_accounts_but_lazy_expired_and_drained_do
             clock.advance(1800.0);
         }
         if mode == "continuous" && !expired && !drain {
-            rig.until(|| rig.pair(ACCOUNT, "unified-143")["state"] == "ready")
+            // 窗口用满只准备备用票：当前窗口继续服务，新网关进入备用。
+            rig.until(|| rig.pair(ACCOUNT, "unified-143")["state"] == "standby")
                 .await;
+            assert_eq!(rig.pair(ACCOUNT, "unified-142")["state"], "ready");
             assert_eq!(rig.fake.calls_to("upstream.probe").len(), 2);
         } else {
             tokio::time::sleep(Duration::from_millis(1200)).await;

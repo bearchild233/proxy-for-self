@@ -169,7 +169,8 @@ impl Harness {
         let harness = Self::new("history", 10_000.0);
         harness.call_ok(
             "configure",
-            serde_json::json!({"gateways": ["unified-142", "unified-143"], "initialRestSeconds": 1, "maximumRestSeconds": 8}),
+            serde_json::json!({"gateways": ["unified-142", "unified-143"], "initialRestSeconds": 1, "maximumRestSeconds": 8,
+                               "backoffMode": "multiplicative"}),
         );
         harness
     }

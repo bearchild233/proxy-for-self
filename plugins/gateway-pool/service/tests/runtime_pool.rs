@@ -384,30 +384,315 @@ fn interrupted_recovery_claim_expires_after_five_minutes_across_restart() {
 }
 
 #[test]
-fn probe_prepares_once_and_switch_preserves_inflight() {
+fn window_used_up_prepares_one_standby_while_the_current_window_keeps_serving() {
     let harness = pool();
-    let (pair, result) = harness.probe_simple(false, json!({}));
+    let (_, result) = harness.probe_simple(false, json!({}));
     assert_eq!(result["classification"], json!("21"));
-    let lease = harness.rt(
-        "reserve",
-        json!({"gateway": pair["gateway"], "generation": pair["generation"], "deadline": harness.now() + 500.0}),
-    )["leaseId"]
-        .clone();
-    harness.rt("sent", json!({"leaseId": lease}));
+    // 窗口还没用满：不准备备用票。
+    assert_eq!(
+        harness.rt("plan", json!({"demand": true}))["probe"],
+        Value::Null
+    );
     harness.advance(181.0);
-    harness.probe_simple(false, json!({}));
-    let old = harness.pair();
-    assert_eq!(old["state"], json!("draining"));
+    let plan = harness.rt("plan", json!({"demand": true}));
+    assert_eq!(plan["rotationDue"], json!(true));
+    assert_eq!(plan["standbyProbe"], json!(true));
+    assert_eq!(plan["ready"]["gateway"], json!("unified-142"));
+    assert_eq!(plan["probe"]["gateway"], json!("unified-143"));
+    let (standby_pair, result) = harness.probe_simple(false, json!({}));
+    assert_eq!(result["classification"], json!("21"));
+    assert_eq!(standby_pair["gateway"], json!("unified-143"));
+    // 当前窗口继续服务；备用票不接业务请求，也没有切换记录。
+    assert_eq!(harness.pair()["state"], json!("ready"));
+    let standby = harness.pair_of("A", "unified-143");
+    assert_eq!(standby["state"], json!("standby"));
+    assert_num(&standby["standbyAt"], harness.now());
+    assert_num(&standby["standbyExpiresAt"], harness.now() + 3000.0);
     assert_eq!(
         harness.rt(
             "reserve",
-            json!({"gateway": pair["gateway"], "generation": pair["generation"], "deadline": harness.now() + 5.0}),
+            json!({"gateway": "unified-143", "generation": standby["generation"], "deadline": harness.now() + 5.0}),
         )["reserved"],
         json!(false)
     );
+    // 只有第一个窗口发布时的那一条切换记录，备用票到达不产生切换。
+    assert_eq!(
+        harness.view(json!({}))["switches"].as_array().map(Vec::len),
+        Some(1)
+    );
+    // 同一账号同时最多一张备用票：不再找票。
+    let plan = harness.rt("plan", json!({"demand": true}));
+    assert_eq!(plan["probe"], Value::Null);
+    assert_eq!(plan["standby"]["gateway"], json!("unified-143"));
+    assert_eq!(
+        harness.rt("claim", json!({"demand": true}))["claimed"],
+        json!(false)
+    );
+}
+
+#[test]
+fn standby_takes_over_at_once_on_a_29_and_the_window_counts_from_its_first_business_access() {
+    let harness = pool();
+    harness.call_ok(
+        "configure",
+        json!({"gateways": ["unified-142", "unified-143", "unified-144"]}),
+    );
+    let (first, _) = harness.probe_simple(false, json!({}));
+    harness.advance(181.0);
+    let (standby, _) = harness.probe_simple(false, with_material(&harness));
+    harness.advance(60.0);
+    let lease = reserve(&harness, &first);
+    harness.rt("sent", json!({"leaseId": lease}));
+    harness.rt(
+        "businessResult",
+        json!({"leaseId": lease, "status": 200, "stateReturned": true, "paired": true, "gatewayMatches": true}),
+    );
+    // 29 的同一次回报里备用票已经接手，不再找票；旧窗口等在途请求结束后静置。
+    assert_eq!(harness.pair()["state"], json!("draining"));
+    assert_eq!(harness.pair()["retiredReason"], json!("29"));
+    let promoted = harness.pair_of("A", "unified-143");
+    assert_eq!(promoted["state"], json!("ready"));
+    assert_eq!(promoted["generation"], standby["generation"]);
+    assert_eq!(promoted["fromStandby"], json!(true));
+    assert_num(&promoted["activatedAt"], harness.now());
+    assert_eq!(promoted["windowStartedAt"], Value::Null);
     harness.advance(10.0);
     harness.rt("finish", json!({"leaseId": lease}));
+    // 旧窗口从最后一次访问结束起静置，起点档 1 小时（初始静置）。
     assert_num(&harness.pair()["restUntil"], harness.now() + 3600.0);
+    let switch = harness.view(json!({}))["switches"][0].clone();
+    assert_eq!(
+        (
+            &switch["fromGateway"],
+            &switch["toGateway"],
+            &switch["cause"]
+        ),
+        (
+            &json!("unified-142"),
+            &json!("unified-143"),
+            &json!("switch")
+        )
+    );
+    // 备用期间不计入窗口：转正后还没有业务访问，窗口不会到期。
+    harness.advance(1000.0);
+    let plan = harness.rt("plan", json!({"demand": true}));
+    assert_eq!(plan["rotationDue"], json!(false));
+    assert_eq!(plan["probe"], Value::Null);
+    // 第一次业务访问开始计时；之后的备用票倒计时也从这里算起。
+    let lease = reserve(&harness, &promoted);
+    harness.rt("sent", json!({"leaseId": lease}));
+    let started = harness.now();
+    assert_num(
+        &harness.pair_of("A", "unified-143")["windowStartedAt"],
+        started,
+    );
+    harness.rt("finish", json!({"leaseId": lease}));
+    harness.advance(179.0);
+    assert_eq!(
+        harness.rt("plan", json!({"demand": true}))["rotationDue"],
+        json!(false)
+    );
+    harness.advance(2.0);
+    let plan = harness.rt("plan", json!({"demand": true}));
+    assert_eq!(plan["rotationDue"], json!(true));
+    assert_eq!(plan["standbyProbe"], json!(true));
+}
+
+#[test]
+fn unused_standby_is_dropped_after_fifty_minutes_and_rests_from_when_it_was_obtained() {
+    let harness = pool();
+    harness.call_ok(
+        "configure",
+        json!({"gateways": ["unified-142", "unified-143", "unified-144"]}),
+    );
+    harness.probe_simple(false, json!({}));
+    harness.advance(181.0);
+    harness.probe_simple(false, json!({}));
+    let obtained = harness.now();
+    harness.advance(2999.0);
+    // 还在存活期内：不丢弃，也不再准备新的。
+    let plan = harness.rt("plan", json!({"demand": true}));
+    assert_eq!(plan["standby"]["state"], json!("standby"));
+    assert_eq!(plan["probe"], Value::Null);
+    harness.advance(2.0);
+    // 超过 50 分钟：丢弃并静置，起点是拿到它的时间；窗口仍超过时长且有需求，准备新的备用票。
+    let plan = harness.rt("plan", json!({"demand": true}));
+    let dropped = harness.pair_of("A", "unified-143");
+    assert_eq!(dropped["state"], json!("cooling"));
+    assert_eq!(dropped["retiredReason"], json!("standby_expired"));
+    assert_num(&dropped["restUntil"], obtained + 3600.0);
+    assert_eq!(plan["standbyProbe"], json!(true));
+    assert_eq!(plan["probe"]["gateway"], json!("unified-144"));
+    // 没有需求时（懒模式）不准备新的。
+    assert_eq!(
+        harness.rt("plan", json!({"demand": false}))["probe"],
+        Value::Null
+    );
+}
+
+#[test]
+fn cookie_ending_swaps_in_the_standby_and_without_one_probes_a_replacement_directly() {
+    let harness = pool();
+    harness.call_ok(
+        "configure",
+        json!({"gateways": ["unified-142", "unified-143", "unified-144"]}),
+    );
+    let material = |seconds: f64| json!({"material": {"state": "s0", "cookie": "__oailb=x; __cflb=y", "expires": harness.now() + seconds}});
+    let (first, _) = harness.probe_simple(false, material(400.0));
+    harness.advance(181.0);
+    let (standby, _) = harness.probe_simple(false, material(3000.0));
+    // 第一个窗口的 Cookie 在 340 秒时进入到期前的准备期：备用票立即接手，不再找票。
+    harness.advance(160.0);
+    let lease = reserve(&harness, &first);
+    harness.rt("sent", json!({"leaseId": lease}));
+    let plan = harness.rt("plan", json!({"demand": true}));
+    assert_eq!(plan["ready"]["generation"], standby["generation"]);
+    assert_eq!(plan["probe"], Value::Null);
+    assert_eq!(plan["rotationDue"], json!(false));
+    let old = harness.pair();
+    assert_eq!(old["state"], json!("draining"));
+    assert_eq!(old["retiredReason"], json!("cookie_expiring"));
+    let switch = harness.view(json!({}))["switches"][0].clone();
+    assert_eq!(switch["cause"], json!("cookie_expiring"));
+    harness.rt("finish", json!({"leaseId": lease}));
+    assert_eq!(harness.pair()["state"], json!("cooling"));
+    // 没有备用票时 Cookie 即将到期：直接找替代（不是备用票），通过后旧窗口退役。
+    harness.advance(2780.0);
+    let plan = harness.rt("plan", json!({"demand": true}));
+    assert_eq!(plan["standbyProbe"], json!(false));
+    assert_eq!(plan["probe"]["gateway"], json!("unified-144"));
+    let (replacement, _) = harness.probe_simple(false, material(3000.0));
+    assert_eq!(replacement["gateway"], json!("unified-144"));
+    let retired = harness.pair_of("A", "unified-143");
+    assert_eq!(retired["state"], json!("cooling"));
+    assert_eq!(retired["retiredReason"], json!("cookie_expiring"));
+    assert_eq!(harness.pair_of("A", "unified-144")["state"], json!("ready"));
+}
+
+#[test]
+fn account_leaving_the_schedule_drops_the_standby_and_rests_it() {
+    let harness = pool();
+    harness.probe_simple(false, json!({}));
+    harness.advance(181.0);
+    harness.probe_simple(false, json!({}));
+    let obtained = harness.now();
+    harness.advance(100.0);
+    harness.rt("quota", json!({"exhausted": true}));
+    let ready = harness.pair();
+    let standby = harness.pair_of("A", "unified-143");
+    assert_eq!(ready["state"], json!("cooling"));
+    assert_eq!(standby["state"], json!("cooling"));
+    assert_eq!(standby["retiredReason"], json!("account_left"));
+    assert_num(&standby["restUntil"], obtained + 3600.0);
+}
+
+#[test]
+fn removing_the_serving_gateway_from_the_scope_promotes_an_in_scope_standby() {
+    let harness = pool();
+    harness.probe_simple(false, json!({}));
+    harness.advance(181.0);
+    harness.probe_simple(false, with_material(&harness));
+    harness.call_ok("configure", json!({"gateways": ["unified-143"]}));
+    assert_eq!(harness.pair()["retiredReason"], json!("configuration"));
+    assert_eq!(harness.pair_of("A", "unified-143")["state"], json!("ready"));
+}
+
+#[test]
+fn additive_backoff_adds_a_step_per_29_retest_and_lowers_after_two_recoveries_on_one_tier() {
+    let harness = pool();
+    harness.call_ok("configure", json!({"gateways": ["unified-142"]}));
+    // 从未静置过的组合先 29：从起始档（初始静置 1h）开始。
+    harness.probe_simple(true, json!({}));
+    assert_num(&harness.pair()["restSeconds"], 3600.0);
+    // 复测仍 29：每次加一个步长（1h）。
+    harness.advance(3600.0);
+    harness.probe_simple(true, json!({}));
+    assert_num(&harness.pair()["restSeconds"], 7200.0);
+    harness.advance(7200.0);
+    harness.probe_simple(true, json!({}));
+    assert_num(&harness.pair()["restSeconds"], 10800.0);
+    harness.advance(10800.0);
+    let (pair, _) = harness.probe_simple(false, json!({}));
+    // 在 3h 档恢复：以后从该档开始。
+    assert_num(&harness.pair()["lastRecoveredRestSeconds"], 10800.0);
+    assert_num(&harness.pair()["learnedRestSeconds"], 10800.0);
+    // 业务中途 29 从起始档开始，不升档。
+    business_29(&harness, &pair);
+    assert_num(&harness.pair()["restSeconds"], 10800.0);
+    assert_num(&harness.pair()["tierSeconds"], 10800.0);
+    // 连续两次在同一档恢复：下次起始档降一档（减一个步长）。
+    harness.advance(10800.0);
+    let (pair, _) = harness.probe_simple(false, json!({}));
+    assert_num(&harness.pair()["recoveryStreak"], 2.0);
+    assert_num(&harness.pair()["learnedRestSeconds"], 7200.0);
+    business_29(&harness, &pair);
+    assert_num(&harness.pair()["restSeconds"], 7200.0);
+    // 在较低的档恢复：不清空，记为新的恢复档。
+    harness.advance(7200.0);
+    harness.probe_simple(false, json!({}));
+    assert_num(&harness.pair()["lastRecoveredRestSeconds"], 7200.0);
+    assert_num(&harness.pair()["recoveryStreak"], 1.0);
+    assert_num(&harness.pair()["learnedRestSeconds"], 7200.0);
+}
+
+#[test]
+fn multiplicative_backoff_doubles_and_halves_within_the_limits() {
+    let harness = pool();
+    harness.call_ok(
+        "configure",
+        json!({"gateways": ["unified-142"], "backoffMode": "multiplicative", "initialRestSeconds": 3600, "maximumRestSeconds": 14400}),
+    );
+    harness.probe_simple(true, json!({}));
+    assert_num(&harness.pair()["restSeconds"], 3600.0);
+    harness.advance(3600.0);
+    harness.probe_simple(true, json!({}));
+    assert_num(&harness.pair()["restSeconds"], 7200.0);
+    harness.advance(7200.0);
+    harness.probe_simple(true, json!({}));
+    assert_num(&harness.pair()["restSeconds"], 14400.0);
+    // 上限：不超过最长静置。
+    harness.advance(14400.0);
+    harness.probe_simple(true, json!({}));
+    assert_num(&harness.pair()["restSeconds"], 14400.0);
+    harness.advance(14400.0);
+    let (pair, _) = harness.probe_simple(false, json!({}));
+    business_29(&harness, &pair);
+    harness.advance(14400.0);
+    let (pair, _) = harness.probe_simple(false, json!({}));
+    // 同一档连续两次恢复：减半，不低于初始静置。
+    assert_num(&harness.pair()["learnedRestSeconds"], 7200.0);
+    business_29(&harness, &pair);
+    assert_num(&harness.pair()["restSeconds"], 7200.0);
+    harness.advance(7200.0);
+    harness.probe_simple(false, json!({}));
+}
+
+#[test]
+fn detection_failure_rests_300_seconds_without_touching_the_tier_or_the_start_tier() {
+    let harness = pool();
+    harness.call_ok("configure", json!({"gateways": ["unified-142"]}));
+    harness.probe_simple(true, json!({}));
+    harness.advance(3600.0);
+    let before = harness.pair();
+    let claim = harness.rt("claim", json!({"demand": true}));
+    harness.rt("sent", json!({"leaseId": claim["leaseId"]}));
+    harness.advance(1.0);
+    harness.rt(
+        "probeResult",
+        json!({"leaseId": claim["leaseId"], "status": 429, "paired": true, "gatewayMatches": true, "failed": true, "failure": "http_status"}),
+    );
+    harness.rt("finish", json!({"leaseId": claim["leaseId"]}));
+    let pair = harness.pair();
+    assert_eq!(pair["retiredReason"], json!("probe_failed"));
+    assert_num(&pair["restSeconds"], 300.0);
+    assert_num(&pair["restUntil"], harness.now() + 300.0);
+    assert_eq!(pair["tierSeconds"], before["tierSeconds"]);
+    assert_eq!(pair["learnedRestSeconds"], before["learnedRestSeconds"]);
+    // 重试仍是 29：在原来的档上升一档，失败不算一档。
+    harness.advance(300.0);
+    harness.probe_simple(true, json!({}));
+    assert_num(&harness.pair()["restSeconds"], 7200.0);
+    assert_num(&harness.pair()["tierSeconds"], 7200.0);
 }
 
 #[test]
@@ -472,7 +757,8 @@ fn cooldown_restarts_at_each_probe_and_records_precontact_idle() {
     harness.probe_simple(false, json!({}));
     let pair = harness.pair();
     assert_num(&pair["lastRecoveredRestSeconds"], 7200.0);
-    assert!(pair.get("learnedRestSeconds").is_none_or(Value::is_null));
+    // 第一次恢复就记下恢复档，下一次从该档开始。
+    assert_num(&pair["learnedRestSeconds"], 7200.0);
 }
 
 #[test]
@@ -589,19 +875,19 @@ fn window_and_observed_idle_start_at_actual_send_not_claim() {
 fn switch_rejects_unsent_reservation_but_keeps_sent_request() {
     let harness = pool();
     let (pair, _) = harness.probe_simple(false, json!({}));
-    let pending = harness.rt(
-        "reserve",
-        json!({"gateway": pair["gateway"], "generation": pair["generation"], "deadline": harness.now() + 500.0}),
-    )["leaseId"]
-        .clone();
+    let pending = reserve(&harness, &pair);
     harness.advance(181.0);
-    harness.probe_simple(false, json!({}));
+    // 备用票到达时当前窗口照常服务，未发送的预约仍可发送。
+    harness.probe_simple(false, with_material(&harness));
+    harness.retire_pair(&pair);
+    // 备用票接手、旧窗口退役之后，旧预约不能再发送到退役组合。
     assert_eq!(
         harness.rt("sent", json!({"leaseId": pending}))["accepted"],
         json!(false)
     );
     harness.rt("finish", json!({"leaseId": pending}));
     assert_num(&harness.pair()["lastContactAt"], 10_000.0);
+    assert_eq!(harness.pair_of("A", "unified-143")["state"], json!("ready"));
 }
 
 #[test]
@@ -668,7 +954,7 @@ fn probe_interval_plan_has_no_probe_without_demand() {
 }
 
 #[test]
-fn error_attempts_remain_unclassified_and_failure_doubles_last_tier() {
+fn error_attempts_remain_unclassified_and_failure_rests_300_seconds() {
     let harness = pool();
     harness.call_ok("configure", json!({"gateways": ["unified-142"]}));
     harness.probe_simple(true, json!({}));
@@ -691,8 +977,8 @@ fn error_attempts_remain_unclassified_and_failure_doubles_last_tier() {
     assert_eq!(result["classification"], Value::Null);
     let pair = harness.pair();
     assert_eq!(pair["retiredReason"], json!("probe_failed"));
-    assert_num(&pair["restSeconds"], 7200.0);
-    assert_num(&pair["restUntil"], harness.now() + 7200.0);
+    assert_num(&pair["restSeconds"], 300.0);
+    assert_num(&pair["restUntil"], harness.now() + 300.0);
     let observations = harness.view(json!({}))["observations"].clone();
     let attempts: Vec<&Value> = observations
         .as_array()
@@ -738,10 +1024,13 @@ fn probe_finishes_after_disable_without_leaving_preparing_state() {
     harness.advance(10.0);
     harness.rt("finish", json!({"leaseId": claim["leaseId"]}));
     let pair = harness.pair();
+    // 没有得到判定：与检测失败相同，固定 300 秒。
     assert_eq!(pair["state"], json!("cooling"));
     assert_eq!(pair["inFlight"], json!(0));
-    assert_num(&pair["restUntil"], harness.now() + 3600.0);
+    assert_eq!(pair["retiredReason"], json!("probe_interrupted"));
+    assert_num(&pair["restUntil"], harness.now() + 300.0);
     harness.store.set_enabled(true);
+    harness.advance(300.0);
     assert!(!harness.rt("plan", json!({"demand": true}))["probe"].is_null());
 }
 
@@ -777,9 +1066,10 @@ fn removed_gateway_cannot_publish_ready_or_send_reserved_request() {
 #[test]
 fn switch_records_follow_account_and_gateway_filters() {
     let harness = pool();
-    harness.probe_simple(false, json!({}));
+    let (pair, _) = harness.probe_simple(false, json!({}));
     harness.advance(181.0);
-    harness.probe_simple(false, json!({}));
+    harness.probe_simple(false, with_material(&harness));
+    harness.retire_pair(&pair);
     assert_eq!(
         harness.view(json!({"accountId": "B"}))["switches"]
             .as_array()
@@ -792,4 +1082,28 @@ fn switch_records_follow_account_and_gateway_filters() {
             .map(Vec::len),
         Some(1)
     );
+}
+
+/// 带配套材料的探测参数：备用票转正前要求材料仍有效。
+fn with_material(harness: &Harness) -> Value {
+    json!({"material": {"state": "s0", "cookie": "__oailb=x; __cflb=y", "expires": harness.now() + 50_000.0}})
+}
+
+fn reserve(harness: &Harness, pair: &Value) -> Value {
+    harness.rt(
+        "reserve",
+        json!({"gateway": pair["gateway"], "generation": pair["generation"], "deadline": harness.now() + 500.0}),
+    )["leaseId"]
+        .clone()
+}
+
+/// 服务中的窗口遇到一次 29 并归还租约。
+fn business_29(harness: &Harness, pair: &Value) {
+    let lease = reserve(harness, pair);
+    harness.rt("sent", json!({"leaseId": lease}));
+    harness.rt(
+        "businessResult",
+        json!({"leaseId": lease, "status": 200, "stateReturned": true, "paired": true, "gatewayMatches": true}),
+    );
+    harness.rt("finish", json!({"leaseId": lease}));
 }

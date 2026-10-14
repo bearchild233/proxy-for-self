@@ -1,10 +1,10 @@
-//! 运行状态机：逐项对应 `gateway_pool.py` 的 `GatewayPool.runtime` 及其辅助函数
+//! 运行状态机：`Store::runtime` 接受 JSON 动作消息、返回 JSON 结果，请求路径钩子都接在它上面
 //! （`availability`、`no_candidate`、`regroup`、`recovery_*`、`reap`、`catalog` 等）。
+//! 备用票的准备、启用与丢弃见 `standby.rs`。
 //!
-//! 这是插件内部接口（接受与 Python 相同的 JSON 消息、返回相同的 JSON），钩子在后续步骤接到它上面。
-//! Python 抛出 `ValueError` 的地方返回带相同消息的 `Failure::Invalid`；`PermissionError` 对应
-//! `Failure::Forbidden`；`KeyError`/`TypeError`（缺字段、类型不符）在宿主处同样按 400 处理，
-//! 这里统一返回 `Failure::Invalid`。
+//! 起源于 Python 实现的 `GatewayPool.runtime`；016 起退避与备用票规则有意不同。Python 抛出 `ValueError` 的
+//! 地方返回带相同消息的 `Failure::Invalid`；`PermissionError` 对应 `Failure::Forbidden`；
+//! `KeyError`/`TypeError`（缺字段、类型不符）统一返回 `Failure::Invalid`。
 
 use rusqlite::{Connection, types::Value as SqlValue};
 use serde_json::{Value, json};
@@ -13,9 +13,10 @@ use crate::{
     error::Failure,
     history,
     num::Num,
-    policy, queue,
+    policy::{self, Cause},
+    queue,
     settings::{account_id, gateway_id},
-    store::{Store, effective_settings, stored_settings},
+    store::{Store, effective_settings},
     util::{
         Object, decode_object, decode_value, encode, exec, is_null_or_missing, num_field, one,
         rows, set, sql_of, sql_of_num, str_field, text, truthy,
@@ -23,7 +24,7 @@ use crate::{
 };
 
 /// 请求缺少必需字段或类型不符（Python 中的 `KeyError`/`TypeError`）。
-fn missing(key: &str) -> Failure {
+pub(crate) fn missing(key: &str) -> Failure {
     Failure::Invalid(format!("缺少字段或类型无效：{key}"))
 }
 
@@ -31,11 +32,11 @@ fn required<'a>(data: &'a Object, key: &str) -> Result<&'a Value, Failure> {
     data.get(key).ok_or_else(|| missing(key))
 }
 
-fn string_of(row: &Object, key: &str) -> String {
+pub(crate) fn string_of(row: &Object, key: &str) -> String {
     str_field(row, key).unwrap_or_default().to_owned()
 }
 
-fn field(row: &Object, key: &str) -> Value {
+pub(crate) fn field(row: &Object, key: &str) -> Value {
     row.get(key).cloned().unwrap_or(Value::Null)
 }
 
@@ -153,7 +154,7 @@ impl Availability {
 }
 
 /// 读取组合；不存在时为 unknown（与 Python `pair()` 的默认值一致）。
-fn load_pair(db: &Connection, account: &str, gateway: &str) -> Result<Object, Failure> {
+pub(crate) fn load_pair(db: &Connection, account: &str, gateway: &str) -> Result<Object, Failure> {
     match one(
         db,
         "SELECT data FROM pairs WHERE account=? AND gateway=?",
@@ -172,7 +173,7 @@ fn load_pair(db: &Connection, account: &str, gateway: &str) -> Result<Object, Fa
 }
 
 /// 账号的全部组合（按存储顺序）。
-fn account_pairs(db: &Connection, account: &str) -> Result<Vec<Object>, Failure> {
+pub(crate) fn account_pairs(db: &Connection, account: &str) -> Result<Vec<Object>, Failure> {
     rows(
         db,
         "SELECT data FROM pairs WHERE account=?",
@@ -225,7 +226,7 @@ fn add_lease(
 }
 
 /// 配套材料：只允许 state、cookie、expires 三项，文本无换行，到期时间在一年之内。
-fn check_material(material: &Value, now: Num) -> Result<(), Failure> {
+pub(crate) fn check_material(material: &Value, now: Num) -> Result<(), Failure> {
     let invalid = || Failure::Invalid("配套材料无效".to_owned());
     let Value::Object(object) = material else {
         return Err(invalid());
@@ -480,17 +481,9 @@ impl Store {
             && pair.get("generation") == lease.get("generation")
         {
             // 停用或结果上报中断时，仍完成探测退役，不留下永久 preparing。
-            let config = stored_settings(db)?.unwrap_or_default();
-            let rest = match num_field(&pair, "probeRestSeconds") {
-                Some(waited) => waited.times(Num::Int(2)),
-                None => match num_field(&pair, "learnedRestSeconds") {
-                    Some(learned) if learned.truthy() => learned,
-                    _ => num_field(&config, "initialRestSeconds").unwrap_or(Num::Int(3600)),
-                },
-            };
-            let maximum = num_field(&config, "maximumRestSeconds").unwrap_or(Num::Int(86400));
-            set(&mut pair, "state", json!("draining"));
-            set(&mut pair, "restSeconds", maximum.min(rest).to_json());
+            // 没有得到判定，与检测失败相同：固定短静置，不升档。
+            let config = effective_settings(db, true)?;
+            policy::retire(&mut pair, &config, policy::Cause::Failed);
             set(&mut pair, "retiredReason", json!("probe_interrupted"));
         }
         policy::settle(&mut pair);
@@ -525,11 +518,10 @@ impl Store {
                 set(&mut pair, "lastContactAt", last.max(expires).to_json());
             }
             if str_field(&lease, "kind") == Some("probe")
+                && str_field(&pair, "state") == Some("preparing")
                 && pair.get("generation") == lease.get("generation")
             {
-                let rest = policy::initial(settings, num_field(&pair, "learnedRestSeconds"));
-                set(&mut pair, "state", json!("draining"));
-                set(&mut pair, "restSeconds", rest.to_json());
+                policy::retire(&mut pair, settings, Cause::Failed);
                 set(&mut pair, "retiredReason", json!("probe_interrupted"));
             }
             policy::settle(&mut pair);
@@ -584,7 +576,7 @@ impl Store {
                 };
                 queue::quota(db, &account, *exhausted)?;
                 if *exhausted {
-                    self.retire_account(db, &account, &settings)?;
+                    self.retire_account(db, &account, &settings, "account_left")?;
                 }
                 return Ok(json!({"accepted": true}));
             }
@@ -677,7 +669,7 @@ impl Store {
             for (id, flag) in ids.iter().zip(&exhausted) {
                 queue::quota(db, id, *flag)?;
                 if !queue::allowed(db, id)? {
-                    self.retire_account(db, id, settings)?;
+                    self.retire_account(db, id, settings, "account_left")?;
                 }
             }
             let mut info = Vec::new();
@@ -778,23 +770,35 @@ impl Store {
             }
         }
         let mut pairs = account_pairs(db, account)?;
+        // 备用票过期就地丢弃，之后的判断才不会把过期的票当成可用。
+        if self.expire_standby_in(db, account, settings, now, &pairs)? {
+            pairs = account_pairs(db, account)?;
+        }
         let ready = pairs
             .iter()
             .find(|pair| str_field(pair, "state") == Some("ready"))
             .cloned();
         if let Some(mut ready) = ready {
-            let due = policy::rotation_due(&ready, settings, now, true);
+            let rotation = policy::rotation(&ready, settings, now);
+            let due = rotation.window_over || rotation.cookie_ending;
             let gateway = string_of(&ready, "gateway");
             if due
                 && queue::remaining(db, account)?.as_deref() == Some(std::slice::from_ref(&gateway))
             {
-                // 本轮网关轮完且窗口到期：账号沉到最后，之后重新开始新一轮。
-                policy::retire(&mut ready, settings, false, false);
+                // 本轮网关轮完且窗口到期：账号沉到最后（备用票一并丢弃），之后重新开始新一轮。
+                policy::retire(&mut ready, settings, Cause::Planned("round_end"));
                 policy::settle(&mut ready);
                 self.save(db, &ready)?;
+                self.discard_standby(db, account, settings, "round_end")?;
                 pairs = account_pairs(db, account)?;
             } else {
-                return Ok(Availability::open(!due));
+                // 窗口用满只是开始准备备用票，当前窗口继续服务；Cookie 即将到期且没有备用票时才算没有窗口。
+                let has_standby = pairs
+                    .iter()
+                    .any(|pair| str_field(pair, "state") == Some("standby"));
+                return Ok(Availability::open(
+                    !(rotation.cookie_ending && !has_standby),
+                ));
             }
         }
         if pairs
@@ -910,6 +914,8 @@ impl Store {
             return Ok(json!({"claimed": false, "yieldAccount": true}));
         }
         let demand = is_true(data.get("demand"));
+        // 备用票过期先丢弃，后面的判断才不会把它当成可用。
+        self.expire_standby(db, account, settings, now)?;
         let supplied = present(data, "catalog");
         let catalog = catalog(db, account, supplied, now)?;
         // 默认跟随池服务目录；设置了限定网关时只在其中挑选。目录不可用时退回限定列表。
@@ -923,28 +929,57 @@ impl Store {
         for gateway in &gateways {
             pairs.push(load_pair(db, account, gateway)?);
         }
-        // 正在服务的组合即使暂时不在目录中，也继续服务到窗口或 Cookie 到期。
+        let continuous = str_field(settings, "mode") == Some("continuous");
+        // 正在服务的组合即使暂时不在目录中，也继续服务到 Cookie 到期或被替换。
         let mut ready = account_pairs(db, account)?
             .into_iter()
             .find(|pair| str_field(pair, "state") == Some("ready"));
-        let mut due = ready
+        let mut rotation = ready
             .as_ref()
-            .is_some_and(|ready| policy::rotation_due(ready, settings, now, demand));
+            .map(|ready| policy::rotation(ready, settings, now))
+            .unwrap_or_default();
         let mut pending = queue::remaining(db, account)?;
+        let mut due = (rotation.window_over || rotation.cookie_ending) && (demand || continuous);
         if due
             && let Some(current) = ready.as_mut()
             && pending.as_deref() == Some(std::slice::from_ref(&string_of(current, "gateway")))
         {
-            policy::retire(current, settings, false, false);
+            // 本轮网关轮完且窗口到期：账号沉到最后，备用票一并丢弃。
+            policy::retire(current, settings, Cause::Planned("round_end"));
             policy::settle(current);
             self.save(db, current)?;
+            self.discard_standby(db, account, settings, "round_end")?;
             if has_exit {
                 return Ok(json!({"claimed": false, "yieldAccount": true}));
             }
             // 没有退路：账号沉底后立即开始新一轮。
             ready = None;
-            due = false;
+            rotation = policy::Rotation::default();
             pending = queue::remaining(db, account)?;
+        }
+        // 备用票随时可以接手：没有服务中的组合，或 Cookie 即将到期时立即转正，不再找票。
+        if (ready.is_none() || rotation.cookie_ending)
+            && self.promote_standby(
+                db,
+                settings,
+                account,
+                now,
+                None,
+                if ready.is_none() {
+                    "rotation"
+                } else {
+                    "cookie_expiring"
+                },
+            )?
+        {
+            ready = account_pairs(db, account)?
+                .into_iter()
+                .find(|pair| str_field(pair, "state") == Some("ready"));
+            rotation = ready
+                .as_ref()
+                .map(|ready| policy::rotation(ready, settings, now))
+                .unwrap_or_default();
+            due = (rotation.window_over || rotation.cookie_ending) && (demand || continuous);
         }
         let mut candidates: Vec<(bool, policy::CandidateKey, Object)> = pairs
             .iter()
@@ -974,9 +1009,16 @@ impl Store {
         let preparing = fresh
             .iter()
             .any(|pair| str_field(pair, "state") == Some("preparing"));
-        let probe = if (demand || str_field(settings, "mode") == Some("continuous"))
-            && (ready.is_none() || due)
-        {
+        let standby = fresh
+            .iter()
+            .find(|pair| str_field(pair, "state") == Some("standby"))
+            .cloned();
+        // 窗口用满只准备备用票（同一账号最多一张），当前窗口继续服务；
+        // 没有窗口或 Cookie 即将到期（且没有备用票）才直接找替代。
+        let standby_probe =
+            ready.is_some() && !rotation.cookie_ending && rotation.window_over && standby.is_none();
+        let replace_probe = ready.is_none() || rotation.cookie_ending;
+        let probe = if (demand || continuous) && (replace_probe || standby_probe) {
             candidates.into_iter().next().map(|(_, _, pair)| pair)
         } else {
             None
@@ -993,10 +1035,20 @@ impl Store {
                 "probe",
                 probe.clone().map_or(Value::Null, Value::Object),
             );
+            set(
+                &mut plan,
+                "standbyProbe",
+                json!(probe.is_some() && standby_probe),
+            );
+            set(
+                &mut plan,
+                "standby",
+                standby.clone().map_or(Value::Null, Value::Object),
+            );
             set(&mut plan, "rotationDue", json!(due));
             set(&mut plan, "preparing", json!(preparing));
             set(&mut plan, "queueTurn", turn);
-            if ready.is_none() && probe.is_none() && !preparing {
+            if ready.is_none() && probe.is_none() && !preparing && standby.is_none() {
                 let reason = self.no_candidate(db, account, &fresh, settings, now)?;
                 set(
                     &mut plan,
@@ -1022,13 +1074,31 @@ impl Store {
         } else {
             Value::Null
         };
+        // 上一轮静置所在的档；复测仍为 29 时在它的基础上升一档，复测为 21 时记为恢复档。
+        let planned_tier = last
+            .and_then(|_| policy::tier_of(&probe))
+            .map_or(Value::Null, Num::to_json);
         let idle = last.map_or(Value::Null, |last| {
             Num::Int(0).max(now.minus(last)).to_json()
         });
         let in_flight = num_field(&probe, "inFlight").ok_or_else(|| missing("inFlight"))?;
+        // 上一代次的备用票与窗口计时事实不带入新代次。
+        for key in [
+            "standbyAt",
+            "activatedAt",
+            "windowStartedAt",
+            "fromStandby",
+            "standbyPlan",
+        ] {
+            probe.remove(key);
+        }
+        if standby_probe {
+            set(&mut probe, "standbyPlan", json!(true));
+        }
         set(&mut probe, "generation", json!(generation));
         set(&mut probe, "state", json!("preparing"));
         set(&mut probe, "probeRestSeconds", planned);
+        set(&mut probe, "probeTierSeconds", planned_tier);
         set(&mut probe, "observedIdleSeconds", idle);
         set(&mut probe, "preparationStartedAt", now.to_json());
         set(&mut probe, "firstContactAt", Value::Null);
@@ -1118,6 +1188,7 @@ impl Store {
         let mut pair = load_pair(db, account, &lease_gateway)?;
         let same_generation = |pair: &Object| pair.get("generation") == lease.get("generation");
         let reject = || Ok(json!({"accepted": false}));
+        let mut invalidated_ready = false;
         match action {
             "sent" => {
                 if !queue::allowed(db, account)? {
@@ -1149,6 +1220,13 @@ impl Store {
                             Num::Int(0).max(now.minus(previous)).to_json()
                         }),
                     );
+                }
+                // 备用票转正的窗口从第一次业务访问开始计时，备用期间不计入。
+                if kind == "business"
+                    && truthy(pair.get("fromStandby"))
+                    && is_null_or_missing(&pair, "windowStartedAt")
+                {
+                    set(&mut pair, "windowStartedAt", now.to_json());
                 }
                 exec(
                     db,
@@ -1230,11 +1308,17 @@ impl Store {
             "probeResult" | "businessResult" => {
                 return self.result_action(db, data, action, account, settings, now, &lease, pair);
             }
-            "invalidate" => policy::retire(&mut pair, settings, false, false),
+            "invalidate" => {
+                invalidated_ready = str_field(&pair, "state") == Some("ready");
+                policy::retire(&mut pair, settings, Cause::Planned("invalidated"));
+            }
             _ => return Failure::invalid("运行操作无效"),
         }
         policy::settle(&mut pair);
         self.save(db, &pair)?;
+        if invalidated_ready {
+            self.promote_standby(db, settings, account, now, Some(pair.clone()), "switch")?;
+        }
         Ok(json!({"accepted": true}))
     }
 
@@ -1293,35 +1377,56 @@ impl Store {
         });
         add_observation(db, now, account, &lease_gateway, &sample)?;
         history::record(db, |db| history::result(db, lease, data, verdict, now))?;
+        // 本次回报让服务中的窗口退役时，立即让备用票接手。
+        let mut retired_ready = false;
+        let mut standby_arrived = false;
         if pair.get("generation") == lease.get("generation") {
             if probing {
                 let in_scope = {
                     let limited = gateway_list(settings);
                     limited.is_empty() || limited.contains(&string_of(&pair, "gateway"))
                 };
+                let allowed = queue::allowed(db, account)?;
                 if verdict == Some("21")
-                    && queue::allowed(db, account)?
+                    && allowed
                     && in_scope
                     && str_field(&pair, "state") == Some("preparing")
                 {
-                    self.publish_window(db, data, account, settings, now, lease, &mut pair)?;
+                    // 备用票：账号已有服务中的组合时只存票，不接业务请求；否则直接发布为窗口。
+                    let serving = account_pairs(db, account)?.iter().any(|other| {
+                        str_field(other, "state") == Some("ready")
+                            && str_field(other, "gateway") != Some(lease_gateway.as_str())
+                    });
+                    if truthy(pair.get("standbyPlan")) && serving {
+                        self.publish_standby(db, data, account, settings, now, lease, &mut pair)?;
+                        standby_arrived = true;
+                    } else {
+                        self.publish_window(db, data, account, settings, now, lease, &mut pair)?;
+                    }
                 } else {
-                    // 检测失败与 29 分开留痕，两者均按最后一次访问重新退避。
-                    policy::retire(
-                        &mut pair,
-                        settings,
-                        verdict == Some("29"),
-                        verdict.is_none(),
-                    );
+                    // 检测失败与 29 分开留痕：29 升档，失败固定短静置。
+                    let cause = match verdict {
+                        Some("29") => Cause::Degraded,
+                        None => Cause::Failed,
+                        Some(_) if !allowed => Cause::Planned("account_left"),
+                        Some(_) if !in_scope => Cause::Planned("configuration"),
+                        Some(_) => Cause::Planned("rotation"),
+                    };
+                    policy::retire(&mut pair, settings, cause);
                     if !sent {
-                        // 池服务失败没触及上游，不重置真实静置；短暂退让避免反复抓同一候选。
+                        // 池服务失败没触及上游，不重置真实静置；短暂退让避免反复抓同一候选，档位保持。
                         let planned = field(&pair, "probeRestSeconds");
                         let rest = if truthy(Some(&planned)) {
                             planned
                         } else {
-                            policy::initial(settings, num_field(&pair, "learnedRestSeconds"))
-                                .to_json()
+                            policy::start_tier(settings, &pair).to_json()
                         };
+                        match field(&pair, "probeTierSeconds") {
+                            Value::Null => {
+                                pair.remove("tierSeconds");
+                            }
+                            tier => set(&mut pair, "tierSeconds", tier),
+                        }
                         set(&mut pair, "state", json!("cooling"));
                         set(&mut pair, "restUntil", now.plus(Num::Int(5)).to_json());
                         set(&mut pair, "restSeconds", rest);
@@ -1330,14 +1435,25 @@ impl Store {
             } else if verdict == Some("29")
                 || data.get("gatewayMatches") == Some(&Value::Bool(false))
             {
-                policy::retire(&mut pair, settings, verdict == Some("29"), false);
+                retired_ready = str_field(&pair, "state") == Some("ready");
+                let cause = if verdict == Some("29") {
+                    Cause::Degraded
+                } else {
+                    Cause::Planned("gateway_mismatch")
+                };
+                policy::retire(&mut pair, settings, cause);
             }
         }
         self.save(db, &pair)?;
+        if retired_ready {
+            self.promote_standby(db, settings, account, now, Some(pair.clone()), "switch")?;
+        } else if standby_arrived {
+            self.promote_if_cookie_ending(db, settings, account, now)?;
+        }
         Ok(json!({"accepted": true, "classification": verdict}))
     }
 
-    /// 21 通过：保存配套材料、学习静置、退役本账号的旧窗口并记录切换，新窗口就绪。
+    /// 21 通过且账号没有备用票可用：保存配套材料、记录恢复档、退役本账号的旧窗口并记录切换，新窗口就绪。
     #[allow(clippy::too_many_arguments)]
     fn publish_window(
         &self,
@@ -1350,21 +1466,9 @@ impl Store {
         pair: &mut Object,
     ) -> Result<(), Failure> {
         let lease_gateway = string_of(lease, "gateway");
-        if let Some(material) = present(data, "material") {
-            check_material(material, now)?;
-            exec(
-                db,
-                "INSERT OR REPLACE INTO materials VALUES (?,?,?,?)",
-                vec![
-                    text(account),
-                    text(&string_of(lease, "generation")),
-                    sql_of(material.get("expires").unwrap_or(&Value::Null)),
-                    text(&encode(material)),
-                ],
-            )?;
-            set(pair, "cookieExpiresAt", field_of_value(material, "expires"));
-        }
-        policy::recover(pair, num_field(pair, "probeRestSeconds"));
+        self.store_material(db, data, account, now, lease, pair)?;
+        policy::recover(pair, settings, num_field(pair, "probeTierSeconds"));
+        pair.remove("standbyPlan");
         // 新窗口就绪后，本账号的旧窗口退役；未发送的请求随之切到新窗口。其他账号的窗口属于别的 Key，不受影响。
         let mut previous_pair: Option<Object> = None;
         for row in rows(
@@ -1374,7 +1478,12 @@ impl Store {
         )? {
             let mut old = decode_object(&string_of(&row, "data"))?;
             if str_field(&old, "state") == Some("ready") {
-                policy::retire(&mut old, settings, false, false);
+                let cause = if policy::rotation(&old, settings, now).cookie_ending {
+                    "cookie_expiring"
+                } else {
+                    "rotation"
+                };
+                policy::retire(&mut old, settings, Cause::Planned(cause));
                 policy::settle(&mut old);
                 self.save(db, &old)?;
                 previous_pair = Some(old);
@@ -1434,6 +1543,33 @@ impl Store {
         set(pair, "state", json!("ready"));
         set(pair, "verifiedAt", now.to_json());
         set(pair, "restUntil", Value::Null);
+        Ok(())
+    }
+
+    /// 保存配套材料（私有，页面不可见）并记下 Cookie 到期时间。
+    pub(crate) fn store_material(
+        &self,
+        db: &Connection,
+        data: &Object,
+        account: &str,
+        now: Num,
+        lease: &Object,
+        pair: &mut Object,
+    ) -> Result<(), Failure> {
+        if let Some(material) = present(data, "material") {
+            check_material(material, now)?;
+            exec(
+                db,
+                "INSERT OR REPLACE INTO materials VALUES (?,?,?,?)",
+                vec![
+                    text(account),
+                    text(&string_of(lease, "generation")),
+                    sql_of(material.get("expires").unwrap_or(&Value::Null)),
+                    text(&encode(material)),
+                ],
+            )?;
+            set(pair, "cookieExpiresAt", field_of_value(material, "expires"));
+        }
         Ok(())
     }
 
@@ -1679,7 +1815,7 @@ fn decrement_in_flight(pair: &mut Object) {
     );
 }
 
-fn field_of_value(value: &Value, key: &str) -> Value {
+pub(crate) fn field_of_value(value: &Value, key: &str) -> Value {
     value.get(key).cloned().unwrap_or(Value::Null)
 }
 

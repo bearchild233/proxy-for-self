@@ -609,7 +609,7 @@ async fn window_without_material_is_retired_and_probed_again() {
     // 旧窗口退役，新窗口在另一个网关上就绪。
     assert_eq!(
         rig.pair(ACCOUNT, "unified-142")["retiredReason"],
-        "rotation"
+        "invalidated"
     );
     assert_eq!(gateway(&upstream), "unified-143");
     assert_eq!(
@@ -810,6 +810,37 @@ async fn account_yields_when_its_round_is_complete_and_the_key_has_a_way_out() {
     assert!(reason.message.contains("让位"), "{}", reason.message);
     assert_eq!(
         rig.pair(ACCOUNT, "unified-142")["retiredReason"],
-        "rotation"
+        "round_end"
     );
+}
+
+/// 窗口用满且有需求：路由路径在后台准备一张备用票（当前窗口继续服务），之后 29 立即换成备用票，不再找票。
+#[tokio::test]
+async fn used_up_window_prepares_a_standby_and_a_29_swaps_it_in_without_probing() {
+    let rig = Rig::start("route-standby", json!({"windowSeconds": 1})).await;
+    let (first, upstream) = lease(&rig, "req_s1", "gpt-6-astra").await;
+    assert_eq!(gateway(&upstream), "unified-142");
+    rig.finish("req_s1", &first, RequestOutcome::Completed)
+        .await;
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    // 窗口用满后的下一个请求仍用当前窗口，同时后台准备备用票。
+    let (second, upstream) = lease(&rig, "req_s2", "gpt-6-astra").await;
+    assert_eq!(gateway(&upstream), "unified-142");
+    rig.until(|| rig.pair(ACCOUNT, "unified-143")["state"] == "standby")
+        .await;
+    assert_eq!(rig.pair(ACCOUNT, "unified-142")["state"], "ready");
+    let probes = rig.fake.calls_to("upstream.probe").len();
+    assert_eq!(probes, 4, "两个窗口各一次取 S0 与一次重放");
+    // 当前窗口遇到 29：备用票在同一次判定里接手，下一次路由不再有任何探测。
+    assert_eq!(
+        rig.head("req_s2", &second, Some(200), true, vec![]).await,
+        ResponseHeadResult::Switch
+    );
+    assert_eq!(rig.pair(ACCOUNT, "unified-143")["state"], "ready");
+    let (third, upstream) = used(rig.drive("req_s2", ACCOUNT, "gpt-6-astra", 10).await);
+    assert_eq!(gateway(&upstream), "unified-143");
+    assert_eq!(upstream.turn_state.as_deref(), Some("state-unified-143"));
+    assert_eq!(rig.fake.calls_to("upstream.probe").len(), probes);
+    rig.finish("req_s2", &third, RequestOutcome::Completed)
+        .await;
 }

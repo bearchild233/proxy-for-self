@@ -682,3 +682,299 @@ fn cooling_views_skip_steps_without_a_due_time() {
     assert!(!accounts.contains(&"B"));
     assert!(accounts.contains(&"A"));
 }
+
+/// 一次判定为 21 的业务访问：开始、过了 `seconds` 秒后带 21 判定结束，并归还租约。
+fn served_21(harness: &Harness, pair: &Value, seconds: f64) -> f64 {
+    let (lease, access) = harness.business(pair);
+    harness.advance(seconds);
+    harness.report(
+        "businessResult",
+        &lease,
+        &access,
+        true,
+        json!({"status": 200, "stateReturned": false, "paired": true, "gatewayMatches": true}),
+    );
+    harness.rt("finish", json!({"leaseId": lease}));
+    harness.now()
+}
+
+fn record_of(harness: &Harness, generation: &Value) -> Value {
+    harness.stats(json!({}))["records"]
+        .as_array()
+        .expect("records")
+        .iter()
+        .find(|row| &row["id"] == generation)
+        .expect("window record")
+        .clone()
+}
+
+#[test]
+fn window_seconds_stop_at_the_last_confirmed_21_instead_of_growing_while_idle() {
+    let harness = Harness::history();
+    let pair = harness.probe("21", json!({}));
+    let first = record_of(&harness, &pair["generation"])["windowStartAt"].clone();
+    let confirmed = served_21(&harness, &pair, 10.0);
+    // 窗口用满之后没有任何使用：时长止于最后一次确认可用，页面不再按查询时刻加时间。
+    harness.advance(5000.0);
+    let row = record_of(&harness, &pair["generation"]);
+    assert_num(&row["lastConfirmedAt"], confirmed);
+    assert_num(&row["windowEndAt"], confirmed);
+    assert_num(
+        &row["windowSeconds"],
+        confirmed - first.as_f64().expect("start"),
+    );
+    harness.advance(5000.0);
+    assert_num(
+        &record_of(&harness, &pair["generation"])["windowSeconds"],
+        confirmed - first.as_f64().expect("start"),
+    );
+    // 之后又被使用且仍为 21：从新的确认时刻继续算。
+    let later = served_21(&harness, &pair, 20.0);
+    let row = record_of(&harness, &pair["generation"]);
+    assert_num(
+        &row["windowSeconds"],
+        later - first.as_f64().expect("start"),
+    );
+    // 最近 windowSeconds 内有使用：仍算到查询时刻。
+    harness.advance(30.0);
+    let row = record_of(&harness, &pair["generation"]);
+    assert_num(
+        &row["windowSeconds"],
+        harness.now() - first.as_f64().expect("start"),
+    );
+    assert_eq!(row["windowEndAt"], Value::Null);
+    // 有在途请求：算到查询时刻，即使很久没有 21 判定。
+    harness.advance(1000.0);
+    harness.business(&pair);
+    harness.advance(1000.0);
+    let row = record_of(&harness, &pair["generation"]);
+    assert_num(
+        &row["windowSeconds"],
+        harness.now() - first.as_f64().expect("start"),
+    );
+}
+
+#[test]
+fn a_window_ended_by_29_stops_at_the_end_of_the_last_21() {
+    let harness = Harness::history();
+    let pair = harness.probe("21", json!({}));
+    let first = record_of(&harness, &pair["generation"])["windowStartAt"]
+        .as_f64()
+        .expect("start");
+    let confirmed = served_21(&harness, &pair, 10.0);
+    harness.advance(600.0);
+    let (lease, access) = harness.business(&pair);
+    harness.advance(2.0);
+    harness.report(
+        "businessResult",
+        &lease,
+        &access,
+        true,
+        json!({"status": 200, "stateReturned": true, "paired": true, "gatewayMatches": true}),
+    );
+    harness.rt("finish", json!({"leaseId": lease}));
+    let row = record_of(&harness, &pair["generation"]);
+    assert_eq!(row["reason"], json!("29"));
+    assert!(row["retiredAt"].as_f64().expect("retired") > confirmed + 600.0);
+    assert_num(&row["lastConfirmedAt"], confirmed);
+    assert_num(&row["windowSeconds"], confirmed - first);
+}
+
+#[test]
+fn a_standby_window_is_counted_from_its_first_business_access_and_a_dropped_one_has_no_window() {
+    let harness = Harness::history();
+    let first = harness.probe("21", json!({}));
+    harness.advance(181.0);
+    // 窗口用满：只准备备用票，当前窗口继续服务。
+    let spare = harness.probe("21", json!({}));
+    let row = record_of(&harness, &spare["generation"]);
+    assert_eq!(row["standby"], json!(true));
+    assert_eq!(row["state"], json!("standby"));
+    assert_num(&row["standbyAt"], harness.now());
+    assert_eq!(row["activatedAt"], Value::Null);
+    assert_num(&row["windowSeconds"], 0.0);
+    // 备用票不是窗口，不缺失计时。
+    assert_eq!(
+        harness.stats(json!({}))["summary"]["missing"]["windowSeconds"],
+        json!(0)
+    );
+    let obtained = harness.now();
+    // 超过 50 分钟仍未启用：丢弃，结束时间记为应当到期的时刻，原因为备用过期。
+    harness.advance(3001.0);
+    harness.rt("plan", json!({"demand": true}));
+    let row = record_of(&harness, &spare["generation"]);
+    assert_eq!(row["reason"], json!("standby_expired"));
+    assert_num(&row["retiredAt"], obtained + 3000.0);
+    assert_num(&row["windowSeconds"], 0.0);
+    // 没有服务过的备用票不算遍历：不进入本批已处理的网关。
+    let batch = harness.stats(json!({"view": "summary"}))["batches"][0].clone();
+    assert!(
+        batch["processed"]
+            .get(spare["gateway"].as_str().expect("gateway"))
+            .is_none()
+    );
+    // 静置起点是拿到它的时间。
+    let cycle = harness.stats(json!({"view": "cooling"}))["recoveries"][0].clone();
+    let step = cycle["steps"][0].clone();
+    assert_eq!(step["reason"], json!("standby_expired"));
+    assert_num(&step["scheduledStartAt"], obtained);
+    // 新的备用票转正：窗口从它的第一次业务访问算起，备用期间不计入。
+    harness.advance(2.0);
+    let next = harness.probe("21", json!({}));
+    assert_eq!(next["gateway"], spare["gateway"]);
+    // 转正要求配套材料仍有效（历史用例的探测不带材料，这里补上）。
+    harness
+        .connection()
+        .execute(
+            "INSERT INTO materials VALUES ('A',?,?,?)",
+            rusqlite::params![
+                next["generation"].as_str(),
+                harness.now() + 50_000.0,
+                json!({"state": "s", "cookie": "c", "expires": harness.now() + 50_000.0})
+                    .to_string()
+            ],
+        )
+        .expect("insert material");
+    harness.retire_pair(&first);
+    let promoted = harness.view(json!({}))["pairs"]
+        .as_array()
+        .expect("pairs")
+        .iter()
+        .find(|pair| pair["generation"] == next["generation"])
+        .expect("promoted pair")
+        .clone();
+    assert_eq!(promoted["state"], json!("ready"));
+    harness.advance(500.0);
+    let row = record_of(&harness, &next["generation"]);
+    assert_num(&row["windowSeconds"], 0.0);
+    assert_eq!(row["windowStartAt"], Value::Null);
+    let started = harness.now();
+    let confirmed = served_21(&harness, &promoted, 12.0);
+    let row = record_of(&harness, &next["generation"]);
+    assert_num(&row["windowStartAt"], started);
+    assert_num(&row["windowSeconds"], confirmed - started);
+    assert!(row["activatedAt"].as_f64().is_some());
+}
+
+#[test]
+fn cooling_steps_record_reason_tier_start_tier_and_the_failure_kind() {
+    let harness = Harness::history();
+    only_142(&harness);
+    harness.probe("29", json!({}));
+    harness.advance(2.0);
+    harness.probe("29", json!({}));
+    harness.advance(3.0);
+    let claim = harness.rt("claim", json!({"demand": true}));
+    harness.rt("sent", json!({"leaseId": claim["leaseId"]}));
+    harness.advance(1.0);
+    harness.rt(
+        "probeResult",
+        json!({"leaseId": claim["leaseId"], "status": 429, "paired": true, "gatewayMatches": true,
+               "failed": true, "failure": "http_status"}),
+    );
+    harness.rt("finish", json!({"leaseId": claim["leaseId"]}));
+    let cycle = harness.stats(json!({"view": "cooling"}))["recoveries"][0].clone();
+    let steps = cycle["steps"].as_array().expect("steps");
+    assert_eq!(steps.len(), 3);
+    let field =
+        |name: &str| -> Vec<Value> { steps.iter().map(|step| step[name].clone()).collect() };
+    assert_eq!(
+        field("reason"),
+        vec![json!("29"), json!("29"), json!("probe_failed")]
+    );
+    // 档位：初始 1 秒，复测仍为 29 时翻倍（乘性）；失败的静置不改档。
+    assert_eq!(
+        field("tierSeconds")
+            .iter()
+            .map(|v| v.as_f64())
+            .collect::<Vec<_>>(),
+        vec![Some(1.0), Some(2.0), Some(2.0)]
+    );
+    assert_eq!(
+        field("plannedSeconds")
+            .iter()
+            .map(|v| v.as_f64())
+            .collect::<Vec<_>>(),
+        vec![Some(1.0), Some(2.0), Some(300.0)]
+    );
+    assert_eq!(field("startTierSeconds")[0].as_f64(), Some(1.0));
+    // 每一步的结果是这一轮静置结束后复测的结果：第二轮之后的复测失败，状态码与失败类别单独记录。
+    assert_eq!(
+        field("result"),
+        vec![json!("29"), json!("failed"), Value::Null]
+    );
+    assert_eq!(field("status")[1], json!(429));
+    assert_eq!(field("failure")[1], json!("http_status"));
+    assert_eq!(field("failure")[0], Value::Null);
+}
+
+#[test]
+fn startup_marks_orphaned_business_accesses_interrupted_and_leaves_live_leases_alone() {
+    let mut harness = Harness::history();
+    let pair = harness.probe("21", json!({}));
+    let (live_lease, live) = harness.business(&pair);
+    let now = harness.now();
+    let connection = harness.connection();
+    for (id, lease) in [("orphan", "gone"), ("expired", "stale")] {
+        connection
+            .execute(
+                "INSERT INTO gp_accesses(id,lease,generation,kind,observed,started,outcome) VALUES (?,?,?,'business',?,?,'headers')",
+                rusqlite::params![id, lease, pair["generation"].as_str(), now, now],
+            )
+            .expect("insert access");
+    }
+    connection
+        .execute(
+            "INSERT INTO leases VALUES ('stale',?,?,?,'business',?,1,'{}')",
+            rusqlite::params![
+                "A",
+                pair["gateway"].as_str(),
+                pair["generation"].as_str(),
+                now - 1.0
+            ],
+        )
+        .expect("insert expired lease");
+    drop(connection);
+    harness.reopen();
+    let connection = harness.connection();
+    let outcome = |id: &str| -> (Option<String>, Option<f64>) {
+        connection
+            .query_row(
+                "SELECT outcome,ended FROM gp_accesses WHERE id=?",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("access row")
+    };
+    // 没有结束时间且不属于在途租约：标为中断，结束时间保持未知。
+    assert_eq!(outcome("orphan"), (Some("interrupted".to_owned()), None));
+    assert_eq!(outcome("expired"), (Some("interrupted".to_owned()), None));
+    // 仍有效的在途租约不动。
+    let live_id = live["id"].as_str().expect("access id");
+    assert_eq!(outcome(live_id), (None, None));
+    assert_eq!(harness.count("leases"), 2);
+    assert!(live_lease.is_string());
+}
+
+#[test]
+fn summary_lists_the_last_24_hours_of_window_seconds_per_account_and_gateway() {
+    let harness = Harness::history();
+    let pair = harness.probe("21", json!({}));
+    let first = record_of(&harness, &pair["generation"])["windowStartAt"]
+        .as_f64()
+        .expect("start");
+    let confirmed = served_21(&harness, &pair, 10.0);
+    // 不受账号与网关筛选影响。
+    let summary =
+        harness.stats(json!({"view": "summary", "accountId": "B", "gateway": "unified-143"}));
+    let recent = summary["recentWindows"].as_array().expect("recent");
+    assert_eq!(recent.len(), 1);
+    assert_eq!(recent[0]["accountId"], json!("A"));
+    assert_eq!(recent[0]["gateway"], pair["gateway"]);
+    assert_eq!(recent[0]["windows"], json!(1));
+    assert_num(&recent[0]["windowSeconds"], confirmed - first);
+    // 只算最近 24 小时：窗口时长早已停在 24 小时之前。
+    harness.advance(100_000.0);
+    let summary = harness.stats(json!({"view": "summary"}));
+    assert_eq!(summary["recentWindows"], json!([]));
+}

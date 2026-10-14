@@ -1,4 +1,4 @@
-//! 设置校验，与 `gateway_pool.py` 的 `configure` 及 `policy.DEFAULTS` 保持相同的顺序、范围与报错文案。
+//! 设置校验：合并已有设置与本次提交，按固定顺序逐项检查范围与格式。
 
 use serde_json::{Value, json};
 
@@ -46,6 +46,21 @@ pub fn prepare(previous: &Object, data: &Object) -> Result<Object, Failure> {
     if initial > maximum || !matches!(mode, Some("lazy" | "continuous")) {
         return Failure::invalid("静置范围或模式无效");
     }
+    if !matches!(
+        str_field(&settings, "backoffMode"),
+        Some("additive" | "multiplicative")
+    ) {
+        return Failure::invalid("退避方式无效");
+    }
+    // 加性步长：60–86400 的整数秒（JSON 里 3600 与 3600.0 都接受，存为整数）。
+    let step = settings
+        .get("backoffStepSeconds")
+        .and_then(Value::as_f64)
+        .filter(|step| step.is_finite() && step.fract() == 0.0 && (60.0..=86400.0).contains(step));
+    let Some(step) = step else {
+        return Failure::invalid("退避步长必须是 60 到 86400 的整数秒");
+    };
+    settings.insert("backoffStepSeconds".to_owned(), json!(step as i64));
     for (field, valid) in [
         ("groupIds", group_list as fn(&Value) -> bool),
         ("gateways", gateway_list as fn(&Value) -> bool),
