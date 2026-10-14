@@ -150,7 +150,15 @@ Rust 插件放在独立 workspace `plugins/Cargo.toml`，共用 `kernel-protocol
 
 ## 8. 生命周期
 
-插件监督由现有 updater 扩展：它已经以 root 身份管理 Excel Worker 的安装、排空、替换和恢复。常驻插件运行在 systemd 模板单元 `proxy-for-self-plugin@<id>.service`，设置 `MemoryMax`、`Restart=on-failure`。网关不依赖插件单元。
+插件监督由现有 updater 扩展：它已经以 root 身份管理 Excel Worker 的安装、排空、替换和恢复。常驻插件运行在 systemd 模板单元 `proxy-for-self-plugin@<实例>.service`（实例名为 `<插件ID>--<内容版本前 12 位>`，新旧版本可以并存），以插件服务用户运行，设置 `MemoryMax`、`Restart=on-failure`。网关不依赖插件单元。
+
+安全边界：
+
+- 插件包由管理面安装到插件存储目录；带服务的插件，updater 自己重新校验清单与文件哈希，再把服务二进制复制到 root 所有的运行目录执行。插件用户能写存储目录，但改不了正在运行的二进制。
+- 插件能获得的能力和 `fetchHosts` 不由插件包决定：updater 配置里按插件 ID 登记允许的上限（root 管理），写入内核注册表的 `grants`、`fetchHosts` 取清单声明与该上限的交集。
+- 内核注册表文件由 updater 原子写入，root 所有、网关可读。
+
+插件包清单新增 `service` 段：服务二进制路径、`kernelApi`、申请的能力、`fetchHosts`、`memoryMax`、`shutdownSeconds`。没有 `service` 段的插件与现在完全一样。
 
 | 操作 | 流程 |
 | --- | --- |
