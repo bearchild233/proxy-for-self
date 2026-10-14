@@ -87,9 +87,10 @@ def _ensure_dir(path: Path, mode: int, owner: tuple[int, int] | None = None) -> 
     path.mkdir(parents=True, exist_ok=True)
     if path.is_symlink() or not path.is_dir():
         raise ValueError("插件目录无效")
-    os.chmod(path, mode)
+    # 先改所有者再设权限：chown 可能清除 setgid 位。
     if owner is not None:
         os.chown(path, owner[0], owner[1])
+    os.chmod(path, mode)
 
 
 def _safe_relative(name) -> str:
@@ -295,7 +296,10 @@ class ServicePlugins:
     def _start(self, plugin_id: str, instance: str, service: dict, registration: dict) -> None:
         uid, gid = self.identity(self.config["user"], self.config["group"])
         _ensure_dir(Path(self.config["socket_root"]), 0o755)
-        _ensure_dir(Path(self.config["socket_root"]) / plugin_id, 0o750, (uid, gid))
+        # socket 目录用单独的连接组（缺省为插件组）并设 setgid，插件创建的 socket 继承该组；
+        # 网关只需加入连接组即可连接，不因此获得插件存储目录的读权限。
+        socket_gid = self.identity(self.config["user"], self.config.get("socket_group", self.config["group"]))[1]
+        _ensure_dir(Path(self.config["socket_root"]) / plugin_id, 0o2750, (uid, socket_gid))
         _ensure_dir(Path(self.config["data_root"]), 0o755)
         data = Path(self.config["data_root"]) / plugin_id
         _ensure_dir(data, 0o700, (uid, gid))
