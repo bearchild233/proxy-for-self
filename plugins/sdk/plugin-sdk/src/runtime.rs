@@ -94,12 +94,16 @@ impl<P: Plugin> Server<P> {
         std::fs::set_permissions(&settings.data, std::fs::Permissions::from_mode(0o700))?;
         let listener = UnixListener::bind(&settings.socket)?;
         std::fs::set_permissions(&settings.socket, std::fs::Permissions::from_mode(0o660))?;
+        let kernel = Kernel {
+            owned_groups: Arc::new(tokio::sync::Mutex::new(descriptor.owned_groups.clone())),
+            ..Kernel::default()
+        };
         Ok(Self {
             listener,
             plugin: Arc::new(plugin),
             settings,
             descriptor,
-            kernel: Kernel::default(),
+            kernel,
         })
     }
 
@@ -202,10 +206,13 @@ async fn connection<P: Plugin>(
     if !is_compatible(hello.kernel_api, descriptor.kernel_api) {
         return;
     }
+    let groups = kernel.owned_groups.lock().await;
+    let mut hello_result = descriptor.hello();
+    hello_result.owned_groups = groups.clone();
     let response = Message::Response {
         id,
         payload: ResponsePayload::Result(
-            serde_json::to_value(descriptor.hello()).expect("hello serialization"),
+            serde_json::to_value(hello_result).expect("hello serialization"),
         ),
     };
     if write_frame(&mut stream, &response).await.is_err() {
@@ -214,6 +221,7 @@ async fn connection<P: Plugin>(
     let (mut reader, write_half) = stream.into_split();
     let (peer, rx) = Peer::new(1);
     kernel.register(&peer);
+    drop(groups);
     // guard 保证 task 被外层 abort 时也撤销连接可用性与挂起请求。
     let _close = ClosePeer(peer.clone());
     let ctx = Context {

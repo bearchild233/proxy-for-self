@@ -9,6 +9,7 @@ pub struct Descriptor {
     pub kernel_api: PluginApi,
     pub hooks: Vec<String>,
     pub capabilities: Vec<String>,
+    pub owned_groups: Vec<String>,
     pub shutdown_timeout: Duration,
 }
 
@@ -22,6 +23,7 @@ impl Descriptor {
             kernel_api: self.kernel_api,
             hooks: self.hooks.clone(),
             capabilities: self.capabilities.clone(),
+            owned_groups: self.owned_groups.clone(),
         }
     }
 }

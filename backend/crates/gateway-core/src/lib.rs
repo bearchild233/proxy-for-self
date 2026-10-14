@@ -14,6 +14,7 @@ pub mod identity;
 pub mod lifecycle;
 pub mod metering;
 pub mod operation;
+pub mod plugin;
 pub mod policy;
 pub mod provider_ports;
 pub mod routing;

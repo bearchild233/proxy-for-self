@@ -39,7 +39,7 @@ fn handshake_lifecycle_examples_and_compatibility() {
         json!({"kernelApi":{"major":0,"minor":1},"kernel":{"version":"test","slot":null}}),
     );
     example::<HelloResult>(
-        json!({"plugin":{"id":"echo","version":"0.0.0"},"sdk":{"version":"0.0.0"},"kernelApi":{"major":0,"minMinor":1},"hooks":["route.prepare"],"capabilities":["log"]}),
+        json!({"plugin":{"id":"echo","version":"0.0.0"},"sdk":{"version":"0.0.0"},"kernelApi":{"major":0,"minMinor":1},"hooks":["route.prepare"],"capabilities":["log"],"ownedGroups":[]}),
     );
     example::<HealthResult>(json!({"ready":true}));
     example::<HealthResult>(json!({"ready":false,"detail":"test"}));
@@ -70,7 +70,7 @@ fn handshake_lifecycle_examples_and_compatibility() {
         KernelApi::default(),
         PluginApi {
             major: 0,
-            min_minor: 2
+            min_minor: 3
         }
     ));
     assert_eq!(
@@ -91,4 +91,16 @@ fn handshake_lifecycle_examples_and_compatibility() {
             "internal"
         ]
     );
+}
+
+#[test]
+fn old_hello_defaults_ownership_and_new_notification_roundtrips() {
+    let hello: HelloResult = serde_json::from_value(json!({
+        "plugin":{"id":"old","version":"0.1"},"sdk":{"version":"0.1"},
+        "kernelApi":{"major":0,"minMinor":1},"hooks":[],"capabilities":[]
+    }))
+    .unwrap();
+    assert!(hello.owned_groups.is_empty());
+    example::<OwnershipChangedParams>(json!({"ownedGroups":["group"]}));
+    assert_eq!(KERNEL_API, (0, 2));
 }

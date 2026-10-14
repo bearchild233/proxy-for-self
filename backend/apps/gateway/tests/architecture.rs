@@ -17,6 +17,7 @@ pub(super) const WORKSPACE_MEMBERS: &[&str] = &[
     "crates/gateway-host",
     "crates/gateway-protocol",
     "crates/gateway-store",
+    "crates/kernel-protocol",
     "crates/providers/openai",
     "crates/providers/xai",
 ];
@@ -143,7 +144,9 @@ impl CrateReferences {
 fn gateway_protocol_has_no_workspace_dependencies() {
     for name in dependency_names("crates/gateway-protocol") {
         assert!(
-            !name.starts_with("gateway-") && !name.starts_with("provider-"),
+            !PACKAGE_TO_MEMBER
+                .iter()
+                .any(|(package, _)| *package == name),
             "gateway-protocol must not depend on workspace crate `{name}`"
         );
     }
@@ -172,6 +175,7 @@ const PACKAGE_TO_MEMBER: &[(&str, &str)] = &[
     ("gateway-host", "crates/gateway-host"),
     ("gateway-protocol", "crates/gateway-protocol"),
     ("gateway-store", "crates/gateway-store"),
+    ("kernel-protocol", "crates/kernel-protocol"),
     ("provider-openai", "crates/providers/openai"),
     ("provider-xai", "crates/providers/xai"),
 ];
@@ -184,6 +188,8 @@ const ADAPTER_PUBLIC_MODULES: &[(&str, &[&str])] = &[
         &[
             "client_distribution",
             "config",
+            "plugin",
+            "plugin_policy",
             "pricing",
             "proxy_probe",
             "serve",
@@ -194,7 +200,7 @@ const ADAPTER_PUBLIC_MODULES: &[(&str, &[&str])] = &[
     ("crates/gateway-store", &["backup", "postgres", "redis"]),
     (
         "crates/providers/openai",
-        &["config", "credential", "transport"],
+        &["config", "credential", "gateway_pool", "transport"],
     ),
     ("crates/providers/xai", &["credential", "transport"]),
 ];
@@ -220,6 +226,8 @@ const ALLOWED_INTERNAL_EDGES: &[(&str, &str)] = &[
     ("gateway-api", "gateway-protocol"),
     ("gateway-host", "gateway-admin"),
     ("gateway-host", "gateway-core"),
+    ("gateway-host", "kernel-protocol"),
+    ("gateway-core", "kernel-protocol"),
     ("gateway-store", "gateway-admin"),
     ("gateway-store", "gateway-core"),
     ("provider-openai", "gateway-admin"),
@@ -580,6 +588,18 @@ fn assert_no_dependency(member: &str, forbidden: &[&str]) {
         assert!(
             !forbidden.contains(&name.as_str()),
             "{member} must not depend on `{name}`"
+        );
+    }
+}
+
+#[test]
+fn kernel_protocol_has_no_workspace_dependencies() {
+    for name in dependency_names("crates/kernel-protocol") {
+        assert!(
+            !PACKAGE_TO_MEMBER
+                .iter()
+                .any(|(package, _)| *package == name),
+            "kernel-protocol must not depend on workspace crate `{name}`"
         );
     }
 }

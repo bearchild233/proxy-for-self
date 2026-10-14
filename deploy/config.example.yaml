@@ -7,6 +7,10 @@
 
 schema_version: 1
 
+# plugins:
+#   registry_path: '/run/proxy-for-self/plugins.json'
+#   ownership_cache_path: '/run/proxy-for-self/plugin-ownership.json'
+
 host:
   listen:
     # 本地 cargo run 使用；Docker 内由 CPR_SERVER_HOST/PORT 覆盖。

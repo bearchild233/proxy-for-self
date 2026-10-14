@@ -15,9 +15,38 @@ use serde::{Serialize, de::DeserializeOwned};
 #[derive(Clone, Default)]
 pub struct Kernel {
     pub(crate) peers: Arc<Mutex<Vec<Weak<Peer>>>>,
+    // 同一把异步锁串行化 hello 注册与归属广播，避免新连接错过设置更新。
+    pub(crate) owned_groups: Arc<tokio::sync::Mutex<Vec<String>>>,
 }
 
 impl Kernel {
+    pub async fn set_owned_groups(&self, groups: Vec<String>) -> RpcResult<()> {
+        let mut current = self.owned_groups.lock().await;
+        *current = groups;
+        let peers: Vec<_> = self
+            .peers
+            .lock()
+            .expect("peers lock")
+            .iter()
+            .filter_map(Weak::upgrade)
+            .filter(|peer| peer.is_open())
+            .collect();
+        let message = Message::Notify {
+            method: "ownership.changed".into(),
+            params: serde_json::to_value(OwnershipChangedParams {
+                owned_groups: current.clone(),
+            })
+            .map_err(internal)?,
+        };
+        let mut result = Ok(());
+        for peer in peers {
+            if let Err(error) = peer.send(&message).await {
+                result = Err(error);
+            }
+        }
+        result
+    }
+
     pub(crate) fn register(&self, peer: &Arc<Peer>) {
         let mut peers = self.peers.lock().expect("peers lock");
         peers.retain(|weak| weak.upgrade().is_some_and(|peer| peer.is_open()));

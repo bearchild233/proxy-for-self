@@ -19,6 +19,8 @@ pub struct GatewayConfig {
     api: gateway_api::ApiConfig,
     #[serde(default)]
     openai: provider_openai::OpenAiConfig,
+    #[serde(default)]
+    plugins: gateway_host::plugin::PluginRuntimeConfig,
 }
 
 impl LoadableConfig for GatewayConfig {
@@ -33,6 +35,7 @@ impl LoadableConfig for GatewayConfig {
             .map_err(|_| ConfigError::InvalidField("api"))?;
         self.host
             .resolve_and_validate(source_dir, &self.api.asset_directory)?;
+        self.plugins.resolve_and_validate(source_dir)?;
         let runtime_data_dir = self.host.runtime_data_dir().to_path_buf();
         self.store
             .resolve_and_validate(&runtime_data_dir)
@@ -61,9 +64,11 @@ pub async fn run() -> Result<(), BootstrapError> {
         client,
         api,
         openai,
+        plugins,
     } = config;
 
-    let host = gateway_host::initialize(host).await?;
+    let kernel_version = host.system_update.version.clone();
+    let mut host = gateway_host::initialize(host).await?;
     host.report_startup_ready("Host");
     let mut store = gateway_store::initialize(store).await?;
     host.report_startup_ready("Store");
@@ -116,6 +121,17 @@ pub async fn run() -> Result<(), BootstrapError> {
     host.start_workers(plan, store.worker_leader_lease())?;
     host.report_startup_ready("Workers");
     store.complete_startup().await?;
+    let runtime = gateway_host::plugin::PluginRuntime::start(
+        plugins,
+        gateway_host::plugin::KernelInfo {
+            version: kernel_version,
+            // TODO(design): Store 的槽标识尚无公开读取端口，握手暂不报告槽。
+            slot: None,
+        },
+        std::sync::Arc::new(gateway_host::plugin::LogCapabilities),
+    )
+    .map_err(gateway_host::HostError::Plugin)?;
+    host.set_plugin_runtime(runtime);
     host.serve(api.router()).await?;
     Ok(())
 }

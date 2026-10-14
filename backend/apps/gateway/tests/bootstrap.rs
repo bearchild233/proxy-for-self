@@ -9,6 +9,15 @@ const REDIS_PASSWORD: &str = "222222222222222222222222222222222222222222222222";
 const ADMIN_PASSWORD: &str = "test-admin-password";
 const TOPOLOGY_CHILD_ENV: &str = "CPR_TEST_TOPOLOGY_CHILD";
 
+#[test]
+fn config_loader_should_accept_plugin_paths_and_reject_partial_configuration() {
+    parse_config(&format!("{}\nplugins:\n  registry_path: plugins.json\n  ownership_cache_path: plugin-ownership.json\n", valid_config())).unwrap();
+    assert_rejected(format!(
+        "{}\nplugins:\n  registry_path: plugins.json\n",
+        valid_config()
+    ));
+}
+
 #[tokio::test]
 async fn proxy_probe_should_use_provider_custom_ca_for_https_proxies() {
     use gateway_admin::ports::proxy::ProxyProbe;

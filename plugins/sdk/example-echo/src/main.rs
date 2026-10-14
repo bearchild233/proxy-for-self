@@ -46,7 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         kernel_api: PluginApi {
             major: KERNEL_API.0,
-            min_minor: KERNEL_API.1,
+            min_minor: 1,
         },
         hooks: vec![
             "route.prepare".into(),
@@ -54,6 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "admin.call".into(),
         ],
         capabilities: vec!["log".into()],
+        owned_groups: vec![],
         shutdown_timeout: Duration::from_millis(shutdown_ms),
     };
     Server::bind(Settings::from_env()?, descriptor, Echo)?

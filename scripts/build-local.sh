@@ -28,6 +28,12 @@ echo $$ > "$group/cgroup.procs"
 # 只同步本地构建镜像；缓存留在 Linux 文件系统内，不进入 Windows 仓库。
 mkdir -p /work/proxy-for-self/backend
 rsync -a --delete --exclude /target --chown=builder:builder "$src/backend/" /work/proxy-for-self/backend/
+# Host 集成测试通过独立插件 workspace 的 SDK 驱动真实 socket。
+mkdir -p /work/proxy-for-self/plugins
+rsync -a --chown=builder:builder "$src/plugins/Cargo.toml" "$src/plugins/Cargo.lock" /work/proxy-for-self/plugins/
+rsync -a --delete --exclude target --chown=builder:builder "$src/plugins/sdk/" /work/proxy-for-self/plugins/sdk/
+mkdir -p /work/proxy-for-self/deploy
+rsync -a --chown=builder:builder "$src/deploy/config.example.yaml" /work/proxy-for-self/deploy/
 cd /work/proxy-for-self/backend
 export PATH=/home/builder/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export CARGO_TARGET_DIR=/work/proxy-for-self/backend/target

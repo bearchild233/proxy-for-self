@@ -128,6 +128,21 @@ impl MockKernel {
             .clone()
     }
 
+    pub fn owned_groups(&self) -> Vec<String> {
+        self.notifications
+            .lock()
+            .expect("notifications lock")
+            .iter()
+            .rev()
+            .find_map(|(method, params)| {
+                (method == "ownership.changed")
+                    .then(|| serde_json::from_value::<OwnershipChangedParams>(params.clone()).ok())
+                    .flatten()
+                    .map(|params| params.owned_groups)
+            })
+            .unwrap_or_else(|| self.hello.owned_groups.clone())
+    }
+
     pub async fn call<P: Serialize + Sync, R: DeserializeOwned>(
         &self,
         method: &str,

@@ -62,6 +62,7 @@ flowchart LR
 | --- | --- |
 | `backend/apps/gateway` | 读取顶层配置、连接 Bundle、注册 Provider 与 Worker |
 | `gateway-protocol` | 跨层共享的 OpenAI wire contract、SSE 编解码与无业务 owner 的解析事实，不依赖其他 workspace crate |
+| `kernel-protocol` | 内核与插件共享的版本、消息、钩子、能力与帧编解码合同，不依赖其他 workspace crate |
 | `gateway-core` | operation、canonical event、请求快照、路由、admission、attempt 协调、交付边界和计量 |
 | `gateway-admin` | 管理领域、Key 用量查询、Provider/Store 端口、审计语义和备份策略 |
 | `gateway-api` | HTTP/WS/SSE 解码与交付、Admin 与 Key 用量 wire、静态 Web UI；不直接访问 Store 或具体 Provider |
@@ -72,6 +73,8 @@ flowchart LR
 | `frontend` | Vue 管理端与 Key 用量页，仅通过各自身份允许的控制面 API 访问状态 |
 
 依赖方向遵守四条规则：
+
+`kernel-protocol` 与 `gateway-protocol` 同为叶子，不依赖其他 workspace crate。
 
 1. Core 不依赖 HTTP、数据库、Redis 或具体 Provider。
 2. Provider 之间不互相依赖，也不决定跨 Provider fallback。

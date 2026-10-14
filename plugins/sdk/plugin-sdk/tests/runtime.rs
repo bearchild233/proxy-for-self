@@ -23,6 +23,27 @@ use tokio::{
 const BUDGET: Duration = Duration::from_secs(3);
 static NEXT: AtomicU64 = AtomicU64::new(1);
 
+#[tokio::test]
+async fn ownership_broadcasts_to_both_slots_and_new_handshakes_see_latest() {
+    let f = Fixture::start();
+    let a = f.connect(Some(KernelSlot::A)).await;
+    let b = f.connect(Some(KernelSlot::B)).await;
+    assert_eq!(a.owned_groups(), vec!["initial"]);
+    f.kernel
+        .set_owned_groups(vec!["latest".into()])
+        .await
+        .unwrap();
+    tokio::time::timeout(BUDGET, async {
+        while a.owned_groups() != vec!["latest"] || b.owned_groups() != vec!["latest"] {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let new = f.connect(None).await;
+    assert_eq!(new.hello.owned_groups, vec!["latest"]);
+}
+
 #[derive(Default)]
 struct Gates {
     entered: Notify,
@@ -132,6 +153,7 @@ impl Fixture {
             },
             hooks: vec!["admin.call".into()],
             capabilities: vec!["quota.read".into(), "log".into()],
+            owned_groups: vec!["initial".into()],
             shutdown_timeout,
         };
         let server = Server::bind(

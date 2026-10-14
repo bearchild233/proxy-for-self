@@ -7,7 +7,7 @@ pub const UNAVAILABLE: &str = "unavailable";
 pub const TIMEOUT: &str = "timeout";
 pub const FORBIDDEN: &str = "forbidden";
 pub const INTERNAL: &str = "internal";
-pub const KERNEL_API: (u32, u32) = (0, 1);
+pub const KERNEL_API: (u32, u32) = (0, 2);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RpcError {
@@ -124,6 +124,15 @@ pub struct HelloResult {
     pub kernel_api: PluginApi,
     pub hooks: Vec<String>,
     pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub owned_groups: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnershipChangedParams {
+    #[serde(default)]
+    pub owned_groups: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

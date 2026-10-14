@@ -8,6 +8,7 @@ rust-version.workspace = true
 autotests = false
 
 [dependencies]
+kernel-protocol = { path = "../kernel-protocol" }
 async-trait = "0.1.89"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
 chrono = { version = "0.4.45", features = ["clock", "serde"] }
@@ -32,6 +33,7 @@ tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 
 [dev-dependencies]
+plugin-sdk = { path = "../../../plugins/sdk/plugin-sdk", features = ["testing"] }
 filetime = "0.2.27"
 tempfile = "3.27.0"
 tokio = { version = "1.52.3", default-features = false, features = ["rt-multi-thread", "test-util"] }

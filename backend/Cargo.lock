@@ -1516,6 +1516,7 @@ dependencies = [
  "chrono-tz",
  "futures",
  "futures-timer",
+ "kernel-protocol",
  "semver",
  "serde",
  "serde_json",
@@ -1540,6 +1541,8 @@ dependencies = [
  "gateway-admin",
  "gateway-core",
  "hex",
+ "kernel-protocol",
+ "plugin-sdk",
  "reqwest",
  "scraper",
  "semver",
@@ -2669,6 +2672,16 @@ name = "pkg-config"
 version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
+
+[[package]]
+name = "plugin-sdk"
+version = "0.0.0"
+dependencies = [
+ "kernel-protocol",
+ "serde",
+ "serde_json",
+ "tokio",
+]
 
 [[package]]
 name = "potential_utf"
