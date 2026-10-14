@@ -84,12 +84,12 @@ class ServiceTests(unittest.TestCase):
         self.health = FakeHealth()
         self.clock = FakeClock()
         self.config = {
-            "registry_file": str(self.root / "registry/plugin-registry.json"),
+            "registry_file": str(self.root / "etc/proxy-for-self/plugins/registry.json"),
             "store_root": str(self.root / "store"),
             "runtime_root": str(self.root / "runtime"),
             "socket_root": str(self.root / "sock"),
             "data_root": str(self.root / "data"),
-            "env_directory": str(self.root / "env"),
+            "env_directory": str(self.root / "etc/proxy-for-self/plugins/services"),
             "unit_directory": str(self.root / "units"),
             "state_file": str(self.root / "state/service-plugins.json"),
             "user": "proxy-for-self-plugins",
@@ -130,7 +130,7 @@ class ServiceTests(unittest.TestCase):
         return manager.state["operation"]
 
     def registry(self):
-        return json.loads((self.root / "registry/plugin-registry.json").read_text())["plugins"][0]
+        return json.loads((self.root / "etc/proxy-for-self/plugins/registry.json").read_text())["plugins"][0]
 
     def runtime_dirs(self):
         return sorted(item.name for item in (self.root / "runtime").iterdir())
@@ -150,7 +150,7 @@ class ServiceTests(unittest.TestCase):
             "id": ID, "enabled": True, "socket": str(self.root / "sock" / ID / f"{instance}.sock"),
             "uid": os.getuid(), "grants": ["log"], "fetchHosts": ["pool.example.test"],
         })
-        env = (self.root / "env" / f"{instance}.env").read_text().splitlines()
+        env = (self.root / "etc/proxy-for-self/plugins/services" / f"{instance}.env").read_text().splitlines()
         self.assertIn("CPR_PLUGIN_SHUTDOWN_MS=30000", env)
         self.assertIn(f"CPR_PLUGIN_SOCKET={self.root / 'sock' / ID / (instance + '.sock')}", env)
         self.assertIn(f"PLUGIN_BINARY={self.root / 'runtime' / instance / 'example-echo'}", env)
@@ -186,7 +186,7 @@ class ServiceTests(unittest.TestCase):
         for version in versions:
             self.assertEqual(self.run_operation(manager, "activate", version)["status"], "succeeded")
         self.assertEqual(self.runtime_dirs(), sorted(instance_name(ID, v) for v in versions[1:]))
-        self.assertFalse((self.root / "env" / f"{instance_name(ID, versions[0])}.env").exists())
+        self.assertFalse((self.root / "etc/proxy-for-self/plugins/services" / f"{instance_name(ID, versions[0])}.env").exists())
 
     def test_health_failure_removes_new_instance_and_keeps_old_version(self):
         manager = self.manager()
@@ -201,7 +201,7 @@ class ServiceTests(unittest.TestCase):
         new = instance_name(ID, second)
         self.assertEqual(self.systemd.stopped(), [f"proxy-for-self-plugin@{new}.service"])
         self.assertEqual(self.runtime_dirs(), [instance_name(ID, first)])
-        self.assertFalse((self.root / "env" / f"{new}.env").exists())
+        self.assertFalse((self.root / "etc/proxy-for-self/plugins/services" / f"{new}.env").exists())
         self.assertTrue(self.registry()["socket"].endswith(instance_name(ID, first) + ".sock"))
         self.assertEqual(manager.state["plugins"][ID]["current"], first)
 
@@ -212,7 +212,7 @@ class ServiceTests(unittest.TestCase):
         operation = self.run_operation(manager, "activate", version)
         self.assertEqual(operation["status"], "failed")
         self.assertEqual(self.runtime_dirs(), [])
-        self.assertFalse((self.root / "registry/plugin-registry.json").exists())
+        self.assertFalse((self.root / "etc/proxy-for-self/plugins/registry.json").exists())
 
     def test_tampered_store_package_is_rejected_before_any_change(self):
         manager = self.manager()
@@ -311,9 +311,9 @@ class ServiceTests(unittest.TestCase):
         self.run_operation(manager, "activate", version)
         (self.root / "data" / ID / "state.db").write_text("kept")
         self.assertEqual(self.run_operation(manager, "uninstall")["status"], "succeeded")
-        self.assertEqual(json.loads((self.root / "registry/plugin-registry.json").read_text())["plugins"], [])
+        self.assertEqual(json.loads((self.root / "etc/proxy-for-self/plugins/registry.json").read_text())["plugins"], [])
         self.assertEqual(self.runtime_dirs(), [])
-        self.assertFalse((self.root / "env" / f"{instance_name(ID, version)}.env").exists())
+        self.assertFalse((self.root / "etc/proxy-for-self/plugins/services" / f"{instance_name(ID, version)}.env").exists())
         self.assertFalse((self.root / "units" / f"proxy-for-self-plugin@{instance_name(ID, version)}.service.d").exists())
         self.assertTrue((self.root / "data" / ID / "state.db").exists())
         self.assertNotIn(ID, manager.state["plugins"])
@@ -423,6 +423,31 @@ class UpdaterWiringTests(unittest.TestCase):
         self.updater.services = None
         with self.assertRaises(ValueError):
             self.updater.service_status()
+
+
+class WritableScopeTests(unittest.TestCase):
+    """写入范围收窄：注册表与服务 env 只位于 /etc/proxy-for-self/plugins/ 下，单元不得放开整个 /etc/proxy-for-self。"""
+
+    ROOT = Path(__file__).resolve().parents[2]
+
+    def test_example_config_writes_registry_and_env_only_under_plugins_directory(self):
+        config = json.loads((self.ROOT / "services/updater/config.example.json").read_text(encoding="utf-8"))
+        services = config["service_plugins"]
+        self.assertEqual(services["registry_file"], "/etc/proxy-for-self/plugins/registry.json")
+        self.assertEqual(services["env_directory"], "/etc/proxy-for-self/plugins/services")
+
+    def test_updater_unit_grants_plugins_directory_not_whole_proxy_for_self_directory(self):
+        unit = (self.ROOT / "deploy/systemd/proxy-for-self-updater.service").read_text(encoding="utf-8")
+        paths = [item for line in unit.splitlines() if line.startswith("ReadWritePaths=")
+                 for item in line.split("=", 1)[1].split()]
+        self.assertIn("-/etc/proxy-for-self/plugins", paths)
+        self.assertNotIn("-/etc/proxy-for-self", paths)
+
+    def test_deployed_units_use_the_same_registry_and_env_locations(self):
+        plugin_unit = (self.ROOT / "deploy/plugin-platform/proxy-for-self-plugin@.service").read_text(encoding="utf-8")
+        control_unit = (self.ROOT / "deploy/plugin-platform/proxy-for-self-plugins.service").read_text(encoding="utf-8")
+        self.assertIn("EnvironmentFile=/etc/proxy-for-self/plugins/services/%i.env", plugin_unit)
+        self.assertIn("--service-registry /etc/proxy-for-self/plugins/registry.json", control_unit)
 
 
 if __name__ == "__main__":

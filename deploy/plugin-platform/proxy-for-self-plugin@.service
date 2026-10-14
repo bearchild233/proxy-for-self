@@ -6,7 +6,7 @@ After=local-fs.target
 # 实例名为 <插件ID>--<内容版本前 12 位>；环境文件由 updater 写入，MemoryMax 与 TimeoutStopSec 由同名 drop-in 提供。
 User=proxy-for-self-plugins
 Group=proxy-for-self-plugins
-EnvironmentFile=/etc/proxy-for-self/plugin-services/%i.env
+EnvironmentFile=/etc/proxy-for-self/plugins/services/%i.env
 # 二进制位于 root 所有的运行目录，插件用户无法替换正在执行的文件。
 ExecStart=${PLUGIN_BINARY}
 Restart=on-failure

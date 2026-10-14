@@ -10,13 +10,23 @@
 
 1. 用 `config.example.json` 创建 root 所有的 `/etc/proxy-for-self/updater.json`（0600），按实例修改路径与数据库连接信息。
 2. 创建 root 独占的 `updater.pgpass`（0600，标准 PostgreSQL passfile），不要把密码放入仓库、命令参数或管理 API。
-3. 将 `updater.py`、`plugins.py`、`plugin_manifest.py`、`plugin_registry.py` 和 `login_security.py` 放入 root 所有的 `/opt/proxy-for-self-updater/`。安装 `deploy/systemd/proxy-for-self-updater.service`；按实例修改 Group 和允许写入的路径。
+3. 将 `updater.py`、`plugins.py`、`plugin_manifest.py`、`plugin_registry.py`、`login_security.py`，以及服务插件监督模块 `service_plugins.py`、`service_manifest.py`、`kernel_protocol.py` 放入 root 所有的 `/opt/proxy-for-self-updater/`。
+   服务插件注册表与 env 文件只写入 `/etc/proxy-for-self/plugins/`（`registry.json` 与 `services/` 子目录）。安装时先以 root 创建 `/etc/proxy-for-self/plugins`（0755），之后再启动 updater：单元中以 `-` 开头的可写路径只在启动时已存在才生效，运行中新建的目录没有写权限（`/etc` 为只读）。安装 `deploy/systemd/proxy-for-self-updater.service`；按实例修改 Group 和允许写入的路径。
 4. 主配置 `host.system_update.managed_socket` 指向私有 socket，`self_restart_enabled: true`。版本由构建元数据提供，不在配置里固定旧版本。网关用户仅需要连接 socket 的组权限。
 5. 确认主服务具有 `Restart=on-failure` 或 `always`，停止超时足以完成请求排空；启用独立 updater。首个正式 GitHub Release 发布前没有可安装更新。
 
 `python -m unittest discover -s services/updater -v` 验证包路径、校验、数据库兼容与回退行为。
 
 中断恢复：如果 updater 自身中断，状态标记 `recovery_required` 并拒绝新的写操作。维护者应先检查 current、主服务健康和备份，再修复状态；不能盲目删状态或重复安装。磁盘至少预留 1.2 GiB，并另行按数据量预留备份空间。旧 release 和数据库备份不自动删除。
+
+服务插件操作中断：updater 重启时若发现服务插件操作仍为 `running`，会把它记为 `interrupted`，并在服务插件状态文件（`service_plugins.state_file`，示例为 `/var/lib/proxy-for-self-updater/service-plugins.json`）中设置 `recovery_required: true`。此后所有服务插件操作（安装、启用、禁用、回退、卸载）都会被拒绝；系统更新与 Excel 操作仍按原有互斥规则执行。维护者应按以下顺序核对，再清除标记：
+
+1. 注册表 `/etc/proxy-for-self/plugins/registry.json` 中该插件的条目：`socket` 指向哪个实例，`enabled` 是否与状态文件 `plugins.<插件ID>.enabled` 一致。
+2. 当前与新实例的 systemd 状态：`systemctl status proxy-for-self-plugin@<插件ID>--<版本前 12 位>.service`，实例名对照状态文件 `plugins.<插件ID>.current` 与 `previous`；新实例若未通过健康检查，不能让注册表指向它。
+3. 运行目录 `/opt/proxy-for-self-plugin-runtime/<实例>/`、env 文件 `/etc/proxy-for-self/plugins/services/<实例>.env`、drop-in `/etc/systemd/system/proxy-for-self-plugin@<实例>.service.d/`：只应保留 `current` 与 `previous` 对应的实例，其余实例的服务、目录与 env 文件需删除。
+4. 注册表、systemd 与状态文件指向同一个期望版本后，才继续操作；不一致时不要重复执行安装或激活，先修正指向。
+
+清除标记：先 `systemctl stop proxy-for-self-updater`，备份状态文件，把其中的 `recovery_required` 改为 `false`（`operation` 中的 `interrupted` 记录保留作审计），再 `systemctl start proxy-for-self-updater`。不得在 updater 运行时直接编辑状态文件：状态在内存中持有，下一次写入会把标记写回。
 
 ## 插件平台
 
