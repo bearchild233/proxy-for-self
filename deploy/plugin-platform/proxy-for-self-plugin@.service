@@ -1,0 +1,25 @@
+[Unit]
+Description=proxy-for-self service plugin %i
+After=local-fs.target
+
+[Service]
+# 实例名为 <插件ID>--<内容版本前 12 位>；环境文件由 updater 写入，MemoryMax 与 TimeoutStopSec 由同名 drop-in 提供。
+User=proxy-for-self-plugins
+Group=proxy-for-self-plugins
+EnvironmentFile=/etc/proxy-for-self/plugin-services/%i.env
+# 二进制位于 root 所有的运行目录，插件用户无法替换正在执行的文件。
+ExecStart=${PLUGIN_BINARY}
+Restart=on-failure
+RestartSec=1
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX
+# 只允许写入自己的 socket 目录与数据目录；其余路径（包括运行目录）只读。
+ReadWritePaths=/run/proxy-for-self-plugins /var/lib/proxy-for-self-plugin-data

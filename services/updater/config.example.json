@@ -14,5 +14,20 @@
     "name": "api_hub",
     "user": "api_hub_bootstrap",
     "pgpass_file": "/etc/proxy-for-self/updater.pgpass"
+  },
+  "service_plugins": {
+    "registry_file": "/etc/proxy-for-self/plugin-registry.json",
+    "store_root": "/var/lib/proxy-for-self/plugins/plugins",
+    "runtime_root": "/opt/proxy-for-self-plugin-runtime",
+    "socket_root": "/run/proxy-for-self-plugins",
+    "data_root": "/var/lib/proxy-for-self-plugin-data",
+    "env_directory": "/etc/proxy-for-self/plugin-services",
+    "unit_directory": "/etc/systemd/system",
+    "state_file": "/var/lib/proxy-for-self-updater/service-plugins.json",
+    "user": "proxy-for-self-plugins",
+    "group": "proxy-for-self-plugins",
+    "allow": {
+      "example-echo": {"grants": ["log"], "fetchHosts": []}
+    }
   }
 }

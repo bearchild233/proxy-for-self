@@ -12,6 +12,7 @@ import threading
 import uuid
 import time
 from datetime import datetime
+from service_manifest import validate_service
 
 ID = re.compile(r"[a-z][a-z0-9-]{0,63}\Z")
 VERSION = re.compile(r"[0-9a-f]{64}\Z")
@@ -141,7 +142,9 @@ class StaticPluginStore:
         if policy_worker is not None and (plugin_id not in {'backup', 'pricing', 'gateway-pool'} or policy_worker != 'worker/policy.py' or policy_worker not in resources):
             raise ValueError('策略后台未授权')
         pages = manifest.get("pages", [])
-        if not isinstance(pages, list) or not 0 < len(pages) <= 16:
+        # 服务插件可以没有页面（例如只提供能力的后台服务）；纯界面插件仍需至少一个页面。
+        service_only = "service" in manifest and pages == []
+        if not isinstance(pages, list) or not (service_only or 0 < len(pages) <= 16):
             raise ValueError("页面声明无效")
         page_ids = set()
         for page in pages:
@@ -159,6 +162,8 @@ class StaticPluginStore:
         capabilities = manifest.get("capabilities", [])
         if not isinstance(capabilities, list) or not all(isinstance(cap, str) for cap in capabilities) or not set(capabilities) <= set(self.policies[plugin_id].get("capabilities", [])):
             raise ValueError("插件能力超出宿主授权")
+        # 服务段由控制面独立校验（二进制头、协议范围、参数上限），不信任 updater 的校验结果。
+        validate_service(manifest, root)
         return manifest
 
     def install(self, plugin_id, archive, expected_sha256):

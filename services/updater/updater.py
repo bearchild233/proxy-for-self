@@ -29,6 +29,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from plugin_registry import PluginRegistry
 from login_security import LoginSecurity, start_guard
+from service_plugins import ServicePlugins
 
 REPOSITORY = "ckcyian23/proxy-for-self"
 MAX_ARCHIVE = 512 * 1024 * 1024
@@ -146,6 +147,12 @@ class Updater:
 
         self.security = LoginSecurity(config["login_security"]) if config.get("login_security") else None
         self.plugins = PluginRegistry(config["plugins"], self.run) if config.get("plugins") else None
+        self.services = (ServicePlugins(config["service_plugins"], self.run, busy=self._system_busy)
+                         if config.get("service_plugins") else None)
+
+    def _system_busy(self):
+        # 只读检查，供服务插件操作在持有 self.lock 时调用，不能再次获取该锁。
+        return self.state["operation"]["status"] == "running" or bool(self.plugins and self.plugins.running)
 
     def plugin_status(self):
         with self.lock:
@@ -153,10 +160,28 @@ class Updater:
 
     def plugin_submit(self, plugin_id, action):
         with self.lock:
-            if not self.plugins or self.state.get("recovery_required") or self.state["operation"]["status"] == "running":
+            if (not self.plugins or self.state.get("recovery_required") or self.state["operation"]["status"] == "running"
+                    or (self.services and self.services.running)):
                 raise ValueError("插件管理不可用或系统操作正在执行")
             operation_id = self.plugins.begin(plugin_id, action)
         threading.Thread(target=self.plugins.execute, args=(plugin_id, action), daemon=True).start()
+        return {"operation_id": operation_id}
+
+    def service_status(self):
+        if not self.services:
+            raise ValueError("服务插件管理未配置")
+        return self.services.status()
+
+    def service_submit(self, value):
+        if not self.services:
+            raise ValueError("服务插件管理未配置")
+        if not isinstance(value, dict) or set(value) - {"id", "action", "version"}:
+            raise ValueError("无效服务插件操作字段")
+        plugin_id, action, version = value.get("id"), value.get("action"), value.get("version")
+        # 锁顺序固定为 Updater.lock → ServicePlugins.lock；执行本身在后台线程中进行。
+        with self.lock:
+            operation_id = self.services.begin(action, plugin_id, version)
+        threading.Thread(target=self.services.execute, args=(operation_id, plugin_id, action, version), daemon=True).start()
         return {"operation_id": operation_id}
 
     def current(self) -> Path:
@@ -208,7 +233,7 @@ class Updater:
         with self.lock:
             if self.state.get("recovery_required"):
                 raise ValueError("上次更新中断，需要维护者检查后恢复")
-            if self.state["operation"]["status"] == "running" or (self.plugins and self.plugins.running):
+            if self.state["operation"]["status"] == "running" or (self.plugins and self.plugins.running) or (self.services and self.services.running):
                 raise ValueError("已有系统操作正在执行")
             if action == "update":
                 current = version(self.state["current_version"])
@@ -390,6 +415,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/plugins":
             self.reply(200, self.server.updater.plugin_status())
+        elif self.path == "/services/status":
+            try:
+                self.reply(200, self.server.updater.service_status())
+            except ValueError as error:
+                self.reply(409, {"error": str(error)})
         elif self.path == "/status":
             self.reply(200, self.server.updater.status())
         else:
@@ -398,7 +428,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
             length = int(self.headers.get("Content-Length", "0"))
-            if self.path not in {"/operation", "/plugins/action", "/plugins/request", "/login-security/policy", "/login-security/unban"} or not 0 < length <= (65536 if self.path == "/plugins/request" else 1024):
+            if self.path not in {"/operation", "/plugins/action", "/plugins/request", "/services/action", "/login-security/policy", "/login-security/unban"} or not 0 < length <= (65536 if self.path == "/plugins/request" else 1024):
                 raise ValueError("无效请求")
             value = json.loads(self.rfile.read(length))
             if self.path.startswith("/login-security/"):
@@ -418,6 +448,9 @@ class Handler(BaseHTTPRequestHandler):
                 if not isinstance(value, dict) or set(value) != {"id", "action"}:
                     raise ValueError("无效插件操作字段")
                 self.reply(202, self.server.updater.plugin_submit(value["id"], value["action"]))
+                return
+            if self.path == "/services/action":
+                self.reply(202, self.server.updater.service_submit(value))
                 return
             if not isinstance(value,dict) or set(value) - {"action","target_version"}:
                 raise ValueError("无效操作字段")
