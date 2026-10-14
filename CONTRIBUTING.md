@@ -37,6 +37,23 @@ push/PR 按改动选择 backend、frontend 或 Python 组件；文档改动保�
 
 后端 CI 关闭 dev/test 调试符号，保留 Clippy、完整测试、调试断言和迁移冻结检查；Rust 缓存包含工作区模块，失败时也保存。首次配置或依赖变化仍需重建，观察 Actions 的 Compile Rust tests 与 Rust tests 分别判断编译和执行耗时。
 
+## 文档维护
+
+[模块总表](docs/modules.md) 和 `docs/modules/` 下的模块文档记录每个模块的职责、实现逻辑、文件表和改动指引，改代码前先读对应文档。每份文档首行注释 `doc-sync paths:` 列出它覆盖的代码路径，`scripts/check-doc-map.py` 据此检查：
+
+- 覆盖：受管目录（`backend/apps`、`backend/crates`、`services`、`plugins`、`packages`、`frontend/src`、`scripts`、`deploy`、`tools`）的一级子目录以及脚本源文件必须出现在总表或某份模块文档里。
+- 失效引用：文档反引号里的仓库路径必须存在。
+- 过时：文档最后一次提交（或文档里的 `reviewed: <提交>`，取较新者）之后，覆盖路径内有非测试代码改动，或工作区有未提交改动，该文档标为“待更新”。
+
+规则：
+
+- **开发中不改模块文档。** 功能逻辑做完、提交前运行 `python scripts/check-doc-map.py`，按“待更新”清单重写对应文档的相关章节，与代码放在同一个提交里。
+- 跨多次提交的大功能，可以在最后一个提交里统一更新文档；脚本在此之前会一直列出“待更新”，这是正常的。
+- 纯重构、只改测试这类不影响文档的改动，把文档里的 `reviewed:` 改成当前提交即可清除标记，不用改正文。
+- 新增、删除或移动模块时，同步更新 `docs/modules.md`。
+- 阶段收尾运行 `python scripts/check-doc-map.py --strict`，必须通过。
+- 文档只写当前事实，不写修改经过；与源码冲突时以源码为准并修正文档。
+
 ## 规则
 
 API 负责协议，Admin/Core 负责用例，Store 负责持久化。前端不得绕过管理 API。Worker 不可读取本机认证或自行换账号。对已输出内容、结果未知的请求和未完成工具调用，不得盲目重试。

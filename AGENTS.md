@@ -20,6 +20,7 @@ proxy-for-self 是自用的 OpenAI/xAI 推理网关：Rust 主网关（`backend/
 - 用户要求先在已授权的线上实例部署，让用户查看效果；只有用户明确同意 push 后才推送 GitHub。不得把功能开发或部署授权当作 push 授权。此偏好自 2026-09-29 起执行。
 - VPS 有独立管理 bot。生产变更后同步 `/root/维护手册/`：README 作入口、07 章记协同操作、10 章记当前配置、08 章记恢复材料。文档直接陈述当前事实和操作步骤，过时内容删除，省略修改经过及纠错对比。写操作先检查运行中的更新/恢复任务，按同一维护流程协调。
 
+- 文档维护：开发中不改模块文档；功能逻辑做完、提交前运行 `python scripts/check-doc-map.py`，按“待更新”清单重写对应文档并与代码放在同一提交；跨多次提交的大功能可在最后一个提交统一更新；新增、删除或移动模块同步 `docs/modules.md`；阶段收尾运行 `--strict` 必须通过。
 - 修改共享数据库行解析字段时，逐一核对所有 SELECT 调用方，并运行受影响模块已有的真实数据库测试（含分组成员等间接入口）。
 - Windows 本地 Rust 检查与编译优先使用 `scripts/build-local.ps1`，复用 WSL Linux 磁盘里的源码镜像和 target；按改动选择包。PowerShell 执行策略拦截该入口时，用 `wsl.exe -d ApiHubBuild-20260928` 直接调用 `scripts/build-local.sh <仓库路径> 4096 3 <任务> <包...>`。不要复用 `.build` 中旧的一次性构建脚本或关闭开发增量缓存。该入口不部署；正式发布仍走发布流程。
 
@@ -32,6 +33,7 @@ proxy-for-self 是自用的 OpenAI/xAI 推理网关：Rust 主网关（`backend/
 | 文档 | 内容 |
 | --- | --- |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | 工具链、本地构建与检查入口 |
+| [docs/modules.md](docs/modules.md) | 模块总表与各模块实现文档，改代码前先读对应模块文档 |
 | [docs/microkernel.md](docs/microkernel.md) | 微内核插件架构、钩子与能力、插件生命周期、分期计划 |
 | [docs/gateway-pool.md](docs/gateway-pool.md) | 网关池规则、术语与判据 |
 | [docs/architecture.md](docs/architecture.md) | Rust 分层、冷流执行、调度与数据约束 |
