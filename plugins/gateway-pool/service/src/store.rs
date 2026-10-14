@@ -1,5 +1,5 @@
 //! 网关池持久化入口，对应 `gateway_pool.py` 中的存储、设置、队列与管理读取部分。
-//! 每次操作打开独立连接：写入用 `BEGIN IMMEDIATE`，报表读取用只读快照，与 Python 的事务语义一致。
+//! 写入复用连接并逐次开启 `BEGIN IMMEDIATE`；报表用独立只读快照，与 Python 的事务语义一致。
 
 use std::{
     path::{Path, PathBuf},
@@ -14,6 +14,7 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior, types::Value as SqlVa
 use serde_json::{Value, json};
 
 use crate::{
+    checkpoint::Checkpoint,
     error::Failure,
     history, history_query,
     ids::{IdSource, random_ids},
@@ -118,6 +119,9 @@ const SCHEMA: &str = "
 
 pub struct Store {
     path: PathBuf,
+    /// SQLite 本就只有一个写者；进程内复用写连接，避免逐 action 关闭最后连接触发 checkpoint。
+    writer: Mutex<Connection>,
+    checkpoint: Checkpoint,
     pub(crate) clock: Clock,
     /// 租约、代次与分组事件标识的来源；测试与对照可以替换为确定的序列。
     pub(crate) ids: IdSource,
@@ -136,13 +140,19 @@ impl Store {
     pub fn open_with_ids(data_dir: &Path, clock: Clock, ids: IdSource) -> Result<Self, Failure> {
         std::fs::create_dir_all(data_dir)?;
         let path = data_dir.join(DB_FILE);
-        {
-            let connection = Connection::open(&path)?;
-            connection.busy_timeout(Duration::from_secs(5))?;
-            connection.pragma_update(None, "journal_mode", "WAL")?;
-        }
+        let connection = Connection::open(&path)?;
+        // WAL/SHM 沿用数据库权限：在首次启用 WAL、创建侧文件前收紧数据库权限。
+        set_file_mode(&path)?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        connection.pragma_update(None, "journal_mode", "WAL")?;
+        // 013 允许 NORMAL：保留事务原子性和进程崩溃恢复，断电可能丢失最近提交。
+        // checkpoint 沿用 SQLite 的既有阈值，但交由独立连接处理，避免提交线程同步磁盘。
+        connection.pragma_update(None, "synchronous", "NORMAL")?;
+        let checkpoint = Checkpoint::start(&path, &connection)?;
         let store = Self {
             path,
+            writer: Mutex::new(connection),
+            checkpoint,
             clock,
             ids,
             enabled: AtomicBool::new(true),
@@ -157,21 +167,19 @@ impl Store {
         Ok(store)
     }
 
-    fn connect(&self) -> Result<Connection, Failure> {
-        let connection = Connection::open(&self.path)?;
-        connection.busy_timeout(Duration::from_secs(5))?;
-        Ok(connection)
-    }
-
     /// 写事务：`BEGIN IMMEDIATE`；出错时事务丢弃即回滚。
     pub(crate) fn write<T>(
         &self,
         work: impl FnOnce(&Connection) -> Result<T, Failure>,
     ) -> Result<T, Failure> {
-        let mut connection = self.connect()?;
+        let mut connection = self
+            .writer
+            .lock()
+            .map_err(|error| Failure::Internal(error.to_string()))?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let value = work(&transaction)?;
         transaction.commit()?;
+        self.checkpoint.committed(&connection);
         Ok(value)
     }
 

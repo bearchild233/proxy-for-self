@@ -349,6 +349,9 @@ fn candidate_gateways(catalog: Option<&Vec<Object>>, settings: &Object) -> Vec<S
     }
 }
 
+/// `runtime_then_finish` 两步各自的结果。
+pub type StepPair = (Result<Value, Failure>, Result<Value, Failure>);
+
 impl Store {
     /// 运行状态机入口：与 `GatewayPool.runtime(message)` 接受并返回相同的 JSON。
     pub fn runtime(&self, message: &Value) -> Result<Value, Failure> {
@@ -379,6 +382,37 @@ impl Store {
         }
         let action = action.unwrap_or_default();
         self.write(|db| self.dispatch_action(db, data, action, now))
+    }
+
+    /// 打票结果回报和探测租约归还放在同一事务里：两步之间账号只有“退役中、租约未还”的中间态，
+    /// 此时并发的 `plan` 会误报没有候选网关。各步结果与分别调用一致，某一步失败只回滚该步（保存点），
+    /// 另一步照常执行，与原先两次独立调用互不影响的行为相同。
+    pub fn runtime_then_finish(&self, report: &Value, finish: &Value) -> Result<StepPair, Failure> {
+        let (Value::Object(report), Value::Object(finish)) = (report, finish) else {
+            return Failure::invalid("本机消息必须为对象");
+        };
+        let step = |db: &Connection, work: &dyn Fn(&Connection) -> Result<Value, Failure>| {
+            db.execute_batch("SAVEPOINT runtime_step")?;
+            let result = work(db);
+            if result.is_ok() {
+                db.execute_batch("RELEASE runtime_step")?;
+            } else {
+                db.execute_batch("ROLLBACK TO runtime_step; RELEASE runtime_step")?;
+            }
+            Ok::<_, Failure>(result)
+        };
+        self.write(|db| {
+            let first = if self.enabled() {
+                let now = self.now_num();
+                step(db, &|db| {
+                    self.dispatch_action(db, report, "probeResult", now)
+                })?
+            } else {
+                Err(Failure::Forbidden("网关池插件未启用".to_owned()))
+            };
+            let second = step(db, &|db| self.finish_lease(db, finish))?;
+            Ok((first, second))
+        })
     }
 
     /// 在途请求归还租约（`finish`）：不读取策略，只用已保存的设置完成探测退役。

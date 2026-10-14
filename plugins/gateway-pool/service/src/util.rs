@@ -121,7 +121,7 @@ pub fn bounded(
     maximum: usize,
     overflow_message: &str,
 ) -> Result<Vec<Object>, Failure> {
-    let mut statement = db.prepare(sql)?;
+    let mut statement = db.prepare_cached(sql)?;
     let names: Vec<String> = statement
         .column_names()
         .into_iter()
@@ -147,7 +147,7 @@ pub fn one(db: &Connection, sql: &str, args: Vec<SqlValue>) -> Result<Option<Obj
 }
 
 pub fn exec(db: &Connection, sql: &str, args: Vec<SqlValue>) -> Result<usize, Failure> {
-    Ok(db.execute(sql, params_from_iter(args))?)
+    Ok(db.prepare_cached(sql)?.execute(params_from_iter(args))?)
 }
 
 /// 生成 ` WHERE a AND b`；没有条件时为空串。

@@ -5,6 +5,7 @@
 
 pub mod admin;
 mod caps;
+mod checkpoint;
 mod cookie;
 mod error;
 mod history;

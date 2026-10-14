@@ -217,15 +217,15 @@ impl Pool {
                 material,
             );
         }
-        let report = self
-            .runtime(json!({"action": "probeResult", "accountId": account, "leaseId": lease,
-                "durationMs": started.elapsed().as_millis() as u64, "preparationStartedAt": preparation_started_at,
-                "status": observation["status"], "stateReturned": observation["stateReturned"],
-                "paired": observation["paired"], "gatewayMatches": observation["gatewayMatches"],
-                "failed": observation["failed"], "material": private_material}))
-            .await;
-        let finish = self
-            .runtime(json!({"action": "finish", "accountId": account, "leaseId": lease}))
+        let (report, finish) = self
+            .runtime_then_finish(
+                json!({"action": "probeResult", "accountId": account, "leaseId": lease,
+                    "durationMs": started.elapsed().as_millis() as u64, "preparationStartedAt": preparation_started_at,
+                    "status": observation["status"], "stateReturned": observation["stateReturned"],
+                    "paired": observation["paired"], "gatewayMatches": observation["gatewayMatches"],
+                    "failed": observation["failed"], "material": private_material}),
+                json!({"action": "finish", "accountId": account, "leaseId": lease}),
+            )
             .await;
         report.map_err(|_| ())?;
         finish.map_err(|_| ())?;

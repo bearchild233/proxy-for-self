@@ -365,6 +365,28 @@ impl Pool {
             .map_err(|error| Failure::Internal(error.to_string()))?
     }
 
+    /// 打票结果与租约归还在同一事务内完成，见 `Store::runtime_then_finish`。
+    pub(super) async fn runtime_then_finish(
+        &self,
+        report: Value,
+        finish: Value,
+    ) -> (Result<Value, Failure>, Result<Value, Failure>) {
+        let store = Arc::clone(&self.store);
+        let joined =
+            tokio::task::spawn_blocking(move || store.runtime_then_finish(&report, &finish)).await;
+        match joined {
+            Ok(Ok(results)) => results,
+            Ok(Err(error)) => (
+                Err(Failure::Internal(error.to_string())),
+                Err(Failure::Internal(error.to_string())),
+            ),
+            Err(error) => (
+                Err(Failure::Internal(error.to_string())),
+                Err(Failure::Internal(error.to_string())),
+            ),
+        }
+    }
+
     pub(super) async fn settings(&self) -> Result<Arc<PoolSettings>, Failure> {
         if let Some((at, settings)) = &*self.settings.lock().expect("settings lock")
             && at.elapsed() < SETTINGS_TTL
