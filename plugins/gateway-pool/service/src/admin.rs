@@ -4,12 +4,18 @@ use std::sync::Arc;
 
 use plugin_sdk::{
     Context, Plugin, RpcResult,
-    protocol::{AdminCallParams, FORBIDDEN, INTERNAL, INVALID_PARAMS, RpcError},
+    protocol::{
+        AdminCallParams, FORBIDDEN, INTERNAL, INVALID_PARAMS, RequestFinishParams,
+        ResponseHeadParams, ResponseHeadResult, RoutePrepareParams, RoutePrepareResult,
+        RouteSelectParams, RouteSelectResult, RpcError,
+    },
 };
 use serde_json::Value;
 
 use crate::{
+    caps::Caps,
     error::Failure,
+    routing::Pool,
     store::{Ownership, Store},
     util::Object,
 };
@@ -34,17 +40,51 @@ pub fn dispatch(
 
 pub struct GatewayPoolService {
     store: Arc<Store>,
+    pool: Arc<Pool>,
 }
 
 impl GatewayPoolService {
     pub fn new(store: Store) -> Self {
+        let store = Arc::new(store);
         Self {
-            store: Arc::new(store),
+            pool: Pool::new(Arc::clone(&store)),
+            store,
         }
     }
 }
 
 impl Plugin for GatewayPoolService {
+    async fn route_select(
+        &self,
+        ctx: Context,
+        params: RouteSelectParams,
+    ) -> RpcResult<RouteSelectResult> {
+        self.pool.select(&Caps::new(ctx.kernel()), params).await
+    }
+
+    async fn route_prepare(
+        &self,
+        ctx: Context,
+        params: RoutePrepareParams,
+    ) -> RpcResult<RoutePrepareResult> {
+        self.pool
+            .prepare_route(&Caps::new(ctx.kernel()), params)
+            .await
+    }
+
+    async fn response_head(
+        &self,
+        _ctx: Context,
+        params: ResponseHeadParams,
+    ) -> RpcResult<ResponseHeadResult> {
+        self.pool.response_head(params).await
+    }
+
+    async fn request_finish(&self, _ctx: Context, params: RequestFinishParams) -> RpcResult<()> {
+        self.pool.finish_request(params).await;
+        Ok(())
+    }
+
     async fn admin_call(&self, ctx: Context, params: AdminCallParams) -> RpcResult<Value> {
         // 与原实现一致：只有管理员角色可以调用网关池管理方法。
         if params.actor.role != "admin" {
@@ -62,9 +102,10 @@ impl Plugin for GatewayPoolService {
                 .map_err(|error| RpcError::new(INTERNAL, error.to_string()))??;
         if let Some(ownership) = ownership {
             // 归属先写入内核侧状态再广播；广播失败时下一次握手会带上最新归属，不回滚已保存的设置。
+            // 观察分组等 011 的降智观察接入后再上报，与启动时的声明一致。
             if let Err(error) = ctx
                 .kernel()
-                .set_ownership(ownership.owned_groups, ownership.watched_groups)
+                .set_ownership(ownership.owned_groups, Vec::new())
                 .await
             {
                 eprintln!("gateway pool ownership broadcast failed: {}", error.message);

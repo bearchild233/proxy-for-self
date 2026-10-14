@@ -113,7 +113,8 @@ pub struct Store {
     pub(crate) clock: Clock,
     /// 租约、代次与分组事件标识的来源；测试与对照可以替换为确定的序列。
     pub(crate) ids: IdSource,
-    /// 插件是否启用。宿主停用插件后，旧在途请求仍可归还租约（`finish`），其余运行动作被拒绝。
+    /// 插件是否启用，默认启用。插件进程在运行就是启用（禁用由监督停止进程），生产代码从不置为 false；
+    /// 保留开关只为与 Python 实现的一致性对照。置为 false 时旧在途请求仍可归还租约（`finish`），其余运行动作被拒绝。
     enabled: AtomicBool,
 }
 
@@ -181,13 +182,27 @@ impl Store {
         Num::Float((self.clock)())
     }
 
-    /// 插件是否启用（默认启用；宿主停用时置为 false）。
+    /// 插件是否启用（默认启用，生产代码从不改变）。
     pub fn enabled(&self) -> bool {
         self.enabled.load(Ordering::SeqCst)
     }
 
+    /// 仅测试与一致性对照使用；插件进程不调用。
     pub fn set_enabled(&self, enabled: bool) {
         self.enabled.store(enabled, Ordering::SeqCst);
+    }
+
+    /// 租约所属账号；租约不存在（已归还或已回收）时返回 None。
+    /// 插件重启或热更新后接管未结束的租约时，用它找到归还租约所需的账号。
+    pub fn lease_account(&self, lease: &str) -> Result<Option<String>, Failure> {
+        self.read(|db| {
+            Ok(one(
+                db,
+                "SELECT account FROM leases WHERE id=?",
+                vec![text(lease)],
+            )?
+            .and_then(|row| str_field(&row, "account").map(str::to_owned)))
+        })
     }
 
     /// 当前有效的归属（启动时用于声明插件描述）。

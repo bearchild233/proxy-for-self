@@ -359,9 +359,8 @@ impl Store {
             Some(Value::String(action)) => Some(action.as_str()),
             _ => None,
         };
-        // TODO(design): 插件被停用时由谁、以什么方式告诉这里（目前只有 `Store::set_enabled`，默认启用）。
-        // 钩子接入（010）时决定：宿主停用后是否仍把请求路径动作交给插件，还是由宿主在入口直接拒绝。
-        // 停用/卸载后仍允许旧在途请求归还租约，不能依赖已卸载的策略。
+        // 插件进程在运行就是启用（禁用由监督停止进程），生产代码从不调用 `set_enabled`，`config` 恒返回启用。
+        // 停用分支只为与 Python 实现的对照（`disabled-plugin-inflight` 等序列）保留；停用后仍允许旧在途请求归还租约。
         if action == Some("finish") {
             return self.write(|db| self.finish_lease(db, data));
         }
