@@ -72,7 +72,7 @@ Rust 插件放在独立 workspace `plugins/Cargo.toml`，共用 `kernel-protocol
 - 版本：`kernelApi` 为 `主版本.次版本`。P0、P1 期间为 0.x，合同可调整；P1 验收后冻结为 1.0，此后次版本只做向后兼容的新增。
 - 握手：双方交换 `kernelApi` 版本范围、插件 ID 与内容版本、声明的钩子和能力。版本不兼容时内核拒绝连接，并按插件声明的禁用行为处理（第 8 节）。
 - 身份：内核用 socket 对端凭据（`SO_PEERCRED` 的 uid）和插件 ID 确认身份，按清单授权能力，每次调用都检查。
-- 超时：每个钩子有独立超时。超时或连接断开按“插件不可用”处理，不阻塞其他账号。
+- 超时：每个钩子有独立超时：`route.select`、`route.prepare`、`response.head` 2 秒；`response.observe` 20 秒（插件可能要做一次确认探测，探测本身上限 15 秒），同时受请求截止时间约束；`admin.call` 10 秒。超时或连接断开按“插件不可用”处理，不阻塞其他账号。
 - 方向：内核 → 插件为钩子、管理 RPC、自检、排空；插件 → 内核为能力调用。
 
 ## 6. 钩子
@@ -141,9 +141,9 @@ Rust 插件放在独立 workspace `plugins/Cargo.toml`，共用 `kernel-protocol
 | --- | --- | --- |
 | `upstream.probe` | 用指定账号发一次只读响应头的探测请求，可带 turn state 和 Cookie；返回状态码、是否返回 state、新 state、Set-Cookie、限流头 | 只能用插件负责的账号；按账号限速；走账号出口；不返回 AT |
 | `http.fetch` | 访问清单白名单内的外部地址（如池服务），可选直连或指定账号出口 | 只限白名单主机；响应大小上限 |
-| `accounts.read` | 读取负责账号的状态、额度、分组、上游账号 ID | 只读，不含凭据 |
+| `accounts.read` | 读取负责账号的状态、分组、上游账号 ID；可带 `model`，逐账号返回该模型是否允许（协议 0.6） | 只读，不含凭据 |
 | `groups.move` | 在插件声明的分组之间移动账号 | 只限声明的分组，写审计 |
-| `quota.read` | 读取账号额度快照与调度信号 | 只读 |
+| `quota.read` | 读取账号额度快照与调度信号；可带 `refreshIfMissing`，没有快照时内核先用该账号出口刷新一次（协议 0.6） | 只读 |
 | 私有存储 | 插件数据目录，插件自管 SQLite | 目录 0700 |
 
 插件可见：池 Cookie、turn state、池服务 Token（插件自己的配置）。插件永远不可见：AT、refresh token、Client Key 明文。
@@ -197,7 +197,7 @@ Rust 插件放在独立 workspace `plugins/Cargo.toml`，共用 `kernel-protocol
 | 期 | 内容 | 发布 |
 | --- | --- | --- |
 | P0 内核运行时 | `kernel-protocol` 与 `plugin-sdk`；内核钩子分发、能力授权、`upstream.probe`、`http.fetch`；OpenAI Provider 在调度和响应头处接入钩子；updater 扩展为通用插件监督。旧网关池路径保留并用开关切换 | 网关 A/B 一次；updater 更新一次 |
-| P1 网关池插件 | 用 Rust 实现网关池服务插件：控制面状态机、打票、降智确认、恢复检测、动态分组。先把现有 Python 与 Rust 测试改写为插件测试，再迁移逻辑；沿用现有私有 SQLite 数据。测试环境验收后上线，切换开关 | 插件安装；不发内核 |
+| P1 网关池插件 | 用 Rust 实现网关池服务插件：控制面状态机、打票、降智确认、恢复检测、动态分组。先把现有 Python 与 Rust 测试改写为插件测试，再迁移逻辑；沿用现有私有 SQLite 数据。测试环境验收后上线，切换开关 | 插件安装；内核随协议 0.6 补充与 P0 运行时一起做一次 A/B（P0 内核尚未上线） |
 | P2 清理 | 下一次内核发布删除旧网关池代码与控制面网关池模块 | 随下一次内核发布 |
 | P3 首个纯插件功能 | 5xx 规则：同网关重试一次，仍失败则换网关 | 插件热更新 |
 | P4 评估其他插件 | 定价、备份、诊断改为按需任务；Excel 并入统一监督；统计类插件视需要使用 `request.observe` | 逐个评估 |
