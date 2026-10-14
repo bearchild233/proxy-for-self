@@ -802,28 +802,40 @@ impl PluginHooks for ConflictHooks {
         _: &str,
         _: RouteSelectParams,
     ) -> Result<RouteSelectResult, RpcError> {
-        Err(RpcError::new(UNAVAILABLE, "conflict fixture must not select"))
+        Err(RpcError::new(
+            UNAVAILABLE,
+            "conflict fixture must not select",
+        ))
     }
     async fn response_observe(
         &self,
         _: &str,
         _: ResponseObserveParams,
     ) -> Result<ResponseObserveResult, RpcError> {
-        Err(RpcError::new(UNAVAILABLE, "conflict fixture must not observe"))
+        Err(RpcError::new(
+            UNAVAILABLE,
+            "conflict fixture must not observe",
+        ))
     }
     async fn route_prepare(
         &self,
         _: &str,
         _: RoutePrepareParams,
     ) -> Result<RoutePrepareResult, RpcError> {
-        Err(RpcError::new(UNAVAILABLE, "conflict fixture must not prepare"))
+        Err(RpcError::new(
+            UNAVAILABLE,
+            "conflict fixture must not prepare",
+        ))
     }
     async fn response_head(
         &self,
         _: &str,
         _: ResponseHeadParams,
     ) -> Result<ResponseHeadResult, RpcError> {
-        Err(RpcError::new(UNAVAILABLE, "conflict fixture must not receive heads"))
+        Err(RpcError::new(
+            UNAVAILABLE,
+            "conflict fixture must not receive heads",
+        ))
     }
     async fn request_finish(&self, _: &str, _: RequestFinishParams) {}
 }
@@ -917,10 +929,18 @@ async fn refused_retry_and_switch_report_specific_reason_codes() {
         let f = Fixture::new(vec![(A, G1)], true).await;
         f.upstream(successful()).await;
         f.controls.actions.lock().unwrap().extend(actions);
-        let error = f.execute(f.ordinary_context(), unsafe_replay).await.err().unwrap();
+        let error = f
+            .execute(f.ordinary_context(), unsafe_replay)
+            .await
+            .err()
+            .unwrap();
         let diagnostic = error.diagnostic().unwrap();
         assert_eq!(diagnostic.code(), Some(code));
-        assert!(diagnostic.as_str().contains(text), "{}", diagnostic.as_str());
+        assert!(
+            diagnostic.as_str().contains(text),
+            "{}",
+            diagnostic.as_str()
+        );
         assert_eq!(f.server.received_requests().await.unwrap().len(), requests);
     }
 }

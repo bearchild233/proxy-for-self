@@ -121,11 +121,15 @@ fn old_hello_defaults_ownership_and_new_notification_roundtrips() {
 #[test]
 fn hello_role_defaults_to_kernel_and_rejects_unknown_values() {
     // 缺省角色按内核连接处理，序列化时显式写出 kernel。
-    let legacy: HelloParams =
-        serde_json::from_value(json!({"kernelApi":{"major":0,"minor":4},"kernel":{"version":"old","slot":null}}))
-            .unwrap();
+    let legacy: HelloParams = serde_json::from_value(
+        json!({"kernelApi":{"major":0,"minor":4},"kernel":{"version":"old","slot":null}}),
+    )
+    .unwrap();
     assert_eq!(legacy.role, ConnectionRole::Kernel);
-    assert_eq!(serde_json::to_value(&legacy).unwrap()["role"], json!("kernel"));
+    assert_eq!(
+        serde_json::to_value(&legacy).unwrap()["role"],
+        json!("kernel")
+    );
     let admin: HelloParams = serde_json::from_value(
         json!({"kernelApi":{"major":0,"minor":5},"kernel":{"version":"v","slot":null},"role":"admin"}),
     )
