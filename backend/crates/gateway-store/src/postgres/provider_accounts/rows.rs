@@ -302,6 +302,8 @@ pub struct RotateProviderAccount {
     pub profile: UpdateProviderAccount,
     pub replacement_identity: Option<ProviderAccountIdentity>,
     pub credential: ProviderCredentialUpdate,
+    /// 仅 OAuth 重新授权置位：目标账号处于归档状态时，在同一事务内离开归档并启用。
+    pub reactivate_archived: bool,
     pub audit: AdminAuditEvent,
 }
 
@@ -314,6 +316,7 @@ impl fmt::Debug for RotateProviderAccount {
             .field("profile", &self.profile)
             .field("replacement_identity", &self.replacement_identity)
             .field("credential", &self.credential)
+            .field("reactivate_archived", &self.reactivate_archived)
             .field("audit", &self.audit)
             .finish()
     }

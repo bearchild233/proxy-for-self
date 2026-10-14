@@ -531,6 +531,7 @@ async fn quota_plan_changes_survive_inflight_background_and_manual_token_refresh
     credential.preserve_profile = true;
     repository
         .rotate_provider_account(RotateProviderAccount {
+            reactivate_archived: false,
             settings: None,
             scope: ProviderAccountAdminScope {
                 provider_kind: "openai".to_owned(),
@@ -2432,6 +2433,7 @@ async fn provider_account_admin_mutations_are_scoped_audited_and_atomic() {
     };
     let wrong_scope_error = repository
         .rotate_provider_account(RotateProviderAccount {
+            reactivate_archived: false,
             settings: None,
             scope: wrong_scope,
             profile: profile("acct_admin_a", "wrong scope"),
@@ -2462,6 +2464,7 @@ async fn provider_account_admin_mutations_are_scoped_audited_and_atomic() {
 
     let rotation = repository
         .rotate_provider_account(RotateProviderAccount {
+            reactivate_archived: false,
             settings: None,
             scope: scope.clone(),
             profile: profile("acct_admin_a", "rotated account"),
@@ -2498,6 +2501,7 @@ async fn provider_account_admin_mutations_are_scoped_audited_and_atomic() {
 
     let identity_conflict = repository
         .rotate_provider_account(RotateProviderAccount {
+            reactivate_archived: false,
             settings: None,
             scope: scope.clone(),
             profile: profile("acct_admin_a", "must roll back"),
@@ -2626,6 +2630,7 @@ async fn credential_rotation_and_settings_share_one_transaction() {
     };
     let result = repository
         .rotate_provider_account(RotateProviderAccount {
+            reactivate_archived: false,
             scope: scope.clone(),
             profile: profile(ACCOUNT_ID, "combined save"),
             replacement_identity: None,
@@ -2694,6 +2699,7 @@ async fn credential_rotation_and_settings_share_one_transaction() {
     ] {
         repository
             .rotate_provider_account(RotateProviderAccount {
+                reactivate_archived: false,
                 scope: scope.clone(),
                 profile: profile(ACCOUNT_ID, "must not persist"),
                 replacement_identity: None,
@@ -2808,6 +2814,7 @@ async fn provider_account_import_and_reauthorization_preserve_existing_membershi
     let revision_before_reauthorization = current_revision(&database.pool).await;
     let reauthorized = repository
         .rotate_provider_account(RotateProviderAccount {
+            reactivate_archived: false,
             settings: None,
             scope,
             profile: profile("acct_grouped_import", "reauthorized"),
@@ -2880,6 +2887,7 @@ async fn verified_credential_rotation_preserves_quota_exhaustion() {
 
     repository
         .rotate_provider_account(RotateProviderAccount {
+            reactivate_archived: false,
             settings: None,
             scope,
             profile: profile("acct_rotation_quota", "reauthorized account"),
@@ -3026,6 +3034,7 @@ async fn disabled_account_preserves_user_state_during_refresh_writes() {
         .expect("disabled state write is a no-op");
     repository
         .rotate_provider_account(RotateProviderAccount {
+            reactivate_archived: false,
             settings: None,
             scope,
             profile: profile(account_id.as_str(), "refreshed disabled account"),

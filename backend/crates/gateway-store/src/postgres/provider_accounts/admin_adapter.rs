@@ -284,6 +284,7 @@ impl PgAdminAccountStore {
         settings: Option<UpdateAccount>,
         context: &MutationContext,
         action: &str,
+        reactivate_archived: bool,
     ) -> AdminStoreResult<CredentialMutationResult> {
         let account_id = prepared.account_id.clone();
         let scope = ProviderAccountAdminScope {
@@ -325,6 +326,7 @@ impl PgAdminAccountStore {
                     next_refresh_at: prepared.next_refresh_at,
                     preserve_profile: prepared.preserve_profile,
                 },
+                reactivate_archived,
                 audit: mutation_audit(
                     context,
                     action,
@@ -646,7 +648,8 @@ impl AccountStore for PgAdminAccountStore {
                         "reauthorization cannot change account settings",
                     ));
                 }
-                self.commit_prepared_rotation(prepared, None, context, "reauthorize")
+                // 只有 OAuth 重新授权成功才解除归档并启用；手动轮换与自动刷新不改变归档状态。
+                self.commit_prepared_rotation(prepared, None, context, "reauthorize", true)
                     .await
             }
         }
@@ -662,6 +665,7 @@ impl AccountStore for PgAdminAccountStore {
             command.settings,
             context,
             "rotate_credential",
+            false,
         )
         .await
     }
@@ -678,7 +682,7 @@ impl AccountStore for PgAdminAccountStore {
                 "credential refresh cannot change account settings",
             ));
         }
-        self.commit_prepared_rotation(command.prepared, None, context, "refresh_credential")
+        self.commit_prepared_rotation(command.prepared, None, context, "refresh_credential", false)
             .await
     }
 

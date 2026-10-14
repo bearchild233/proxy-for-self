@@ -594,6 +594,15 @@ impl ProviderAccountAdminRepository for PgProviderAccountRepository {
             .map_err(|_| postgres_unavailable("begin provider account admin rotation"))?;
         let result = async {
             let config_revision = bump_config_revision_in_transaction(&mut transaction).await?;
+            // 重新授权成功的归档账号先离开归档并启用，再轮换凭据：
+            // 轮换按“已启用账号”重置凭据状态与错误信息，且凭据 CAS 失败时两步一起回滚。
+            let reactivated = command.reactivate_archived
+                && reactivate_archived_account_in_transaction(
+                    &mut transaction,
+                    &command.scope,
+                    &command.profile.id,
+                )
+                .await?;
             let credential_revision = rotate_provider_account_in_transaction(
                 &mut transaction,
                 &command.scope,
@@ -626,12 +635,17 @@ impl ProviderAccountAdminRepository for PgProviderAccountRepository {
                         .await?;
                 }
             }
-            append_admin_audit_event_in_transaction(
-                &mut transaction,
-                command.audit,
-                config_revision,
-            )
-            .await?;
+            let mut audit = command.audit;
+            if reactivated {
+                // 审计需要能看出这次重新授权同时解除了归档并启用了账号。
+                for field in ["enabled", "restore_archived"] {
+                    if !audit.changed_fields.iter().any(|changed| changed == field) {
+                        audit.changed_fields.push(field.to_owned());
+                    }
+                }
+            }
+            append_admin_audit_event_in_transaction(&mut transaction, audit, config_revision)
+                .await?;
             Ok(ProviderAccountAdminRotation {
                 config_revision,
                 credential_revision,
@@ -972,6 +986,29 @@ pub(crate) async fn upsert_provider_account_in_transaction(
         kind: ConflictKind::InvalidTransition,
     })?;
     Ok(imported_id)
+}
+
+/// 归档账号离开归档并启用；保留 `archivedAt`，与“恢复到主列表”一致，
+/// 维护任务只会按新的凭据与订阅事实重新判断。返回是否确实发生了状态变化。
+async fn reactivate_archived_account_in_transaction(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: &ProviderAccountAdminScope,
+    account_id: &str,
+) -> StoreResult<bool> {
+    let updated = sqlx::query_scalar::<_, String>(
+        "update provider_accounts
+         set enabled = true,
+             lifecycle_json = lifecycle_json || '{\"archived\":false,\"archiveReason\":null}'::jsonb,
+             updated_at = greatest(now(), updated_at)
+         where id = $1 and provider_kind = $2 and lifecycle_json->>'archived' = 'true'
+         returning id",
+    )
+    .bind(account_id)
+    .bind(&scope.provider_kind)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(|_| postgres_unavailable("reactivate archived provider account"))?;
+    Ok(updated.is_some())
 }
 
 pub(crate) async fn rotate_provider_account_in_transaction(
