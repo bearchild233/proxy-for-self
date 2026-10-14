@@ -16,7 +16,7 @@
     "pgpass_file": "/etc/proxy-for-self/updater.pgpass"
   },
   "service_plugins": {
-    "registry_file": "/etc/proxy-for-self/plugins/registry.json",
+    "registry_file": "/etc/proxy-for-self-kernel/registry.json",
     "store_root": "/var/lib/proxy-for-self/plugins/plugins",
     "runtime_root": "/opt/proxy-for-self-plugin-runtime",
     "socket_root": "/run/proxy-for-self-plugins",

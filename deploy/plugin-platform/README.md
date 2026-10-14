@@ -22,4 +22,11 @@
 
 上线时同步 VPS 维护文档的服务名、目录、升级/恢复命令和当前版本；不复制旧的过时说明。
 
-当前生产控制面 B 使用 `proxy-for-self-plugins-b.service`、回环18337；A 服务 `proxy-for-self-plugins.service` 在18335保留配置且停止、自启禁用。共享 Vue 主壳与12个内置组件包已上线；服务 `--assets` 指向当前平台发行目录的 `frontend/dist`。后续框架升级先启动空闲控制面，再条件切换公网 Caddy 中的两条控制面 upstream；持久化配置同步，验收后关闭原服务。插件包更新无需重启推理网关。第三方共享 Vue 运行时仅接受宿主显式信任的包。
+当前生产控制面 A 使用 `proxy-for-self-plugins.service`、回环18335；B 服务 `proxy-for-self-plugins-b.service` 在18337保留配置且停止、自启禁用。共享 Vue 主壳与12个内置组件包已上线；服务 `--assets` 指向当前平台发行目录的 `frontend/dist`。后续框架升级先启动空闲控制面，再条件切换公网 Caddy 中的两条控制面 upstream；持久化配置同步，验收后关闭原服务。插件包更新无需重启推理网关。第三方共享 Vue 运行时仅接受宿主显式信任的包。
+
+## 服务插件
+
+- updater 配置的 `service_plugins` 段登记存储、运行、socket、数据目录和每个服务插件的能力上限（`allow`），`store_root` 指向控制面插件存储下的 `plugins` 目录。updater 单元若启用 `ProtectSystem`，须用 drop-in 把 env 目录（`/etc/proxy-for-self/plugins/services`）和内核注册表所在目录加入 `ReadWritePaths`，否则激活会在写 env 文件时失败。
+- 内核注册表放在网关用户可以读到的 root 目录（生产为 `/etc/proxy-for-self-kernel/registry.json`，目录 0755、文件 0644）；`/etc/proxy-for-self` 为 0700，不能放在其下。控制面以 `--service-registry` 读取同一文件。
+- 网关槽配置增加 `plugins.registry_path`、`plugins.ownership_cache_path`（两槽共用、网关用户可写的目录）和 `openai.plugin_routing: true`；槽单元的 `SupplementaryGroups` 加入连接组，`ReadWritePaths` 加入归属缓存目录。两槽都要改，未改的槽只能运行旧网关池路径。
+- 从旧 Python 网关池迁移时，先在插件数据目录用 SQLite 备份接口复制 `gateway-pool-runtime/state.sqlite3` 为 `state.sqlite3`，再激活服务实例，最后做网关 A/B。
