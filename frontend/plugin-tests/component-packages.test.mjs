@@ -97,5 +97,7 @@ test('actual component packages share Vue and prepare without business calls', a
     assert.equal(calls, 0, `${id} must not fetch business data before opening`)
     checked++
   }
-  assert.equal(checked + serviceOnly, process.env.PLUGIN_ID ? 1 : 12)
+  // 全量模式应计入 .build/plugins 中全部界面组件包，共 13 个，与 packages/plugin-sdk/policies.json 的 13 项一致；
+  // 其中 excel-bridge 是界面包（Worker 由独立更新器安装），同样需要满足共享 Vue 与无业务请求的约定。
+  assert.equal(checked + serviceOnly, process.env.PLUGIN_ID ? 1 : 13)
 })
