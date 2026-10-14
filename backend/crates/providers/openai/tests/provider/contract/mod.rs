@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+mod gateway_pool_e2e;
 mod hub;
 mod plugin_routing;
 use std::io::{self, Write};
