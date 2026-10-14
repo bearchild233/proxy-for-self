@@ -1,5 +1,6 @@
 # Rust
 /backend/**/target/
+/plugins/target/
 *.profraw
 *.profdata
 
