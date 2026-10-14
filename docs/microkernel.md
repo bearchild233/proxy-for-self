@@ -85,9 +85,13 @@ Rust 插件放在独立 workspace `plugins/Cargo.toml`，共用 `kernel-protocol
 
 内核把每个插件最近一次报告的归属写入运行目录的 `plugin-ownership.json`（两个网关槽共用）。插件已启用但未连接时（启动中、崩溃、重启），按缓存的归属让这些分组的账号失败关闭；插件在注册表中被禁用或移除时，删除缓存的归属，账号交还默认调度。
 
+插件还可以声明观察分组 `watchedGroups`（协议 0.3）：这些分组的账号仍由内核默认调度，但内核在收到它们的上游响应头后调用 `response.observe`，插件可要求换一个账号重发（用于动态分组的降智检测）。观察分组与归属分组一起报告和缓存；同一分组可以被多个插件观察，但不能同时被另一个插件拥有。
+
 ### 6.1.1 注册表与授权
 
-内核从 root 管理的插件注册表（JSON 文件，路径由内核配置给出，变化后自动重新加载）读取常驻插件：`id`、`enabled`、`socket`、`grants`（允许的能力）。插件在握手中申请的能力与 `grants` 取交集。注册表由插件监督（updater）在安装、启用、禁用、卸载时写入。
+内核从 root 管理的插件注册表（JSON 文件，路径由内核配置给出，变化后自动重新加载）读取常驻插件：`id`、`enabled`、`socket`、`uid`（可选，给出时内核用 socket 对端凭据校验插件进程用户）、`grants`（允许的能力）、`fetchHosts`（`http.fetch` 允许访问的主机）。插件在握手中申请的能力与 `grants` 取交集。注册表由插件监督（updater）在安装、启用、禁用、卸载时写入。
+
+能力只作用于插件归属或观察分组内的账号：`accounts.read`、`quota.read`、`upstream.probe` 只能用这些账号；`groups.move` 只能在这些分组之间移动这些账号。
 
 ### 6.1.2 内核侧位置
 
@@ -104,6 +108,7 @@ Rust 插件放在独立 workspace `plugins/Cargo.toml`，共用 `kernel-protocol
 | `route.prepare` | 内核选定账号、发送前 | 租约 ID 与本次发送的附加材料（池 Cookie、turn state），或“等待/放弃”及原因码 |
 | `response.head` | 收到上游响应头、尚未向客户端提交 | `accept`、`retry{delayMs}`（同网关重发）、`switch`（换网关重发）、`fail{code,message}` |
 | `request.finish` | 请求结束（成功、失败、取消、中断） | 无；异步投递，不阻塞客户端 |
+| `response.observe` | 观察分组账号收到上游响应头、尚未向客户端提交 | `accept`，或 `switchAccount`（内核排除该账号，按默认调度重选并重发） |
 
 `route.select` 与 `route.prepare` 在常见路径上合并为一次调用。每个请求同步调用约 2 次（准备、响应头），结束通知异步发送。
 
