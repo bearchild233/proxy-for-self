@@ -24,6 +24,9 @@ struct Lifecycle {
     draining: bool,
     stopping: bool,
     in_flight: u32,
+    // 管理连接的调用在 in_flight 中，但不计入 drain 返回的在途数（它们不持有租约）。
+    // TODO(design): 规格中“管理连接不计入 drain 后的在途统计以外的特殊处理”语义不明确，此处按“不计入 drain 在途数、仍计入关停等待”实现，需设计方确认。
+    excluded: u32,
 }
 
 struct State {
@@ -38,13 +41,19 @@ impl State {
         self.stop.send_replace(true);
     }
 
-    fn admit(self: &Arc<Self>) -> Option<CallGuard> {
+    fn admit(self: &Arc<Self>, excluded: bool) -> Option<CallGuard> {
         let mut life = self.lifecycle.lock().expect("lifecycle lock");
         if life.stopping {
             return None;
         }
         life.in_flight = life.in_flight.checked_add(1)?;
-        Some(CallGuard(self.clone()))
+        if excluded {
+            life.excluded += 1;
+        }
+        Some(CallGuard {
+            state: self.clone(),
+            excluded,
+        })
     }
 
     async fn wait_idle(&self) {
@@ -58,11 +67,20 @@ impl State {
     }
 }
 
-struct CallGuard(Arc<State>);
+struct CallGuard {
+    state: Arc<State>,
+    excluded: bool,
+}
 impl Drop for CallGuard {
     fn drop(&mut self) {
-        self.0.lifecycle.lock().expect("lifecycle lock").in_flight -= 1;
-        self.0.idle.notify_one();
+        {
+            let mut life = self.state.lifecycle.lock().expect("lifecycle lock");
+            life.in_flight -= 1;
+            if self.excluded {
+                life.excluded -= 1;
+            }
+        }
+        self.state.idle.notify_one();
     }
 }
 
@@ -229,9 +247,13 @@ async fn connection<P: Plugin>(
     if write_frame(&mut stream, &response).await.is_err() {
         return;
     }
+    let role = hello.role;
     let (mut reader, write_half) = stream.into_split();
     let (peer, rx) = Peer::new(1);
-    kernel.register(&peer);
+    // 只有内核连接参与能力调用、后台句柄选路与归属广播；管理连接不登记。
+    if role == ConnectionRole::Kernel {
+        kernel.register(&peer);
+    }
     drop(groups);
     // guard 保证 task 被外层 abort 时也撤销连接可用性与挂起请求。
     let _close = ClosePeer(peer.clone());
@@ -239,6 +261,7 @@ async fn connection<P: Plugin>(
         peer: peer.clone(),
         data,
         kernel,
+        role,
     };
     let mut calls = JoinSet::new();
     let mut write_loop = Box::pin(writer(write_half, rx));
@@ -266,15 +289,21 @@ async fn connection<P: Plugin>(
                 }
                 last_id = id;
                 // 准入与 drain 顺序在读循环内决定，不能由 hook task 的调度顺序决定。
-                let Some(guard) = state.admit() else {
+                let Some(guard) = state.admit(role == ConnectionRole::Admin) else {
                     continue;
                 };
-                let immediate = if method == "drain" {
+                // 管理连接只处理 health 与 admin.call；其他钩子与能力返回 forbidden。
+                let forbidden = role == ConnectionRole::Admin
+                    && !matches!(method.as_str(), "health" | "admin.call");
+                let immediate = if forbidden {
+                    Some(Err(RpcError::new(FORBIDDEN, method.clone())))
+                } else if method == "drain" {
                     Some(params::<EmptyParams>(value.clone()).and_then(|_| {
                         let mut life = state.lifecycle.lock().expect("lifecycle lock");
                         life.draining = true;
+                        // drain 只统计持有租约的在途调用；本次 drain 自身与管理连接调用不计入。
                         serde_json::to_value(DrainResult {
-                            in_flight: life.in_flight - 1,
+                            in_flight: life.in_flight - life.excluded - 1,
                         })
                         .map_err(internal)
                     }))
@@ -308,13 +337,18 @@ async fn connection<P: Plugin>(
                 method,
                 params: value,
             } => {
+                // 管理连接不接受通知类钩子（含 shutdown 与 request.finish），直接忽略。
+                // TODO(design): 管理连接发来通知类钩子时忽略还是断开连接；规格只写明“只处理 health 与 admin.call”。
+                if role == ConnectionRole::Admin {
+                    continue;
+                }
                 if method == "shutdown" {
                     if params::<EmptyParams>(value).is_err() {
                         break;
                     }
                     state.shutdown();
                 } else if method == "request.finish" {
-                    let Some(guard) = state.admit() else {
+                    let Some(guard) = state.admit(false) else {
                         continue;
                     };
                     let Ok(value) = params(value) else {

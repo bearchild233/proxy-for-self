@@ -36,6 +36,8 @@ pub(super) async fn select(
     let mut selection = Selection::default();
     let mut grouped: BTreeMap<String, Vec<ProviderAccountId>> = BTreeMap::new();
     let mut unavailable_plugins = BTreeSet::new();
+    // 同一账号的分组分属多个插件时单独记录：失败关闭，并以 plugin_ownership_conflict 报告。
+    let mut conflicting_plugins = BTreeSet::new();
     let mut excluded = Vec::new();
     for account in &candidates {
         let mut owners = BTreeMap::new();
@@ -55,8 +57,8 @@ pub(super) async fn select(
             }
         }
         if owners.len() > 1 {
-            // TODO(design): 一个账号通过不同分组归属多个插件时的仲裁规则；未确定前失败关闭。
-            unavailable_plugins.extend(owners.into_keys());
+            // 不做仲裁：账号排除出插件候选，全部候选都被排除时返回冲突诊断。
+            conflicting_plugins.extend(owners.into_keys());
             excluded.push(account.id().clone());
         } else if let Some((plugin, available)) = owners.into_iter().next() {
             if available {
@@ -130,6 +132,21 @@ pub(super) async fn select(
             .owners
             .extend(accounts.iter().cloned().map(|id| (id, plugin.clone())));
     }
+    if !conflicting_plugins.is_empty()
+        && candidates
+            .iter()
+            .all(|account| excluded.contains(account.id()))
+    {
+        return Err(unavailable(
+            &conflicting_plugins
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(", "),
+            "plugin_ownership_conflict",
+            "账号的分组归属多个插件，已失败关闭",
+            false,
+        ));
+    }
     if !unavailable_plugins.is_empty()
         && candidates
             .iter()
@@ -184,6 +201,11 @@ impl Finish {
 impl Drop for Finish {
     fn drop(&mut self) {
         let data = self.data.get_mut().expect("plugin finish");
+        // 没有取得租约（未收到 route.prepare 的 use）时插件没有需要结束的状态，不发送 request.finish。
+        let leases = std::mem::take(&mut data.leases);
+        if leases.is_empty() {
+            return;
+        }
         let outcome = if self.cancellation.is_cancelled()
             && !matches!(data.outcome, RequestOutcome::Completed)
         {
@@ -195,18 +217,12 @@ impl Drop for Finish {
         let plugin = self.plugin.clone();
         let params = RequestFinishParams {
             request_id: self.request_id.clone(),
+            // 占位仅用于 clone 基础字段，每个租约投递时都会被替换为真实 leaseId。
             lease_id: String::new(),
             outcome,
             duration_ms: self.created.elapsed().as_millis() as u64,
             first_byte_ms: data.first_byte_ms,
             usage: None,
-        };
-        // TODO(design): prepare 未取得租约时的 finish 标识尚无协议约定，暂用空 leaseId。
-        // 无租约也投递终结通知，让插件结束 requestId 对应的等待状态。
-        let leases = if data.leases.is_empty() {
-            vec![String::new()]
-        } else {
-            std::mem::take(&mut data.leases)
         };
         tokio::spawn(async move {
             for lease_id in leases {
@@ -533,13 +549,28 @@ impl Attempt<'_> {
                 Ok(ResponseHeadResult::Fail { reason }) => {
                     return Err(failure(&reason.code, &reason.message, true));
                 }
-                // TODO(design): retry/switch 被安全边界拒绝时没有插件原因码，暂沿用 plugin_unavailable。
+                // 插件要求 retry/switch，但内核边界拒绝：不可安全重放优先于尝试上限，两者都说明插件原本的动作。
+                Ok(action @ (ResponseHeadResult::Retry { .. } | ResponseHeadResult::Switch)) => {
+                    let requested = match action {
+                        ResponseHeadResult::Retry { .. } => "同网关重试（retry）",
+                        _ => "换网关重发（switch）",
+                    };
+                    let (code, message) = if replay_safe {
+                        (
+                            "plugin_attempt_limit",
+                            format!("插件要求{requested}，但已达到每个请求 4 次上游尝试上限"),
+                        )
+                    } else {
+                        (
+                            "plugin_retry_unsafe",
+                            format!("插件要求{requested}，但请求不可安全重放"),
+                        )
+                    };
+                    return Err(failure(code, &message, true));
+                }
+                // 插件无响应、超时或返回无效结果，沿用插件不可用。
                 _ => {
-                    return Err(failure(
-                        "plugin_unavailable",
-                        "插件响应不可用或不允许重放",
-                        true,
-                    ));
+                    return Err(failure("plugin_unavailable", "插件响应不可用", true));
                 }
             }
             attempt += 1;

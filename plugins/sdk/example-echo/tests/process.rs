@@ -41,6 +41,7 @@ async fn environment_echo_and_sigterm_process_exit() {
                 version: "test".into(),
                 slot: None,
             },
+            role: ConnectionRole::Kernel,
         },
         budget,
     )

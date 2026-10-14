@@ -12,7 +12,7 @@ use serde_json::Value;
 use tokio::{
     io::AsyncWriteExt,
     net::unix::OwnedWriteHalf,
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, watch},
 };
 
 use kernel_protocol::*;
@@ -29,6 +29,18 @@ pub(crate) struct Peer {
     next: AtomicU64,
     send_order: Mutex<()>,
     closed: AtomicBool,
+    // 已被运行时选中、尚未返回的钩子或管理调用数。退役连接等它归零后才能关闭。
+    admitted: watch::Sender<usize>,
+    // 连接被新 socket 的连接替换后置位：不再接收新调用，只完成已准入的调用。
+    retired: watch::Sender<bool>,
+}
+
+/// 一次钩子或管理调用对连接的占用；释放时计数减一。
+pub(crate) struct Admission(Arc<Peer>);
+impl Drop for Admission {
+    fn drop(&mut self) {
+        self.0.admitted.send_modify(|count| *count -= 1);
+    }
 }
 
 pub(crate) fn unavailable() -> RpcError {
@@ -48,6 +60,8 @@ impl Peer {
                 next: AtomicU64::new(next),
                 send_order: Mutex::new(()),
                 closed: AtomicBool::new(false),
+                admitted: watch::channel(0).0,
+                retired: watch::channel(false).0,
             }),
             rx,
         )
@@ -55,6 +69,30 @@ impl Peer {
 
     pub(crate) fn is_open(&self) -> bool {
         !self.closed.load(Ordering::Acquire)
+    }
+
+    /// 在选中连接的同一把状态锁内调用，保证退役前准入的调用一定被计入排空等待。
+    pub(crate) fn admit(self: &Arc<Self>) -> Admission {
+        self.admitted.send_modify(|count| *count += 1);
+        Admission(self.clone())
+    }
+
+    pub(crate) fn retire(&self) {
+        self.retired.send_replace(true);
+    }
+
+    pub(crate) fn is_retired(&self) -> bool {
+        *self.retired.borrow()
+    }
+
+    pub(crate) async fn retired(&self) {
+        let mut receiver = self.retired.subscribe();
+        let _ = receiver.wait_for(|retired| *retired).await;
+    }
+
+    pub(crate) async fn drained(&self) {
+        let mut receiver = self.admitted.subscribe();
+        let _ = receiver.wait_for(|count| *count == 0).await;
     }
 
     pub(crate) fn close(&self) {

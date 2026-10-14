@@ -46,6 +46,18 @@ pub struct PluginRegistration {
     pub fetch_hosts: Vec<String>,
 }
 
+impl PluginRegistration {
+    /// 两个启用中的注册只有 socket 不同：运行时据此平滑切换，而不是断开重连。
+    pub(super) fn is_socket_switch_of(&self, previous: &Self) -> bool {
+        if !(self.enabled && previous.enabled) || self.socket == previous.socket {
+            return false;
+        }
+        let mut moved = previous.clone();
+        moved.socket = self.socket.clone();
+        moved == *self
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginRegistry {
     pub plugins: Vec<PluginRegistration>,

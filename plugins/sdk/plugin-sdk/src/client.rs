@@ -96,6 +96,7 @@ pub struct Context {
     pub(crate) peer: Arc<Peer>,
     pub(crate) data: Arc<PathBuf>,
     pub(crate) kernel: Kernel,
+    pub(crate) role: ConnectionRole,
 }
 
 impl Context {
@@ -106,17 +107,25 @@ impl Context {
         self.kernel.clone()
     }
 
+    /// 能力调用只走内核连接：内核连接上的钩子沿用原连接，管理连接上的调用改由内核连接发出。
+    fn capability_peer(&self) -> RpcResult<Arc<Peer>> {
+        match self.role {
+            ConnectionRole::Kernel => Ok(self.peer.clone()),
+            ConnectionRole::Admin => self.kernel.peer(),
+        }
+    }
+
     pub async fn call<P: Serialize + Sync, R: DeserializeOwned>(
         &self,
         method: &str,
         params: &P,
         timeout: Duration,
     ) -> RpcResult<R> {
-        self.peer.call(method, params, timeout).await
+        self.capability_peer()?.call(method, params, timeout).await
     }
 
     pub async fn log(&self, params: &LogParams, timeout: Duration) -> RpcResult<()> {
-        send_log(&self.peer, params, timeout).await
+        send_log(self.capability_peer()?.as_ref(), params, timeout).await
     }
 }
 

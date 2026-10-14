@@ -91,8 +91,12 @@ impl Plugin for TestPlugin {
     async fn admin_call(&self, ctx: Context, params: AdminCallParams) -> RpcResult<Value> {
         match params.method.as_str() {
             "slow" => {
+                // 先登记释放等待者再通知已进入，测试释放时每个等待者都已注册，许可不会丢失。
+                let released = self.0.release.notified();
+                tokio::pin!(released);
+                released.as_mut().enable();
                 self.0.entered.notify_one();
-                self.0.release.notified().await;
+                released.await;
                 Ok(params.params)
             }
             "capability" => {
@@ -194,8 +198,12 @@ impl Fixture {
     }
 
     async fn connect(&self, slot: Option<KernelSlot>) -> Arc<MockKernel> {
+        self.connect_as(slot, ConnectionRole::Kernel).await
+    }
+
+    async fn connect_as(&self, slot: Option<KernelSlot>, role: ConnectionRole) -> Arc<MockKernel> {
         Arc::new(
-            MockKernel::connect(&self.socket, hello(slot), BUDGET)
+            MockKernel::connect(&self.socket, hello_as(slot, role), BUDGET)
                 .await
                 .unwrap(),
         )
@@ -226,12 +234,16 @@ impl Drop for Fixture {
 }
 
 fn hello(slot: Option<KernelSlot>) -> HelloParams {
+    hello_as(slot, ConnectionRole::Kernel)
+}
+fn hello_as(slot: Option<KernelSlot>, role: ConnectionRole) -> HelloParams {
     HelloParams {
         kernel_api: KernelApi::default(),
         kernel: KernelInfo {
             version: "test".into(),
             slot,
         },
+        role,
     }
 }
 fn admin(method: &str, value: Value) -> AdminCallParams {
@@ -806,4 +818,200 @@ async fn watched_groups_broadcast_and_observe_accepts_by_default() {
         .await
         .unwrap();
     assert_eq!(result, ResponseObserveResult::Accept);
+}
+
+#[tokio::test]
+async fn unknown_connection_role_disconnects_before_registration() {
+    let f = Fixture::start();
+    let mut stream = UnixStream::connect(&f.socket).await.unwrap();
+    let mut params = serde_json::to_value(hello(None)).unwrap();
+    params["role"] = json!("root");
+    write_frame(
+        &mut stream,
+        &Message::Request {
+            id: 1,
+            method: "hello".into(),
+            params,
+        },
+    )
+    .await
+    .unwrap();
+    // 未知角色不能退化为内核连接，握手必须失败并断开。
+    closed(&mut stream).await;
+    assert!(!f.task.is_finished());
+}
+
+#[tokio::test]
+async fn admin_connection_allows_only_health_and_admin_call() {
+    let f = Fixture::start();
+    let kernel = f.connect(Some(KernelSlot::A)).await;
+    let admin_conn = f.connect_as(None, ConnectionRole::Admin).await;
+    let empty = EmptyParams {};
+    assert!(
+        admin_conn
+            .call::<_, HealthResult>("health", &empty, BUDGET)
+            .await
+            .unwrap()
+            .ready
+    );
+    assert_eq!(
+        admin_conn
+            .call::<_, Value>("admin.call", &admin("echo", json!("ok")), BUDGET)
+            .await
+            .unwrap(),
+        json!("ok")
+    );
+    // 其他钩子与 drain 在管理连接上返回 forbidden，且不会改变排空状态。
+    let error = admin_conn
+        .call::<_, RoutePrepareResult>("route.prepare", &route(), BUDGET)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, FORBIDDEN);
+    let error = admin_conn
+        .call::<_, DrainResult>("drain", &empty, BUDGET)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, FORBIDDEN);
+    assert_eq!(
+        kernel
+            .call::<_, DrainResult>("drain", &empty, BUDGET)
+            .await
+            .unwrap()
+            .in_flight,
+        0
+    );
+    // 管理连接上的通知类钩子不被处理：shutdown 不停止插件，request.finish 不进入插件。
+    admin_conn
+        .notify(
+            "request.finish",
+            &RequestFinishParams {
+                request_id: "r".into(),
+                lease_id: "l".into(),
+                outcome: RequestOutcome::Completed,
+                duration_ms: 1,
+                first_byte_ms: None,
+                usage: None,
+            },
+        )
+        .await
+        .unwrap();
+    admin_conn
+        .notify("shutdown", &EmptyParams {})
+        .await
+        .unwrap();
+    // 同一连接上的请求按序处理，echo 返回即说明前面的通知已读取完毕。
+    assert_eq!(
+        admin_conn
+            .call::<_, Value>("admin.call", &admin("echo", json!("after")), BUDGET)
+            .await
+            .unwrap(),
+        json!("after")
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), f.gates.finished.notified())
+            .await
+            .is_err()
+    );
+    assert!(!f.task.is_finished());
+}
+
+#[tokio::test]
+async fn admin_connection_is_excluded_from_ownership_fanout() {
+    let f = Fixture::start();
+    let kernel = f.connect(Some(KernelSlot::A)).await;
+    let admin_conn = f.connect_as(None, ConnectionRole::Admin).await;
+    f.kernel
+        .set_owned_groups(vec!["latest".into()])
+        .await
+        .unwrap();
+    tokio::time::timeout(BUDGET, async {
+        while kernel.owned_groups() != vec!["latest"] {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    // 归属变化只发给内核连接；管理连接保持握手时的归属，且没有收到通知。
+    assert!(
+        admin_conn
+            .notifications()
+            .iter()
+            .all(|(method, _)| method != "ownership.changed")
+    );
+    assert_eq!(admin_conn.hello.owned_groups, vec!["initial"]);
+}
+
+#[tokio::test]
+async fn admin_capability_calls_use_kernel_connection_or_fail_unavailable() {
+    let f = Fixture::start();
+    let admin_conn = f.connect_as(None, ConnectionRole::Admin).await;
+    let call = admin("capability", Value::Null);
+    // 没有内核连接时能力调用返回 unavailable，不能落到管理连接上。
+    assert_eq!(
+        admin_conn
+            .call::<_, Value>("admin.call", &call, BUDGET)
+            .await
+            .unwrap_err()
+            .code,
+        UNAVAILABLE
+    );
+    let kernel = f.connect(Some(KernelSlot::B)).await;
+    kernel.push_reply(CapabilityReply {
+        method: "quota.read".into(),
+        params: json!({"accountId":"test"}),
+        result: Ok(json!({"snapshot":"kernel"})),
+    });
+    assert_eq!(
+        admin_conn
+            .call::<_, Value>("admin.call", &call, BUDGET)
+            .await
+            .unwrap(),
+        json!({"snapshot":"kernel"})
+    );
+    assert_eq!(kernel.remaining_replies(), 0);
+}
+
+#[tokio::test]
+async fn drain_counts_only_kernel_calls_and_admin_calls_keep_running() {
+    let f = Fixture::start();
+    let kernel = f.connect(Some(KernelSlot::A)).await;
+    let admin_conn = f.connect_as(None, ConnectionRole::Admin).await;
+    let k = kernel.clone();
+    let kernel_slow = tokio::spawn(async move {
+        k.call::<_, Value>("admin.call", &admin("slow", Value::Null), BUDGET)
+            .await
+    });
+    tokio::time::timeout(BUDGET, f.gates.entered.notified())
+        .await
+        .unwrap();
+    let a = admin_conn.clone();
+    let admin_slow = tokio::spawn(async move {
+        a.call::<_, Value>("admin.call", &admin("slow", Value::Null), BUDGET)
+            .await
+    });
+    tokio::time::timeout(BUDGET, f.gates.entered.notified())
+        .await
+        .unwrap();
+    let other = f.connect(Some(KernelSlot::B)).await;
+    // 两个慢调用都在途，但只有内核连接的那个计入 drain 返回的在途数（本次 drain 自身不计）。
+    assert_eq!(
+        other
+            .call::<_, DrainResult>("drain", &EmptyParams {}, BUDGET)
+            .await
+            .unwrap()
+            .in_flight,
+        1
+    );
+    // 排空中管理连接的 admin.call 照常处理。
+    assert_eq!(
+        admin_conn
+            .call::<_, Value>("admin.call", &admin("echo", json!("during-drain")), BUDGET)
+            .await
+            .unwrap(),
+        json!("during-drain")
+    );
+    f.gates.release.notify_one();
+    f.gates.release.notify_one();
+    assert_eq!(kernel_slow.await.unwrap().unwrap(), Value::Null);
+    assert_eq!(admin_slow.await.unwrap().unwrap(), Value::Null);
 }

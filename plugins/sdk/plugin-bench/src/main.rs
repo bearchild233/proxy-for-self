@@ -109,6 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     version: "bench".into(),
                     slot: None,
                 },
+                role: ConnectionRole::Kernel,
             },
             timeout,
         )

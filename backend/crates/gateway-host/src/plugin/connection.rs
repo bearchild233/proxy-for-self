@@ -1,7 +1,7 @@
 use super::{
     registry::PluginRegistration,
     state::{ConnectionState, State},
-    transport::{Peer, internal, writer},
+    transport::{Outbound, Peer, internal, writer},
 };
 use gateway_core::{
     lifecycle::CancellationToken,
@@ -12,65 +12,100 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tokio::{net::UnixStream, task::JoinSet};
+use tokio::{net::UnixStream, sync::mpsc, task::JoinSet};
 
+/// 单个注册 ID 的连接任务。
+///
+/// - `stop`：禁用、删除或关停时立即结束会话。
+/// - `superseded`：注册表只改了 socket，新 socket 的任务已接管。本任务的会话继续服务，
+///   直到它被新连接退役并排空；之后不再重连旧 socket。
 pub(super) async fn run(
     registration: PluginRegistration,
     state: Arc<Mutex<State>>,
     stop: CancellationToken,
     kernel: KernelInfo,
     capabilities: Arc<dyn PluginCapabilities>,
+    superseded: CancellationToken,
 ) {
     let mut backoff = Duration::from_millis(100);
-    let stopping = stop.cancelled();
-    tokio::pin!(stopping);
     loop {
-        let result = tokio::select! {
-            _ = &mut stopping => break,
+        if stop.is_cancelled() || superseded.is_cancelled() {
+            break;
+        }
+        let connected = tokio::select! {
+            _ = stop.cancelled() => break,
+            _ = superseded.cancelled() => break,
             result = connect(&registration, &kernel) => result,
         };
-        let result = match result {
+        match connected {
             Ok((stream, hello, uid)) => {
                 backoff = Duration::from_millis(100);
-                session(
+                let (peer, rx) = Peer::new(2);
+                let result = session(
                     stream,
                     hello,
                     uid,
+                    peer.clone(),
+                    rx,
                     &registration,
                     state.clone(),
                     stop.clone(),
                     capabilities.clone(),
                 )
-                .await
-            }
-            Err(error) => Err(error),
-        };
-        {
-            let mut state = state.lock().expect("plugin state");
-            if let Some(entry) = state.entries.get_mut(&registration.id) {
-                if let Some(peer) = entry.peer.take() {
-                    peer.close();
-                }
-                entry.snapshot.state = ConnectionState::Unavailable;
-                if let Err(error) = result {
-                    entry.error(error);
+                .await;
+                detach(&state, &registration.id, Some(&peer), result.err());
+                // 被新连接退役的会话排空后结束，它的旧 socket 已不再属于本任务。
+                if peer.is_retired() {
+                    break;
                 }
             }
+            Err(error) => detach(&state, &registration.id, None, Some(error)),
         }
-        tokio::select! { _ = &mut stopping => break, _ = tokio::time::sleep(backoff) => {} }
+        if stop.is_cancelled() || superseded.is_cancelled() {
+            break;
+        }
+        tokio::select! {
+            _ = stop.cancelled() => break,
+            _ = superseded.cancelled() => break,
+            _ = tokio::time::sleep(backoff) => {},
+        }
         backoff = (backoff * 2).min(Duration::from_secs(5));
     }
-    if let Some(entry) = state
-        .lock()
-        .expect("plugin state")
-        .entries
-        .get_mut(&registration.id)
-    {
-        if let Some(peer) = entry.peer.take() {
-            peer.close();
-        }
-        entry.snapshot.state = ConnectionState::Unavailable;
+}
+
+/// 会话或连接尝试结束后的状态收尾。
+///
+/// 只有当前活动连接（或尚无活动连接）结束时才清空状态并标记不可用；
+/// 已被新连接替换的旧会话只记录错误，不能把正在服务的新连接标记为不可用。
+fn detach(state: &Mutex<State>, id: &str, peer: Option<&Arc<Peer>>, error: Option<RpcError>) {
+    let mut state = state.lock().expect("plugin state");
+    let Some(entry) = state.entries.get_mut(id) else {
+        return;
+    };
+    if let Some(error) = error {
+        entry.error(error);
     }
+    let current = match (&entry.peer, peer) {
+        (Some(active), Some(mine)) => Arc::ptr_eq(active, mine),
+        (Some(_), None) => false,
+        (None, _) => true,
+    };
+    if !current {
+        return;
+    }
+    if let Some(active) = entry.peer.take() {
+        active.close();
+    }
+    entry.snapshot.state = ConnectionState::Unavailable;
+}
+
+/// 只有活动连接的归属报告才会写入状态；旧连接的通知在切换后必须被忽略。
+fn is_active(state: &State, id: &str, peer: &Arc<Peer>) -> bool {
+    state
+        .entries
+        .get(id)
+        .and_then(|entry| entry.peer.as_ref())
+        .is_some_and(|active| Arc::ptr_eq(active, peer))
 }
 
 async fn connect(
@@ -93,6 +128,8 @@ async fn connect(
                 params: serde_json::to_value(HelloParams {
                     kernel_api: KernelApi::default(),
                     kernel: kernel.clone(),
+                    // 内核发起的连接；管理连接由插件管理面另行握手。
+                    role: ConnectionRole::Kernel,
                 })
                 .map_err(internal)?,
             },
@@ -118,10 +155,13 @@ async fn connect(
     .map_err(|_| RpcError::new(TIMEOUT, "hello"))?
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn session(
     stream: UnixStream,
     hello: HelloResult,
     uid: u32,
+    peer: Arc<Peer>,
+    rx: mpsc::UnboundedReceiver<Outbound>,
     registration: &PluginRegistration,
     state: Arc<Mutex<State>>,
     stop: CancellationToken,
@@ -133,26 +173,38 @@ async fn session(
         .filter(|grant| hello.capabilities.contains(grant))
         .cloned()
         .collect();
-    let (peer, rx) = Peer::new(2);
     let _close = ClosePeer(peer.clone());
-    {
+    // 握手成功即激活：新调用立即发往本连接，原活动连接转为退役，等在途调用排空后关闭。
+    // 归属以本连接 hello 报告为准。
+    let previous = {
         let mut state = state.lock().expect("plugin state");
         let entry = state
             .entries
             .get_mut(&registration.id)
             .expect("registered plugin");
-        entry.peer = Some(peer.clone());
+        let previous = entry.peer.replace(peer.clone());
         entry.snapshot.state = ConnectionState::Available;
         entry.snapshot.version = Some(hello.plugin.version);
         entry.snapshot.kernel_api = Some(hello.kernel_api);
         entry.snapshot.granted_capabilities = grants.clone();
         entry.snapshot.peer_uid = Some(uid);
         state.ownership(&registration.id, hello.owned_groups, hello.watched_groups);
+        previous
+    };
+    if let Some(previous) = previous {
+        previous.retire();
     }
     let (mut reader, write_half) = stream.into_split();
     let write_loop = writer(write_half, rx);
     let health_loop = health(peer.clone());
     tokio::pin!(write_loop, health_loop);
+    // 退役后等待本连接已准入的调用全部返回或超时（各自受钩子超时约束），再结束会话。
+    let retired_peer = peer.clone();
+    let drained = async move {
+        retired_peer.retired().await;
+        retired_peer.drained().await;
+    };
+    tokio::pin!(drained);
     let mut calls = JoinSet::new();
     let mut last_id = 0;
     let stopping = stop.cancelled();
@@ -164,6 +216,7 @@ async fn session(
         let message = loop {
             tokio::select! {
                 _ = &mut stopping => return Ok(()),
+                _ = &mut drained => return Ok(()),
                 _ = &mut write_loop => return Err(internal("plugin writer disconnected")),
                 error = &mut health_loop => return Err(error),
                 Some(_) = calls.join_next(), if !calls.is_empty() => {},
@@ -175,11 +228,10 @@ async fn session(
             Message::Notify { method, params } if method == "ownership.changed" => {
                 let params: OwnershipChangedParams =
                     serde_json::from_value(params).map_err(internal)?;
-                state.lock().expect("plugin state").ownership(
-                    &registration.id,
-                    params.owned_groups,
-                    params.watched_groups,
-                );
+                let mut state = state.lock().expect("plugin state");
+                if is_active(&state, &registration.id, &peer) {
+                    state.ownership(&registration.id, params.owned_groups, params.watched_groups);
+                }
             }
             Message::Request { id, method, params } => {
                 if id <= last_id {

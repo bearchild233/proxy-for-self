@@ -7,7 +7,7 @@ pub const UNAVAILABLE: &str = "unavailable";
 pub const TIMEOUT: &str = "timeout";
 pub const FORBIDDEN: &str = "forbidden";
 pub const INTERNAL: &str = "internal";
-pub const KERNEL_API: (u32, u32) = (0, 4);
+pub const KERNEL_API: (u32, u32) = (0, 5);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RpcError {
@@ -100,11 +100,24 @@ pub struct KernelInfo {
     pub slot: Option<KernelSlot>,
 }
 
+/// 连接角色（协议 0.5）。内核连接承担钩子与能力；管理连接只处理 `health` 与 `admin.call`。
+/// 缺省为 `kernel`，保证不带该字段的握手按内核连接处理。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConnectionRole {
+    #[default]
+    Kernel,
+    Admin,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HelloParams {
     pub kernel_api: KernelApi,
     pub kernel: KernelInfo,
+    /// 协议 0.5 新增，可选；缺省按 `kernel` 处理。
+    #[serde(default)]
+    pub role: ConnectionRole,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -15,7 +15,7 @@ use tokio::task::JoinHandle;
 
 use super::{
     connection,
-    registry::{PluginRegistry, PluginRuntimeConfig},
+    registry::{PluginRegistration, PluginRegistry, PluginRuntimeConfig},
     state::{ConnectionState, Entry, RuntimeSnapshot, State, read_cache, update_cache},
     transport::unavailable,
 };
@@ -123,16 +123,20 @@ impl PluginRuntime {
         params: &P,
         budget: Duration,
     ) -> Result<R, RpcError> {
-        let peer = self
-            .state
-            .lock()
-            .expect("plugin state")
-            .entries
-            .get(plugin)
-            .filter(|entry| entry.snapshot.state == ConnectionState::Available)
-            .and_then(|entry| entry.peer.clone())
-            .ok_or_else(unavailable)?;
+        // 选择连接与准入在同一把状态锁内完成：连接切换时已准入的旧调用必定被排空等待。
+        let (peer, admission) = {
+            let state = self.state.lock().expect("plugin state");
+            let peer = state
+                .entries
+                .get(plugin)
+                .filter(|entry| entry.snapshot.state == ConnectionState::Available)
+                .and_then(|entry| entry.peer.clone())
+                .ok_or_else(unavailable)?;
+            let admission = peer.admit();
+            (peer, admission)
+        };
         let result = peer.call(method, params, budget).await;
+        drop(admission);
         if let Err(error) = &result {
             if let Some(entry) = self
                 .state
@@ -258,6 +262,37 @@ impl PluginHooks for PluginRuntime {
     }
 }
 
+/// 注册 ID 当前代表的连接任务。
+struct Task {
+    registration: PluginRegistration,
+    stop: CancellationToken,
+    superseded: CancellationToken,
+    handle: JoinHandle<()>,
+}
+
+/// 已被新 socket 任务接管的旧任务，只负责排空它上面的在途调用。
+struct Retiring {
+    id: String,
+    stop: CancellationToken,
+    handle: JoinHandle<()>,
+}
+
+/// 取消并等待一个插件的全部任务（当前任务与仍在排空的旧任务）。
+async fn stop_plugin(tasks: &mut BTreeMap<String, Task>, retiring: &mut Vec<Retiring>, id: &str) {
+    if let Some(task) = tasks.remove(id) {
+        task.stop.cancel();
+        let _ = task.handle.await;
+    }
+    let (stopped, kept): (Vec<_>, Vec<_>) = std::mem::take(retiring)
+        .into_iter()
+        .partition(|old| old.id == id);
+    *retiring = kept;
+    for old in stopped {
+        old.stop.cancel();
+        let _ = old.handle.await;
+    }
+}
+
 async fn supervise(
     path: PathBuf,
     state: Arc<Mutex<State>>,
@@ -265,7 +300,8 @@ async fn supervise(
     kernel: KernelInfo,
     capabilities: Arc<dyn PluginCapabilities>,
 ) {
-    let mut tasks: BTreeMap<String, (CancellationToken, JoinHandle<()>)> = BTreeMap::new();
+    let mut tasks: BTreeMap<String, Task> = BTreeMap::new();
+    let mut retiring: Vec<Retiring> = Vec::new();
     let mut stamp = None;
     let mut ticker = tokio::time::interval(Duration::from_secs(5));
     let stopping = stop.cancelled();
@@ -275,6 +311,7 @@ async fn supervise(
             _ = &mut stopping => break,
             _ = ticker.tick() => {},
         }
+        retiring.retain(|old| !old.handle.is_finished());
         let current = std::fs::metadata(&path).and_then(|meta| Ok((meta.modified()?, meta.len())));
         if current.as_ref().ok() == stamp.as_ref() && stamp.is_some() {
             continue;
@@ -287,21 +324,27 @@ async fn supervise(
             }
         };
         stamp = current.ok();
-        // 先取消并回收旧连接，再发布新表，避免旧连接把禁用后的归属写回来。
-        let changed: Vec<_> = {
+        // 先取消并回收被删除、禁用或改动了除 socket 外字段的旧连接，再发布新表，
+        // 避免旧连接把禁用后的归属写回来。只改 socket 的插件不在此列，由下面的平滑切换处理。
+        let restart: Vec<String> = {
             let state = state.lock().expect("plugin state");
             state
                 .entries
                 .iter()
-                .filter(|(_, entry)| !registry.plugins.contains(&entry.registration))
+                .filter(|(id, entry)| {
+                    match registry.plugins.iter().find(|plugin| &plugin.id == *id) {
+                        None => true,
+                        Some(new) => {
+                            *new != entry.registration
+                                && !new.is_socket_switch_of(&entry.registration)
+                        }
+                    }
+                })
                 .map(|(id, _)| id.clone())
                 .collect()
         };
-        for id in &changed {
-            if let Some((cancel, task)) = tasks.remove(id) {
-                cancel.cancel();
-                let _ = task.await;
-            }
+        for id in &restart {
+            stop_plugin(&mut tasks, &mut retiring, id).await;
         }
         {
             let mut state = state.lock().expect("plugin state");
@@ -338,6 +381,13 @@ async fn supervise(
                 {
                     continue;
                 }
+                // 只改 socket：保留活动连接、快照与归属，新连接握手成功后再接管。
+                if let Some(entry) = state.entries.get_mut(&registration.id)
+                    && registration.is_socket_switch_of(&entry.registration)
+                {
+                    entry.registration = registration.clone();
+                    continue;
+                }
                 let groups = if registration.enabled {
                     state
                         .entries
@@ -368,24 +418,58 @@ async fn supervise(
             }
         }
         for registration in registry.plugins.into_iter().filter(|p| p.enabled) {
-            if tasks.contains_key(&registration.id) {
+            if tasks
+                .get(&registration.id)
+                .is_some_and(|task| task.registration == registration)
+            {
                 continue;
             }
-            let cancel = CancellationToken::new();
-            let task = tokio::spawn(connection::run(
+            let switching = tasks
+                .get(&registration.id)
+                .is_some_and(|task| registration.is_socket_switch_of(&task.registration));
+            if switching {
+                // 旧任务保持服务；新任务握手成功并激活后会退役它。旧任务不再重连旧 socket。
+                let old = tasks.remove(&registration.id).expect("switched task");
+                old.superseded.cancel();
+                retiring.push(Retiring {
+                    id: registration.id.clone(),
+                    stop: old.stop,
+                    handle: old.handle,
+                });
+            } else if tasks.contains_key(&registration.id) {
+                stop_plugin(&mut tasks, &mut retiring, &registration.id).await;
+            }
+            let stop = CancellationToken::new();
+            let superseded = CancellationToken::new();
+            let handle = tokio::spawn(connection::run(
                 registration.clone(),
                 state.clone(),
-                cancel.clone(),
+                stop.clone(),
                 kernel.clone(),
                 capabilities.clone(),
+                superseded.clone(),
             ));
-            tasks.insert(registration.id, (cancel, task));
+            tasks.insert(
+                registration.id.clone(),
+                Task {
+                    registration,
+                    stop,
+                    superseded,
+                    handle,
+                },
+            );
         }
     }
-    for (cancel, _) in tasks.values() {
-        cancel.cancel();
+    for task in tasks.values() {
+        task.stop.cancel();
     }
-    for (_, (_, task)) in tasks {
-        let _ = task.await;
+    for old in &retiring {
+        old.stop.cancel();
+    }
+    for task in tasks.into_values() {
+        let _ = task.handle.await;
+    }
+    for old in retiring {
+        let _ = old.handle.await;
     }
 }

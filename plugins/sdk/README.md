@@ -1,4 +1,4 @@
-# Rust 插件 SDK（kernelApi 0.4）
+# Rust 插件 SDK（kernelApi 0.5）
 
 `plugins/Cargo.toml` 是独立 workspace。`kernel-protocol` 是 backend workspace 成员，
 插件通过路径依赖使用它；其 edition、license、rust-version 与 lints 从所属的 backend
@@ -15,7 +15,7 @@ workspace 继承，不从消费它的 plugins workspace 继承。两个 workspac
 `shutdown_timeout`。SDK 版本来自本 crate 的包版本（目前为 workspace 的 `0.0.0`）。
 声明能力不意味着授权；内核负责每次调用的权限检查，本 SDK 不实现内核能力。
 
-协议 0.4 要求 `minMinor: 4`，不接受 0.1～0.3 插件。调度前的 `route.select` 接收
+协议 0.5 的插件声明 `minMinor: 4` 即可，不接受 0.1～0.3 插件；0.5 新增的 `hello.role` 可选，缺省为内核连接。调度前的 `route.select` 接收
 内核过滤后的账号，返回 `preferred/live/blocked/pinnedDecision`；选定账号后才调用
 `route.prepare`，其参数使用 `accountId`，结果仅有 `use/wait/fail`。
 `response.observe.canSwitch` 表示内核是否允许换号；`request.finish.firstByteMs` 表示
@@ -29,7 +29,9 @@ socket 父目录由监督进程准备；SDK 清理残留 socket，拒绝覆盖�
 在 hook 中通过 `Context::call::<_, ResultType>(method, &params, timeout)` 调用原连接上的
 能力；`Context::log(params, timeout)` 发送日志通知。`Context::data_dir()` 返回私有数据目录。
 后台任务使用 `Server::kernel()` 或 `Context::kernel()` 获取 `Kernel`，调用形式相同。
-后台调用选取首条仍可用的已握手连接，不自动重试；无连接返回 `unavailable`。
+后台调用选取首条仍可用的内核连接，不自动重试；无连接返回 `unavailable`。
+能力调用只走内核连接：在管理连接上处理 `admin.call` 时调用 `Context::call` 或 `Context::log`，
+同样改由内核连接发出，没有内核连接则返回 `unavailable`。
 所有调用预算由调用方显式提供，无隐含超时默认值。
 
 ```rust,ignore
@@ -42,12 +44,16 @@ let snapshot: plugin_sdk::protocol::QuotaReadResult = ctx.call(
 
 每条连接独立握手和编号，内核从 1（hello）开始，插件的能力请求从 1 开始。
 reader 分发请求为并发 task，独立 writer 写入完整帧；取消或超时不会中断半帧写入。
-迟到或未匹配的能力响应丢弃。超限长度、非法帧、握手前非 hello 消息使连接关闭。
+迟到或未匹配的能力响应丢弃。超限长度、非法帧、握手前非 hello 消息、未知 `role` 使连接关闭。
+
+连接角色由 `hello.role` 决定：`kernel`（缺省）承担全部钩子与能力，并接收归属通知；
+`admin` 是插件管理面的直连，只处理 `health` 与 `admin.call`，其他方法返回 `forbidden`，
+通知类钩子（含 `shutdown` 与 `request.finish`）不处理。管理连接不参与后台 `Kernel` 句柄的选路与归属广播。
 
 `drain` 对插件进程整体生效：后续 `route.prepare` 返回 `fail/plugin_draining`；
 `response.head` 与 `request.finish` 继续处理。`inFlight` 是当前已准入且尚未完成写回的
-SDK 调用数（包含正在处理的通知，不包含 drain 本身），不是业务租约数。
-SDK 不持有业务租约，租约持久化由插件负责。
+SDK 调用数（包含正在处理的通知，不包含 drain 本身，也不包含管理连接上的调用），不是业务租约数。
+管理连接的 `admin.call` 在排空中照常处理。SDK 不持有业务租约，租约持久化由插件负责。
 
 `shutdown` / SIGTERM 停止接受新连接与调用，保留在途调用需要的能力响应通道；
 等待已有调用完成并写回后退出。超过描述提供的预算则取消剩余任务并返回超时错误。
@@ -60,6 +66,7 @@ SDK 不持有业务租约，租约持久化由插件负责。
 顺序匹配方法和参数；不匹配返回 `invalid_params`，脚本用尽返回 `not_supported`。
 `notifications()` 获取日志通知；`remaining_replies()` 检查脚本是否消费完。
 `MockKernel` 可以放进 `Arc`，在同一连接并发发送钩子；丢弃它会断开连接并停止读写任务。
+模拟管理连接时，把 `HelloParams.role` 设为 `ConnectionRole::Admin` 再调用 `connect()`。
 
 从仓库根目录在 WSL 中执行（示意变量 `repo` 为当前仓库 Linux 路径）：
 

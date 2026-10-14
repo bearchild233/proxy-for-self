@@ -777,12 +777,152 @@ async fn cancel_prepare_wait_finishes_without_sending() {
         request.await.err().unwrap().kind(),
         ProviderErrorKind::Cancelled
     );
-    until(|| !f.controls.finishes.lock().unwrap().is_empty()).await;
-    assert_eq!(
-        f.controls.finishes.lock().unwrap()[0].outcome,
-        RequestOutcome::Cancelled
-    );
+    // 没有取得租约的请求不发送 request.finish；留出投递时间后确认插件没有收到通知。
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(f.controls.finishes.lock().unwrap().is_empty());
     assert!(f.server.received_requests().await.unwrap().is_empty());
+}
+
+const G1: &str = "grp_00000000000000000000000000000001";
+const G2: &str = "grp_00000000000000000000000000000002";
+
+/// 两个不同插件分别负责 G1 与 G2；同一账号同时属于两个分组时必须失败关闭。
+struct ConflictHooks;
+#[async_trait::async_trait]
+impl PluginHooks for ConflictHooks {
+    fn ownership(&self, group: &str) -> Ownership {
+        let plugin = if group == G1 { "plugin-a" } else { "plugin-b" };
+        Ownership::Owned {
+            plugin: plugin.into(),
+            available: true,
+        }
+    }
+    async fn route_select(
+        &self,
+        _: &str,
+        _: RouteSelectParams,
+    ) -> Result<RouteSelectResult, RpcError> {
+        Err(RpcError::new(UNAVAILABLE, "conflict fixture must not select"))
+    }
+    async fn response_observe(
+        &self,
+        _: &str,
+        _: ResponseObserveParams,
+    ) -> Result<ResponseObserveResult, RpcError> {
+        Err(RpcError::new(UNAVAILABLE, "conflict fixture must not observe"))
+    }
+    async fn route_prepare(
+        &self,
+        _: &str,
+        _: RoutePrepareParams,
+    ) -> Result<RoutePrepareResult, RpcError> {
+        Err(RpcError::new(UNAVAILABLE, "conflict fixture must not prepare"))
+    }
+    async fn response_head(
+        &self,
+        _: &str,
+        _: ResponseHeadParams,
+    ) -> Result<ResponseHeadResult, RpcError> {
+        Err(RpcError::new(UNAVAILABLE, "conflict fixture must not receive heads"))
+    }
+    async fn request_finish(&self, _: &str, _: RequestFinishParams) {}
+}
+
+/// 按账号列出分组的请求上下文；用于构造单个账号同属多个分组的场景。
+fn scoped_context(id: &str, accounts: &[(&str, &[&str])]) -> AttemptContext {
+    let provider = ProviderKind::new("openai").unwrap();
+    let directory = accounts
+        .iter()
+        .map(|(account, groups)| {
+            (
+                ProviderAccountId::new(*account).unwrap(),
+                RuntimeAccount::new(
+                    provider.clone(),
+                    groups
+                        .iter()
+                        .map(|group| {
+                            gateway_core::account::scope::AccountGroupId::new(*group).unwrap()
+                        })
+                        .collect(),
+                ),
+            )
+        })
+        .collect();
+    let scope = Arc::new(FrozenAccountScope::new(
+        Arc::new(RuntimeAccountDirectory::new(directory)),
+        ClientRoutingScope::all_accounts(),
+    ));
+    AttemptContext::new(
+        RequestAttemptContext::new(
+            ModelRequestId::new(id).unwrap(),
+            ClientApiKeyId::new("key_plugin").unwrap(),
+        ),
+        NonZeroU32::new(1).unwrap(),
+        SystemTime::now() + BUDGET,
+        account_policy(),
+        AccountAttemptContext::new(BTreeSet::new(), None, None).with_account_scope(scope),
+        None,
+        CancellationToken::new(),
+    )
+}
+
+#[tokio::test]
+async fn ownership_conflict_fails_closed_and_names_both_plugins() {
+    let store = Arc::new(MemoryAccountStore::default());
+    create_account(&store, A).await;
+    let server = MockServer::start().await;
+    let provider = provider_with_base_url(&store, server.uri()).with_plugin_routing(true);
+    provider.set_plugin_hooks(Arc::new(ConflictHooks));
+    let context = scoped_context("req_conflict", &[(A, &[G1, G2])]);
+    let error = provider
+        .execute(planned_request("openai", operation(false)), context)
+        .await
+        .err()
+        .unwrap();
+    let diagnostic = error.diagnostic().unwrap();
+    assert_eq!(diagnostic.code(), Some("plugin_ownership_conflict"));
+    assert_eq!(
+        diagnostic.as_str(),
+        "插件 plugin-a, plugin-b：账号的分组归属多个插件，已失败关闭"
+    );
+    assert_eq!(error.send_state(), UpstreamSendState::NotSent);
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn refused_retry_and_switch_report_specific_reason_codes() {
+    for (actions, unsafe_replay, code, requests, text) in [
+        (
+            vec![ResponseHeadResult::Retry { delay_ms: 1 }],
+            true,
+            "plugin_retry_unsafe",
+            1,
+            "retry",
+        ),
+        (
+            vec![ResponseHeadResult::Switch],
+            true,
+            "plugin_retry_unsafe",
+            1,
+            "switch",
+        ),
+        (
+            vec![ResponseHeadResult::Switch; 5],
+            false,
+            "plugin_attempt_limit",
+            4,
+            "上限",
+        ),
+    ] {
+        let f = Fixture::new(vec![(A, G1)], true).await;
+        f.upstream(successful()).await;
+        f.controls.actions.lock().unwrap().extend(actions);
+        let error = f.execute(f.ordinary_context(), unsafe_replay).await.err().unwrap();
+        let diagnostic = error.diagnostic().unwrap();
+        assert_eq!(diagnostic.code(), Some(code));
+        assert!(diagnostic.as_str().contains(text), "{}", diagnostic.as_str());
+        assert_eq!(f.server.received_requests().await.unwrap().len(), requests);
+    }
 }
 
 #[tokio::test]

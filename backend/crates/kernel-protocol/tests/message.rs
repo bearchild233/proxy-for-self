@@ -33,10 +33,10 @@ fn example<T: serde::Serialize + serde::de::DeserializeOwned>(wire: Value) {
 #[test]
 fn handshake_lifecycle_examples_and_compatibility() {
     example::<HelloParams>(
-        json!({"kernelApi":{"major":0,"minor":1},"kernel":{"version":"test","slot":"a"}}),
+        json!({"kernelApi":{"major":0,"minor":1},"kernel":{"version":"test","slot":"a"},"role":"kernel"}),
     );
     example::<HelloParams>(
-        json!({"kernelApi":{"major":0,"minor":1},"kernel":{"version":"test","slot":null}}),
+        json!({"kernelApi":{"major":0,"minor":1},"kernel":{"version":"test","slot":null},"role":"admin"}),
     );
     example::<HelloResult>(
         json!({"plugin":{"id":"echo","version":"0.0.0"},"sdk":{"version":"0.0.0"},"kernelApi":{"major":0,"minMinor":1},"hooks":["route.prepare"],"capabilities":["log"],"ownedGroups":[],"watchedGroups":[]}),
@@ -52,11 +52,19 @@ fn handshake_lifecycle_examples_and_compatibility() {
             min_minor: 4
         }
     ));
-    assert!(!is_compatible(
+    // 0.5 内核兼容声明 minMinor 5 的插件；插件声明的新增字段均为可选。
+    assert!(is_compatible(
         KernelApi::default(),
         PluginApi {
             major: 0,
             min_minor: 5
+        }
+    ));
+    assert!(!is_compatible(
+        KernelApi::default(),
+        PluginApi {
+            major: 0,
+            min_minor: 6
         }
     ));
     assert!(!is_compatible(
@@ -95,7 +103,7 @@ fn old_hello_defaults_ownership_and_new_notification_roundtrips() {
     .unwrap();
     assert!(hello.owned_groups.is_empty());
     example::<OwnershipChangedParams>(json!({"ownedGroups":["group"],"watchedGroups":["watch"]}));
-    assert_eq!(KERNEL_API, (0, 4));
+    assert_eq!(KERNEL_API, (0, 5));
     assert!(hello.watched_groups.is_empty());
     for min_minor in [0, 1, 2, 3] {
         assert!(!is_compatible(
@@ -108,4 +116,26 @@ fn old_hello_defaults_ownership_and_new_notification_roundtrips() {
     }
     let old: OwnershipChangedParams = serde_json::from_value(json!({"ownedGroups":[]})).unwrap();
     assert!(old.watched_groups.is_empty());
+}
+
+#[test]
+fn hello_role_defaults_to_kernel_and_rejects_unknown_values() {
+    // 缺省角色按内核连接处理，序列化时显式写出 kernel。
+    let legacy: HelloParams =
+        serde_json::from_value(json!({"kernelApi":{"major":0,"minor":4},"kernel":{"version":"old","slot":null}}))
+            .unwrap();
+    assert_eq!(legacy.role, ConnectionRole::Kernel);
+    assert_eq!(serde_json::to_value(&legacy).unwrap()["role"], json!("kernel"));
+    let admin: HelloParams = serde_json::from_value(
+        json!({"kernelApi":{"major":0,"minor":5},"kernel":{"version":"v","slot":null},"role":"admin"}),
+    )
+    .unwrap();
+    assert_eq!(admin.role, ConnectionRole::Admin);
+    // 未知角色不能退化为内核连接，必须让握手失败。
+    assert!(
+        serde_json::from_value::<HelloParams>(
+            json!({"kernelApi":{"major":0,"minor":5},"kernel":{"version":"v","slot":null},"role":"root"}),
+        )
+        .is_err()
+    );
 }
