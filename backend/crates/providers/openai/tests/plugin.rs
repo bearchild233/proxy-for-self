@@ -24,6 +24,58 @@ use wiremock::{
     matchers::{method, path},
 };
 struct Access(Mutex<bool>);
+#[tokio::test]
+async fn quota_refresh_if_missing_uses_account_egress_and_preserves_cached_snapshot() {
+    let direct = MockServer::start().await;
+    let proxy = MockServer::start().await;
+    Mock::given(method("GET")).respond_with(ResponseTemplate::new(200).set_body_json(json!({
+        "rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{"used_percent":10,"reset_at":2000000000}}
+    }))).mount(&proxy).await;
+    let f = Fixture::new(direct.uri()).await;
+    f.store.set_egress(
+        "acct_a",
+        Some(gateway_core::account::OutboundProxy::parse(&proxy.uri()).unwrap()),
+        None,
+    );
+    let old = f
+        .upstream
+        .quota(QuotaReadParams {
+            account_id: "acct_a".into(),
+            refresh_if_missing: false,
+        })
+        .await
+        .unwrap();
+    assert!(old.snapshot["quota"].is_null());
+    assert!(proxy.received_requests().await.unwrap().is_empty());
+    for _ in 0..2 {
+        let result = f
+            .upstream
+            .quota(QuotaReadParams {
+                account_id: "acct_a".into(),
+                refresh_if_missing: true,
+            })
+            .await
+            .unwrap();
+        assert!(!result.snapshot["quota"].is_null());
+    }
+    assert_eq!(proxy.received_requests().await.unwrap().len(), 1);
+    assert!(direct.received_requests().await.unwrap().is_empty());
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&direct)
+        .await;
+    assert_eq!(
+        f.upstream
+            .quota(QuotaReadParams {
+                account_id: "acct_b".into(),
+                refresh_if_missing: true
+            })
+            .await
+            .unwrap_err()
+            .code,
+        UNAVAILABLE
+    );
+}
 impl PluginAccess for Access {
     fn id(&self) -> &str {
         "fixture"
@@ -42,11 +94,16 @@ impl PluginAccess for Access {
 struct Directory;
 #[async_trait]
 impl PluginAccounts for Directory {
-    async fn read(&self, ids: Option<&[String]>) -> Result<Vec<AccountSummary>, RpcError> {
+    async fn read(
+        &self,
+        ids: Option<&[String]>,
+        _model: Option<&str>,
+    ) -> Result<Vec<AccountSummary>, RpcError> {
         Ok(ids
             .unwrap()
             .iter()
             .map(|id| AccountSummary {
+                model_allowed: None,
                 id: id.clone(),
                 enabled: true,
                 status: "normal".into(),
@@ -269,6 +326,7 @@ async fn probe_success_maps_headers_uses_hi_and_persists_passive_quota() {
     let result = f
         .upstream
         .quota(QuotaReadParams {
+            refresh_if_missing: false,
             account_id: "acct_a".into(),
         })
         .await
@@ -353,6 +411,7 @@ async fn probe_no_response_and_account_eligibility() {
     assert_eq!(
         f.upstream
             .quota(QuotaReadParams {
+                refresh_if_missing: false,
                 account_id: "acct_xai".into()
             })
             .await

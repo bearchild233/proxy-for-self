@@ -23,7 +23,8 @@ impl Pool {
         caps: &Caps,
         id: &str,
     ) -> Result<Option<AccountSummary>, PoolFailure> {
-        caps.accounts(&[id.to_owned()])
+        let settings = self.settings().await?;
+        caps.accounts(&[id.to_owned()], &settings.probe_model)
             .await
             .map(|rows| rows.into_iter().find(|row| row.id == id))
             .map_err(|_| PoolFailure::kernel())
@@ -32,10 +33,7 @@ impl Pool {
     /// 账号能否参与网关池：启用、OAuth、状态正常、额度未耗尽。不满足时返回具体原因。
     /// 同时把额度耗尽与否同步给运行状态机（与旧 `eligible_account` 相同）。
     ///
-    /// 与旧路径的差异：旧路径还检查账号对打票模型的使用权限（`model_access`），内核能力没有提供该信息，
-    /// 该检查改由 `upstream.probe` 在探测时拒绝；旧路径在没有额度快照时先刷新再读，插件没有刷新能力，
-    /// 没有快照时按“读取不到额度”处理。
-    // TODO(design): 缺少额度快照和账号无打票模型权限两种情况如何处理，见汇报。
+    /// 协议 0.6 提供打票模型权限与缺失额度刷新，恢复旧路径的两项准入检查。
     pub(super) async fn eligible(
         &self,
         caps: &Caps,
@@ -46,6 +44,10 @@ impl Pool {
         }
         if row.authentication_kind != "oauth" {
             return Err(PoolFailure::new("not_oauth", "网关池只支持 OAuth 账号"));
+        }
+        if row.model_allowed == Some(false) {
+            let settings = self.settings().await?;
+            return Err(Self::model_denied(&settings.probe_model));
         }
         match row.status.as_str() {
             "normal" => {}
@@ -94,6 +96,13 @@ impl Pool {
         self.runtime(json!({"action": "quota", "accountId": account, "exhausted": exhausted}))
             .await?;
         Ok(())
+    }
+
+    pub(super) fn model_denied(model: &str) -> PoolFailure {
+        PoolFailure::new(
+            "no_probe_model_access",
+            format!("账号没有打票模型 {model} 的使用权限，无法检测网关"),
+        )
     }
 
     fn cached_catalog(&self, identity: &str) -> Option<Value> {

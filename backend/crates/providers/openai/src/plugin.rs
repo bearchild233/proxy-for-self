@@ -61,11 +61,19 @@ impl OpenAiPluginUpstream {
 impl PluginUpstream for OpenAiPluginUpstream {
     async fn quota(&self, params: QuotaReadParams) -> Result<QuotaReadResult, RpcError> {
         let account = self.account(&params.account_id, true).await?;
-        let snapshot = self
+        let mut snapshot = self
             .quota
             .read_account(account.id())
             .await
             .map_err(|_| RpcError::new(UNAVAILABLE, "quota.read"))?;
+        if params.refresh_if_missing && snapshot.is_none() {
+            snapshot = Some(
+                self.quota
+                    .refresh_account(account.id())
+                    .await
+                    .map_err(|_| RpcError::new(UNAVAILABLE, "quota.read"))?,
+            );
+        }
         let signals = self.quota.scheduling_signals(&account);
         // 协议 0.x 原样透传额度与调度快照，字段合同在 P1 网关池插件使用时冻结。
         let snapshot = snapshot.map(|snapshot| json!({

@@ -6,8 +6,8 @@ use plugin_sdk::{
     Context, Plugin, RpcResult,
     protocol::{
         AdminCallParams, FORBIDDEN, INTERNAL, INVALID_PARAMS, RequestFinishParams,
-        ResponseHeadParams, ResponseHeadResult, RoutePrepareParams, RoutePrepareResult,
-        RouteSelectParams, RouteSelectResult, RpcError,
+        ResponseHeadParams, ResponseHeadResult, ResponseObserveParams, ResponseObserveResult,
+        RoutePrepareParams, RoutePrepareResult, RouteSelectParams, RouteSelectResult, RpcError,
     },
 };
 use serde_json::Value;
@@ -54,6 +54,22 @@ impl GatewayPoolService {
 }
 
 impl Plugin for GatewayPoolService {
+    fn start(&self, kernel: plugin_sdk::Kernel) {
+        self.pool.start_background(kernel);
+    }
+
+    fn stop_background(&self) {
+        self.pool.stop_background();
+    }
+
+    async fn response_observe(
+        &self,
+        ctx: Context,
+        params: ResponseObserveParams,
+    ) -> RpcResult<ResponseObserveResult> {
+        self.pool.observe(&Caps::new(ctx.kernel()), params).await
+    }
+
     async fn route_select(
         &self,
         ctx: Context,
@@ -101,11 +117,11 @@ impl Plugin for GatewayPoolService {
                 .await
                 .map_err(|error| RpcError::new(INTERNAL, error.to_string()))??;
         if let Some(ownership) = ownership {
+            self.pool.invalidate_settings();
             // 归属先写入内核侧状态再广播；广播失败时下一次握手会带上最新归属，不回滚已保存的设置。
-            // 观察分组等 011 的降智观察接入后再上报，与启动时的声明一致。
             if let Err(error) = ctx
                 .kernel()
-                .set_ownership(ownership.owned_groups, Vec::new())
+                .set_ownership(ownership.owned_groups, ownership.watched_groups)
                 .await
             {
                 eprintln!("gateway pool ownership broadcast failed: {}", error.message);

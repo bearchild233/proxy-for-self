@@ -38,7 +38,7 @@ pub async fn require_account(
     id: &str,
 ) -> Result<(), RpcError> {
     ProviderAccountId::new(id).map_err(|_| RpcError::new(INVALID_PARAMS, "accountId"))?;
-    let rows = accounts.read(Some(&[id.to_owned()])).await?;
+    let rows = accounts.read(Some(&[id.to_owned()]), None).await?;
     let groups = access.groups();
     if !rows
         .iter()
@@ -63,7 +63,10 @@ impl PluginCapabilities for KernelCapabilities {
                 for id in params.ids.iter().flatten() {
                     ProviderAccountId::new(id).map_err(|_| RpcError::new(INVALID_PARAMS, "ids"))?;
                 }
-                let rows = self.accounts.read(params.ids.as_deref()).await?;
+                let rows = self
+                    .accounts
+                    .read(params.ids.as_deref(), params.model.as_deref())
+                    .await?;
                 let groups = access.groups();
                 encode(AccountsReadResult {
                     accounts: rows

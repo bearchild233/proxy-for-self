@@ -83,7 +83,14 @@ fn ownership_of(settings: &Object) -> Ownership {
         .unwrap_or_default();
     let dynamic = matches!(settings.get("dynamicGroups"), Some(Value::Bool(true)));
     let watched_groups = match str_field(settings, "normalGroupId") {
-        Some(normal) if dynamic && !normal.is_empty() => vec![normal.to_owned()],
+        Some(normal)
+            if dynamic
+                && !normal.is_empty()
+                && str_field(settings, "degradedGroupId")
+                    .is_some_and(|degraded| !degraded.is_empty() && degraded != normal) =>
+        {
+            vec![normal.to_owned()]
+        }
         _ => Vec::new(),
     };
     Ownership {
@@ -92,8 +99,9 @@ fn ownership_of(settings: &Object) -> Ownership {
     }
 }
 
-/// 与 Python `GatewayPool` 的 `__init__` 中 executescript 相同的基础表结构。
+/// Python 控制面的基础表保持原样；额外接管事实只增加 gp_hook_leases 私有表。
 const SCHEMA: &str = "
+        CREATE TABLE IF NOT EXISTS gp_hook_leases (id TEXT PRIMARY KEY, data TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS pairs (account TEXT NOT NULL, gateway TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(account,gateway));
         CREATE TABLE IF NOT EXISTS leases (id TEXT PRIMARY KEY, account TEXT NOT NULL, gateway TEXT NOT NULL, generation TEXT NOT NULL, kind TEXT NOT NULL, expires REAL NOT NULL, sent INTEGER NOT NULL DEFAULT 0, data TEXT NOT NULL);
@@ -202,6 +210,31 @@ impl Store {
                 vec![text(lease)],
             )?
             .and_then(|row| str_field(&row, "account").map(str::to_owned)))
+        })
+    }
+
+    /// 仅增加私有接管表；沿用 leases 的到期时间与存在性，不另定保留周期。
+    pub(crate) fn save_hook_lease(&self, id: &str, data: &Value) -> Result<(), Failure> {
+        self.write(|db| {
+            let saved = db.execute("INSERT OR REPLACE INTO gp_hook_leases(id,data) SELECT id,? FROM leases WHERE id=? AND expires>?",
+                rusqlite::params![data.to_string(), id, sql_of_num(self.now_num())])?;
+            if saved != 1 { return Failure::invalid("lease expired before persistence"); }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn load_hook_lease(&self, id: &str) -> Result<Option<Value>, Failure> {
+        self.read(|db| {
+            one(db, "SELECT h.data FROM gp_hook_leases h JOIN leases l ON l.id=h.id WHERE h.id=? AND l.expires>?",
+                vec![text(id), sql_of_num(self.now_num())])?
+                .map(|row| decode_value(&string_of(&row, "data"))).transpose()
+        })
+    }
+
+    pub(crate) fn delete_hook_lease(&self, id: &str) -> Result<(), Failure> {
+        self.write(|db| {
+            db.execute("DELETE FROM gp_hook_leases WHERE id=?", [id])?;
+            Ok(())
         })
     }
 

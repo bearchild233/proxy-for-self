@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 use common::Harness;
 use serde_json::json;
 
-const TABLES: [&str; 18] = [
+const TABLES: [&str; 19] = [
     "settings",
     "pairs",
     "leases",
@@ -20,6 +20,7 @@ const TABLES: [&str; 18] = [
     "group_events",
     "recovery_checks",
     "gp_history_meta",
+    "gp_hook_leases",
     "gp_batches",
     "gp_windows",
     "gp_accesses",

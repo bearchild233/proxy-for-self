@@ -35,6 +35,17 @@ struct Controls {
 }
 struct TestPlugin(Arc<Controls>);
 impl Plugin for TestPlugin {
+    async fn response_observe(
+        &self,
+        _: Context,
+        _: ResponseObserveParams,
+    ) -> RpcResult<ResponseObserveResult> {
+        if self.0.slow.load(Ordering::Relaxed) {
+            std::future::pending::<()>().await;
+        }
+        Ok(ResponseObserveResult::Accept)
+    }
+
     async fn route_prepare(
         &self,
         _: Context,
@@ -108,6 +119,7 @@ fn descriptor(id: &str, groups: &[&str]) -> Descriptor {
             min_minor: 4,
         },
         hooks: vec![
+            "response.observe".into(),
             "route.prepare".into(),
             "response.head".into(),
             "request.finish".into(),
@@ -248,6 +260,59 @@ fn head() -> ResponseHeadParams {
         duration_ms: 0,
         replay_safe: true,
     }
+}
+
+#[tokio::test]
+async fn observe_has_twenty_second_budget_while_head_and_prepare_keep_two_seconds() {
+    let root = tempfile::tempdir().unwrap();
+    let fixture = Fixture::start(root.path(), "test", &["g"]);
+    registry(
+        root.path(),
+        vec![registration(root.path(), "test", true, &[])],
+    );
+    let runtime = start(root.path());
+    available(&runtime, "test").await;
+    fixture.controls.slow.store(true, Ordering::Relaxed);
+    let params = ResponseObserveParams {
+        sse: true,
+        request_id: "r".into(),
+        account_id: "a".into(),
+        attempt: 1,
+        model: "m".into(),
+        request_had_turn_state: true,
+        status: Some(200),
+        error_kind: None,
+        state_returned: true,
+        turn_state: Some("s".into()),
+        set_cookies: vec![],
+        replay_safe: true,
+        can_switch: true,
+    };
+    let started = std::time::Instant::now();
+    let (observe, head, prepare) = tokio::join!(
+        async {
+            let r = runtime.response_observe("test", params).await;
+            (r, started.elapsed())
+        },
+        async {
+            let r = runtime.response_head("test", head()).await;
+            (r, started.elapsed())
+        },
+        async {
+            let r = runtime.route_prepare("test", route()).await;
+            (r, started.elapsed())
+        }
+    );
+    for (error, elapsed) in [
+        (head.0.unwrap_err(), head.1),
+        (prepare.0.unwrap_err(), prepare.1),
+    ] {
+        assert_eq!(error.code, UNAVAILABLE);
+        assert!(elapsed >= Duration::from_secs(2) && elapsed < Duration::from_secs(4));
+    }
+    assert_eq!(observe.0.unwrap_err().code, UNAVAILABLE);
+    assert!(observe.1 >= Duration::from_secs(20) && observe.1 < Duration::from_secs(23));
+    runtime.shutdown().await;
 }
 
 #[test]

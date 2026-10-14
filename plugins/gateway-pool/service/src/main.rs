@@ -18,15 +18,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         kernel_api: PluginApi {
             major: KERNEL_API.0,
-            // 管理连接（hello.role = admin）自 0.5 起存在。
-            min_minor: 5,
+            // 资格检查与 SSE 观察依赖协议 0.6。
+            min_minor: 6,
         },
         hooks: HOOKS.map(str::to_owned).to_vec(),
         // 对外访问全部经内核能力；清单里的 `service` 段在 012 打包时再加。
         capabilities: CAPABILITIES.map(str::to_owned).to_vec(),
         owned_groups: ownership.owned_groups,
-        // 观察分组（动态分组的正常分组）要等 011 的降智观察接入后再上报；此处不上报，避免内核对这些账号调用 `response.observe`。
-        watched_groups: Vec::new(),
+        watched_groups: ownership.watched_groups,
         shutdown_timeout: Duration::from_millis(shutdown_ms),
     };
     Server::bind(settings, descriptor, GatewayPoolService::new(store))?

@@ -8,12 +8,13 @@
 //! - `response.head` ← `GatewayPoolGuard::observe` 与 `GatewayPoolAttempt::send` 的判定（`head.rs`）
 //! - `request.finish` ← `GatewayPoolGuard::finish`（`head.rs`）
 //!
-//! 不在本任务范围（011）：普通账号降智观察与确认、恢复检测、持续模式后台任务、移组。
-//! 旧路径里登记“近期经过网关池的账号”和“降智分组账号”（`active`、`recoverable`）只服务于这些后台任务，
-//! 011 接入时再加。
+//! 普通账号观察与移组见 `observe`，恢复检测与持续模式见 `background`。
 
 mod access;
+mod background;
 mod head;
+mod observe;
+mod persistence;
 mod prepare;
 mod probe;
 mod select;
@@ -21,7 +22,7 @@ mod ticket;
 
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, atomic::AtomicBool},
     time::{Duration, Instant},
 };
 
@@ -46,15 +47,18 @@ const PREPARE_TIMEOUT: Duration = Duration::from_secs(35);
 const PROBE_ATTEMPT_MS: u64 = 15_000;
 /// 内核钩子的调用预算是 2 秒（`gateway-host` 的 `PluginRuntime`）；钩子内部的等待不超过其中的这一段，
 /// 超出时返回 `wait` 让内核稍后再来。
-// TODO(design): 1.5 秒是按 2 秒钩子预算留 0.5 秒余量得出的推断值，需确认。
+// 011 已确认：钩子内部等待上限为 1.5 秒。
 const HOOK_BUDGET: Duration = Duration::from_millis(1500);
 /// `route.select` 记录的请求状态在没有截止时间可用时的保留时间。
-// TODO(design): `route.select` 的参数里没有请求截止时间，保留时间取 600 秒（与目录保留时间相同）是推断值，需确认。
+// 011 已确认：未收到请求截止时间前保留 600 秒。
 const SELECT_KEEP_SECONDS: f64 = 600.0;
 
 /// 池设置中请求路径用到的字段（`config` 动作的结果，含池服务凭证）。
 #[derive(Clone)]
 pub struct PoolSettings {
+    pub dynamic_groups: bool,
+    pub normal_group_id: String,
+    pub degraded_group_id: String,
     pub mode: String,
     pub pool_account_ids: HashMap<String, String>,
     pub pool_url: String,
@@ -70,6 +74,9 @@ impl PoolSettings {
     fn from_config(value: &Value) -> Self {
         let text = |key: &str| value[key].as_str().unwrap_or_default().to_owned();
         Self {
+            dynamic_groups: value["dynamicGroups"] == true,
+            normal_group_id: text("normalGroupId"),
+            degraded_group_id: text("degradedGroupId"),
             mode: text("mode"),
             pool_account_ids: value["poolAccountIds"]
                 .as_object()
@@ -93,6 +100,13 @@ impl PoolSettings {
                 .to_owned(),
             pool_direct: value["poolDirect"].as_bool().unwrap_or(true),
         }
+    }
+
+    pub fn dynamic_groups_ready(&self) -> bool {
+        self.dynamic_groups
+            && !self.normal_group_id.is_empty()
+            && !self.degraded_group_id.is_empty()
+            && self.normal_group_id != self.degraded_group_id
     }
 
     /// 池服务成员标识：管理员显式映射优先，否则按上游账号与用户自动生成。
@@ -134,7 +148,7 @@ impl PoolFailure {
     }
 
     /// 内核能力（账号、额度）读取失败。旧路径里这些读取在进程内，没有对应原因码。
-    // TODO(design): `kernel_unavailable` 及其文案是推断，需确认。
+    // 011 已确认采用此原因码与文案。
     pub fn kernel() -> Self {
         Self::new(
             "kernel_unavailable",
@@ -210,6 +224,7 @@ pub(super) struct AccessTiming {
     pub id: String,
     at: f64,
     started: Instant,
+    elapsed_before: Duration,
     ended: Option<(Duration, &'static str)>,
 }
 
@@ -219,19 +234,20 @@ impl AccessTiming {
             id,
             at,
             started: Instant::now(),
+            elapsed_before: Duration::ZERO,
             ended: None,
         }
     }
 
     pub fn end(&mut self, outcome: &'static str) {
         self.ended
-            .get_or_insert_with(|| (self.started.elapsed(), outcome));
+            .get_or_insert_with(|| (self.elapsed_before + self.started.elapsed(), outcome));
     }
 
     pub fn value(&self) -> Value {
         let (elapsed, outcome) = self
             .ended
-            .unwrap_or_else(|| (self.started.elapsed(), "headers"));
+            .unwrap_or_else(|| (self.elapsed_before + self.started.elapsed(), "headers"));
         json!({"id": self.id, "startedAt": self.at, "elapsedMs": elapsed.as_millis(), "ended": self.ended.is_some(), "outcome": outcome})
     }
 }
@@ -277,6 +293,8 @@ pub(super) struct LeaseState {
     pub account: String,
     pub model: String,
     pub gateway: String,
+    pub generation: String,
+    pub state: String,
     /// 本次发送使用的 Cookie（票的 Cookie 或窗口 Cookie）。
     pub cookie: String,
     pub timing: Option<AccessTiming>,
@@ -296,9 +314,19 @@ pub struct Pool {
     probes: Arc<Semaphore>,
     requests: Mutex<HashMap<String, RequestState>>,
     leases: Mutex<HashMap<String, LeaseState>>,
+    active: Mutex<HashMap<String, f64>>,
+    recoverable: Mutex<HashMap<String, f64>>,
+    recovering: Mutex<HashSet<String>>,
+    confirmations: Mutex<HashMap<String, f64>>,
+    stopped: AtomicBool,
+    background: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Pool {
+    pub(crate) fn invalidate_settings(&self) {
+        *self.settings.lock().expect("settings lock") = None;
+    }
+
     pub fn new(store: Arc<Store>) -> Arc<Self> {
         Arc::new(Self {
             store,
@@ -311,6 +339,12 @@ impl Pool {
             probes: Arc::new(Semaphore::new(PROBE_PERMITS)),
             requests: Mutex::new(HashMap::new()),
             leases: Mutex::new(HashMap::new()),
+            active: Mutex::new(HashMap::new()),
+            recoverable: Mutex::new(HashMap::new()),
+            recovering: Mutex::new(HashSet::new()),
+            confirmations: Mutex::new(HashMap::new()),
+            stopped: AtomicBool::new(false),
+            background: Mutex::new(None),
         })
     }
 
@@ -346,11 +380,17 @@ impl Pool {
 
     /// 归还租约；失败时由运行状态机的租约超时回收兜底。
     pub(super) async fn release(&self, account: &str, lease: &str, access: Option<Value>) -> bool {
-        self.runtime(
+        let released = self.runtime(
             json!({"action": "finish", "accountId": account, "leaseId": lease, "access": access}),
         )
         .await
-        .is_ok()
+        .is_ok();
+        if released {
+            let store = self.store.clone();
+            let lease = lease.to_owned();
+            let _ = tokio::task::spawn_blocking(move || store.delete_hook_lease(&lease)).await;
+        }
+        released
     }
 
     /// 清除过期的请求与租约状态；已预约却没有交给内核的窗口在这里归还。

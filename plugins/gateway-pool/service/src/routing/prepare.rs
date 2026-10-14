@@ -80,6 +80,7 @@ impl Pool {
     }
 
     fn take_attempt(&self, request_id: &str, account: &str, deadline: f64) -> Attempt {
+        // 热更新接管或 select 状态过期时，按没有替代账号、没有普通退路继续准备，不能失败请求。
         let mut requests = self.requests.lock().expect("requests lock");
         let state = requests
             .entry(request_id.to_owned())
@@ -145,6 +146,16 @@ impl Pool {
                 "无法生成池成员标识：账号缺少上游账号 ID 或用户 ID，请重新登录该账号或在网关池设置里指定",
             ));
         };
+        self.active
+            .lock()
+            .expect("active lock")
+            .insert(account.to_owned(), self.now());
+        if row.groups.contains(&settings.degraded_group_id) {
+            self.recoverable
+                .lock()
+                .expect("recoverable lock")
+                .insert(account.to_owned(), self.now());
+        }
         self.eligible(caps, &row).await?;
         if self.now() >= deadline - GIVE_UP_BEFORE_DEADLINE {
             return Err(PoolFailure::new(
@@ -192,17 +203,25 @@ impl Pool {
             Some(ticket) => (ticket.cookie.clone(), ticket.state.clone()),
             None => (held.material.cookie.clone(), held.material.state.clone()),
         };
-        self.leases.lock().expect("leases lock").insert(
-            held.lease.clone(),
-            LeaseState {
-                account: account.to_owned(),
-                model: params.model.clone(),
-                gateway: held.material.pair.gateway.clone(),
-                cookie: cookie.clone(),
-                timing: Some(AccessTiming::new(access_id, self.now())),
-                expires: deadline,
-            },
-        );
+        let lease = LeaseState {
+            account: account.to_owned(),
+            model: params.model.clone(),
+            gateway: held.material.pair.gateway.clone(),
+            generation: held.material.pair.generation.clone(),
+            state: state.clone(),
+            cookie: cookie.clone(),
+            timing: Some(AccessTiming::new(access_id, self.now())),
+            expires: deadline,
+        };
+        // 只有接管事实成功落库后才能把材料交给内核。
+        if let Err(error) = self.persist_lease(&held.lease, &lease).await {
+            self.release(account, &held.lease, None).await;
+            return Err(error.into());
+        }
+        self.leases
+            .lock()
+            .expect("leases lock")
+            .insert(held.lease.clone(), lease);
         Ok(Step::Use {
             lease_id: held.lease,
             cookie,

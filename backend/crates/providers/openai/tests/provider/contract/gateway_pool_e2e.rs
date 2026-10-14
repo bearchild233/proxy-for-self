@@ -76,13 +76,18 @@ fn gateway_of(cookie: &str) -> Option<String> {
 struct Directory(Arc<MemoryAccountStore>);
 #[async_trait]
 impl PluginAccounts for Directory {
-    async fn read(&self, ids: Option<&[String]>) -> Result<Vec<AccountSummary>, RpcError> {
+    async fn read(
+        &self,
+        ids: Option<&[String]>,
+        model: Option<&str>,
+    ) -> Result<Vec<AccountSummary>, RpcError> {
         Ok(ids
             .unwrap_or_default()
             .iter()
             .filter_map(|id| {
                 let account = self.0.account(id)?;
                 Some(AccountSummary {
+                    model_allowed: model.map(|model| account.model_access().allows(model)),
                     id: id.clone(),
                     enabled: account.enabled(),
                     status: "normal".into(),
@@ -482,4 +487,334 @@ async fn until_idle(runtime: &PluginRuntime) {
     })
     .await
     .expect("leases were not returned");
+}
+
+/// 真实 PostgreSQL 成员关系供能力授权现读，移组由生产 PgProviderAccountRepository 执行。
+struct ObservedDirectory {
+    accounts: Arc<MemoryAccountStore>,
+    pool: sqlx::PgPool,
+}
+#[async_trait]
+impl PluginAccounts for ObservedDirectory {
+    async fn read(
+        &self,
+        ids: Option<&[String]>,
+        model: Option<&str>,
+    ) -> Result<Vec<AccountSummary>, RpcError> {
+        let mut rows = Vec::new();
+        for id in ids.unwrap_or_default() {
+            let Some(account) = self.accounts.account(id) else {
+                continue;
+            };
+            let groups = sqlx::query_scalar::<_, String>(
+                "SELECT account_group_id FROM account_group_accounts WHERE provider_account_id=$1",
+            )
+            .bind(id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|_| RpcError::new(UNAVAILABLE, "directory"))?;
+            rows.push(AccountSummary {
+                id: id.clone(),
+                enabled: account.enabled(),
+                status: "normal".into(),
+                authentication_kind: "oauth".into(),
+                groups,
+                upstream_account_id: account.upstream_account_id().map(str::to_owned),
+                user_id: account.upstream_user_id().map(str::to_owned),
+                model_allowed: model.map(|m| account.model_access().allows(m)),
+            });
+        }
+        Ok(rows)
+    }
+}
+
+#[tokio::test]
+#[ignore = "需要 gateway-pool 插件二进制和隔离 CPR_TEST_DATABASE_URL，阶段验收必跑"]
+async fn gateway_pool_plugin_observes_degradation_moves_group_and_delivers_from_other_account() {
+    const NORMAL: &str = "grp_00000000000000000000000000000050";
+    const SPARE: &str = "acct_normal_spare";
+    let database =
+        std::env::var("CPR_TEST_DATABASE_URL").expect("isolated test PostgreSQL required");
+    let admin_db = sqlx::PgPool::connect(&database).await.unwrap();
+    let schema = format!("cpr_pool_e2e_{}", uuid::Uuid::new_v4().simple());
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+        .execute(&admin_db)
+        .await
+        .unwrap();
+    let search = schema.clone();
+    let db = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .after_connect(move |conn, _| {
+            let search = search.clone();
+            Box::pin(async move {
+                sqlx::query("SELECT set_config('search_path',$1,false)")
+                    .bind(search)
+                    .execute(conn)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(&database)
+        .await
+        .unwrap();
+    sqlx::migrate!("../../../migrations")
+        .run(&db)
+        .await
+        .unwrap();
+    let store = Arc::new(MemoryAccountStore::default());
+    for id in [ACCOUNT, SPARE] {
+        store
+            .seed_oauth_credential(ImportCodexOAuthCredential {
+                account_id: id.into(),
+                name: id.into(),
+                secret: secret(id),
+                verified_account: profile(id),
+                next_refresh_at: None,
+                enabled: true,
+            })
+            .await;
+        sqlx::query("INSERT INTO provider_accounts (id,provider_kind,name,upstream_user_id,upstream_account_id,authentication_kind,provider_credentials_json,credential_revision,has_refresh_token,enabled,credential_state,credential_observed_at,created_at,updated_at) VALUES ($1,'openai',$1,$1,$1,'oauth','{}'::jsonb,1,false,true,'ready',now(),now(),now())")
+            .bind(id).execute(&db).await.unwrap();
+    }
+    store.set_scheduling(ACCOUNT, None, AccountWeight::new(90).unwrap());
+    store.set_scheduling(SPARE, None, AccountWeight::new(1).unwrap());
+    for group in [NORMAL, POOL_GROUP] {
+        sqlx::query("INSERT INTO account_groups (id,name,color,created_at,updated_at) VALUES ($1,$1,'#2563EBFF',now(),now())").bind(group).execute(&db).await.unwrap();
+    }
+    for id in [ACCOUNT, SPARE] {
+        sqlx::query("INSERT INTO account_group_accounts (account_group_id,provider_account_id,created_at) VALUES ($1,$2,now())").bind(NORMAL).bind(id).execute(&db).await.unwrap();
+    }
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/codex/responses"))
+        .respond_with(|r: &wiremock::Request| {
+            let bad = r.headers["authorization"]
+                .to_str()
+                .unwrap()
+                .ends_with(ACCOUNT);
+            let probe = captured_request_body(r)["input"][0]["content"][0]["text"] == "hi";
+            if probe {
+                assert!(bad);
+                assert_eq!(r.headers["x-codex-turn-state"], "returned-state-a");
+                assert_eq!(r.headers["cookie"], "route=new");
+            }
+            let response =
+                ResponseTemplate::new(200).insert_header("content-type", "text/event-stream");
+            if bad {
+                response
+                    .insert_header("x-codex-turn-state", "returned-state-a")
+                    .insert_header("set-cookie", "route=new; Path=/")
+                    .set_body_string(BAD_BODY)
+            } else {
+                response.set_body_string(GOOD_BODY)
+            }
+        })
+        .mount(&upstream)
+        .await;
+    let (provider, quota) = provider_and_quota_with_affinity_and_base_url_and_leases(
+        &store,
+        Arc::new(MemorySessionAffinity::default()),
+        upstream.uri(),
+        Arc::new(TestLeaseCoordinator::default()),
+        u32::try_from(DEFAULT_STREAM_MAX_RETRIES).unwrap(),
+    );
+    let provider = provider.with_plugin_routing(true);
+    let capabilities = Arc::new(KernelCapabilities {
+        accounts: Arc::new(ObservedDirectory {
+            accounts: store.clone(),
+            pool: db.clone(),
+        }),
+        upstream: Arc::new(OpenAiPluginUpstream::new(
+            store.clone(),
+            store.repository(),
+            quota,
+            CodexBackendClient::new(
+                reqwest::Client::builder().no_proxy().build().unwrap(),
+                upstream.uri(),
+                wire_profile(),
+            ),
+        )),
+        groups: Arc::new(gateway_store::postgres::PgProviderAccountRepository::new(
+            db.clone(),
+        )),
+        log: Arc::new(LogCapabilities),
+    });
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("pool.sock");
+    let process = PluginProcess(
+        std::process::Command::new(plugin_binary())
+            .env("CPR_PLUGIN_SOCKET", &socket)
+            .env("CPR_PLUGIN_DATA", root.path().join("data"))
+            .env("CPR_PLUGIN_SHUTDOWN_MS", "3000")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    until(|| socket.exists()).await;
+    std::fs::write(root.path().join("registry.json"),serde_json::to_vec(&json!({"plugins":[{"id":"gateway-pool","enabled":true,"socket":socket,"grants":["accounts.read","quota.read","upstream.probe","groups.move","http.fetch","log"]}]})).unwrap()).unwrap();
+    let runtime = Arc::new(
+        PluginRuntime::start(
+            PluginRuntimeConfig {
+                registry_path: Some(root.path().join("registry.json")),
+                ownership_cache_path: Some(root.path().join("ownership.json")),
+            },
+            KernelInfo {
+                version: "test".into(),
+                slot: None,
+            },
+            capabilities,
+        )
+        .unwrap()
+        .unwrap(),
+    );
+    until(|| {
+        runtime
+            .snapshot()
+            .plugins
+            .iter()
+            .any(|p| p.state == gateway_host::plugin::ConnectionState::Available)
+    })
+    .await;
+    admin(&runtime,"configure",json!({"groupIds":[POOL_GROUP],"dynamicGroups":true,"normalGroupId":NORMAL,"degradedGroupId":POOL_GROUP,"probeModel":PROBE_MODEL})).await;
+    until(|| matches!(runtime.ownership(NORMAL), Ownership::Watched { .. })).await;
+    provider.set_plugin_hooks(runtime.clone());
+    let budget = PluginAttemptBudget::default();
+    let context = || {
+        let kind = ProviderKind::new("openai").unwrap();
+        let scope = Arc::new(FrozenAccountScope::new(
+            Arc::new(RuntimeAccountDirectory::new(
+                [ACCOUNT, SPARE]
+                    .into_iter()
+                    .map(|id| {
+                        (
+                            ProviderAccountId::new(id).unwrap(),
+                            RuntimeAccount::new(
+                                kind.clone(),
+                                BTreeSet::from([
+                                    gateway_core::account::scope::AccountGroupId::new(NORMAL)
+                                        .unwrap(),
+                                ]),
+                            ),
+                        )
+                    })
+                    .collect(),
+            )),
+            ClientRoutingScope::all_accounts(),
+        ));
+        AttemptContext::new(
+            RequestAttemptContext::new(
+                ModelRequestId::new("req_observe_e2e").unwrap(),
+                ClientApiKeyId::new("key_observe").unwrap(),
+            )
+            .with_plugin_attempt_budget(budget.clone()),
+            NonZeroU32::new(1).unwrap(),
+            SystemTime::now() + BUDGET,
+            account_policy(),
+            AccountAttemptContext::new(
+                BTreeSet::new(),
+                None,
+                Some(gateway_core::engine::ProviderAccountStateOwner::new(
+                    ProviderKind::new("openai").unwrap(),
+                    ProviderAccountId::new(ACCOUNT).unwrap(),
+                )),
+            )
+            .with_account_scope(scope),
+            None,
+            CancellationToken::new(),
+        )
+    };
+    let operation = || {
+        let body = json!({"model":PROBE_MODEL,"input":"hello","client_metadata":{"x-codex-turn-state":"original"}});
+        Operation::Generate(GenerateRequest::from_protocol_payload(
+            ProtocolPayload::json_object("openai", body.as_object().unwrap().clone())
+                .unwrap()
+                .with_original_json(Bytes::from(body.to_string()))
+                .with_context(Map::from_iter([("use_websocket".into(), json!(false))])),
+        ))
+    };
+    let mut first = provider
+        .execute(planned_request("openai", operation()), context())
+        .await
+        .unwrap();
+    assert_eq!(first.metadata().provider_account_id().as_str(), ACCOUNT);
+    let mut delivered = String::new();
+    let error = loop {
+        match first.next().await {
+            Some(Err(error)) => break error,
+            Some(Ok(e)) => {
+                if let Some(w) = e.wire_event() {
+                    delivered.push_str(&w.data().to_string());
+                }
+            }
+            None => panic!("expected switchAccount"),
+        }
+    };
+    assert!(delivered.is_empty());
+    assert_eq!(
+        error.pre_delivery_retry(),
+        Some(PreDeliveryRetry::AccountRotation)
+    );
+    assert_eq!(error.diagnostic().unwrap().code(), Some("account_degraded"));
+    drop(first);
+    // 按 Core 的 AccountRotation 标记排除首账号，同一请求预算与冻结范围交给下一 attempt。
+    let mut next = context();
+    next.exclude_accounts([ProviderAccountId::new(ACCOUNT).unwrap()]);
+    let mut stream = provider
+        .execute(planned_request("openai", operation()), next)
+        .await
+        .unwrap();
+    assert_eq!(stream.metadata().provider_account_id().as_str(), SPARE);
+    while let Some(e) = stream.next().await {
+        if let Some(w) = e.unwrap().wire_event() {
+            delivered.push_str(&w.data().to_string());
+        }
+    }
+    assert!(delivered.contains("complete good answer"));
+    assert!(!delivered.contains("BAD ANSWER"));
+    timeout(BUDGET, async {
+        loop {
+            let view = admin(&runtime, "read", json!({})).await;
+            if view["groupEvents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["status"] == "moved")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let groups = sqlx::query_scalar::<_, String>(
+        "SELECT account_group_id FROM account_group_accounts WHERE provider_account_id=$1",
+    )
+    .bind(ACCOUNT)
+    .fetch_all(&db)
+    .await
+    .unwrap();
+    assert_eq!(groups, vec![POOL_GROUP]);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM admin_audit_events WHERE entity_ref=$1 AND action='regroup'"
+        )
+        .bind(ACCOUNT)
+        .fetch_one(&db)
+        .await
+        .unwrap(),
+        1
+    );
+    assert_eq!(upstream.received_requests().await.unwrap().len(), 3);
+    runtime.shutdown().await;
+    drop(process);
+    drop(provider);
+    drop(runtime);
+    db.close().await;
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+        .execute(&admin_db)
+        .await
+        .unwrap();
+    admin_db.close().await;
 }

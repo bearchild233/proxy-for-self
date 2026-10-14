@@ -489,6 +489,8 @@ impl Store {
     ) -> Result<Value, Failure> {
         let settings = effective_settings(db, true)?;
         self.reap(db, &settings, now)?;
+        // 接管事实与原租约同寿命；Python 回退归还租约后留下的记录也在此清理。
+        db.execute("DELETE FROM gp_hook_leases WHERE NOT EXISTS (SELECT 1 FROM leases WHERE leases.id=gp_hook_leases.id)", [])?;
         exec(
             db,
             "DELETE FROM materials WHERE expires<=?",

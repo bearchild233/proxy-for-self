@@ -1,4 +1,4 @@
-//! 内核与插件共享的 0.5 wire contract；不包含调度或授权实现。
+//! 内核与插件共享的 0.6 wire contract；不包含调度或授权实现。
 mod capabilities;
 mod frame;
 mod hooks;

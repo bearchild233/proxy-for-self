@@ -599,6 +599,7 @@ pub(super) async fn observe(
             hooks.response_observe(
                 plugin,
                 ResponseObserveParams {
+                    sse: response.transport == CodexBackendTransport::HttpSse && !response.is_json,
                     request_id: context.request_id().as_str().to_owned(),
                     account_id: account.id().as_str().to_owned(),
                     attempt: context.attempt_index().get(),

@@ -52,6 +52,12 @@ impl Settings {
 }
 
 pub trait Plugin: Send + Sync + 'static {
+    /// 服务启动时取得可跨连接选路的内核句柄，用于插件自有后台任务。
+    fn start(&self, _kernel: crate::Kernel) {}
+
+    /// drain、shutdown 与进程停止共用的同步停止信号；实现必须幂等且不阻塞。
+    fn stop_background(&self) {}
+
     fn health(&self, _ctx: Context) -> impl Future<Output = RpcResult<HealthResult>> + Send {
         async {
             Ok(HealthResult {

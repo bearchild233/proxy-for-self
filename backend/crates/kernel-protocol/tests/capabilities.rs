@@ -27,7 +27,7 @@ fn every_capability_matches_wire_contract() {
     example::<HttpFetchResult>(
         json!({"status":200,"headers":[["content-type","text/plain"]],"body":"test"}),
     );
-    example::<AccountsReadParams>(json!({"ids":["a"]}));
+    example::<AccountsReadParams>(json!({"ids":["a"],"model":null}));
     assert_eq!(
         serde_json::from_value::<AccountsReadParams>(json!({}))
             .unwrap()
@@ -35,7 +35,7 @@ fn every_capability_matches_wire_contract() {
         None
     );
     example::<AccountsReadResult>(
-        json!({"accounts":[{"id":"a","enabled":true,"status":"ready","authenticationKind":"oauth","groups":["g"],"upstreamAccountId":null,"userId":null}]}),
+        json!({"accounts":[{"id":"a","enabled":true,"status":"ready","authenticationKind":"oauth","groups":["g"],"upstreamAccountId":null,"userId":null,"modelAllowed":null}]}),
     );
     example::<GroupsMoveParams>(
         json!({"accountId":"a","removeGroup":null,"addGroup":"g","reason":{"code":"test","message":"test"}}),
@@ -43,7 +43,7 @@ fn every_capability_matches_wire_contract() {
     for outcome in ["moved", "unchanged"] {
         example::<GroupsMoveResult>(json!({"outcome":outcome}));
     }
-    example::<QuotaReadParams>(json!({"accountId":"a"}));
+    example::<QuotaReadParams>(json!({"accountId":"a","refreshIfMissing":false}));
     example::<QuotaReadResult>(json!({"snapshot":{"remaining":1}}));
     example::<LogParams>(json!({"level":"info","message":"test","fields":{"key":"value"}}));
 }
@@ -53,4 +53,19 @@ fn fetch_truncation_is_optional() {
     example::<HttpFetchResult>(
         json!({"status":200,"headers":[],"body":"partial","truncated":true}),
     );
+}
+
+#[test]
+fn protocol_six_defaults_and_model_fields() {
+    let old: QuotaReadParams = serde_json::from_value(json!({"accountId":"a"})).unwrap();
+    assert!(!old.refresh_if_missing);
+    let old: AccountsReadParams = serde_json::from_value(json!({"ids":["a"]})).unwrap();
+    assert_eq!(old.model, None);
+    example::<AccountsReadParams>(json!({"ids":["a"],"model":"gpt-test"}));
+    example::<QuotaReadParams>(json!({"accountId":"a","refreshIfMissing":true}));
+    for allowed in [true, false] {
+        example::<AccountSummary>(
+            json!({"id":"a","enabled":true,"status":"normal","authenticationKind":"oauth","groups":[],"upstreamAccountId":null,"userId":null,"modelAllowed":allowed}),
+        );
+    }
 }

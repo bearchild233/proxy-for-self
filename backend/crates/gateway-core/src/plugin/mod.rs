@@ -80,7 +80,11 @@ pub trait PluginAccess: Send + Sync {
 
 #[async_trait]
 pub trait PluginAccounts: Send + Sync {
-    async fn read(&self, ids: Option<&[String]>) -> Result<Vec<AccountSummary>, RpcError>;
+    async fn read(
+        &self,
+        ids: Option<&[String]>,
+        model: Option<&str>,
+    ) -> Result<Vec<AccountSummary>, RpcError>;
 }
 
 #[async_trait]

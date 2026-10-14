@@ -149,6 +149,7 @@ impl<P: Plugin> Server<P> {
             idle: Notify::new(),
         });
         let mut connections = JoinSet::new();
+        self.plugin.start(self.kernel.clone());
         tokio::pin!(shutdown);
         let result = loop {
             tokio::select! {
@@ -164,6 +165,7 @@ impl<P: Plugin> Server<P> {
             }
         };
         state.shutdown();
+        self.plugin.stop_background();
         drop(self.listener);
         // 保留读循环接收能力响应，直到已准入调用（包括通知）完成并写回响应。
         let drained =
@@ -299,6 +301,7 @@ async fn connection<P: Plugin>(
                     Some(Err(RpcError::new(FORBIDDEN, method.clone())))
                 } else if method == "drain" {
                     Some(params::<EmptyParams>(value.clone()).and_then(|_| {
+                        plugin.stop_background();
                         let mut life = state.lifecycle.lock().expect("lifecycle lock");
                         life.draining = true;
                         // drain 只统计持有租约的在途调用；本次 drain 自身与管理连接调用不计入。
@@ -347,6 +350,7 @@ async fn connection<P: Plugin>(
                         break;
                     }
                     state.shutdown();
+                    plugin.stop_background();
                 } else if method == "request.finish" {
                     let Some(guard) = state.admit(false) else {
                         continue;

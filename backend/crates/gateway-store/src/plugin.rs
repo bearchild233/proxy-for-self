@@ -2,7 +2,7 @@
 use async_trait::async_trait;
 use gateway_admin::ports::store::AdminStorePorts;
 use gateway_core::{
-    account::ProviderAccountStore,
+    account::{ProviderAccountId, ProviderAccountStore},
     plugin::{AccountSummary, PluginAccounts, RpcError, UNAVAILABLE},
 };
 use std::sync::Arc;
@@ -13,7 +13,11 @@ pub(crate) struct PluginAccountDirectory {
 }
 #[async_trait]
 impl PluginAccounts for PluginAccountDirectory {
-    async fn read(&self, ids: Option<&[String]>) -> Result<Vec<AccountSummary>, RpcError> {
+    async fn read(
+        &self,
+        ids: Option<&[String]>,
+        model: Option<&str>,
+    ) -> Result<Vec<AccountSummary>, RpcError> {
         let unavailable = |_| RpcError::new(UNAVAILABLE, "account directory");
         let ids = match ids {
             Some(ids) => ids.to_vec(),
@@ -46,7 +50,24 @@ impl PluginAccounts for PluginAccountDirectory {
                 .map_err(unavailable)?
             {
                 let account = item.account;
+                // 模型权限复用账号领域值，不在目录投影中重新解释策略。
+                let model_allowed = if let Some(model) = model {
+                    let id = ProviderAccountId::new(&id)
+                        .map_err(|_| RpcError::new(UNAVAILABLE, "account directory"))?;
+                    let Some(current) = self
+                        .accounts
+                        .get_account(&id)
+                        .await
+                        .map_err(|_| RpcError::new(UNAVAILABLE, "account directory"))?
+                    else {
+                        continue;
+                    };
+                    Some(current.model_access().allows(model))
+                } else {
+                    None
+                };
                 rows.push(AccountSummary {
+                    model_allowed,
                     id: account.id,
                     enabled: account.enabled,
                     status: item.projection.status.as_str().into(),

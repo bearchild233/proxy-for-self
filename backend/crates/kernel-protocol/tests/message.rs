@@ -64,7 +64,7 @@ fn handshake_lifecycle_examples_and_compatibility() {
         KernelApi::default(),
         PluginApi {
             major: 0,
-            min_minor: 6
+            min_minor: 7
         }
     ));
     assert!(!is_compatible(
@@ -103,7 +103,7 @@ fn old_hello_defaults_ownership_and_new_notification_roundtrips() {
     .unwrap();
     assert!(hello.owned_groups.is_empty());
     example::<OwnershipChangedParams>(json!({"ownedGroups":["group"],"watchedGroups":["watch"]}));
-    assert_eq!(KERNEL_API, (0, 5));
+    assert_eq!(KERNEL_API, (0, 6));
     assert!(hello.watched_groups.is_empty());
     for min_minor in [0, 1, 2, 3] {
         assert!(!is_compatible(

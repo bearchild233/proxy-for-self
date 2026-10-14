@@ -46,6 +46,8 @@ async fn ownership_broadcasts_to_both_slots_and_new_handshakes_see_latest() {
 
 #[derive(Default)]
 struct Gates {
+    starts: AtomicU64,
+    stops: AtomicU64,
     entered: Notify,
     release: Notify,
     finished: Notify,
@@ -53,6 +55,12 @@ struct Gates {
 struct TestPlugin(Arc<Gates>);
 
 impl Plugin for TestPlugin {
+    fn start(&self, _: Kernel) {
+        self.0.starts.fetch_add(1, Ordering::SeqCst);
+    }
+    fn stop_background(&self) {
+        self.0.stops.fetch_add(1, Ordering::SeqCst);
+    }
     async fn route_select(
         &self,
         _: Context,
@@ -103,6 +111,7 @@ impl Plugin for TestPlugin {
                 ctx.call(
                     "quota.read",
                     &QuotaReadParams {
+                        refresh_if_missing: false,
                         account_id: "test".into(),
                     },
                     BUDGET,
@@ -113,6 +122,7 @@ impl Plugin for TestPlugin {
                 ctx.call(
                     "quota.read",
                     &QuotaReadParams {
+                        refresh_if_missing: false,
                         account_id: "test".into(),
                     },
                     Duration::from_millis(20),
@@ -375,7 +385,7 @@ async fn concurrent_hooks_do_not_block_and_capabilities_use_origin_connection() 
     for (kernel, value) in [(&a, "a"), (&b, "b")] {
         kernel.push_reply(CapabilityReply {
             method: "quota.read".into(),
-            params: json!({"accountId":"test"}),
+            params: json!({"accountId":"test","refreshIfMissing":false}),
             result: Ok(json!({"snapshot":value})),
         });
     }
@@ -405,12 +415,19 @@ async fn background_capability_and_log_notification() {
     let a = f.connect(None).await;
     a.push_reply(CapabilityReply {
         method: "accounts.read".into(),
-        params: json!({"ids":null}),
+        params: json!({"ids":null,"model":null}),
         result: Ok(json!({"accounts":[]})),
     });
     let result: AccountsReadResult = f
         .kernel
-        .call("accounts.read", &AccountsReadParams { ids: None }, BUDGET)
+        .call(
+            "accounts.read",
+            &AccountsReadParams {
+                ids: None,
+                model: None,
+            },
+            BUDGET,
+        )
         .await
         .unwrap();
     assert!(result.accounts.is_empty());
@@ -447,6 +464,8 @@ async fn drain_is_global_preserves_existing_head_and_finish() {
             .in_flight,
         1
     );
+    assert_eq!(f.gates.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(f.gates.stops.load(Ordering::SeqCst), 1);
     for kernel in [&a, &b] {
         let result: RoutePrepareResult = kernel
             .call("route.prepare", &route(), BUDGET)
@@ -507,6 +526,7 @@ async fn shutdown_waits_for_inflight_and_flushes_response() {
         .unwrap()
         .unwrap();
     assert!(!f.socket.exists());
+    assert!(f.gates.stops.load(Ordering::SeqCst) >= 1);
 }
 
 #[tokio::test]
@@ -800,6 +820,7 @@ async fn watched_groups_broadcast_and_observe_accepts_by_default() {
         .call(
             "response.observe",
             &ResponseObserveParams {
+                sse: true,
                 request_id: "r".into(),
                 account_id: "a".into(),
                 attempt: 1,
@@ -958,7 +979,7 @@ async fn admin_capability_calls_use_kernel_connection_or_fail_unavailable() {
     let kernel = f.connect(Some(KernelSlot::B)).await;
     kernel.push_reply(CapabilityReply {
         method: "quota.read".into(),
-        params: json!({"accountId":"test"}),
+        params: json!({"accountId":"test","refreshIfMissing":false}),
         result: Ok(json!({"snapshot":"kernel"})),
     });
     assert_eq!(

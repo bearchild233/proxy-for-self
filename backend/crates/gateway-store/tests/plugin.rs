@@ -59,7 +59,7 @@ async fn directory_matches_admin_status_and_reads_current_group_membership() {
             .bind(group).execute(&database.pool).await.unwrap();
     }
     let directory = bundle.plugin_accounts();
-    let rows = directory.read(None).await.unwrap();
+    let rows = directory.read(None, None).await.unwrap();
     assert_eq!(rows.len(), 2);
     for row in &rows {
         let runtime = bundle
@@ -86,8 +86,25 @@ async fn directory_matches_admin_status_and_reads_current_group_membership() {
         "acct_missing".into(),
         "acct_plugin_a".into(),
     ];
-    let rows = directory.read(Some(&ids)).await.unwrap();
+    let rows = directory.read(Some(&ids), None).await.unwrap();
     assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].model_allowed, None);
+    let policy = gateway_core::account::AccountModelAccess::new(
+        gateway_core::account::AccountModelAccessMode::Denylist,
+        vec!["gpt-denied".into()],
+    )
+    .unwrap();
+    sqlx::query("UPDATE provider_accounts SET model_access_json=$1 WHERE id='acct_plugin_a'")
+        .bind(sqlx::types::Json(policy))
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    for (model, allowed) in [("gpt-denied", false), ("gpt-allowed", true)] {
+        assert_eq!(
+            directory.read(Some(&ids), Some(model)).await.unwrap()[0].model_allowed,
+            Some(allowed)
+        );
+    }
     assert_eq!(rows[0].groups.len(), 2);
     assert!(rows[0].groups.contains(&g.to_owned()));
     assert!(rows[0].groups.contains(&h.to_owned()));
@@ -109,7 +126,10 @@ async fn directory_matches_admin_status_and_reads_current_group_membership() {
         mover.move_account_group(&request).await.unwrap(),
         AccountGroupMoveOutcome::Unchanged
     );
-    assert_eq!(directory.read(Some(&ids)).await.unwrap()[0].groups, vec![h]);
+    assert_eq!(
+        directory.read(Some(&ids), None).await.unwrap()[0].groups,
+        vec![h]
+    );
     let actors = sqlx::query_scalar::<_, String>(
         "select actor_ref from admin_audit_events where entity_ref = $1 and action = 'regroup'",
     )

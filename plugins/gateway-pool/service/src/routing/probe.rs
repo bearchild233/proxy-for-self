@@ -46,6 +46,9 @@ impl Pool {
         state: Option<&str>,
         cookie: Option<&str>,
     ) -> Option<Observation> {
+        if self.is_stopped() {
+            return None;
+        }
         let result = caps
             .probe(UpstreamProbeParams {
                 account_id: account.to_owned(),
@@ -68,7 +71,7 @@ impl Pool {
 
     /// 为账号领取候选并在后台打票；已有 4 个打票任务在跑时不启动。
     /// `until` 是请求截止时间（Unix 秒）：旧路径随请求取消而停止，钩子里拿不到取消信号，改以截止时间为界。
-    // TODO(design): 客户端提前断开时后台打票不会被取消，会做完当前一次探测（最长 35 秒），需确认。
+    // 011 已确认：客户端断开后仍以请求截止时间为界。
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn start_prepare(
         self: &Arc<Self>,
@@ -80,6 +83,9 @@ impl Pool {
         fallback: Fallback,
         catalog: Value,
     ) -> Result<(), PoolFailure> {
+        if self.is_stopped() {
+            return Ok(());
+        }
         let Ok(permit) = Arc::clone(&self.probes).try_acquire_owned() else {
             return Ok(());
         };
@@ -111,7 +117,7 @@ impl Pool {
                         .await;
                     break;
                 }
-                if pool.past(until) {
+                if pool.past(until) || pool.is_stopped() {
                     break;
                 }
                 // 候选失败后立即尝试下一组合，不等待下一次周期。
@@ -242,6 +248,9 @@ impl Pool {
             .flatten()
             .ok_or(())?;
         self.eligible(caps, &row).await.map_err(|_| ())?;
+        if self.is_stopped() {
+            return Err(());
+        }
         let identity = settings
             .member_id(
                 &row.id,

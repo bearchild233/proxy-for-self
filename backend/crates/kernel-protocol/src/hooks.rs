@@ -142,6 +142,8 @@ pub struct AdminCallParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResponseObserveParams {
+    #[serde(default)]
+    pub sse: bool,
     pub request_id: String,
     pub account_id: String,
     pub attempt: u32,

@@ -59,9 +59,17 @@ fn every_hook_and_action_matches_wire_contract() {
 
 #[test]
 fn response_observe_wire_contract() {
-    let wire = serde_json::json!({"requestId":"r","accountId":"a","attempt":1,"model":"m","canSwitch":true,"requestHadTurnState":false,"status":null,"errorKind":"connect","stateReturned":false,"turnState":null,"setCookies":[],"replaySafe":true});
+    let wire = serde_json::json!({"sse":true,"requestId":"r","accountId":"a","attempt":1,"model":"m","canSwitch":true,"requestHadTurnState":false,"status":null,"errorKind":"connect","stateReturned":false,"turnState":null,"setCookies":[],"replaySafe":true});
     let params: kernel_protocol::ResponseObserveParams =
         serde_json::from_value(wire.clone()).unwrap();
+    assert!(params.sse);
+    let mut old = wire.clone();
+    old.as_object_mut().unwrap().remove("sse");
+    assert!(
+        !serde_json::from_value::<ResponseObserveParams>(old)
+            .unwrap()
+            .sse
+    );
     assert_eq!(serde_json::to_value(params).unwrap(), wire);
     for wire in [
         serde_json::json!({"action":"accept"}),

@@ -92,6 +92,8 @@ pub fn gateway_of(cookie: &str) -> Option<String> {
 
 #[derive(Clone)]
 pub struct FakeAccount {
+    pub model_allowed: bool,
+    pub groups: Vec<String>,
     pub enabled: bool,
     pub status: String,
     pub kind: String,
@@ -102,6 +104,8 @@ pub struct FakeAccount {
 impl FakeAccount {
     pub fn normal() -> Self {
         Self {
+            model_allowed: true,
+            groups: vec![GROUP.into()],
             enabled: true,
             status: "normal".into(),
             kind: "oauth".into(),
@@ -244,7 +248,7 @@ impl Fake {
                         let account = accounts.get(id)?;
                         Some(
                             json!({"id": id, "enabled": account.enabled, "status": account.status,
-                            "authenticationKind": account.kind, "groups": [GROUP],
+                            "authenticationKind": account.kind, "groups": account.groups, "modelAllowed": account.model_allowed,
                             "upstreamAccountId": account.upstream, "userId": account.user}),
                         )
                     })
@@ -268,6 +272,19 @@ impl Fake {
                     "schedulingSignals": item.rank.map(|rank| json!({"remainingRank": rank}))}})
             }
             "upstream.probe" => (self.probe.lock().expect("probe"))(params),
+            "groups.move" => {
+                let id = params["accountId"].as_str().unwrap();
+                self.account_mut(id, |account| {
+                    account
+                        .groups
+                        .retain(|g| Some(g.as_str()) != params["removeGroup"].as_str());
+                    let group = params["addGroup"].as_str().unwrap().to_owned();
+                    if !account.groups.contains(&group) {
+                        account.groups.push(group);
+                    }
+                });
+                json!({"outcome":"moved"})
+            }
             "http.fetch" => self.fetch(params),
             "log" => Value::Null,
             other => return Some(Err(RpcError::new(NOT_SUPPORTED, other))),
@@ -322,6 +339,7 @@ fn default_probe(params: &Value) -> Value {
 }
 
 pub struct Rig {
+    pub clock: gateway_pool::Clock,
     pub dir: TestDir,
     /// 与服务共用同一数据目录的另一个句柄：用于配置、播种和核对状态。
     pub store: Store,
@@ -333,9 +351,13 @@ pub struct Rig {
 impl Rig {
     /// 启动服务并连接模拟内核。`configure` 在启动前写入设置。
     pub async fn start(label: &str, configure: Value) -> Self {
+        Self::start_clock(label, configure, system_clock()).await
+    }
+
+    pub async fn start_clock(label: &str, configure: Value, clock: gateway_pool::Clock) -> Self {
         let dir = TestDir::new(label);
         let data = dir.path().join("data");
-        let store = Store::open(&data, system_clock()).expect("open store");
+        let store = Store::open(&data, clock.clone()).expect("open store");
         let mut settings = json!({
             "groupIds": [GROUP], "poolUrl": POOL_URL, "poolToken": POOL_TOKEN,
             "probeIntervalMs": 10, "probeModel": "gpt-6-astra",
@@ -352,16 +374,16 @@ impl Rig {
             },
             kernel_api: PluginApi {
                 major: 0,
-                min_minor: 5,
+                min_minor: 6,
             },
             hooks: HOOKS.map(str::to_owned).to_vec(),
             capabilities: CAPABILITIES.map(str::to_owned).to_vec(),
             owned_groups: vec![GROUP.into()],
-            watched_groups: vec![],
+            watched_groups: store.ownership().unwrap().watched_groups,
             shutdown_timeout: Duration::from_secs(3),
         };
         let service =
-            GatewayPoolService::new(Store::open(&data, system_clock()).expect("service store"));
+            GatewayPoolService::new(Store::open(&data, clock.clone()).expect("service store"));
         let server = Server::bind(
             Settings {
                 socket: socket.clone(),
@@ -391,12 +413,60 @@ impl Rig {
         let handler = Arc::clone(&fake);
         kernel.set_handler(move |method, params| handler.answer(method, params));
         Self {
+            clock,
             dir,
             store,
             kernel,
             fake,
             task,
         }
+    }
+
+    pub async fn peer(&self) -> (MockKernel, JoinHandle<std::io::Result<()>>) {
+        let socket = self.dir.path().join("new.sock");
+        let data = self.dir.path().join("data");
+        let ownership = self.store.ownership().unwrap();
+        let server = Server::bind(
+            Settings {
+                socket: socket.clone(),
+                data: data.clone(),
+            },
+            Descriptor {
+                plugin: PluginInfo {
+                    id: "gateway-pool".into(),
+                    version: "new".into(),
+                },
+                kernel_api: PluginApi {
+                    major: 0,
+                    min_minor: 6,
+                },
+                hooks: HOOKS.map(str::to_owned).to_vec(),
+                capabilities: CAPABILITIES.map(str::to_owned).to_vec(),
+                owned_groups: ownership.owned_groups,
+                watched_groups: ownership.watched_groups,
+                shutdown_timeout: Duration::from_secs(3),
+            },
+            GatewayPoolService::new(Store::open(&data, self.clock.clone()).unwrap()),
+        )
+        .unwrap();
+        let task = tokio::spawn(server.run_until(std::future::pending()));
+        let kernel = MockKernel::connect(
+            &socket,
+            HelloParams {
+                kernel_api: KernelApi::default(),
+                kernel: KernelInfo {
+                    version: "test".into(),
+                    slot: None,
+                },
+                role: ConnectionRole::Kernel,
+            },
+            Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+        let fake = self.fake.clone();
+        kernel.set_handler(move |method, params| fake.answer(method, params));
+        (kernel, task)
     }
 
     // ---- 钩子调用 ----

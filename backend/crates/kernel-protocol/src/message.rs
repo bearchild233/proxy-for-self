@@ -7,7 +7,7 @@ pub const UNAVAILABLE: &str = "unavailable";
 pub const TIMEOUT: &str = "timeout";
 pub const FORBIDDEN: &str = "forbidden";
 pub const INTERNAL: &str = "internal";
-pub const KERNEL_API: (u32, u32) = (0, 5);
+pub const KERNEL_API: (u32, u32) = (0, 6);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RpcError {

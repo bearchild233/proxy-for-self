@@ -20,7 +20,11 @@ impl PluginAccess for Access {
 struct Accounts(Mutex<Vec<AccountSummary>>);
 #[async_trait]
 impl PluginAccounts for Accounts {
-    async fn read(&self, ids: Option<&[String]>) -> Result<Vec<AccountSummary>, RpcError> {
+    async fn read(
+        &self,
+        ids: Option<&[String]>,
+        _model: Option<&str>,
+    ) -> Result<Vec<AccountSummary>, RpcError> {
         Ok(self
             .0
             .lock()
@@ -92,6 +96,7 @@ impl PluginCapabilities for Log {
 }
 fn account(id: &str, group: &str) -> AccountSummary {
     AccountSummary {
+        model_allowed: None,
         id: id.into(),
         enabled: true,
         status: "normal".into(),

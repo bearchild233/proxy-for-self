@@ -618,19 +618,23 @@ async fn window_without_material_is_retired_and_probed_again() {
     );
 }
 
-/// 响应头的判定：21 接受，29 换网关，非 200 与网关不一致失败，没有响应时交回内核。
+/// 响应头的判定：21 接受，29 换网关，网关不一致失败，非 200 和没有响应时交回内核。
 #[tokio::test]
 async fn response_head_decisions() {
-    // 非 200：失败并带状态码，租约立即归还。
+    // 非 200：归还租约并 accept，让内核透传原错误。
     let rig = Rig::start("head-status", json!({})).await;
     let (lease_id, _) = lease(&rig, "req_h", "gpt-6-astra").await;
-    let ResponseHeadResult::Fail { reason } =
-        rig.head("req_h", &lease_id, Some(429), false, vec![]).await
-    else {
-        panic!("expected fail");
-    };
-    assert_eq!(reason.code, "upstream_status");
-    assert!(reason.message.contains("429"), "{}", reason.message);
+    assert_eq!(
+        rig.head(
+            "req_h",
+            &lease_id,
+            Some(429),
+            false,
+            vec!["__cflb=invalid\nvalue".into()]
+        )
+        .await,
+        ResponseHeadResult::Accept
+    );
     assert_eq!(rig.lease_count(&lease_id), 0);
     let status_row = rig
         .observations()

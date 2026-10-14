@@ -46,8 +46,10 @@ impl Pool {
         self.sweep();
         // 读不到设置、账号、额度或调度状态时整体不可用：内核据此让本插件的账号失败关闭。
         let unavailable = |what: &'static str| move |_| RpcError::new(UNAVAILABLE, what);
-        self.settings().await.map_err(unavailable("settings"))?;
-        let rows = caps.accounts(&params.accounts).await?;
+        let settings = self.settings().await.map_err(unavailable("settings"))?;
+        let rows = caps
+            .accounts(&params.accounts, &settings.probe_model)
+            .await?;
 
         let mut blocked = Vec::new();
         let mut candidates = Vec::new();
@@ -61,6 +63,10 @@ impl Pool {
                 Some(row) if row.authentication_kind != "oauth" => blocked.push(blocked_entry(
                     id,
                     &PoolFailure::new("not_oauth", "网关池只支持 OAuth 账号"),
+                )),
+                Some(row) if row.model_allowed == Some(false) => blocked.push(blocked_entry(
+                    id,
+                    &Self::model_denied(&settings.probe_model),
                 )),
                 Some(row) => candidates.push(row),
             }
@@ -79,6 +85,17 @@ impl Pool {
             let (id, quota) = joined.map_err(|_| RpcError::new(INTERNAL, "quota.read"))?;
             quotas.insert(id, quota?);
         }
+        candidates.retain(|row| {
+            if quotas.get(&row.id).is_some_and(|quota| !quota.present) {
+                blocked.push(blocked_entry(
+                    &row.id,
+                    &PoolFailure::new("quota_unreadable", "读取不到账号额度，网关池暂不检测该账号"),
+                ));
+                false
+            } else {
+                true
+            }
+        });
         let candidate_json: Vec<Value> = candidates
             .iter()
             .map(|row| {

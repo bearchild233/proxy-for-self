@@ -67,6 +67,7 @@ pub struct HttpFetchResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountsReadParams {
     pub ids: Option<Vec<String>>,
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +80,7 @@ pub struct AccountSummary {
     pub groups: Vec<String>,
     pub upstream_account_id: Option<String>,
     pub user_id: Option<String>,
+    pub model_allowed: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,6 +113,8 @@ pub struct GroupsMoveResult {
 #[serde(rename_all = "camelCase")]
 pub struct QuotaReadParams {
     pub account_id: String,
+    #[serde(default)]
+    pub refresh_if_missing: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

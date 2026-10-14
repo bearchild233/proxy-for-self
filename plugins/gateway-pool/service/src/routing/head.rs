@@ -15,6 +15,7 @@ impl Pool {
         params: ResponseHeadParams,
     ) -> RpcResult<ResponseHeadResult> {
         self.sweep();
+        self.restore_lease(&params.lease_id).await?;
         let status = params.status.unwrap_or(0);
         // 取出判定所需的事实；非 200 或又返回了 state 的访问在此固定计时终态。
         let known = self
@@ -37,7 +38,7 @@ impl Pool {
                 )
             });
         let Some((account, model, gateway, cookie, access)) = known else {
-            // 插件重启后丢失了内存中的租约事实：无法判断网关是否一致。
+            // 数据库也不存在有效租约事实时，无法判断网关是否一致。
             return Ok(ResponseHeadResult::Fail {
                 reason: PoolFailure::new(
                     "lease_unknown",
@@ -49,14 +50,16 @@ impl Pool {
         let fail = |failure: PoolFailure| ResponseHeadResult::Fail {
             reason: failure.reason(),
         };
-        let Some(merged) = merge_cookie(&cookie, &params.set_cookies) else {
+        let merged = merge_cookie(&cookie, &params.set_cookies);
+        if merged.is_none() && !params.status.is_some_and(|status| status != 200) {
             self.finish_now(&params.lease_id, &account).await;
             return Ok(fail(PoolFailure::new(
                 "cookie_invalid",
                 "上游返回的路由 Cookie 无法合并，已放弃该窗口",
             )));
-        };
-        let matches = cookie_gateway(&merged).as_deref() == Some(gateway.as_str());
+        }
+        let matches =
+            merged.as_deref().and_then(cookie_gateway).as_deref() == Some(gateway.as_str());
         // 与旧路径一致：只有 200 响应才带 state 事实，错误响应按未返回 state 记录。
         let reported_state = status == 200 && params.state_returned;
         let result = self
@@ -66,6 +69,11 @@ impl Pool {
                 "gatewayMatches": matches, "durationMs": params.duration_ms, "access": access}),
             )
             .await;
+        if params.status.is_some_and(|status| status != 200) {
+            // 错误内容与原有反馈/重试策略由内核处理，不能用插件错误覆盖上游错误。
+            self.finish_now(&params.lease_id, &account).await;
+            return Ok(ResponseHeadResult::Accept);
+        }
         let classification = match &result {
             Ok(value) => value["classification"].as_str().map(str::to_owned),
             Err(_) => {
@@ -85,13 +93,11 @@ impl Pool {
         }
         // 没有响应（连接失败、超时、取消）：交回内核按原有错误处理，租约在请求结束时归还。
         if params.status.is_none() && params.error_kind.is_some() {
+            self.persist_current(&params.lease_id).await?;
             return Ok(ResponseHeadResult::Accept);
         }
         self.finish_now(&params.lease_id, &account).await;
         Ok(fail(match params.status {
-            Some(code) if code != 200 => {
-                PoolFailure::new("upstream_status", format!("上游返回状态码 {code}"))
-            }
             _ if !matches => PoolFailure::new(
                 "gateway_mismatch",
                 "上游响应的路由 Cookie 指向了别的网关，已放弃该窗口",
@@ -116,6 +122,7 @@ impl Pool {
     }
 
     pub(crate) async fn finish_request(self: &Arc<Self>, params: RequestFinishParams) {
+        let _ = self.restore_lease(&params.lease_id).await;
         let outcome = match params.outcome {
             RequestOutcome::Completed => "completed",
             RequestOutcome::Failed => "failed",

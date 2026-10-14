@@ -222,7 +222,8 @@ impl PluginHooks for PluginRuntime {
         plugin: &str,
         params: ResponseObserveParams,
     ) -> Result<ResponseObserveResult, RpcError> {
-        self.call(plugin, "response.observe", &params, Duration::from_secs(2))
+        // 请求截止时间由 Provider 的 bounded 同时约束；确认探测允许占用 15 秒。
+        self.call(plugin, "response.observe", &params, Duration::from_secs(20))
             .await
     }
     async fn route_prepare(

@@ -585,6 +585,7 @@ async fn observe_switch_guard_failure_open_and_shared_budget() {
         budget.clone(),
     );
     let error = f.execute(context, false).await.err().unwrap();
+    assert!(f.controls.observed.lock().unwrap()[0].sse);
     assert_eq!(
         error.pre_delivery_retry(),
         Some(PreDeliveryRetry::AccountRotation)
@@ -723,6 +724,7 @@ async fn absent_runtime_json_observation_and_hook_failures() {
     assert!(f.controls.observed.lock().unwrap().is_empty());
     assert!(f.execute(f.ordinary_context(), false).await.is_ok());
     assert_eq!(f.controls.observed.lock().unwrap().len(), 1);
+    assert!(!f.controls.observed.lock().unwrap()[0].sse);
 
     let f = Fixture::new(vec![(A, "grp_00000000000000000000000000000001")], true).await;
     f.upstream(successful()).await;
@@ -968,6 +970,29 @@ async fn response_head_observes_http_error_before_account_cooldown() {
     assert_eq!(heads[0].set_cookies, vec!["fixture=response"]);
     assert!(f.execute(f.ordinary_context(), false).await.is_err());
     assert_eq!(f.server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn response_head_accept_preserves_original_non_200_error() {
+    let f = Fixture::new(vec![(A, "grp_00000000000000000000000000000001")], true).await;
+    let body = r#"{"error":{"code":"upstream_original","message":"original body"}}"#;
+    f.upstream(
+        ResponseTemplate::new(422)
+            .insert_header("content-type", "application/json")
+            .set_body_string(body),
+    )
+    .await;
+    let error = f.execute(f.ordinary_context(), false).await.err().unwrap();
+    assert_eq!(error.upstream_status(), Some(422));
+    assert_eq!(
+        error
+            .client_visible_upstream_response()
+            .unwrap()
+            .body()
+            .as_ref(),
+        body.as_bytes()
+    );
+    assert_eq!(f.controls.heads.lock().unwrap()[0].status, Some(422));
 }
 
 #[tokio::test]
