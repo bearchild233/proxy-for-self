@@ -10,8 +10,9 @@ import time
 from pathlib import Path, PureWindowsPath
 
 REPO = Path(__file__).resolve().parents[2]
-# 服务插件操作等待 updater 完成的时限与轮询间隔。TODO(design): 任务未给出，需要设计负责人确认。
+# 服务插件操作等待 updater 完成的时限：240 秒（006 推断，007 经设计负责人接受）。
 SERVICE_TIMEOUT_SECONDS = 240
+# 轮询 updater 操作状态的间隔。TODO(design): 任务未给出，需要设计负责人确认。
 SERVICE_POLL_SECONDS = 1
 
 

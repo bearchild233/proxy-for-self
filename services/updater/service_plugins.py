@@ -30,17 +30,18 @@ ACTIONS = frozenset({"activate", "enable", "disable", "rollback", "uninstall"})
 UNIT_TEMPLATE = "proxy-for-self-plugin@{instance}.service"
 REQUIRED_CONFIG = ("registry_file", "store_root", "runtime_root", "socket_root", "data_root",
                    "env_directory", "state_file", "user", "group", "allow")
-# 任务给出的数值。
+# 任务给出的数值：新实例须在该时限内通过健康检查；切换后等待内核重新加载注册表（两倍加载周期）；
+# 停止旧实例时 systemd 的 TimeoutStopSec 为其 shutdownSeconds 加上 STOP_MARGIN_SECONDS。
 HEALTH_DEADLINE_SECONDS = 15
 RELOAD_WAIT_SECONDS = 10
 STOP_MARGIN_SECONDS = 5
 # 状态中缺少某版本的关停超时记录时（只会出现在被手工改动的状态文件里），按清单允许的最大值等待，避免提前强制停止。
 SHUTDOWN_FALLBACK_SECONDS = 600
-# 任务未给出的数值，以下为实现占位，需要设计负责人确认。TODO(design): 确认下列超时与间隔。
-PROBE_TIMEOUT_SECONDS = 2  # TODO(design): 单次健康探测的连接与读取超时
-PROBE_INTERVAL_SECONDS = 0.25  # TODO(design): 健康探测重试间隔
-SYSTEMCTL_TIMEOUT_SECONDS = 60  # TODO(design): systemctl start/daemon-reload 的执行超时
-STOP_CALL_SLACK_SECONDS = 10  # TODO(design): systemctl stop 外层超时在 TimeoutStopSec 之外的余量
+# 006 推断、007 经设计负责人接受的数值（任务未给出，但已确认沿用）。
+PROBE_TIMEOUT_SECONDS = 2  # 单次健康探测的连接与读取超时，超时后按间隔重试直到健康期限
+PROBE_INTERVAL_SECONDS = 0.25  # 健康探测失败后再次探测前的等待间隔
+SYSTEMCTL_TIMEOUT_SECONDS = 60  # daemon-reload、start、is-active 等 systemctl 调用的执行超时
+STOP_CALL_SLACK_SECONDS = 10  # systemctl stop 的外层执行超时 = shutdownSeconds + STOP_MARGIN_SECONDS + 本余量，避免外层先于 systemd 超时
 MAX_MANIFEST_BYTES = 65536  # 与控制面 static_plugins 的 plugin.json 上限保持一致
 MAX_RESOURCE_BYTES = 4 * 1024 * 1024  # 与控制面 static_plugins 的单文件上限保持一致
 DEFAULT_UNIT_DIRECTORY = "/etc/systemd/system"
