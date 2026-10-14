@@ -468,6 +468,8 @@ config 返回 `{ name, plaintextKey }`，仅读取服务端会话绑定的当前
 | `GET` | `/api/admin/accounts/models` | `accountId` | 优先读取该 Provider + 套餐的模型 cache，缺失时有限实时拉取 |
 | `POST` | `/api/admin/accounts/models/refresh` | `{ accountId }` | 强制拉取最新模型并覆盖 cache |
 | `GET` | `/api/admin/accounts/connection-test` | `accountId`、`modelId` | 通过 SSE 返回实时连接测试事件，不作为业务 Responses 用量记录 |
+| `POST` | `/api/admin/accounts/diagnostic` | `{ accountId, input }`，`input` 为 Provider 自有的诊断参数对象（序列化后不超过 64 KiB） | 账号诊断观察，供账号诊断插件使用；目前只有 OpenAI 实现（`input.phase` 为 `text` / `prepare` / `probe`）。Cookie 与 turn state 只留在 Provider 内存，响应只含观察结果与随机 `materialRef`；头部检测不读取 SSE 正文，不做传输重试 |
+| `GET` | `/api/admin/accounts/profile-avatar` | `accountId` | 以同源受保护响应流式返回 OpenAI 官方个人头像（固定来源、有界大小，仅图片类型） |
 | `POST` | `/api/admin/accounts/oauth/start` | `{ provider, name, accountId?, outboundProxyId?, outboundProxyUrl? }` | 创建 OpenAI 或 xAI OAuth flow；`accountId` 表示重新授权 |
 | `POST` | `/api/admin/accounts/oauth/complete` | `{ provider, flowId, callbackUrl, settings? }` | 消费 OAuth callback；首次授权可附带账号设置，重新授权保留原设置 |
 
@@ -546,6 +548,7 @@ Images、独立 Search 及管理员连接测试不受该文本模型限制；连
 | `POST` | `/api/admin/proxies/create` | `{ name, proxyUrl, location? }` | `201 { record, configRevision }` |
 | `POST` | `/api/admin/proxies/update` | `{ id, revision, name, proxyUrl?, location? }` | `{ record, configRevision }` |
 | `POST` | `/api/admin/proxies/test` | `{ id, revision }` | 最新代理记录 / Proxy record with test result |
+| `POST` | `/api/admin/proxies/probe` | `{ proxyUrl }` | 对尚未保存的代理 URL 做一次受限出口测试，返回测试结果，不写入数据库 |
 | `POST` | `/api/admin/proxies/delete` | `{ id, revision }` | `{ configRevision }` |
 
 `record` 包含 `id`、`name`、`endpoint`、`hasAuthentication`、`revision`、`accountCount`、`location`、
@@ -1514,6 +1517,13 @@ OpenAI OAuth 额度的手动请求、页面自动刷新和后台同步共用只�
 
 账号页快捷筛选与账号、平台、状态、分组条件共同生效，读取全部匹配目录后筛选并分页，不仅筛当前页。3 天内到期按官方订阅结束时间判断；额度不足表示任一已知窗口剩余不超过 10% 或已确认耗尽；需要授权包含身份未确认、凭据无效/过期，以及缺少刷新令牌的 Access Token 过期；封禁不伪装成可重新授权恢复。订阅未知独立显示。订阅筛选至多 2 个客户端并发，页面缓存 5 分钟，手动刷新清除该缓存；短期后端缓存仍可能复用最近 15 秒的结果。
 
+
+## 插件入口
+
+插件控制面有两条互相独立的入口：
+
+- 网关内置的原生插件入口（身份只取自登录会话，不接受客户端声明的角色或 Key ID；请求体上限 60 KiB；响应 `Cache-Control: no-store`），由 Host 转发给 updater 的原生插件注册表（Excel 等）：`GET /api/plugins` 目录（按当前身份过滤页面）、`GET /api/plugins/{id}/pages/{name}` 页面、`POST /api/plugins/{id}/rpc/{name}` 能力调用；`POST /api/plugin-devices/{id}/rpc/{name}` 是插件自有凭据入口（无网关身份，必须由插件自己验证设备凭据）。未配置插件平台时目录返回空数组，其余返回 409。
+- Python 插件控制面 `/api/plugin-platform/*`（目录、管理目录、页面租约、能力调用、上传、生命周期、排序、懒加载），由反向代理直接转发，不经过网关；见 [插件平台](plugin-migration.md) 与 `services/plugin_host`。
 
 ## 管理插件
 

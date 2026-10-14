@@ -3,6 +3,7 @@
 本文说明模块职责、请求流程、状态存储和必须保持的约束。
 具体 HTTP 字段见 [接口文档](api.md)，部署参数见 [部署文档](../deploy/README.md)；上游 URL、超时、
 重试间隔和 UI 布局属于源码或配置，不在架构文档重复维护。
+各模块的实现逻辑、文件表与改动指引见 [模块总表](modules.md)；本文只保留分层总览与必须保持的约束。
 
 网关默认持有 PostgreSQL 会话级排他实例锁。显式配置 `store.deployment_slot: a|b` 后，使用每槽独立锁和共享存活锁；同一数据库最多一对 A/B 槽。加入存活槽时保留在途请求与 Redis 活动租约，两个槽都退出后的冷启动才执行中断恢复。槽模式只验证 schema，不运行迁移。生产接入状态和交接限制见 [A/B 发布](../deploy/ab-slots/README.md)。
 
@@ -601,7 +602,7 @@ HTTP Client 构造失败也不会阻断网关启动。外部解析在已认证�
 
 安全边界：
 
-- Provider credential 以 Provider schema 的明文 JSON 保存在 PostgreSQL；数据库和备份必须按敏感数据保护。
+- Provider credential（Provider schema 的 JSON）与 Client Key 明文在写入 PostgreSQL 前由 Store 的 vault 用 AES-256-GCM 加密（`store.vault_key_file` 指向 32 字节十六进制主密钥，行 ID 作为附加认证数据，Key 另有 HMAC 查找摘要），读取时在内存解密；冷启动时把遗留明文行迁移为密文。未配置 vault 密钥时按明文读写，已加密的行在缺少密钥时拒绝读取。数据库、备份和 vault 密钥必须按敏感数据保护并一起备份，缺一无法恢复；不要对已有部署重新生成密钥。
 - `host.logging.oauth_recovery` 默认关闭，开启后将 OAuth 原始 AT/RT 写入独立文件；
   与普通文件日志开关分别控制，不输出到普通日志或 stdout。`.runtime/logs` 同样属于敏感数据。
 - `host.logging.request_dump` 默认关闭；开启后独立请求转储包含原始请求头和正文，

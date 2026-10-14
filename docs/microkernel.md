@@ -144,6 +144,7 @@ Rust 插件放在独立 workspace `plugins/Cargo.toml`，共用 `kernel-protocol
 | `accounts.read` | 读取负责账号的状态、分组、上游账号 ID；可带 `model`，逐账号返回该模型是否允许（协议 0.6） | 只读，不含凭据 |
 | `groups.move` | 在插件声明的分组之间移动账号 | 只限声明的分组，写审计 |
 | `quota.read` | 读取账号额度快照与调度信号；可带 `refreshIfMissing`，没有快照时内核先用该账号出口刷新一次（协议 0.6） | 只读 |
+| `log` | 向内核日志写一条结构化日志（通知，无应答），级别 debug / info / warn / error，带插件 ID | 需在 `grants` 中授权；消息按 UTF-8 边界截断到 4 KiB |
 | 私有存储 | 插件数据目录，插件自管 SQLite | 目录 0700 |
 
 插件可见：池 Cookie、turn state、池服务 Token（插件自己的配置）。插件永远不可见：AT、refresh token、Client Key 明文。
