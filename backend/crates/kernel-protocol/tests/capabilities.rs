@@ -11,7 +11,7 @@ fn example<T: serde::Serialize + serde::de::DeserializeOwned>(wire: Value) {
 #[test]
 fn every_capability_matches_wire_contract() {
     example::<UpstreamProbeParams>(
-        json!({"accountId":"a","model":"m","turnState":null,"cookie":null,"timeoutMs":7}),
+        json!({"accountId":"a","model":"m","turnState":null,"cookie":null,"includeAccountCookies":false,"timeoutMs":7}),
     );
     example::<UpstreamProbeResult>(
         json!({"status":200,"errorKind":null,"stateReturned":true,"turnState":"s","setCookies":["test"],"rateLimitHeaders":[["remaining","1"]],"retryAfterMs":null,"durationMs":7}),

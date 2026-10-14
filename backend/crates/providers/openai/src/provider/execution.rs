@@ -165,6 +165,10 @@ struct RawJsonEndpointRequest {
 }
 
 pub(super) struct ColdResponse {
+    pub(super) plugin_hooks: Option<Arc<dyn gateway_core::plugin::PluginHooks>>,
+    pub(super) plugin_owner: Option<String>,
+    pub(super) plugin_watchers: Vec<String>,
+    pub(super) plugin_routing: bool,
     pub(super) client: CodexBackendClient,
     pub(super) response_origin: Url,
     pub(super) request: CodexResponsesRequest,
@@ -377,7 +381,7 @@ pub(super) fn map_handshake_attempt_error(
 }
 
 /// 只有客户端执行的工具可在未交付输出时重放。上游执行工具可能已有副作用。
-fn request_replay_safe(request: &CodexResponsesRequest) -> bool {
+pub(super) fn request_replay_safe(request: &CodexResponsesRequest) -> bool {
     request.body().get("tools").is_none_or(|tools| {
         tools.as_array().is_some_and(|tools| {
             tools
@@ -388,7 +392,7 @@ fn request_replay_safe(request: &CodexResponsesRequest) -> bool {
 }
 
 /// 请求是否携带了客户端的 turn state（头、字段或 client_metadata）。
-fn request_carried_turn_state(request: &CodexResponsesRequest) -> bool {
+pub(super) fn request_carried_turn_state(request: &CodexResponsesRequest) -> bool {
     request.turn_state.is_some()
         || request
             .passthrough_headers
@@ -401,7 +405,7 @@ fn request_carried_turn_state(request: &CodexResponsesRequest) -> bool {
 }
 
 /// 响应头里的 turn state（只在内存里用于确认，不记录、不输出）。
-fn response_turn_state(response: &CodexBackendStreamingResponse) -> Option<String> {
+pub(super) fn response_turn_state(response: &CodexBackendStreamingResponse) -> Option<String> {
     response
         .response_metadata
         .client_headers
@@ -411,7 +415,7 @@ fn response_turn_state(response: &CodexBackendStreamingResponse) -> Option<Strin
 }
 
 /// 账号 Cookie 与本次响应的 Set-Cookie 合并成确认请求要带的 Cookie 头。
-fn merged_cookie_header(existing: Option<&str>, updates: &[String]) -> Option<String> {
+pub(crate) fn merged_cookie_header(existing: Option<&str>, updates: &[String]) -> Option<String> {
     let mut pairs: Vec<(String, String)> = Vec::new();
     let mut put = |name: &str, value: &str| {
         let name = name.trim();
@@ -881,7 +885,26 @@ fn image_response_metering(
 }
 
 pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
+    let finish = response
+        .plugin_hooks
+        .as_ref()
+        .zip(response.plugin_owner.as_ref())
+        .map(|(hooks, plugin)| {
+            plugin_routing::Finish::new(hooks.clone(), plugin.clone(), &response.context)
+        });
+    let stream = cold_response_stream_inner(response, finish.clone());
+    plugin_routing::track(stream, finish)
+}
+
+fn cold_response_stream_inner(
+    response: ColdResponse,
+    finish: Option<Arc<plugin_routing::Finish>>,
+) -> EventStream {
     let ColdResponse {
+        plugin_hooks,
+        plugin_owner,
+        plugin_watchers,
+        plugin_routing,
         client,
         response_origin,
         mut request,
@@ -936,9 +959,20 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
         let request_transport_requirement = transport_requirement(&request);
         let trace = context.trace();
         let mut pool_guard = None;
-        let response = if let Some(service) = gateway_pool.as_ref() {
+        let response = if let Some((hooks, plugin)) = plugin_hooks.as_ref().zip(plugin_owner.as_ref()) {
+            plugin_routing::Attempt {
+                hooks: hooks.as_ref(), plugin, client: &client, request: &mut request,
+                context: &context, lease: &lease, account: &active_account,
+                authorization: &authorization, selection: account_selection,
+                finish: finish.as_ref().expect("owned plugin finish"), failure_context: &failure_context,
+            }.send().await
+        } else if let Some(service) = gateway_pool.as_ref() {
             GatewayPoolAttempt { service, fallback: &pool_fallback, client: &client, request: &mut request, context: &context, lease: &lease, account: &active_account, authorization: &authorization, selection: account_selection }.send(&mut pool_guard).await
-        } else { create_response_attempt(
+        } else {
+            if plugin_routing && context.plugin_attempt_budget().claim().is_none() {
+                Err(plugin_routing::unavailable("", "plugin_unavailable", "上游尝试预算已耗尽", false))?;
+            }
+            create_response_attempt(
             &client,
             &request,
             codex_request_context(
@@ -1012,6 +1046,11 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
             .await;
             Err(failure.error)?;
             return;
+        }
+        let mut response = response;
+        if let Some(hooks) = &plugin_hooks
+            && response.transport != CodexBackendTransport::WebSocket {
+            plugin_routing::observe(hooks.as_ref(), &plugin_watchers, &context, &active_account, &request, &mut response).await?;
         }
         // 普通账号降智检测：带 state 的 HTTP 请求又返回 state，先用返回的 state 做一次短确认。
         // 确认降智则兜底：未输出、可安全重放且无续接约束时放弃本次响应交给核心换号；其余情况
@@ -1095,6 +1134,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
         }
         if allows_account_state_mutation
             && pool_guard.is_none()
+            && plugin_owner.is_none()
             && !response.set_cookie_headers.is_empty()
             && let Ok(outcome) = selector
                 .capture_response_cookies(

@@ -143,6 +143,10 @@ pub async fn run() -> Result<(), BootstrapError> {
         }),
     )
     .map_err(gateway_host::HostError::Plugin)?;
+    let runtime = runtime.map(std::sync::Arc::new);
+    if let Some(runtime) = &runtime {
+        openai.set_plugin_hooks(runtime.clone());
+    }
     host.set_plugin_runtime(runtime);
     host.serve(api.router()).await?;
     Ok(())

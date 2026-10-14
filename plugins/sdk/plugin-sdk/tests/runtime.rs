@@ -53,12 +53,24 @@ struct Gates {
 struct TestPlugin(Arc<Gates>);
 
 impl Plugin for TestPlugin {
+    async fn route_select(
+        &self,
+        _: Context,
+        params: RouteSelectParams,
+    ) -> RpcResult<RouteSelectResult> {
+        Ok(RouteSelectResult {
+            preferred: params.accounts,
+            live: vec![],
+            blocked: vec![],
+            pinned_decision: params.pinned.map(|_| PinnedDecision::Stay),
+        })
+    }
     async fn route_prepare(
         &self,
         _ctx: Context,
         _params: RoutePrepareParams,
     ) -> RpcResult<RoutePrepareResult> {
-        Ok(RoutePrepareResult::Fallback {
+        Ok(RoutePrepareResult::Fail {
             reason: Reason {
                 code: "test".into(),
                 message: "test".into(),
@@ -149,7 +161,7 @@ impl Fixture {
             },
             kernel_api: PluginApi {
                 major: 0,
-                min_minor: 1,
+                min_minor: 4,
             },
             hooks: vec!["admin.call".into()],
             capabilities: vec!["quota.read".into(), "log".into()],
@@ -238,8 +250,7 @@ fn route() -> RoutePrepareParams {
         model: "m".into(),
         deadline_unix_ms: 1,
         replay_safe: true,
-        accounts: vec![],
-        ordinary_available: true,
+        account_id: "a".into(),
     }
 }
 fn head() -> ResponseHeadParams {
@@ -283,7 +294,7 @@ async fn handshake_permissions_and_two_slots() {
     let a = f.connect(Some(KernelSlot::A)).await;
     let b = f.connect(Some(KernelSlot::B)).await;
     assert_eq!(a.hello.plugin.id, "test");
-    assert_eq!(a.hello.kernel_api.min_minor, 1);
+    assert_eq!(a.hello.kernel_api.min_minor, 4);
     let empty = EmptyParams {};
     let (a_result, b_result) = tokio::join!(
         a.call::<_, HealthResult>("health", &empty, BUDGET),
@@ -447,6 +458,7 @@ async fn drain_is_global_preserves_existing_head_and_finish() {
             lease_id: "l".into(),
             outcome: RequestOutcome::Completed,
             duration_ms: 1,
+            first_byte_ms: None,
             usage: None,
         },
     )
@@ -741,6 +753,22 @@ async fn watched_groups_broadcast_and_observe_accepts_by_default() {
     let f = Fixture::start();
     let a = f.connect(Some(KernelSlot::A)).await;
     let b = f.connect(Some(KernelSlot::B)).await;
+    let selected: RouteSelectResult = a
+        .call(
+            "route.select",
+            &RouteSelectParams {
+                request_id: "r".into(),
+                model: "m".into(),
+                accounts: vec!["a".into()],
+                ordinary_available: false,
+                pinned: Some("a".into()),
+            },
+            BUDGET,
+        )
+        .await
+        .unwrap();
+    assert_eq!(selected.preferred, vec!["a"]);
+    assert_eq!(selected.pinned_decision, Some(PinnedDecision::Stay));
     f.kernel
         .set_ownership(vec!["own".into()], vec!["watch".into()])
         .await
@@ -765,6 +793,7 @@ async fn watched_groups_broadcast_and_observe_accepts_by_default() {
                 attempt: 1,
                 model: "m".into(),
                 request_had_turn_state: false,
+                can_switch: true,
                 status: Some(200),
                 error_kind: None,
                 state_returned: false,

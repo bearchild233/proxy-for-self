@@ -9,14 +9,46 @@ pub struct Reason {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RouteSelectParams {
+    pub request_id: String,
+    pub model: String,
+    pub accounts: Vec<String>,
+    pub ordinary_available: bool,
+    pub pinned: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PinnedDecision {
+    Stay,
+    Escape,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockedAccount {
+    pub account_id: String,
+    pub reason: Reason,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteSelectResult {
+    pub preferred: Vec<String>,
+    pub live: Vec<String>,
+    pub blocked: Vec<BlockedAccount>,
+    pub pinned_decision: Option<PinnedDecision>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RoutePrepareParams {
     pub request_id: String,
+    pub account_id: String,
     pub attempt: u32,
     pub model: String,
     pub deadline_unix_ms: u64,
     pub replay_safe: bool,
-    pub accounts: Vec<String>,
-    pub ordinary_available: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,9 +72,6 @@ pub enum RoutePrepareResult {
     },
     Wait {
         retry_after_ms: u64,
-        reason: Reason,
-    },
-    Fallback {
         reason: Reason,
     },
     Fail {
@@ -94,6 +123,7 @@ pub struct RequestFinishParams {
     pub lease_id: String,
     pub outcome: RequestOutcome,
     pub duration_ms: u64,
+    pub first_byte_ms: Option<u64>,
     pub usage: Option<Value>,
 }
 
@@ -123,6 +153,7 @@ pub struct ResponseObserveParams {
     pub turn_state: Option<String>,
     pub set_cookies: Vec<String>,
     pub replay_safe: bool,
+    pub can_switch: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

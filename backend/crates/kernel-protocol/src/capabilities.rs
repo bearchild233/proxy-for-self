@@ -8,6 +8,8 @@ pub struct UpstreamProbeParams {
     pub model: String,
     pub turn_state: Option<String>,
     pub cookie: Option<String>,
+    #[serde(default)]
+    pub include_account_cookies: bool,
     pub timeout_ms: u64,
 }
 

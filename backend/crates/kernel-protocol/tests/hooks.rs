@@ -10,8 +10,17 @@ fn example<T: serde::Serialize + serde::de::DeserializeOwned>(wire: Value) {
 
 #[test]
 fn every_hook_and_action_matches_wire_contract() {
+    example::<RouteSelectParams>(
+        json!({"requestId":"r","model":"m","accounts":["a"],"ordinaryAvailable":false,"pinned":"a"}),
+    );
+    example::<RouteSelectResult>(
+        json!({"preferred":["a"],"live":["a"],"blocked":[],"pinnedDecision":"stay"}),
+    );
+    example::<RouteSelectResult>(
+        json!({"preferred":[],"live":[],"blocked":[{"accountId":"a","reason":{"code":"test","message":"test"}}],"pinnedDecision":"escape"}),
+    );
     example::<RoutePrepareParams>(
-        json!({"requestId":"r","attempt":1,"model":"m","deadlineUnixMs":7,"replaySafe":true,"accounts":["a"],"ordinaryAvailable":false}),
+        json!({"requestId":"r","attempt":1,"model":"m","deadlineUnixMs":7,"replaySafe":true,"accountId":"a"}),
     );
     example::<RoutePrepareResult>(
         json!({"action":"use","accountId":"a","leaseId":"l","upstream":{"cookie":null,"turnState":"s"}}),
@@ -19,11 +28,9 @@ fn every_hook_and_action_matches_wire_contract() {
     example::<RoutePrepareResult>(
         json!({"action":"wait","retryAfterMs":7,"reason":{"code":"test","message":"test"}}),
     );
-    for action in ["fallback", "fail"] {
-        example::<RoutePrepareResult>(
-            json!({"action":action,"reason":{"code":"test","message":"test"}}),
-        );
-    }
+    example::<RoutePrepareResult>(
+        json!({"action":"fail","reason":{"code":"test","message":"test"}}),
+    );
     example::<ResponseHeadParams>(
         json!({"requestId":"r","leaseId":"l","attempt":1,"status":200,"errorKind":null,"stateReturned":true,"turnState":"s","setCookies":["test"],"durationMs":7,"replaySafe":true}),
     );
@@ -39,11 +46,11 @@ fn every_hook_and_action_matches_wire_contract() {
     );
     for outcome in ["completed", "failed", "cancelled", "interrupted"] {
         example::<RequestFinishParams>(
-            json!({"requestId":"r","leaseId":"l","outcome":outcome,"durationMs":7,"usage":null}),
+            json!({"requestId":"r","leaseId":"l","outcome":outcome,"durationMs":7,"firstByteMs":null,"usage":null}),
         );
     }
     example::<RequestFinishParams>(
-        json!({"requestId":"r","leaseId":"l","outcome":"completed","durationMs":7,"usage":{"tokens":2}}),
+        json!({"requestId":"r","leaseId":"l","outcome":"completed","durationMs":7,"firstByteMs":null,"usage":{"tokens":2}}),
     );
     example::<AdminCallParams>(
         json!({"method":"echo","params":{"text":"test"},"actor":{"role":"admin"}}),
@@ -52,7 +59,7 @@ fn every_hook_and_action_matches_wire_contract() {
 
 #[test]
 fn response_observe_wire_contract() {
-    let wire = serde_json::json!({"requestId":"r","accountId":"a","attempt":1,"model":"m","requestHadTurnState":false,"status":null,"errorKind":"connect","stateReturned":false,"turnState":null,"setCookies":[],"replaySafe":true});
+    let wire = serde_json::json!({"requestId":"r","accountId":"a","attempt":1,"model":"m","canSwitch":true,"requestHadTurnState":false,"status":null,"errorKind":"connect","stateReturned":false,"turnState":null,"setCookies":[],"replaySafe":true});
     let params: kernel_protocol::ResponseObserveParams =
         serde_json::from_value(wire.clone()).unwrap();
     assert_eq!(serde_json::to_value(params).unwrap(), wire);

@@ -168,6 +168,7 @@ where
             request_id,
             client_api_key_ref,
             concurrency_wait_budget: ConcurrencyWaitBudget::default(),
+            plugin_attempt_budget: Default::default(),
             observation: ResponseObservation::new(timing_started_at),
             budget_prior_attempts_usd: Decimal::ZERO,
             budget_attempt_already_counted: false,
@@ -274,6 +275,7 @@ pub struct ResponseExecutionSession<S: ?Sized> {
     request_id: ModelRequestId,
     client_api_key_ref: crate::policy::ClientApiKeyId,
     concurrency_wait_budget: ConcurrencyWaitBudget,
+    plugin_attempt_budget: crate::plugin::PluginAttemptBudget,
     observation: ResponseObservation,
     budget_prior_attempts_usd: Decimal,
     budget_attempt_already_counted: bool,
@@ -822,6 +824,7 @@ where
                 .with_pricing(self.plan.pricing())
                 .with_request_location(self.plan.request_location().cloned())
                 .with_concurrency_wait_budget(self.concurrency_wait_budget.clone())
+                .with_plugin_attempt_budget(self.plugin_attempt_budget.clone())
                 .with_timing_started_at(self.observation.timing_started_at)
                 .with_trace(self.trace.clone()),
             next_attempt,

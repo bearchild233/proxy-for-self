@@ -260,6 +260,49 @@ struct AffinityTelemetry {
 }
 
 impl CodexCredentialSelector {
+    /// 钩子只看已通过授权、模型政策、账号资格和传输资格的候选。
+    pub(crate) async fn plugin_candidates(
+        &self,
+        attempt: &mut AttemptContext,
+        model: &str,
+        requires_websocket: bool,
+    ) -> Result<Vec<ProviderAccount>, CredentialSelectionError> {
+        let mut accounts = self.repository.list_for_provider().await?;
+        accounts.retain(|account| {
+            account.provider() == &self.provider_kind
+                && !attempt.excluded_accounts().contains(account.id())
+                && attempt
+                    .account_scope()
+                    .is_some_and(|scope| scope.allows_model(account.id(), model))
+        });
+        self.quota.prepare_scheduling(&accounts).await;
+        let mut candidates = Vec::new();
+        for account in accounts {
+            let cooldown = self.quota.cooldown(account.id()).await.unwrap_or(None);
+            if account
+                .status_projection(SystemTime::now(), cooldown)
+                .status
+                != AccountStatus::Normal
+            {
+                // 选号阶段会重新读取账号，期间恢复的账号也不能绕过本次钩子候选。
+                attempt.exclude_accounts([account.id().clone()]);
+                continue;
+            }
+            if requires_websocket
+                && account.authentication_kind() == super::CODEX_AUTHENTICATION_KIND_API_KEY
+            {
+                let runtime = self.repository.load_runtime_credential(&account).await?;
+                if !matches!(runtime.authentication, CodexRuntimeAuthentication::ApiKey(ref auth)
+                    if auth.configuration.transport == super::ApiKeyTransport::PreferWebsocket)
+                {
+                    attempt.exclude_accounts([account.id().clone()]);
+                    continue;
+                }
+            }
+            candidates.push(account);
+        }
+        Ok(candidates)
+    }
     #[must_use]
     // 选择器显式持有各能力边界，避免把 Provider 私有服务重新包装成通用容器。
     #[expect(clippy::too_many_arguments)]

@@ -1,4 +1,4 @@
-# Rust 插件 SDK（kernelApi 0.1）
+# Rust 插件 SDK（kernelApi 0.4）
 
 `plugins/Cargo.toml` 是独立 workspace。`kernel-protocol` 是 backend workspace 成员，
 插件通过路径依赖使用它；其 edition、license、rust-version 与 lints 从所属的 backend
@@ -8,12 +8,19 @@ workspace 继承，不从消费它的 plugins workspace 继承。两个 workspac
 ## 编写插件
 
 实现 `Plugin`，参照 `example-echo/src/main.rs`。方法返回 `Send` future，可以用 `async fn`
-实现。默认 `health` 返回 ready；其他 hook 默认返回 `not_supported`。`request.finish` 是
+实现。默认 `health` 返回 ready，`response.observe` 返回 accept；其他 hook 默认返回 `not_supported`。`request.finish` 是
 通知，其处理错误不会产生响应。通用请求错误使用协议的六个标准码。
 
 创建 `Descriptor`，显式声明内容版本、最低 API 次版本、hooks、capabilities 和
 `shutdown_timeout`。SDK 版本来自本 crate 的包版本（目前为 workspace 的 `0.0.0`）。
 声明能力不意味着授权；内核负责每次调用的权限检查，本 SDK 不实现内核能力。
+
+协议 0.4 要求 `minMinor: 4`，不接受 0.1～0.3 插件。调度前的 `route.select` 接收
+内核过滤后的账号，返回 `preferred/live/blocked/pinnedDecision`；选定账号后才调用
+`route.prepare`，其参数使用 `accountId`，结果仅有 `use/wait/fail`。
+`response.observe.canSwitch` 表示内核是否允许换号；`request.finish.firstByteMs` 表示
+发送开始至首个交付字节的耗时。`upstream.probe.includeAccountCookies` 缺省 false，
+开启时内核在账号 Cookie 上合并插件 Cookie，账号 Cookie 不会返回插件。
 
 `Settings::from_env()` 要求 `CPR_PLUGIN_SOCKET` 和 `CPR_PLUGIN_DATA`。
 socket 父目录由监督进程准备；SDK 清理残留 socket，拒绝覆盖普通文件，监听权限为 0660。

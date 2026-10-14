@@ -61,6 +61,14 @@ pub trait Plugin: Send + Sync + 'static {
         }
     }
 
+    fn route_select(
+        &self,
+        _ctx: Context,
+        _params: RouteSelectParams,
+    ) -> impl Future<Output = RpcResult<RouteSelectResult>> + Send {
+        async { Err(RpcError::new(NOT_SUPPORTED, "route.select")) }
+    }
+
     fn route_prepare(
         &self,
         _ctx: Context,

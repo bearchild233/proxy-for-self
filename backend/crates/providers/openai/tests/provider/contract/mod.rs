@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 mod hub;
+mod plugin_routing;
 use std::io::{self, Write};
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};

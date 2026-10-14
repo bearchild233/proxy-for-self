@@ -39,7 +39,7 @@ pub struct HostBundle {
     workers: WorkerSupervisor,
     system: Arc<ProcessSystemOperations>,
     client_distribution: Arc<RgAdguardClientDistribution>,
-    plugin_runtime: Option<plugin::PluginRuntime>,
+    plugin_runtime: Option<Arc<plugin::PluginRuntime>>,
 }
 
 /// 在启动其他包之前初始化进程级能力。
@@ -67,15 +67,15 @@ pub async fn initialize(config: HostConfig) -> Result<HostBundle, HostError> {
 }
 
 impl HostBundle {
-    /// 组合根注入独立插件运行时；请求路径暂不消费其钩子端口。
-    pub fn set_plugin_runtime(&mut self, runtime: Option<plugin::PluginRuntime>) {
+    /// 组合根共享插件运行时；Host 负责排空和关停。
+    pub fn set_plugin_runtime(&mut self, runtime: Option<Arc<plugin::PluginRuntime>>) {
         self.plugin_runtime = runtime;
     }
 
     pub fn plugin_hooks(&self) -> Option<&dyn gateway_core::plugin::PluginHooks> {
         self.plugin_runtime
             .as_ref()
-            .map(|runtime| runtime as &dyn gateway_core::plugin::PluginHooks)
+            .map(|runtime| runtime.as_ref() as &dyn gateway_core::plugin::PluginHooks)
     }
     /// 向启动控制台报告一个组装阶段已就绪。
     pub fn report_startup_ready(&self, service: &'static str) {

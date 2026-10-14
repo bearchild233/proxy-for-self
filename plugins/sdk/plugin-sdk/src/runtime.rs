@@ -173,6 +173,9 @@ async fn dispatch<P: Plugin>(
             let _: EmptyParams = params(value)?;
             serde_json::to_value(plugin.health(ctx).await?).map_err(internal)
         }
+        "route.select" => {
+            serde_json::to_value(plugin.route_select(ctx, params(value)?).await?).map_err(internal)
+        }
         "route.prepare" => {
             serde_json::to_value(plugin.route_prepare(ctx, params(value)?).await?).map_err(internal)
         }

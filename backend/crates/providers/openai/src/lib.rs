@@ -50,7 +50,7 @@ pub struct ProviderBundle {
     #[cfg(feature = "gateway-pool-experiment")]
     gateway_pool_experiment: Option<gateway_pool::GatewayPoolExperiment>,
     plugin_upstream: Arc<dyn gateway_core::plugin::PluginUpstream>,
-    core_provider: Arc<dyn Provider>,
+    core_provider: Arc<CodexProvider>,
     admin_provider: Arc<dyn ProviderAdmin>,
     worker_contributions: Vec<WorkerContribution>,
 }
@@ -199,7 +199,12 @@ pub async fn initialize(
             profile.clone(),
         ),
     ));
-    let gateway_pool = if let Some(configuration) = config.gateway_pool.as_ref() {
+    if config.plugin_routing && config.gateway_pool.is_some() {
+        tracing::warn!("openai.plugin_routing overrides openai.gateway_pool");
+    }
+    let gateway_pool = if !config.plugin_routing
+        && let Some(configuration) = config.gateway_pool.as_ref()
+    {
         Some(
             gateway_pool::GatewayPoolService::new(
                 configuration,
@@ -218,7 +223,7 @@ pub async fn initialize(
     } else {
         None
     };
-    let core_provider: Arc<dyn Provider> = Arc::new(
+    let core_provider = Arc::new(
         CodexProvider::new(
             selector,
             Arc::clone(&catalog),
@@ -233,6 +238,7 @@ pub async fn initialize(
         .map_err(OpenAiInitializeError::Provider)?
         .with_session_identity(session_identity)
         .with_gateway_pool(gateway_pool.clone())
+        .with_plugin_routing(config.plugin_routing)
         .with_pinned_cli_profile(config.pinned_cli_profile.clone())
         .with_excel_plugin_state_file(config.excel_plugin_state_file.clone())
         .with_excel_worker_socket(config.excel_worker_socket.as_deref())
@@ -333,6 +339,9 @@ pub async fn initialize(
 }
 
 impl ProviderBundle {
+    pub fn set_plugin_hooks(&self, hooks: Arc<dyn gateway_core::plugin::PluginHooks>) {
+        self.core_provider.set_plugin_hooks(hooks);
+    }
     #[must_use]
     pub fn plugin_upstream(&self) -> Arc<dyn gateway_core::plugin::PluginUpstream> {
         self.plugin_upstream.clone()
@@ -344,7 +353,7 @@ impl ProviderBundle {
     }
     #[must_use]
     pub fn core_provider(&self) -> Arc<dyn Provider> {
-        Arc::clone(&self.core_provider)
+        self.core_provider.clone()
     }
 
     #[must_use]

@@ -71,14 +71,13 @@ async fn environment_echo_and_sigterm_process_exit() {
                 model: "m".into(),
                 deadline_unix_ms: 1,
                 replay_safe: true,
-                accounts: vec![],
-                ordinary_available: true,
+                account_id: "a".into(),
             },
             budget,
         )
         .await
         .unwrap();
-    assert!(matches!(route, RoutePrepareResult::Fallback { .. }));
+    assert!(matches!(route, RoutePrepareResult::Fail { .. }));
     let status = Command::new("kill")
         .args(["-TERM", &child.id().unwrap().to_string()])
         .status()

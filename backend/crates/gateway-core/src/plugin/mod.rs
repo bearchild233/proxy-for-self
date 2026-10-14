@@ -1,10 +1,31 @@
-//! Provider 无关的插件端口；这里只定义合同，不进入现有推理路径。
+//! Provider 无关的插件钩子与能力端口。
 use async_trait::async_trait;
 use serde_json::Value;
 
 pub use kernel_protocol::*;
 mod capabilities;
 pub use capabilities::*;
+
+/// 同一请求跨账号及 Provider attempt 共享发送预算，插件不能重置内核上限。
+#[derive(Debug, Clone, Default)]
+pub struct PluginAttemptBudget(std::sync::Arc<std::sync::atomic::AtomicU32>);
+impl PluginAttemptBudget {
+    pub fn claim(&self) -> Option<u32> {
+        use std::sync::atomic::Ordering;
+        self.0
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                (used < 4).then_some(used + 1)
+            })
+            .ok()
+            .map(|used| used + 1)
+    }
+    pub fn available(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Relaxed) < 4
+    }
+    pub fn next_attempt(&self) -> u32 {
+        self.0.load(std::sync::atomic::Ordering::Relaxed) + 1
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ownership {
@@ -16,6 +37,16 @@ pub enum Ownership {
 #[async_trait]
 pub trait PluginHooks: Send + Sync {
     fn ownership(&self, group: &str) -> Ownership;
+    async fn route_select(
+        &self,
+        plugin: &str,
+        params: RouteSelectParams,
+    ) -> Result<RouteSelectResult, RpcError>;
+    async fn response_observe(
+        &self,
+        plugin: &str,
+        params: ResponseObserveParams,
+    ) -> Result<ResponseObserveResult, RpcError>;
     async fn route_prepare(
         &self,
         plugin: &str,

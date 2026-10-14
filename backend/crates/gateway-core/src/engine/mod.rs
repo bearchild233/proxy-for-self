@@ -314,6 +314,7 @@ impl ContinuationAttempt {
 /// Provider 每次执行可见的 request-local context。
 #[derive(Debug, Clone)]
 pub struct RequestAttemptContext {
+    plugin_attempt_budget: crate::plugin::PluginAttemptBudget,
     pricing: Arc<crate::metering::PricingOverrides>,
     request_profile: Option<crate::account::OpaqueProviderData>,
     disable_fast: bool,
@@ -326,6 +327,13 @@ pub struct RequestAttemptContext {
 }
 
 impl RequestAttemptContext {
+    pub fn with_plugin_attempt_budget(
+        mut self,
+        budget: crate::plugin::PluginAttemptBudget,
+    ) -> Self {
+        self.plugin_attempt_budget = budget;
+        self
+    }
     #[must_use]
     pub fn with_pricing(mut self, pricing: Arc<crate::metering::PricingOverrides>) -> Self {
         self.pricing = pricing;
@@ -359,6 +367,7 @@ impl RequestAttemptContext {
     #[must_use]
     pub fn new(request_id: ModelRequestId, client_api_key_ref: ClientApiKeyId) -> Self {
         Self {
+            plugin_attempt_budget: Default::default(),
             request_id,
             client_api_key_ref,
             request_profile: None,
@@ -426,6 +435,14 @@ pub struct AttemptContext {
 }
 
 impl AttemptContext {
+    pub fn plugin_attempt_budget(&self) -> &crate::plugin::PluginAttemptBudget {
+        &self.request.plugin_attempt_budget
+    }
+
+    /// 插件不可用时只收窄当前 attempt 的候选，不改变冻结的 Key 授权。
+    pub fn exclude_accounts(&mut self, accounts: impl IntoIterator<Item = ProviderAccountId>) {
+        self.account.excluded_accounts.extend(accounts);
+    }
     #[must_use]
     pub fn pricing(&self) -> &crate::metering::PricingOverrides {
         &self.request.pricing

@@ -3,6 +3,24 @@ use std::path::Path;
 use provider_openai::config::{DEFAULT_STREAM_MAX_RETRIES, MAX_STREAM_MAX_RETRIES, OpenAiConfig};
 
 #[test]
+fn plugin_routing_defaults_off_and_ignores_legacy_pool_configuration() {
+    assert!(!OpenAiConfig::default().plugin_routing);
+    let mut config: OpenAiConfig = serde_json::from_value(serde_json::json!({
+        "plugin_routing":true,"gateway_pool":{"runtime_url":"ignored","key_file":"ignored"}
+    }))
+    .unwrap();
+    config
+        .resolve_and_validate(Path::new("/tmp/plugin-test"))
+        .unwrap();
+    config.plugin_routing = false;
+    assert!(
+        config
+            .resolve_and_validate(Path::new("/tmp/plugin-test"))
+            .is_err()
+    );
+}
+
+#[test]
 fn openai_config_ignores_removed_yaml_identity_fields() {
     let config: OpenAiConfig = serde_json::from_value(serde_json::json!({
         "wire_profile": {"originator": "legacy-client", "codex_version": "invalid", "residency": "us"}

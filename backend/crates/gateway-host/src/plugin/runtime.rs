@@ -205,6 +205,22 @@ impl PluginHooks for PluginRuntime {
         }
     }
 
+    async fn route_select(
+        &self,
+        plugin: &str,
+        params: RouteSelectParams,
+    ) -> Result<RouteSelectResult, RpcError> {
+        self.call(plugin, "route.select", &params, Duration::from_secs(2))
+            .await
+    }
+    async fn response_observe(
+        &self,
+        plugin: &str,
+        params: ResponseObserveParams,
+    ) -> Result<ResponseObserveResult, RpcError> {
+        self.call(plugin, "response.observe", &params, Duration::from_secs(2))
+            .await
+    }
     async fn route_prepare(
         &self,
         plugin: &str,

@@ -99,14 +99,17 @@ mod excel;
 mod execution;
 mod failure;
 mod observation;
+mod plugin_routing;
 mod replay;
 mod workers;
 pub(crate) use workers::ClientReleaseServices;
 
+pub(crate) use execution::merged_cookie_header;
 use execution::*;
 #[doc(hidden)]
 pub use failure::openai_failure_affects_account_score;
 use failure::*;
+pub(crate) use observation::build_cookie_header as plugin_cookie_header;
 use observation::*;
 pub(crate) use workers::gateway_pool_worker;
 pub(crate) use workers::worker_contributions;
@@ -159,9 +162,19 @@ pub struct CodexProvider {
     excel_plugin_state_file: Option<std::path::PathBuf>,
     pinned_cli_profile: Option<crate::transport::profile::CodexWireProfile>,
     gateway_pool: Option<Arc<crate::gateway_pool::GatewayPoolService>>,
+    plugin_routing: bool,
+    plugin_hooks: std::sync::OnceLock<Arc<dyn gateway_core::plugin::PluginHooks>>,
 }
 
 impl CodexProvider {
+    pub fn with_plugin_routing(mut self, enabled: bool) -> Self {
+        self.plugin_routing = enabled;
+        self
+    }
+
+    pub fn set_plugin_hooks(&self, hooks: Arc<dyn gateway_core::plugin::PluginHooks>) {
+        let _ = self.plugin_hooks.set(hooks);
+    }
     fn client_for_request(
         &self,
         context: &AttemptContext,
@@ -217,6 +230,8 @@ impl CodexProvider {
             excel_plugin_state_file: None,
             pinned_cli_profile: None,
             gateway_pool: None,
+            plugin_routing: false,
+            plugin_hooks: std::sync::OnceLock::new(),
         })
     }
 
@@ -400,7 +415,7 @@ impl Provider for CodexProvider {
     async fn execute(
         &self,
         request: ProviderRequest,
-        context: AttemptContext,
+        mut context: AttemptContext,
     ) -> Result<ProviderStream, ProviderError> {
         if context
             .account_scope()
@@ -504,7 +519,29 @@ impl Provider for CodexProvider {
                     state.continuation_scope == OpenAiContinuationScope::ConnectionLocal
                 }) || matches!(context.continuation(), Some(ContinuationBinding::Pinned(binding))
                         if binding.scope() == NativeContinuationScope::ConnectionLocal)));
-        let pool_selection = if let Some(service) = self.gateway_pool.as_ref() {
+        let plugin_hooks = self
+            .plugin_routing
+            .then(|| self.plugin_hooks.get().cloned())
+            .flatten();
+        let plugin_selection = if let Some(hooks) = &plugin_hooks {
+            let candidates = self
+                .selector
+                .plugin_candidates(&mut context, upstream_model.as_str(), requires_websocket)
+                .await
+                .map_err(map_selection_error)?;
+            plugin_routing::select(
+                hooks.as_ref(),
+                candidates,
+                &mut context,
+                upstream_model.as_str(),
+            )
+            .await?
+        } else {
+            plugin_routing::Selection::default()
+        };
+        let pool_selection = if !self.plugin_routing
+            && let Some(service) = self.gateway_pool.as_ref()
+        {
             service.selection(&context).await.map_err(|_| {
                 provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent)
             })?
@@ -545,8 +582,16 @@ impl Provider for CodexProvider {
                 cyber_policy_session_key.as_ref(),
                 session_affinity.as_ref(),
                 requires_websocket,
-                &pool_selection.preferred,
-                &pool_selection.members,
+                if self.plugin_routing {
+                    &plugin_selection.preferred
+                } else {
+                    &pool_selection.preferred
+                },
+                if self.plugin_routing {
+                    &plugin_selection.members
+                } else {
+                    &pool_selection.members
+                },
             )
             .await
             .map_err(map_selection_error)?;
@@ -554,6 +599,12 @@ impl Provider for CodexProvider {
             u64::try_from(selection_started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
         let lease = Arc::new(lease);
         let pool_enabled = pool_selection.members.contains(lease.account_id());
+        let plugin_owner = plugin_selection.owners.get(lease.account_id()).cloned();
+        let plugin_watchers = plugin_selection
+            .watchers
+            .get(lease.account_id())
+            .cloned()
+            .unwrap_or_default();
         // 首字计时的起点：账号选择完成之后、上游建立之前。
         if !replaying
             && previous_session.as_ref().is_some_and(|state| {
@@ -720,6 +771,18 @@ impl Provider for CodexProvider {
         } else {
             transport
         };
+        let transport = if plugin_owner.is_some() {
+            // 当前响应头钩子采用 HTTP 合同，连接局部续接不能降级为 HTTP。
+            if requirement.requires_websocket() {
+                return Err(provider_error(
+                    ProviderErrorKind::Unsupported,
+                    UpstreamSendState::NotSent,
+                ));
+            }
+            CodexProviderTransport::HttpOnly
+        } else {
+            transport
+        };
         apply_transport(&mut upstream_request, transport);
         let metadata = ProviderCallMetadata::new(
             provider_kind,
@@ -782,9 +845,15 @@ impl Provider for CodexProvider {
             websocket_retry_count,
             stream_max_retries: self.stream_max_retries,
             session_capture,
+            plugin_hooks,
+            plugin_owner,
+            plugin_watchers,
+            plugin_routing: self.plugin_routing,
             gateway_pool: pool_enabled.then(|| self.gateway_pool.clone()).flatten(),
             // 普通账号：HTTP 响应上做降智检测，必要时兜底并自动调整分组。
-            degradation_watch: (!pool_enabled).then(|| self.gateway_pool.clone()).flatten(),
+            degradation_watch: (!self.plugin_routing && !pool_enabled)
+                .then(|| self.gateway_pool.clone())
+                .flatten(),
             pool_fallback: pool_selection.fallback_for(lease.account_id()),
         });
         let stream = ProviderStream::new(metadata, events, lease);

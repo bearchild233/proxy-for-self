@@ -44,7 +44,7 @@ impl Plugin for TestPlugin {
         if self.0.slow.load(Ordering::Relaxed) {
             std::future::pending::<()>().await;
         }
-        Ok(RoutePrepareResult::Fallback {
+        Ok(RoutePrepareResult::Fail {
             reason: Reason {
                 code: NOT_SUPPORTED.into(),
                 message: "fixture".into(),
@@ -105,7 +105,7 @@ fn descriptor(id: &str, groups: &[&str]) -> Descriptor {
         },
         kernel_api: PluginApi {
             major: 0,
-            min_minor: 1,
+            min_minor: 4,
         },
         hooks: vec![
             "route.prepare".into(),
@@ -232,8 +232,7 @@ fn route() -> RoutePrepareParams {
         model: "test".into(),
         deadline_unix_ms: 0,
         replay_safe: true,
-        accounts: vec![],
-        ordinary_available: true,
+        account_id: "a".into(),
     }
 }
 fn head() -> ResponseHeadParams {
@@ -498,13 +497,13 @@ async fn hooks_and_capability_intersection() {
         runtime.snapshot().plugins[0].kernel_api,
         Some(PluginApi {
             major: 0,
-            min_minor: 1
+            min_minor: 4
         })
     );
     assert!(runtime.snapshot().plugins[0].peer_uid.is_some());
     assert!(matches!(
         runtime.route_prepare("test", route()).await.unwrap(),
-        RoutePrepareResult::Fallback { .. }
+        RoutePrepareResult::Fail { .. }
     ));
     assert_eq!(
         runtime.response_head("test", head()).await.unwrap(),
@@ -518,6 +517,7 @@ async fn hooks_and_capability_intersection() {
                 lease_id: "lease".into(),
                 outcome: RequestOutcome::Completed,
                 duration_ms: 1,
+                first_byte_ms: None,
                 usage: None,
             },
         )

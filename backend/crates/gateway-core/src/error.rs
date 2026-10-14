@@ -192,6 +192,7 @@ pub struct ProviderDiagnostic {
     message: String,
     stage: Option<&'static str>,
     code: Option<&'static str>,
+    plugin_code: Option<String>,
 }
 
 impl ProviderDiagnostic {
@@ -201,6 +202,7 @@ impl ProviderDiagnostic {
             message: message.into(),
             stage: None,
             code: None,
+            plugin_code: None,
         }
     }
 
@@ -209,6 +211,14 @@ impl ProviderDiagnostic {
     pub const fn with_classification(mut self, stage: &'static str, code: &'static str) -> Self {
         self.stage = Some(stage);
         self.code = Some(code);
+        self
+    }
+
+    /// 插件原因码由协议提供，保留为拥有所有权的字符串，不能泄漏成静态引用。
+    #[must_use]
+    pub fn with_plugin_classification(mut self, code: impl Into<String>) -> Self {
+        self.stage = Some("plugin");
+        self.plugin_code = Some(code.into());
         self
     }
 
@@ -247,8 +257,8 @@ impl ProviderDiagnostic {
     }
 
     #[must_use]
-    pub const fn code(&self) -> Option<&'static str> {
-        self.code
+    pub fn code(&self) -> Option<&str> {
+        self.plugin_code.as_deref().or(self.code)
     }
 
     #[must_use]

@@ -56,6 +56,9 @@ pub struct OpenAiConfig {
     /// 本机插件控制面的数据能力入口；不接受客户端指定地址。
     #[serde(default)]
     pub gateway_pool: Option<crate::gateway_pool::GatewayPoolConfig>,
+    /// 使用插件钩子路由；启用时完全跳过旧网关池服务。
+    #[serde(default)]
+    pub plugin_routing: bool,
     #[serde(skip)]
     identity_secret_path: PathBuf,
 }
@@ -70,7 +73,9 @@ impl OpenAiConfig {
         self.ws_pool.validate()?;
         self.quota.validate()?;
         self.auth.validate()?;
-        if let Some(config) = &self.gateway_pool {
+        if !self.plugin_routing
+            && let Some(config) = &self.gateway_pool
+        {
             config
                 .validate()
                 .map_err(|_| OpenAiConfigError::InvalidField("openai.gateway_pool"))?;
@@ -167,6 +172,7 @@ impl Default for OpenAiConfig {
             pinned_cli_profile: None,
             pinned_cli_auto_update: false,
             gateway_pool: None,
+            plugin_routing: false,
             identity_secret_path: PathBuf::new(),
         }
     }

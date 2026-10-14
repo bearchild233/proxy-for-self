@@ -170,6 +170,7 @@ fn probe(id: &str, timeout_ms: u64) -> UpstreamProbeParams {
         model: "gpt-test".into(),
         turn_state: Some("fixture-state".into()),
         cookie: Some("fixture=1".into()),
+        include_account_cookies: false,
         timeout_ms,
     }
 }
@@ -516,7 +517,7 @@ async fn fetch_truncates_body_preserves_plugin_headers_and_does_not_follow_redir
         .await
         .unwrap();
     assert_eq!(result.status, 200);
-    assert_eq!(result.body.len(), 512 * 1024);
+    assert_eq!(result.body.len(), 512 * 1024 - 2);
     assert_eq!(result.truncated, Some(true));
     let result = f
         .upstream
@@ -531,6 +532,90 @@ async fn fetch_truncates_body_preserves_plugin_headers_and_does_not_follow_redir
         requests[0].headers.get("authorization").unwrap(),
         "Bearer plugin-fixture"
     );
+}
+
+#[tokio::test]
+async fn fetch_limits_json_escaped_body_with_invalid_utf8_at_character_boundaries() {
+    let server = MockServer::start().await;
+    let bytes = [b'"', b'\\', 0, 1, 0xff, b'\n'].repeat(100_000);
+    Mock::given(path("/escaped"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+        .mount(&server)
+        .await;
+    let f = Fixture::new(server.uri()).await;
+    let result = f
+        .upstream
+        .fetch(fetch(format!("{}/escaped", server.uri())))
+        .await
+        .unwrap();
+    assert_eq!(result.truncated, Some(true));
+    assert!(result.body.contains('\u{fffd}'));
+    let encoded = serde_json::to_vec(&result.body).unwrap();
+    assert!(encoded.len() <= 512 * 1024);
+    assert!(encoded.len() > 512 * 1024 - 6);
+    let frame = Message::Response {
+        id: 1,
+        payload: ResponsePayload::Result(serde_json::to_value(result).unwrap()),
+    };
+    assert!(serde_json::to_vec(&frame).unwrap().len() < 1024 * 1024);
+}
+
+#[tokio::test]
+async fn probe_merges_account_cookies_only_when_requested() {
+    use provider_openai::credential::{CodexCredentialAdmin, CodexCredentialCodec};
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(""))
+        .mount(&server)
+        .await;
+    let f = Fixture::new(server.uri()).await;
+    let mut account = CodexCredentialAdmin
+        .prepare_import(ImportCodexOAuthCredential {
+            account_id: "acct_cookie".into(),
+            name: "fixture".into(),
+            secret: secret("fixture"),
+            verified_account: profile("fixture"),
+            next_refresh_at: None,
+            enabled: true,
+        })
+        .unwrap();
+    account.credential = CodexCredentialCodec::encode_new(
+        &secret("fixture"),
+        &profile("fixture"),
+        vec![
+            provider_openai::credential::CodexCookie {
+                name: "own".into(),
+                value: "account".into(),
+                domain: "127.0.0.1".into(),
+                path: "/".into(),
+                host_only: true,
+                secure: false,
+                expires_at: None,
+            },
+            provider_openai::credential::CodexCookie {
+                name: "fixture".into(),
+                value: "old".into(),
+                domain: "127.0.0.1".into(),
+                path: "/".into(),
+                host_only: true,
+                secure: false,
+                expires_at: None,
+            },
+        ],
+    )
+    .unwrap();
+    f.store.create_account(account).await.unwrap();
+    for include in [false, true] {
+        let mut params = probe("acct_cookie", 1000);
+        params.include_account_cookies = include;
+        f.upstream
+            .probe(&Access(Mutex::new(true)), &Directory, params)
+            .await
+            .unwrap();
+    }
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests[0].headers["cookie"], "fixture=1");
+    assert_eq!(requests[1].headers["cookie"], "own=account; fixture=1");
 }
 
 #[tokio::test]

@@ -7,7 +7,7 @@ pub const UNAVAILABLE: &str = "unavailable";
 pub const TIMEOUT: &str = "timeout";
 pub const FORBIDDEN: &str = "forbidden";
 pub const INTERNAL: &str = "internal";
-pub const KERNEL_API: (u32, u32) = (0, 3);
+pub const KERNEL_API: (u32, u32) = (0, 4);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RpcError {
@@ -82,7 +82,9 @@ pub struct PluginApi {
 }
 
 pub fn is_compatible(kernel: KernelApi, plugin: PluginApi) -> bool {
-    kernel.major == plugin.major && plugin.min_minor <= kernel.minor
+    kernel.major == plugin.major
+        && plugin.min_minor <= kernel.minor
+        && (kernel.major != 0 || plugin.min_minor >= 4)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

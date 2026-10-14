@@ -5,12 +5,24 @@ use plugin_sdk::{Context, Descriptor, Plugin, RpcResult, Server, Settings, proto
 struct Echo;
 
 impl Plugin for Echo {
+    async fn route_select(
+        &self,
+        _ctx: Context,
+        params: RouteSelectParams,
+    ) -> RpcResult<RouteSelectResult> {
+        Ok(RouteSelectResult {
+            preferred: params.accounts,
+            live: vec![],
+            blocked: vec![],
+            pinned_decision: params.pinned.map(|_| PinnedDecision::Stay),
+        })
+    }
     async fn route_prepare(
         &self,
         _ctx: Context,
         _params: RoutePrepareParams,
     ) -> RpcResult<RoutePrepareResult> {
-        Ok(RoutePrepareResult::Fallback {
+        Ok(RoutePrepareResult::Fail {
             reason: Reason {
                 code: "not_supported".into(),
                 message: "not_supported".into(),
@@ -46,9 +58,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         kernel_api: PluginApi {
             major: KERNEL_API.0,
-            min_minor: 1,
+            min_minor: 4,
         },
         hooks: vec![
+            "route.select".into(),
             "route.prepare".into(),
             "response.head".into(),
             "admin.call".into(),

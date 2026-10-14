@@ -147,7 +147,22 @@ impl PluginUpstream for OpenAiPluginUpstream {
             );
             context.session_id = Some(&session);
             context.turn_state = params.turn_state.as_deref();
-            context.cookie_header = params.cookie.as_deref();
+            let own_cookie = if params.include_account_cookies {
+                crate::provider::plugin_cookie_header(&credential.cookies)
+                    .map_err(|_| RpcError::new(UNAVAILABLE, "account cookies unavailable"))?
+            } else {
+                None
+            };
+            let cookie = crate::provider::merged_cookie_header(
+                own_cookie.as_ref().map(ExposeSecret::expose_secret),
+                &params
+                    .cookie
+                    .as_deref()
+                    .into_iter()
+                    .flat_map(|value| value.split(';').map(str::to_owned))
+                    .collect::<Vec<_>>(),
+            );
+            context.cookie_header = cookie.as_deref();
             let observation = client.plugin_probe_headers(&request, context).await;
             Ok((account, observation))
         })
@@ -242,20 +257,36 @@ impl PluginUpstream for OpenAiPluginUpstream {
             let mut stream = response.bytes_stream();
             let mut bytes = Vec::new();
             let mut truncated = false;
-            // TODO(design): 512 KiB 正文仍可能因 JSON 转义或 UTF-8 替换膨胀而超出 1 MiB 帧；需决定额外截断或报错策略。
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(|_| RpcError::new(UNAVAILABLE, "http.fetch body"))?;
-                let remaining = (512 * 1024usize).saturating_sub(bytes.len());
+                // 多读一个 UTF-8 字符，避免原始字节上限把合法字符截成替换字符。
+                let remaining = (512 * 1024usize + 4).saturating_sub(bytes.len());
                 bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
                 if chunk.len() > remaining {
                     truncated = true;
                     break;
                 }
             }
+            let mut body = String::from_utf8_lossy(&bytes).into_owned();
+            // 按完整 JSON 字符串编码长度计数（含双引号），替换字符同样消耗预算。
+            let mut encoded_len = 2;
+            for (offset, ch) in body.char_indices() {
+                let length = match ch {
+                    '"' | '\\' | '\n' | '\r' | '\t' | '\u{08}' | '\u{0c}' => 2,
+                    '\u{00}'..='\u{1f}' => 6,
+                    _ => ch.len_utf8(),
+                };
+                if encoded_len + length > 512 * 1024 {
+                    body.truncate(offset);
+                    truncated = true;
+                    break;
+                }
+                encoded_len += length;
+            }
             Ok(HttpFetchResult {
                 status,
                 headers,
-                body: String::from_utf8_lossy(&bytes).into_owned(),
+                body,
                 truncated: Some(truncated),
             })
         };
