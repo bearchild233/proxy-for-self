@@ -1,4 +1,4 @@
-//! 运行状态机与 Python 实现的一致性对照。默认忽略：需要 `CPR_GP_PARITY_DIR` 指向 `.build` 中由 Python 生成的产物目录。
+//! 运行状态机与 Python 实现的一致性对照。默认忽略：需要 `CPR_GP_PARITY_DIR` 指向由 `tests/parity/` 里的 Python 脚本生成的产物目录（见 `tests/parity/README.md`）。
 //! 每个序列在全新数据库上按 Python 记录的消息与时钟逐步重放，比较每一步的返回值（整数与浮点严格区分），
 //! 序列结束后比较整库内容；同时把 Rust 写出的数据库保存下来，供 Python 读取后再比较一次。
 
@@ -139,7 +139,7 @@ fn first_database_difference(rust: &Value, python: &Value) -> Option<String> {
 }
 
 #[test]
-#[ignore = "需要 CPR_GP_PARITY_DIR：由 .build 中的 Python 生成脚本产生"]
+#[ignore = "需要 CPR_GP_PARITY_DIR：由 tests/parity 里的 Python 脚本产生"]
 fn runtime_sequences_match_python() {
     let directory = parity_dir();
     let text = std::fs::read_to_string(directory.join("runtime-cases.json")).expect("read cases");

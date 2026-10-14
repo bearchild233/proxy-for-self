@@ -1,4 +1,4 @@
-//! 与 Python 实现的一致性对照。默认忽略：需要 `CPR_GP_PARITY_DIR` 指向 `.build` 中由 Python 生成的产物目录。
+//! 与 Python 实现的一致性对照。默认忽略：需要 `CPR_GP_PARITY_DIR` 指向由 `tests/parity/` 里的 Python 脚本生成的产物目录（见 `tests/parity/README.md`）。
 //! - `python_expectations_match_rust_plugin`：重放 Python 生成的写路径与快照读取，逐项比较 JSON（整数与浮点严格区分）。
 //! - `rust_writes_database_for_python`：Rust 写入数据库并记录期望输出，供 Python 读取后比较。
 
@@ -121,7 +121,7 @@ fn run_sql(path: &Path, sql: &str, args: &[Value]) {
 
 /// 写路径与快照读取的逐项比较；返回不一致的步骤摘要。
 #[test]
-#[ignore = "需要 CPR_GP_PARITY_DIR：由 .build 中的 Python 生成脚本产生"]
+#[ignore = "需要 CPR_GP_PARITY_DIR：由 tests/parity 里的 Python 脚本产生"]
 fn python_expectations_match_rust_plugin() {
     let directory = parity_dir();
     let document = read_json(&directory.join("cases.json"));
@@ -230,7 +230,7 @@ fn python_expectations_match_rust_plugin() {
 
 /// Rust 写入数据库，记录期望输出，供 Python 读取后比较。
 #[test]
-#[ignore = "需要 CPR_GP_PARITY_DIR：由 .build 中的 Python 生成脚本产生"]
+#[ignore = "需要 CPR_GP_PARITY_DIR：由 tests/parity 里的 Python 脚本产生"]
 fn rust_writes_database_for_python() {
     let directory = parity_dir().join("rust-written");
     std::fs::create_dir_all(&directory).expect("create output directory");
