@@ -2,7 +2,7 @@
 
 <!-- doc-sync paths: plugins/gateway-pool -->
 
-为降智账号所在的分组，按“账号 × 网关”轮换满血网关。降智信号在交付前拦截，用户只感到等待稍长。插件 UI 与策略可热更新；传输桥在 Rust 内核，首次启用需要内核与控制面升级。
+为降智账号所在的分组，按“账号 × 网关”轮换满血网关。降智信号在交付前拦截，用户只感到等待稍长。插件由两部分组成：管理页面（UI 包，经控制面安装）与 Rust 服务进程（由 updater 监督，经内核请求钩子参与路由）；两者都可热更新，不重启主网关。
 
 ## 术语
 
@@ -146,17 +146,22 @@
 
 ## 部署
 
-```toml
-[openai.gateway_pool]
-runtime_url = "http://127.0.0.1:<控制面端口>/api/plugin-platform/internal/gateway-pool"
-key_file = "<控制面根目录>/gateway-pool-runtime.key"
+主网关配置（每个 A/B 槽目录下的 deploy/config.yaml，两槽保持一致；模板见 `deploy/config.example.yaml`）：
+
+```yaml
+plugins:
+  registry_path: /etc/proxy-for-self-kernel/registry.json
+  ownership_cache_path: /var/lib/api-hub/plugins/plugin-ownership.json
+openai:
+  plugin_routing: true   # 打开后覆盖旧的 openai.gateway_pool
 ```
 
-- `runtime_url` 必须指向当前活动的控制面槽；切换控制面槽时同步网关配置。端口以 VPS 实际状态为准。
-- 能力密钥由控制面生成（0640），网关进程需能读取。
-- 优先级、按 Key 的窗口和失败原因需要配套 Rust 选号桥、控制面队列能力及新版 UI；不能仅更新界面就启用实际排序。Rust 更新仍按 A/B 发布流程执行。
-- 0.3.0 统计首次升级需要 Rust 计时采集、控制面的历史模块与 `gateway-pool.history.read` 能力同时具备。旧平台会拒绝缺少能力的新包，不能仅上传 UI 获得完整计时；UI 回退不删除历史。
-- 状态库位于 `<控制面根目录>/gateway-pool-runtime/state.sqlite3`，备份时与能力密钥一起保留并限制访问。
+- 网关进程需加入 `proxy-for-self-plugin-ipc` 组（连接插件 socket），并对归属缓存目录有写权限（单元 `ReadWritePaths`）。
+- updater 配置的 `service_plugins` 段登记允许的能力（`accounts.read`、`quota.read`、`upstream.probe`、`http.fetch`、`groups.move`、`log`）与 `fetchHosts`（池服务域名）；updater 写 `/etc` 下注册表需要沙箱 drop-in 的 `ReadWritePaths`。细节见 [插件平台部署](../deploy/plugin-platform/README.md) 的“服务插件”一节。
+- 控制面带 `--service-registry` 启动，页面的 `gateway-pool.*` 管理调用经它转给服务实例。
+- 发布：控制面把新包装入插件存储 → updater `activate` 新版本（新实例健康后切换注册表，旧实例排空）；回退用 updater `rollback`。主网关只在内核协议变化时才需要 A/B 发布。
+- 数据：`/var/lib/proxy-for-self-plugin-data/gateway-pool/state.sqlite3`（含设置与池服务 Bearer），备份时限制访问；升级前用 SQLite 在线备份做快照。
+- 线上版本、端口与实例名以 VPS 实际状态和维护手册为准。
 
 ## 验证
 
@@ -164,7 +169,7 @@ key_file = "<控制面根目录>/gateway-pool-runtime.key"
 - 内核端到端：`backend/crates/providers/openai/tests/provider/contract/gateway_pool_e2e.rs`（`gateway_pool_plugin_` 开头的忽略用例，真实插件进程加临时 PostgreSQL）。
 - 旧路径（P2 删除前仍在仓库）：`python -m unittest discover -s services/plugin_host -p "test_*.py"`，`provider-openai` 的 `admin::gateway_pool` 用例。
 - 前端：`node scripts/check-plugin.mjs gateway-pool`、`node scripts/build-plugin.mjs gateway-pool`、相关 lint 与 `pnpm --dir frontend typecheck`。
-- 本机预览：构建主壳和插件后运行 `python -X utf8 scripts/preview-gateway-pool.py`，入口 `http://127.0.0.1:18335/extensions/gateway-pool`。使用真实主壳、插件包和统计库，账号与事件为模拟数据，无真实 Rust 网关或上游连接；每次启动新建隔离库。
+- 本机预览（模拟数据尚未包含备用票字段）：构建主壳和插件后运行 `python -X utf8 scripts/preview-gateway-pool.py`，入口 `http://127.0.0.1:18335/extensions/gateway-pool`。使用真实主壳、插件包和统计库，账号与事件为模拟数据，无真实 Rust 网关或上游连接；每次启动新建隔离库。
 
 ## 尚未验证
 
