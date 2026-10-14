@@ -7,7 +7,7 @@
 | 分类 | 插件 |
 | --- | --- |
 | 基础，始终启用 | accounts、groups、keys、usage-analytics、gateway-settings |
-| 账号工具 | account-diagnostics |
+| 账号工具 | account-diagnostics、gateway-pool（服务插件，见 [网关池](gateway-pool.md)） |
 | 客户端接入 | client-access |
 | 功能扩展 | excel-bridge、appearance |
 | 运维工具 | proxy-management、backup、pricing |
@@ -62,11 +62,11 @@ python scripts/package-ui-plugin.py groups
 
 仓库提供独立 `plugin-release.yml`，只检查、构建所选插件；Excel 另做干净依赖测试并发布运行包。版本读取该插件 `plugin.json`。工作流是手动触发，不自动部署。
 
-完整平台初始化包由 `scripts/package-plugin-platform.py` 生成，含主壳、控制面和 12 个预装包。首次迁移先安装并验证平台，再切换网关/主壳；未声明已支持协议2的旧更新器拒绝此类整站升级。生产安装步骤见 [平台部署](../deploy/plugin-platform/README.md)。
+完整平台初始化包由 `scripts/package-plugin-platform.py` 生成，含主壳、控制面和 `packages/plugin-sdk/policies.json` 登记的全部内置插件包。首次迁移先安装并验证平台，再切换网关/主壳；未声明已支持协议2的旧更新器拒绝此类整站升级。生产安装步骤见 [平台部署](../deploy/plugin-platform/README.md)。
 
 ## 新旧方案成本
 
-前端按功能独立构建，共用一个 Vue 应用；版本、租约、能力接口和恢复逻辑是额外维护成本。代码与样式默认预载，页面数据首次进入时查询，表单和筛选在切页后保留。12 个页面不对应 12 个后台进程，诊断按需启动，备份策略短进程运行，Excel 独立管理。推理流量直接访问 Rust。浏览器组件/数据缓存仍占内存；不能用包体缩小比例代替运行内存实测。
+前端按功能独立构建，共用一个 Vue 应用；版本、租约、能力接口和恢复逻辑是额外维护成本。代码与样式默认预载，页面数据首次进入时查询，表单和筛选在切页后保留。插件页面不对应各自的后台进程，诊断按需启动，备份策略短进程运行，Excel 独立管理。推理流量直接访问 Rust。浏览器组件/数据缓存仍占内存；不能用包体缩小比例代替运行内存实测。
 
 生产采用共享 Vue 组件平台。功能变更先在本机独立环境验证，再经用户授权上线；GitHub push 需单独授权。测试环境见 [本机测试](plugin-stage.md)。
 

@@ -1,6 +1,6 @@
 # 本机插件测试
 
-入口：<http://127.0.0.1:18335/>。这是完整主壳与 12 个真实插件包，使用隔离的 Rust 管理 API。自动登录仅在本机准确地址开放，不能部署到公网。
+入口：<http://127.0.0.1:18335/>。这是完整主壳与全部内置真实插件包，使用隔离的 Rust 管理 API。自动登录仅在本机准确地址开放，不能部署到公网。
 
 | 组件 | 位置 |
 | --- | --- |
@@ -36,7 +36,7 @@ Excel 测试运行包准备入口：WSL 内执行 `python3 scripts/plugin-stage-
 
 ## 验证入口
 
-- `scripts/test-plugin-stage.py`：真实接口鉴权、来源限制、能力边界、12 包资源与分组 CRUD/排序。
+- `scripts/test-plugin-stage.py`：真实接口鉴权、来源限制、能力边界、全部内置包资源与分组 CRUD/排序。
 - `scripts/test-plugin-hot-update.py`：真实单包更新、旧页租约、坏包拒绝和回退，记录网关 PID/启动时间及健康探针。
 - `scripts/test-plugin-lifecycle.py`：Key 用户权限、可选插件停用后的旧 RPC 拒绝、模板持久化、Excel 启停联动。
 - `services/plugin_host/test_platform.py`：按版本排空任务、任务所有权、诊断材料归属和备份策略。
@@ -51,9 +51,9 @@ Excel 测试运行包准备入口：WSL 内执行 `python3 scripts/plugin-stage-
 
 ## 共享 Vue 组件版
 
-12 个界面包共用主应用的 Vue 和基础组件，版本见各自 `plugin.json`。真实测试入口为 `http://127.0.0.1:18335/settings/pricing`。只下载预载代码，表格和表单按首次进入加载；切页保留实例。
+全部界面包共用主应用的 Vue 和基础组件，版本见各自 `plugin.json`。真实测试入口为 `http://127.0.0.1:18335/settings/pricing`。只下载预载代码，表格和表单按首次进入加载；切页保留实例。
 
-构建后运行 `node --test frontend/plugin-tests/component-packages.test.mjs`，检查实际 12 个模块未内置 Vue、未创建第二个应用、工厂初始化不发业务请求。单插件发布流程通过 `PLUGIN_ID` 只检查所选包。`test-plugin-stage.py` 与 `test-plugin-hot-update.py` 同时支持组件和 iframe 包。
+构建后运行 `node --test frontend/plugin-tests/component-packages.test.mjs`，检查实际组件模块未内置 Vue、未创建第二个应用、工厂初始化不发业务请求。单插件发布流程通过 `PLUGIN_ID` 只检查所选包。`test-plugin-stage.py` 与 `test-plugin-hot-update.py` 同时支持组件和 iframe 包。
 
 本机真实分组 CRUD、单包更新、损坏包拒绝、旧版本租约及回退已验证；网关 PID/启动时间保持不变。浏览器确认组件版无 iframe，设置页标题保持不变、未保存编辑和筛选可保留。静态包体和运行内存分开评估，尚未完成最初单体版的同条件内存对比。
 
@@ -62,7 +62,7 @@ Excel 测试运行包准备入口：WSL 内执行 `python3 scripts/plugin-stage-
 - 账号列表默认展示全部列，保留用户主动保存的列偏好；列菜单重置后恢复全列。
 - 账号诊断使用宽版双栏弹窗，结果和配置独立滚动，底部测试按钮固定可见；模板编辑复用公共输入控件。
 - 同一插件版本的多个页面复用租约，最后一个页面退出时释放；登录身份变化后不复用旧租约。
-- 本机类型检查、构建、12 个实际组件包契约、租约并发/失败/会话切换测试及独立环境接口检查通过。视觉验收由用户完成。
+- 本机类型检查、构建、全部实际组件包契约、租约并发/失败/会话切换测试及独立环境接口检查通过。视觉验收由用户完成。
 
 ### 账号界面演示数据
 

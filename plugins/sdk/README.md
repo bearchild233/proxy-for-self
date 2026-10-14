@@ -1,4 +1,4 @@
-# Rust 插件 SDK（kernelApi 0.5）
+# Rust 插件 SDK（kernelApi 0.6）
 
 `plugins/Cargo.toml` 是独立 workspace。`kernel-protocol` 是 backend workspace 成员，
 插件通过路径依赖使用它；其 edition、license、rust-version 与 lints 从所属的 backend
@@ -21,6 +21,7 @@ workspace 继承，不从消费它的 plugins workspace 继承。两个 workspac
 `response.observe.canSwitch` 表示内核是否允许换号；`request.finish.firstByteMs` 表示
 发送开始至首个交付字节的耗时。`upstream.probe.includeAccountCookies` 缺省 false，
 开启时内核在账号 Cookie 上合并插件 Cookie，账号 Cookie 不会返回插件。
+协议 0.6 新增 `accounts.read.model`（逐账号返回该模型是否允许）与 `quota.read.refreshIfMissing`（没有快照时由内核先刷新一次），使用它们的插件声明 `minMinor: 6`。
 
 `Settings::from_env()` 要求 `CPR_PLUGIN_SOCKET` 和 `CPR_PLUGIN_DATA`。
 socket 父目录由监督进程准备；SDK 清理残留 socket，拒绝覆盖普通文件，监听权限为 0660。

@@ -1,5 +1,7 @@
 # 网关池插件
 
+<!-- doc-sync paths: plugins/gateway-pool -->
+
 为降智账号所在的分组，按“账号 × 网关”轮换满血网关。降智信号在交付前拦截，用户只感到等待稍长。插件 UI 与策略可热更新；传输桥在 Rust 内核，首次启用需要内核与控制面升级。
 
 ## 术语
@@ -78,9 +80,32 @@
 
 页面查询不触发上游请求。底层历史合同及已采集事实保留兼容，界面不再提供其他耗时指标。完整采集口径见 [设计说明](gateway-pool-usage-design.md)。
 
+## 实现逻辑
+
+规则见上文，本节只写代码如何实现。进程内的状态机与钩子分工、与内核的边界：
+
+**进程与协议**：服务插件（清单 `plugins/gateway-pool/plugin.json` 的 `service` 段：二进制 service/gateway-pool、`kernelApi` 最低 0.6、`memoryMax 64M`、`shutdownSeconds 40`、内核能力 `accounts.read` `quota.read` `upstream.probe` `http.fetch` `groups.move` `log`、`fetchHosts` 只含池服务域名）。`main.rs` 读取 `CPR_PLUGIN_SOCKET` / `CPR_PLUGIN_DATA` / `CPR_PLUGIN_SHUTDOWN_MS`，打开 `$CPR_PLUGIN_DATA/state.sqlite3`，按已保存设置声明归属分组（`owned_groups`）与观察分组（`watched_groups`），启动 SDK 服务；`configure` 保存设置后立即广播新的归属（`ownership.changed`）。声明的钩子：`route.select` `route.prepare` `response.head` `request.finish` `response.observe` `admin.call`。对外访问只走 `caps.rs` 封装的内核能力（读取类预算 5 秒）。
+
+**状态与存储**：`store.rs::Store` 是 SQLite 入口（WAL，单写连接复用，写事务 `BEGIN IMMEDIATE`；管理页报表用独立只读快照；`checkpoint.rs` 后台 WAL checkpoint）。表：`settings`（单行设置）、`pairs`（账号×网关组合状态）、`leases` 与 `gp_hook_leases`（运行租约与钩子租约）、`materials`（配套 Cookie / state 材料）、`model_tickets`（按模型的票）、`catalogs`（网关目录缓存）、`observations` `switches` `group_events`（观测、换网关、分组变动）、`recovery_checks`（恢复检测暂停与领取）、`gp_account_queue` `gp_queue_revision`（共用账号队列与版本）、历史表 `gp_history_meta` `gp_batches` `gp_windows` `gp_accesses` `gp_segments` `gp_cooling`。表结构只增不删，保证热更新回滚后旧版本仍能读取；新旧版本可并存读写，租约在库里，新版本能接管旧版本未结束的租约。
+
+**请求路径**（钩子预算 2 秒，内部 `HOOK_BUDGET` 1.5 秒）：
+- `route.select`（`routing/select.rs`）：读账号与额度，调 runtime `active` 得优先顺序、持窗账号和被挡原因，候选记入 `Pool.requests`；原生续接固定账号时返回 `stay` 或 `escape`。
+- `route.prepare`（`routing/prepare.rs`）：内核按 wait 间隔反复调。资格 → `plan` → 需要找票则 `probe.rs::start_prepare` 起后台任务（同一账号同时一个，单组合预算 35 秒，最多 4 路并发探测）→ 取材料 → `reserve` → 按模型取票（`ticket.rs`）→ `sent` → `use`（返回租约 ID 与池 Cookie / turn state）。
+- `response.head`（`routing/head.rs`）：把业务结果写入状态并按条件归还租约（同一事务）；`next_step` 是事务内外共用的唯一决策：21 → `accept`，29 → `switch`（满足重放安全条件时），失败按类别处理。
+- `request.finish`：补访问计时并归还租约。`response.observe`（`routing/observe.rs`）：普通账号降智确认（用返回的 state 同账号重放一次 `hi`，确认后 `switchAccount` 并经 `groups.move` 移组）。
+- `background.rs`：每秒恢复检测（领取 → 旧 state 重放 → 两次全新 bootstrap 重放 → `groups.move` 移回）与持续模式找票。`probe.rs` 后台打票：`claim` 领候选 → 取池 Cookie（`pool_service.rs`、`cookie.rs`）→ bootstrap 取 S0 → 重放判 21/29 → `probeResult` 与租约归还同事务；失败类别随 `failure` 记入静置步骤。
+
+**状态机**（`runtime.rs::Store::runtime` 的 `dispatch_action`）：动作 `config` `active` `quota` `plan` `claim` `reserve` `material` `ticket` `sent` `probeAttempt` `ticketResult` `probeResult` `businessResult` `invalidate` `finish` `regroup` `regroupResult` `recoveryCheck` `recoveryResult`；每个动作开头先回收过期租约、清理过期材料与票。组合状态 `unknown` `preparing` `standby` `ready` `draining` `cooling`：`standby.rs` 负责备用票到达（`publish_standby`）、转正（`promote_standby`）、过期与丢弃；`policy.rs` 负责 21/29 判定、窗口起点与到期、退役（`retire` + `settle`）和退避档（`escalate` / `recover` / `lower`）、候选排序；`queue.rs` 负责共用队列与“一轮”清单；`history.rs` 把组合状态同步为 `gp_windows` 等历史行（保存点写入，失败只记缺口，不回滚调度），`history_query.rs::window_figures` 是窗口时长唯一口径。改组合状态一律经 `Store::save`（同步历史并更新队列），退役必须经 `policy::retire` + `policy::settle`。
+
+**管理方法**（`admin.rs::dispatch`，仅管理员角色）：`read`（页面数据：账号、组合、设置、分组变动）、`configure`（校验 `settings.rs` 后保存并返回新归属）、`queue.update`（优先级顺序与参与开关）、`history.read`（统计查询）；控制面把页面能力 `gateway-pool.<方法>` 转为这些调用。
+
+**页面**（`ui/page/`）：`GatewayPoolPage.vue` 用 `usePluginPolling` 每 10 秒读 `gateway-pool.read`、每 60 秒读账号/分组目录；标签页“账号与网关 / 分组变动 / 轮转明细 / 轮转统计”；拖动排序与开关走 `gateway-pool.queue.update`，设置弹窗走 `gateway-pool.configure`，统计组件走 `gateway-pool.history.read`。
+
+**旧实现**：`services/plugin_host/gateway_pool*.py` 与 `plugins/gateway-pool/worker/policy.py` 是 Python 控制面时代的实现，清单带 `service` 段时不再使用，回退到无服务段的旧包才会走到；内核侧旧传输桥 `backend/crates/providers/openai/src/gateway_pool.rs` 在 `openai.plugin_routing` 打开时被跳过。均在 P2 删除。
+
 ## 实现位置
 
-网关池是 Rust 服务插件（`plugins/gateway-pool/`，清单 `plugin.json`）。内核经 socket 调用插件的请求路径钩子；管理页经控制面 `admin.call` 转发到插件的管理方法。插件对外访问（账号、额度、上游探测、池服务）全部经内核能力，状态保存在插件自己的 SQLite（`state.sqlite3`，管理视图不返回 state、Cookie、账号 Token 或池服务凭证）。旧的 Python 控制面实现（`services/plugin_host/gateway_pool*.py`、`worker/policy.py`）与网关内的 `gateway_pool.rs` 路径已停用，P2 删除。
+网关池是 Rust 服务插件（`plugins/gateway-pool/`，清单 `plugin.json`）。内核经 socket 调用插件的请求路径钩子；管理页经控制面 `admin.call` 转发到插件的管理方法。插件对外访问（账号、额度、上游探测、池服务）全部经内核能力，状态保存在插件自己的 SQLite（`state.sqlite3`，管理视图不返回 state、Cookie、账号 Token 或池服务凭证）。旧的 Python 控制面实现（`services/plugin_host/gateway_pool*.py`、`worker/policy.py`）与网关内的 `backend/crates/providers/openai/src/gateway_pool.rs` 路径已停用，P2 删除。
 
 `plugins/gateway-pool/service/src/`：
 
@@ -136,7 +161,7 @@ key_file = "<控制面根目录>/gateway-pool-runtime.key"
 ## 验证
 
 - 插件服务：`scripts/build-plugins-local.sh <仓库路径> 4096 3 test gateway-pool`，覆盖状态机、备用票、退避、历史口径、设置、队列与钩子；`... clippy gateway-pool` 做 clippy。
-- 内核端到端：`gateway_pool_e2e.rs`（`gateway_pool_plugin_` 开头的忽略用例，真实插件进程加临时 PostgreSQL）。
+- 内核端到端：`backend/crates/providers/openai/tests/provider/contract/gateway_pool_e2e.rs`（`gateway_pool_plugin_` 开头的忽略用例，真实插件进程加临时 PostgreSQL）。
 - 旧路径（P2 删除前仍在仓库）：`python -m unittest discover -s services/plugin_host -p "test_*.py"`，`provider-openai` 的 `admin::gateway_pool` 用例。
 - 前端：`node scripts/check-plugin.mjs gateway-pool`、`node scripts/build-plugin.mjs gateway-pool`、相关 lint 与 `pnpm --dir frontend typecheck`。
 - 本机预览：构建主壳和插件后运行 `python -X utf8 scripts/preview-gateway-pool.py`，入口 `http://127.0.0.1:18335/extensions/gateway-pool`。使用真实主壳、插件包和统计库，账号与事件为模拟数据，无真实 Rust 网关或上游连接；每次启动新建隔离库。
