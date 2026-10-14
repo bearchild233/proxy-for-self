@@ -18,6 +18,7 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from jobs import Jobs
 from lifecycle import Lifecycle
+from service_calls import ServiceCalls
 from gateway_pool import GatewayPool
 import secrets
 import tarfile
@@ -44,7 +45,7 @@ def package_directory(source, archive):
 
 
 class Platform:
-    def __init__(self, root, gateway_port, local_excel=None, updater_socket=None):
+    def __init__(self, root, gateway_port, local_excel=None, updater_socket=None, service_registry=None):
         self.root = Path(root).resolve()
         self.gateway_port = gateway_port
         self.policies = json.loads((REPO / 'packages/plugin-sdk/policies.json').read_text(encoding='utf-8'))
@@ -56,6 +57,8 @@ class Platform:
         self.store = StaticPluginStore(self.root / 'plugins', self.policies)
         self.jobs = Jobs(self)
         self.lifecycle = Lifecycle(self,local_excel,updater_socket)
+        # 内核注册表由 updater 写入；未配置时服务插件的管理调用不可用。
+        self.service_calls = ServiceCalls(service_registry) if service_registry else None
         self.data_lock = threading.RLock()
         self.gateway_pool = GatewayPool(self.root, self.store)
         key_path = self.root / 'gateway-pool-runtime.key'
@@ -74,7 +77,9 @@ class Platform:
         caps=registration.get('capabilities',[])
         if not isinstance(plugin_id,str) or not re.fullmatch(r'[a-z][a-z0-9-]{0,63}',plugin_id) or plugin_id in self.policies:
             raise ValueError('插件标识无效或已注册')
-        if not isinstance(caps,list) or not all(isinstance(cap,str) for cap in caps) or not set(caps)<=(set(self.operations)|{'tasks.start','tasks.status','tasks.cancel'}):
+        # 服务插件可申请自己的管理能力 <插件ID>.<方法>；这些名字只在其服务段存在时由控制面转发，不进入平台能力表。
+        own = {cap for cap in caps if isinstance(cap,str) and registration.get('service') is not None and cap.startswith(plugin_id+'.') and re.fullmatch(r'[a-z][a-z0-9_-]*(\.[a-z][a-z0-9_-]*)*',cap[len(plugin_id)+1:])} if isinstance(caps,list) else set()
+        if not isinstance(caps,list) or not all(isinstance(cap,str) for cap in caps) or not set(caps)<=(set(self.operations)|{'tasks.start','tasks.status','tasks.cancel'}|own):
             raise ValueError('只能申请平台已提供的能力')
         if any(not isinstance(registration.get(key),str) or not 0<len(registration[key])<=2000 for key in ('name','description')):
             raise ValueError('插件介绍无效')
@@ -184,6 +189,14 @@ class Platform:
                     return 400, json.dumps({'error':str(error)}, ensure_ascii=False).encode(), None
             else:
                 raise PermissionError('网关池能力未注册')
+            return 200, json.dumps(value, ensure_ascii=False).encode(), None
+        if name.startswith(plugin_id + '.') and manifest.get('service') is not None:
+            # 服务插件的管理能力：仅管理员；参数原样经管理连接的 admin.call 转给插件进程。
+            if role != 'admin':
+                raise PermissionError('没有此服务能力的权限')
+            if self.service_calls is None:
+                raise ConnectionError('插件服务暂不可用')
+            value = self.service_calls.call(plugin_id, name[len(plugin_id) + 1:], data, role)
             return 200, json.dumps(value, ensure_ascii=False).encode(), None
         if name == 'pricing.schedule.status':
             if role != 'admin' or plugin_id != 'pricing':
@@ -363,14 +376,22 @@ class Handler(BaseHTTPRequestHandler):
                     plugin_id=manifest.get('id')
                     if not isinstance(plugin_id,str):raise ValueError('插件标识无效')
                     if plugin_id=='excel-bridge' and platform.lifecycle.operations.get(plugin_id,{}).get('status')=='running':raise ValueError('Worker 操作仍在执行')
+                    # 服务插件需要安装器可用且无并发操作；在注册或存储切换之前检查。
+                    service = manifest.get('service') is not None
+                    if service:
+                        platform.lifecycle.require_service_ready(plugin_id)
                     fresh=plugin_id not in platform.policies
                     if fresh:
                         slots={'settings','key-usage','key-editor','key-config','account-menu','account-detail','group-menu','key-menu','proxy-menu','usage-detail','dashboard'}
                         if not isinstance(manifest.get('pages'),list) or any(not isinstance(page,dict) or (page.get('route') is not None and (not isinstance(page['route'],str) or not page['route'].startswith('/extensions/'+str(plugin_id)+'/'))) or (not page.get('route') and page.get('slot') not in slots) for page in manifest['pages']):
                             raise ValueError('新增插件的页面必须使用独立扩展路径')
                         platform.register({**manifest,'worker':bool(manifest.get('worker'))})
+                    before = platform.store.state(plugin_id)
                     try:
-                        return self.reply(platform.store.install(plugin_id,archive,data['sha256']))
+                        state = platform.store.install(plugin_id,archive,data['sha256'])
+                        if service or (before['current'] and platform.lifecycle.has_service(plugin_id,before['current'])):
+                            platform.lifecycle.launch_service(plugin_id,'update' if before['current'] else 'install',before)
+                        return self.reply(state)
                     except Exception:
                         if fresh:
                             with platform.store.mutation():
@@ -445,10 +466,11 @@ def main():
     parser.add_argument('--plugin')
     parser.add_argument('--local-excel-wsl')
     parser.add_argument('--updater-socket',type=Path)
+    parser.add_argument('--service-registry',type=Path)
     args=parser.parse_args()
     if args.local_access and args.origin != 'http://127.0.0.1:18335':
         raise ValueError('便捷登录只允许本机测试')
-    platform=Platform(args.root,args.gateway_port,args.local_excel_wsl,args.updater_socket)
+    platform=Platform(args.root,args.gateway_port,args.local_excel_wsl,args.updater_socket,args.service_registry)
     if args.action=='install':
         ids=[args.plugin] if args.plugin else list(platform.policies)
         for plugin_id in ids:

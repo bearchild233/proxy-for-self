@@ -7,7 +7,7 @@ User=proxy-for-self-plugins
 Group=proxy-for-self-plugins
 # Set supplementary updater socket group in a deployment-specific drop-in.
 WorkingDirectory=/opt/proxy-for-self/platform-current
-ExecStart=/usr/bin/python3 -I services/plugin_host/server.py serve --root /var/lib/proxy-for-self/plugins --gateway-port 8080 --port 18335 --origin https://api.example.com --updater-socket /run/proxy-for-self-updater/control.sock
+ExecStart=/usr/bin/python3 -I services/plugin_host/server.py serve --root /var/lib/proxy-for-self/plugins --gateway-port 8080 --port 18335 --origin https://api.example.com --updater-socket /run/proxy-for-self-updater/control.sock --service-registry /etc/proxy-for-self/plugin-registry.json
 Restart=on-failure
 RestartSec=3
 TimeoutStopSec=100
