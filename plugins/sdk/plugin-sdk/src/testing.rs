@@ -23,10 +23,14 @@ pub struct CapabilityReply {
     pub result: RpcResult<Value>,
 }
 
+/// 按方法与参数即时应答能力调用的处理器：返回 None 时回退到脚本。用于并发、顺序不固定的场景。
+pub type CapabilityHandler = Arc<dyn Fn(&str, &Value) -> Option<RpcResult<Value>> + Send + Sync>;
+
 pub struct MockKernel {
     peer: Arc<Peer>,
     task: JoinHandle<()>,
     script: Arc<Mutex<VecDeque<CapabilityReply>>>,
+    handler: Arc<Mutex<Option<CapabilityHandler>>>,
     notifications: Arc<Mutex<Vec<(String, Value)>>>,
     pub hello: HelloResult,
 }
@@ -67,9 +71,11 @@ impl MockKernel {
         }
         let (peer, rx) = Peer::new(2);
         let script = Arc::new(Mutex::new(VecDeque::<CapabilityReply>::new()));
+        let handler = Arc::new(Mutex::new(None::<CapabilityHandler>));
         let notifications = Arc::new(Mutex::new(Vec::new()));
         let task_peer = peer.clone();
         let task_script = script.clone();
+        let task_handler = handler.clone();
         let task_notifications = notifications.clone();
         let task = tokio::spawn(async move {
             let (mut reader, write_half) = stream.into_split();
@@ -83,15 +89,24 @@ impl MockKernel {
                 match message {
                     Message::Response { id, payload } => task_peer.resolve(id, payload),
                     Message::Request { id, method, params } => {
-                        let reply = task_script.lock().expect("script lock").pop_front();
-                        let result = match reply {
-                            Some(reply) if reply.method == method && reply.params == params => {
-                                reply.result
+                        let handled = task_handler
+                            .lock()
+                            .expect("handler lock")
+                            .clone()
+                            .and_then(|handler| handler(&method, &params));
+                        let result = if let Some(result) = handled {
+                            result
+                        } else {
+                            let reply = task_script.lock().expect("script lock").pop_front();
+                            match reply {
+                                Some(reply) if reply.method == method && reply.params == params => {
+                                    reply.result
+                                }
+                                Some(_) => {
+                                    Err(RpcError::new(INVALID_PARAMS, "capability script mismatch"))
+                                }
+                                None => Err(RpcError::new(NOT_SUPPORTED, method)),
                             }
-                            Some(_) => {
-                                Err(RpcError::new(INVALID_PARAMS, "capability script mismatch"))
-                            }
-                            None => Err(RpcError::new(NOT_SUPPORTED, method)),
                         };
                         // writer 在同一 task 中驱动，不能在这里等待写完再回到 select。
                         let response = async { task_peer.respond(id, result).await };
@@ -110,6 +125,7 @@ impl MockKernel {
             peer,
             task,
             script,
+            handler,
             notifications,
             hello: plugin,
         })
@@ -117,6 +133,13 @@ impl MockKernel {
 
     pub fn push_reply(&self, reply: CapabilityReply) {
         self.script.lock().expect("script lock").push_back(reply);
+    }
+    /// 安装处理器：能力调用先交给它，返回 None 的调用再按脚本顺序应答。
+    pub fn set_handler(
+        &self,
+        handler: impl Fn(&str, &Value) -> Option<RpcResult<Value>> + Send + Sync + 'static,
+    ) {
+        *self.handler.lock().expect("handler lock") = Some(Arc::new(handler));
     }
     pub fn remaining_replies(&self) -> usize {
         self.script.lock().expect("script lock").len()
