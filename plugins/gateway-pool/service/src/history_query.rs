@@ -349,8 +349,11 @@ pub fn cooling_summary(db: &Connection, account: &str, gateway: &str) -> Result<
                 continue;
             };
             let started = num_field(step_object, "startedAt");
-            let due = num_field(step_object, "dueAt")
-                .ok_or_else(|| Failure::Internal("静置步骤缺少到期时间".to_owned()))?;
+            // 有意与 Python 不同：Python 在步骤缺少 dueAt 时抛出 KeyError（页面 500）。运行时写入的步骤总有
+            // dueAt，缺失只会来自手工或旧数据；这里与周期列表一致，跳过该步骤而不是让整张卡片读取失败。
+            let Some(due) = num_field(step_object, "dueAt") else {
+                continue;
+            };
             let mut visit = step_object.clone();
             let idle = started.map_or(Value::Null, |started| {
                 Num::Int(0).max(probe.minus(started)).to_json()
@@ -741,10 +744,12 @@ pub fn read(db: &Connection, now: Num, query: &Object) -> Result<Value, Failure>
                 "recovered"
             } else if !is_null_or_missing(step, "probeAt") && is_null_or_missing(step, "resultAt") {
                 "probing"
-            } else if num_field(step, "dueAt").is_some_and(|due| due.le(now)) {
-                "due"
+            } else if let Some(due) = num_field(step, "dueAt") {
+                if due.le(now) { "due" } else { "cooling" }
             } else {
-                "cooling"
+                // 有意与 Python 不同：Python 在最后一步缺少 dueAt 时抛出 KeyError（页面 500）。
+                // 缺少到期时间就无法判断周期状态，这里与卡片摘要一致，跳过该步骤所代表的周期而不报错。
+                continue;
             };
             let incomplete = steps
                 .iter()
