@@ -86,6 +86,8 @@ class ServiceManifestTests(unittest.TestCase):
     def test_accepts_boundary_values(self):
         self.assertEqual(self.check(memoryMax="16M", shutdownSeconds=5)["memoryMaxMiB"], 16)
         self.assertEqual(self.check(memoryMax="512M", shutdownSeconds=600)["shutdownSeconds"], 600)
+        for minor in (4, 5, 6):
+            self.assertEqual(self.check(kernelApi={"major": 0, "minMinor": minor})["kernelApi"]["minMinor"], minor)
 
     def test_rejects_unknown_capabilities_and_duplicates(self):
         for value in [["exec"], ["log", "log"], ["log", 1], "log"]:
@@ -98,7 +100,7 @@ class ServiceManifestTests(unittest.TestCase):
                 self.check(fetchHosts=value)
 
     def test_rejects_incompatible_kernel_api(self):
-        for value in [{"major": 1, "minMinor": 5}, {"major": 0, "minMinor": 3}, {"major": 0, "minMinor": 6},
+        for value in [{"major": 1, "minMinor": 5}, {"major": 0, "minMinor": 3}, {"major": 0, "minMinor": 7},
                       {"major": 0}, {"major": 0, "minMinor": 5, "extra": 1}]:
             with self.subTest(value=value), self.assertRaises(ValueError):
                 self.check(kernelApi=value)

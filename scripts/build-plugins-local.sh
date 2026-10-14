@@ -41,7 +41,8 @@ export CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=1
 export RUST_MIN_STACK=16777216
 if [[ $task == release ]]; then
     # 插件增量发布测量保留增量缓存；优化配置沿用本地构建入口。
-    export CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_CODEGEN_UNITS=8
+    export CARGO_PROFILE_RELEASE_LTO=${CARGO_PROFILE_RELEASE_LTO:-false}
+    export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=${CARGO_PROFILE_RELEASE_CODEGEN_UNITS:-8}
     CPR_GIT_SHA=${CPR_GIT_SHA:-$(git -C "$src" rev-parse HEAD)}
     [[ $CPR_GIT_SHA =~ ^[0-9a-f]{40}$ ]] || exit 2
     export CPR_GIT_SHA

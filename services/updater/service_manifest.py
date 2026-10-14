@@ -12,7 +12,7 @@ KERNEL_CAPABILITIES = frozenset({"log", "upstream.probe", "http.fetch", "account
 # 与 kernel-protocol 的 is_compatible 对齐：内核主版本 0，插件次版本下限 4，上限不超过内核次版本。
 KERNEL_API_MAJOR = 0
 KERNEL_API_MIN_MINOR = 4
-KERNEL_API_MINOR = 5
+KERNEL_API_MINOR = 6
 SERVICE_FIELDS = frozenset({"binary", "kernelApi", "capabilities", "fetchHosts", "memoryMax", "shutdownSeconds"})
 MEMORY_MIN_MIB = 16
 MEMORY_MAX_MIB = 512

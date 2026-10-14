@@ -59,8 +59,7 @@ impl Pool {
                     return Ok(());
                 }
                 // 先占进程内名额，再领取持久化代次；无候选时立即释放，不把账号永久挂在 recovering。
-                // TODO(design): recoveryCheck 已领取的代次没有过期回收；进程中断后同代不会重领，
-                // 只有新窗口代次才能再检测。是否增加恢复检测租约及其期限需要设计决定。
+                // recoveryCheck 在持久化状态机中回收超过 5 分钟未回报的领取，支持进程中断后重领。
                 if !self
                     .recovering
                     .lock()

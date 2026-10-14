@@ -8,6 +8,7 @@ import tempfile
 import time
 import signal
 import unittest
+from unittest.mock import Mock, patch
 
 from server import Platform, package_directory, REPO
 from lifecycle import Lifecycle
@@ -112,6 +113,43 @@ class ServicePlatformTests(unittest.TestCase):
         self.assertEqual(policy['capabilities'], ['sample.echo.deep'])
 
     # ----- 管理调用转发 -----
+
+    def test_gateway_pool_uses_current_service_manifest_and_falls_back_on_rollback(self):
+        service = json.loads((REPO / 'plugins/gateway-pool/plugin.json').read_text(encoding='utf-8'))
+        legacy = {key: value for key, value in service.items() if key != 'service'}
+        calls = Mock()
+        calls.call.return_value = {'source': 'service'}
+        self.platform.service_calls = calls
+        # 页面可以仍租用升级前的包；选择后端必须跟随当前安装版本，包括回退。
+        for current, page in [(service, legacy), (legacy, service)]:
+            with self.subTest(service='service' in current), \
+                    patch.object(self.platform.store, 'state', return_value={'enabled': True}), \
+                    patch.object(self.platform.store, 'manifest', side_effect=lambda _, version=None: page if version else current), \
+                    patch.object(self.platform.gateway_pool, 'configure', return_value={'source': 'python'}) as configure, \
+                    patch.object(self.platform.gateway_pool, 'update_queue', return_value={'source': 'python'}) as queue, \
+                    patch.object(self.platform.gateway_pool, 'view', return_value={'source': 'python'}) as view, \
+                    patch.object(self.platform.gateway_pool, 'settings_for_ui', return_value={}), \
+                    patch.object(self.platform.gateway_pool, 'statistics', return_value={'source': 'python'}) as history:
+                for method, target in [('configure', configure), ('queue.update', queue), ('read', view), ('history.read', history)]:
+                    calls.reset_mock()
+                    target.reset_mock()
+                    data = {'nested': [1, None]}
+                    status, body, _ = self.platform.call('gateway-pool', 'page', 'gateway-pool.' + method, data, 'session', 'admin', 'http://localhost')
+                    self.assertEqual(status, 200)
+                    self.assertEqual(json.loads(body)['source'], 'service' if 'service' in current else 'python')
+                    if 'service' in current:
+                        calls.call.assert_called_once_with('gateway-pool', method, data, 'admin')
+                        target.assert_not_called()
+                    else:
+                        calls.call.assert_not_called()
+                        target.assert_called_once()
+                    calls.reset_mock()
+                    target.reset_mock()
+                    for role in ('key', '', 'viewer'):
+                        with self.assertRaises(PermissionError):
+                            self.platform.call('gateway-pool', 'page', 'gateway-pool.' + method, {}, 'session', role, 'http://localhost')
+                    calls.call.assert_not_called()
+                    target.assert_not_called()
 
     def test_admin_call_is_forwarded_to_registry_socket_and_restricted_to_admin(self):
         version = self.install('1')

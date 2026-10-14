@@ -1,4 +1,4 @@
-"""updater 与控制面共用的最小内核协议客户端（协议 0.5，只用管理连接）。
+"""updater 与控制面共用的最小内核协议客户端（协议 0.6，只用管理连接）。
 
 帧格式与 backend/crates/kernel-protocol 一致：4 字节大端长度 + UTF-8 JSON，单帧上限 1 MiB。
 只实现管理连接需要的 hello、health、admin.call；管理连接不处理钩子和能力调用。
@@ -14,7 +14,7 @@ import time
 MAX_FRAME_BYTES = 1_048_576
 KERNEL_API_MAJOR = 0
 KERNEL_API_MIN_MINOR = 4
-KERNEL_API_MINOR = 5
+KERNEL_API_MINOR = 6
 # 握手中报告给插件的内核版本。TODO(design): 任务未规定握手版本字符串，此处使用固定占位值。
 KERNEL_VERSION = "updater"
 

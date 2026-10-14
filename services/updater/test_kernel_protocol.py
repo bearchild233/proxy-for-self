@@ -72,6 +72,7 @@ class FakePlugin:
         self.ready = ready
         self.minor = minor
         self.roles = []
+        self.kernel_apis = []
         self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.server.bind(self.path)
         self.server.listen(4)
@@ -103,6 +104,7 @@ class FakePlugin:
             method, params, request_id = message["method"], message["params"], message["id"]
             if method == "hello":
                 self.roles.append(params["role"])
+                self.kernel_apis.append(params["kernelApi"])
                 self.reply(connection, request_id, {
                     "plugin": {"id": self.plugin_id, "version": "test"}, "sdk": {"version": "test"},
                     "kernelApi": {"major": 0, "minMinor": self.minor}, "hooks": [], "capabilities": ["log"],
@@ -136,6 +138,14 @@ class AdminClientTests(unittest.TestCase):
     def test_admin_call_returns_plugin_result_unchanged(self):
         value = admin_call(self.fake.path, "echo", {"nested": [1, None, "x"]}, "admin", 5)
         self.assertEqual(value, {"nested": [1, None, "x"]})
+
+    def test_protocol_six_plugin_is_supported_and_future_version_is_refused(self):
+        self.fake.minor = 6
+        self.assertEqual(health(self.fake.path, 5), {"ready": True})
+        self.assertEqual(self.fake.kernel_apis[-1], {"major": 0, "minor": 6})
+        self.fake.minor = 7
+        with self.assertRaises(ProtocolError):
+            health(self.fake.path, 5)
 
     def test_plugin_error_keeps_protocol_code(self):
         with self.assertRaises(RpcFailure) as context:

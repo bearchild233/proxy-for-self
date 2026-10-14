@@ -44,6 +44,7 @@ class PlatformContracts(unittest.TestCase):
         from server import BoundedServer, Handler
         import threading
         manifest = json.loads((REPO/'plugins/gateway-pool/plugin.json').read_text(encoding='utf-8'))
+        manifest.pop('service', None)  # 固定验证旧包的 Python 路径与内部接口。
         with patch.object(self.platform.store, 'state', return_value={'enabled':True,'current':'version'}), patch.object(self.platform.store, 'manifest', return_value=manifest):
             with self.assertRaises(PermissionError):
                 self.platform.call('gateway-pool','version','gateway-pool.configure',{},'session','key','http://localhost')

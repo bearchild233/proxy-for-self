@@ -328,6 +328,62 @@ fn recovery_check_ignores_generations_with_degraded_signals_or_expired_material(
 }
 
 #[test]
+fn interrupted_recovery_claim_expires_after_five_minutes_across_restart() {
+    let mut harness = pool();
+    dynamic_groups(&harness);
+    let (pair, _) = harness.probe_simple(
+        false,
+        json!({"material": {
+            "state": "s0", "cookie": "__oailb=x; __cflb=y", "expires": harness.now() + 20_000.0
+        }}),
+    );
+    harness.advance(480.0);
+    let claim = || json!({"action": "recoveryCheck", "accountId": "A"});
+    assert_eq!(
+        harness.rt_raw(claim())["check"]["generation"],
+        pair["generation"]
+    );
+    harness.reopen(); // 领取后进程中断，没有 recoveryResult。
+    harness.advance(299.0);
+    assert_eq!(harness.rt_raw(claim())["check"], Value::Null);
+    harness.advance(1.0);
+    assert_eq!(harness.rt_raw(claim())["check"], Value::Null);
+    harness.advance(0.001);
+    let other = gateway_pool::Store::open(harness.dir.path(), harness.clock.clock()).unwrap();
+    let results = std::thread::scope(|scope| {
+        let a = scope.spawn(|| harness.rt_raw(claim()));
+        let b = scope.spawn(|| other.runtime(&claim()).unwrap());
+        [a.join().unwrap(), b.join().unwrap()]
+    });
+    assert_eq!(
+        results
+            .iter()
+            .filter(|r| r["check"]["generation"] == pair["generation"])
+            .count(),
+        1
+    );
+    assert_eq!(harness.rt_raw(claim())["check"], Value::Null);
+    // 旧记录缺领取时间时视为过期，即使仍保留 claimed_generation。
+    harness
+        .connection()
+        .execute(
+            "UPDATE recovery_checks SET claimed_at=NULL WHERE account='A'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        harness.rt_raw(claim())["check"]["generation"],
+        pair["generation"]
+    );
+    // 已回报的同代不重领；失败暂停与成功/无法检测的既有规则保持不变。
+    for outcome in ["failed", "unavailable", "recovered"] {
+        harness.rt("recoveryResult", json!({"outcome": outcome}));
+        harness.advance(3601.0);
+        assert_eq!(harness.rt_raw(claim())["check"], Value::Null);
+    }
+}
+
+#[test]
 fn probe_prepares_once_and_switch_preserves_inflight() {
     let harness = pool();
     let (pair, result) = harness.probe_simple(false, json!({}));

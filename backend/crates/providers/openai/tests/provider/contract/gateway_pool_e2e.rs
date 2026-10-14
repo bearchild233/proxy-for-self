@@ -818,3 +818,371 @@ async fn gateway_pool_plugin_observes_degradation_moves_group_and_delivers_from_
         .unwrap();
     admin_db.close().await;
 }
+
+/// 只在测试装置计时：包含真实 socket 往返与插件内部的账号/额度读取，不修改生产热路径。
+struct TimedHooks {
+    runtime: Arc<PluginRuntime>,
+    samples: Mutex<[Vec<f64>; 3]>,
+}
+
+impl TimedHooks {
+    fn record(&self, index: usize, start: std::time::Instant) {
+        let micros = start.elapsed().as_secs_f64() * 1_000_000.0;
+        self.samples.lock().unwrap()[index].push(micros);
+    }
+}
+
+#[async_trait]
+impl PluginHooks for TimedHooks {
+    fn ownership(&self, group: &str) -> Ownership {
+        self.runtime.ownership(group)
+    }
+
+    async fn route_select(
+        &self,
+        plugin: &str,
+        params: RouteSelectParams,
+    ) -> Result<RouteSelectResult, RpcError> {
+        let start = std::time::Instant::now();
+        let result = self.runtime.route_select(plugin, params).await;
+        self.record(0, start);
+        result
+    }
+
+    async fn route_prepare(
+        &self,
+        plugin: &str,
+        params: RoutePrepareParams,
+    ) -> Result<RoutePrepareResult, RpcError> {
+        let start = std::time::Instant::now();
+        let result = self.runtime.route_prepare(plugin, params).await;
+        self.record(1, start);
+        result
+    }
+
+    async fn response_head(
+        &self,
+        plugin: &str,
+        params: ResponseHeadParams,
+    ) -> Result<ResponseHeadResult, RpcError> {
+        let start = std::time::Instant::now();
+        let result = self.runtime.response_head(plugin, params).await;
+        self.record(2, start);
+        result
+    }
+
+    async fn response_observe(
+        &self,
+        plugin: &str,
+        params: ResponseObserveParams,
+    ) -> Result<ResponseObserveResult, RpcError> {
+        self.runtime.response_observe(plugin, params).await
+    }
+
+    async fn request_finish(&self, plugin: &str, params: RequestFinishParams) {
+        self.runtime.request_finish(plugin, params).await;
+    }
+}
+
+fn latency_scope(ids: &[String], pooled: bool) -> Arc<FrozenAccountScope> {
+    Arc::new(FrozenAccountScope::new(
+        Arc::new(RuntimeAccountDirectory::new(
+            ids.iter()
+                .map(|id| {
+                    let groups = if pooled {
+                        BTreeSet::from([gateway_core::account::scope::AccountGroupId::new(
+                            POOL_GROUP,
+                        )
+                        .unwrap()])
+                    } else {
+                        BTreeSet::new()
+                    };
+                    (
+                        ProviderAccountId::new(id).unwrap(),
+                        RuntimeAccount::new(ProviderKind::new("openai").unwrap(), groups),
+                    )
+                })
+                .collect(),
+        )),
+        ClientRoutingScope::all_accounts(),
+    ))
+}
+
+async fn latency_request(
+    provider: &CodexProvider,
+    scope: Arc<FrozenAccountScope>,
+    request: &str,
+) -> f64 {
+    let context = AttemptContext::new(
+        RequestAttemptContext::new(
+            ModelRequestId::new(format!("req_{request}")).unwrap(),
+            ClientApiKeyId::new("key_latency").unwrap(),
+        ),
+        NonZeroU32::new(1).unwrap(),
+        SystemTime::now() + BUDGET,
+        account_policy(),
+        AccountAttemptContext::new(BTreeSet::new(), None, None).with_account_scope(scope),
+        None,
+        CancellationToken::new(),
+    );
+    let body = json!({"model": PROBE_MODEL, "input": "hello"});
+    let operation = Operation::Generate(GenerateRequest::from_protocol_payload(
+        ProtocolPayload::json_object("openai", body.as_object().unwrap().clone())
+            .unwrap()
+            .with_original_json(Bytes::from(body.to_string()))
+            .with_context(Map::from_iter([("use_websocket".into(), json!(false))])),
+    ));
+    let start = std::time::Instant::now();
+    let mut stream = provider
+        .execute(planned_request("openai", operation), context)
+        .await
+        .unwrap();
+    let mut completed = false;
+    while let Some(event) = stream.next().await {
+        // 与主用例一致：以完整消费到上游正文末尾为准。
+        if let Some(wire) = event.unwrap().wire_event() {
+            completed |= wire.data().to_string().contains("complete good answer");
+        }
+    }
+    drop(stream);
+    let micros = start.elapsed().as_secs_f64() * 1_000_000.0;
+    assert!(completed);
+    micros
+}
+
+fn latency_summary(values: &[f64]) -> Value {
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    // nearest-rank 分位数；总差值按交替请求逐对相减，同时保留两组原始总耗时。
+    json!({"count": sorted.len(), "p50": sorted[(sorted.len() * 50).div_ceil(100) - 1],
+        "p99": sorted[(sorted.len() * 99).div_ceil(100) - 1],
+        "mean": sorted.iter().sum::<f64>() / sorted.len() as f64})
+}
+
+#[tokio::test]
+#[ignore = "本机 release 延迟测量；设置 GATEWAY_POOL_PLUGIN_BIN 与 GATEWAY_POOL_LATENCY_OUTPUT"]
+#[allow(clippy::assertions_on_constants)] // 调试构建仍可编译此 ignored 用例，显式运行时才拒绝计时。
+async fn gateway_pool_plugin_hook_latency_release() {
+    assert!(!cfg!(debug_assertions), "run with cargo test --release");
+    let output = std::env::var_os("GATEWAY_POOL_LATENCY_OUTPUT").expect("measurement output path");
+    let mut results = Vec::new();
+    for count in [1, 20] {
+        let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = probes.clone();
+        let upstream = MockServer::builder()
+            .disable_request_recording()
+            .start()
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/codex/responses"))
+            .respond_with(move |request: &wiremock::Request| {
+                let probe =
+                    captured_request_body(request)["input"][0]["content"][0]["text"] == "hi";
+                if probe {
+                    observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let response = ResponseTemplate::new(200).set_body_string("not read");
+                    return if request.headers.contains_key("x-codex-turn-state") {
+                        response
+                    } else {
+                        response.insert_header("x-codex-turn-state", "latency-ticket")
+                    };
+                }
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(GOOD_BODY)
+            })
+            .mount(&upstream)
+            .await;
+        let store = Arc::new(MemoryAccountStore::default());
+        let ids: Vec<String> = (0..count).map(|n| format!("acct_latency_{n}")).collect();
+        for id in &ids {
+            create_account(&store, id).await;
+            let account = store.account(id).unwrap();
+            let now = SystemTime::now();
+            store
+                .compare_and_swap_quota(QuotaObservation {
+                    plan_type: None,
+                    account_id: account.id().clone(),
+                    expected_revision: account.revision(),
+                    observed_at: now,
+                    state: QuotaState::allowed(now),
+                    quota: OpaqueProviderData::new(
+                        json!({"rate_limit":{"allowed":true,"limit_reached":false,
+                    "primary_window":{"used_percent":10,"reset_at":Utc::now().timestamp()+18000}}})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                    ),
+                })
+                .await
+                .unwrap();
+        }
+        let (provider, quota) = provider_and_quota_with_affinity_and_base_url_and_leases(
+            &store,
+            Arc::new(MemorySessionAffinity::default()),
+            upstream.uri(),
+            Arc::new(TestLeaseCoordinator::default()),
+            u32::try_from(DEFAULT_STREAM_MAX_RETRIES).unwrap(),
+        );
+        let provider = provider.with_plugin_routing(true);
+        let capabilities = Arc::new(Capabilities {
+            inner: KernelCapabilities {
+                accounts: Arc::new(Directory(store.clone())),
+                upstream: Arc::new(OpenAiPluginUpstream::new(
+                    store.clone(),
+                    store.repository(),
+                    quota,
+                    CodexBackendClient::new(
+                        reqwest::Client::builder().no_proxy().build().unwrap(),
+                        upstream.uri(),
+                        wire_profile(),
+                    ),
+                )),
+                groups: Arc::new(NoGroupMoves),
+                log: Arc::new(LogCapabilities),
+            },
+            fetches: Mutex::new(Vec::new()),
+        });
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("latency.sock");
+        let process = PluginProcess(
+            std::process::Command::new(plugin_binary())
+                .env("CPR_PLUGIN_SOCKET", &socket)
+                .env("CPR_PLUGIN_DATA", root.path().join("data"))
+                .env("CPR_PLUGIN_SHUTDOWN_MS", "3000")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        until(|| socket.exists()).await;
+        std::fs::write(
+            root.path().join("registry.json"),
+            serde_json::to_vec(&json!({"plugins":[{
+            "id":"gateway-pool","enabled":true,"socket":socket,
+            "grants":["accounts.read","quota.read","upstream.probe","http.fetch","log"]}]}))
+            .unwrap(),
+        )
+        .unwrap();
+        let runtime = Arc::new(
+            PluginRuntime::start(
+                PluginRuntimeConfig {
+                    registry_path: Some(root.path().join("registry.json")),
+                    ownership_cache_path: Some(root.path().join("ownership.json")),
+                },
+                KernelInfo {
+                    version: "latency-release".into(),
+                    slot: None,
+                },
+                capabilities.clone(),
+            )
+            .unwrap()
+            .unwrap(),
+        );
+        until(|| {
+            runtime
+                .snapshot()
+                .plugins
+                .iter()
+                .any(|p| p.state == gateway_host::plugin::ConnectionState::Available)
+        })
+        .await;
+        admin(
+            &runtime,
+            "configure",
+            json!({"groupIds":[POOL_GROUP], "poolUrl":"https://pool.example.invalid",
+            "poolToken":"demo-pool-token", "probeIntervalMs":10, "probeModel":PROBE_MODEL}),
+        )
+        .await;
+        until(|| {
+            matches!(
+                runtime.ownership(POOL_GROUP),
+                Ownership::Owned {
+                    available: true,
+                    ..
+                }
+            )
+        })
+        .await;
+        let timed = Arc::new(TimedHooks {
+            runtime: runtime.clone(),
+            samples: Mutex::new(std::array::from_fn(|_| Vec::new())),
+        });
+        provider.set_plugin_hooks(timed.clone());
+        // 每个账号单独完成真实打票，再以全部候选测量。普通组使用相同账号库、Provider 和上游。
+        for (index, id) in ids.iter().enumerate() {
+            latency_request(
+                &provider,
+                latency_scope(std::slice::from_ref(id), true),
+                &format!("warm_{index}"),
+            )
+            .await;
+        }
+        until_idle(&runtime).await;
+        let pooled = latency_scope(&ids, true);
+        let ordinary = latency_scope(&ids, false);
+        latency_request(&provider, ordinary.clone(), "warm_ordinary").await;
+        *timed.samples.lock().unwrap() = std::array::from_fn(|_| Vec::new());
+        let probe_count = probes.load(std::sync::atomic::Ordering::Relaxed);
+        let fetch_count = capabilities.fetches.lock().unwrap().len();
+        let mut plugin_us = Vec::new();
+        let mut ordinary_us = Vec::new();
+        for n in 0..1000 {
+            // 交替先后顺序，降低顺序漂移；普通账号必须不触发任何同步钩子。
+            let baseline_first = n % 2 == 0;
+            for baseline in [baseline_first, !baseline_first] {
+                if baseline {
+                    let before: Vec<_> =
+                        timed.samples.lock().unwrap().iter().map(Vec::len).collect();
+                    ordinary_us.push(
+                        latency_request(&provider, ordinary.clone(), &format!("ordinary_{n}"))
+                            .await,
+                    );
+                    assert_eq!(
+                        before,
+                        timed
+                            .samples
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .map(Vec::len)
+                            .collect::<Vec<_>>()
+                    );
+                } else {
+                    plugin_us.push(
+                        latency_request(&provider, pooled.clone(), &format!("pooled_{n}")).await,
+                    );
+                }
+            }
+        }
+        until_idle(&runtime).await;
+        // 探测只来自插件后台续期窗口，业务请求的钩子路径不探测；计数写入结果而不是断言为零。
+        let background_probes = probes.load(std::sync::atomic::Ordering::Relaxed) - probe_count;
+        // 池服务访问只来自插件后台续期，不在钩子路径上；计数写入结果而不是断言为零。
+        let background_fetches = capabilities.fetches.lock().unwrap().len() - fetch_count;
+        let samples = timed.samples.lock().unwrap().clone();
+        assert!(
+            samples.iter().all(|samples| samples.len() == 1000),
+            "exactly three hooks per pooled request"
+        );
+        let delta: Vec<_> = plugin_us
+            .iter()
+            .zip(&ordinary_us)
+            .map(|(a, b)| a - b)
+            .collect();
+        results.push(json!({"accounts":count,"requests_per_path":1000,"unit":"us",
+            "background_pool_fetches_during_timing":background_fetches,
+            "background_probes_during_timing":background_probes,
+            "route.select":latency_summary(&samples[0]),"route.prepare":latency_summary(&samples[1]),
+            "response.head":latency_summary(&samples[2]),"plugin_total":latency_summary(&plugin_us),
+            "ordinary_total":latency_summary(&ordinary_us),"paired_delta":latency_summary(&delta),
+            "raw":{"select":samples[0],"prepare":samples[1],"head":samples[2],"plugin":plugin_us,"ordinary":ordinary_us}}));
+        runtime.shutdown().await;
+        drop(process);
+    }
+    std::fs::write(
+        output,
+        serde_json::to_vec_pretty(&json!({"profile":"release", "cases":results})).unwrap(),
+    )
+    .unwrap();
+}

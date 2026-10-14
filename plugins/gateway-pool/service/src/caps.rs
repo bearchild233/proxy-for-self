@@ -9,7 +9,7 @@ use std::time::Duration;
 use plugin_sdk::{Kernel, RpcResult, protocol::*};
 use serde_json::Value;
 
-/// 插件向内核申请的能力（写入握手；`plugin.json` 的 `service` 段在 012 打包时再加）。
+/// 插件向内核申请的能力，与 `plugin.json` 的 `service` 段一致。
 pub const CAPABILITIES: [&str; 6] = [
     "groups.move",
     "accounts.read",
@@ -101,7 +101,7 @@ impl Caps {
     }
 
     pub async fn move_group(&self, params: GroupsMoveParams) -> RpcResult<GroupsMoveResult> {
-        // TODO(design): groups.move 的独立调用预算尚未规定；目前复用既有能力调用预算。
+        // 012 已确认：groups.move 复用读取类能力的 5 秒预算。
         self.kernel.call("groups.move", &params, READ_TIMEOUT).await
     }
 

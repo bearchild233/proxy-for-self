@@ -1478,6 +1478,12 @@ impl Store {
             }
             if row.as_ref().is_some_and(|row| {
                 str_field(row, "claimed_generation") == Some(generation.as_str())
+                    && num_field(row, "claimed_at").is_some_and(|claimed| {
+                        // 与 Python 有意不同：未回报的领取超过 5 分钟可重领；旧记录无时间视为过期。
+                        // 已回报的同代次仍只检测一次，不改变 recoveryResult 的暂停规则。
+                        now.minus(claimed).le(Num::Int(300))
+                            || num_field(row, "last_at").is_some_and(|last| last.ge(claimed))
+                    })
             }) {
                 continue;
             }

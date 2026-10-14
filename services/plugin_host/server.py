@@ -175,6 +175,9 @@ class Platform:
         if name.startswith('gateway-pool.'):
             if role != 'admin' or plugin_id != 'gateway-pool':
                 raise PermissionError('没有网关池管理权限')
+            # 页面租约可能仍指向旧包；执行后端以当前安装版本为准，回退旧包即恢复 Python。
+            manifest = self.store.manifest(plugin_id)
+        if name.startswith('gateway-pool.') and manifest.get('service') is None:
             if name == 'gateway-pool.configure':
                 value = self.gateway_pool.configure(data)
             elif name == 'gateway-pool.queue.update':

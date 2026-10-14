@@ -22,7 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             min_minor: 6,
         },
         hooks: HOOKS.map(str::to_owned).to_vec(),
-        // 对外访问全部经内核能力；清单里的 `service` 段在 012 打包时再加。
+        // 对外访问全部经内核能力，与清单里的 service.capabilities 一致。
         capabilities: CAPABILITIES.map(str::to_owned).to_vec(),
         owned_groups: ownership.owned_groups,
         watched_groups: ownership.watched_groups,

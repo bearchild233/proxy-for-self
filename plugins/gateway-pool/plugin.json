@@ -1,9 +1,22 @@
 {
-  "id": "gateway-pool", "version": "0.3.2", "protocol": 2, "kind": "ui", "sdk": 1,
+  "id": "gateway-pool", "version": "0.4.0", "protocol": 2, "kind": "ui", "sdk": 1,
   "runtime": "vue-component", "hostApi": 1,
   "pages": [{"id":"main","title":"网关池","entry":"ui/module.js","roles":["admin"],"route":"/extensions/gateway-pool"}],
   "capabilities": ["gateway-pool.read","gateway-pool.history.read","gateway-pool.queue.update","gateway-pool.configure","account-groups.get.admin.account-groups","accounts.get.admin.accounts"],
   "policyWorker": "worker/policy.py",
-  "releasedAt": "2026-10-13T12:00:00+08:00",
-  "releaseNotes": ["账号卡片与统计只显示当前分组成员：移出的账号不再出现，移入的账号自动出现（动态分组调整立即刷新，手动调整一分钟内刷新）", "账号顺序是优先级而不是排队：任何可用账号都可被选中，窗口按账号、一个 Key 一个账号；只绑定一个降智账号的 Key 不再被提前拒绝", "新增动态分组：普通账号确认降智后自动移入降智分组，设置里指定正常分组和降智分组，所有调整记录在“分组变动”", "失败时给出具体原因（账号停用、额度耗尽、网关全部静置、等待超时等）", "账号支持拖拽共用队列和卡片内参与开关，一轮网关或额度用完后移到队尾", "合并检测与轮转明细，保留详情；独立轮转统计页展示账号与每批窗口时长", "保留冷却恢复比例图，按真实再访问间隔汇总；查询不触发上游检测", "Key 授权范围内优先按队列使用降智账号，不可用时回退普通账号原有策略", "保留持续模式与失败退避；需要配套 Rust 网关及控制面的历史、队列能力"]
+  "service": {
+    "binary": "service/gateway-pool",
+    "kernelApi": {"major": 0, "minMinor": 6},
+    "capabilities": ["accounts.read", "quota.read", "upstream.probe", "http.fetch", "groups.move", "log"],
+    "fetchHosts": ["pool.0102400.xyz"],
+    "memoryMax": "64M",
+    "shutdownSeconds": 40
+  },
+  "releasedAt": "2026-10-14T22:00:00+08:00",
+  "releaseNotes": [
+    "网关池改为独立服务插件：更新网关池只需热更新插件，不再重启网关；热更新时进行中的请求由新版本接管",
+    "账号没有额度记录时先刷新再检测；账号没有打票模型权限时直接给出原因",
+    "上游返回错误时保留原始错误内容，不再改写成网关池错误",
+    "降智确认、自动移组、恢复检测、持续模式与原有规则一致"
+  ]
 }
