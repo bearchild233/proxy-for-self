@@ -3,7 +3,7 @@ import type { PoolStatistics, UsageBatch, UsageRecord } from '../history'
 import type { DirectoryAccount, Observation } from '../model'
 import { usePluginPolling } from '@sdk/polling'
 import { call } from '@sdk/ui'
-import { computed, onActivated, onDeactivated, onMounted, onScopeDispose, shallowRef, watch } from 'vue'
+import { computed, nextTick, onActivated, onDeactivated, onMounted, onScopeDispose, shallowRef, watch } from 'vue'
 import BaseButton from '@/components/base/BaseButton.vue'
 import BaseInput from '@/components/base/BaseInput.vue'
 import BaseSelect from '@/components/base/BaseSelect.vue'
@@ -16,6 +16,14 @@ import PoolCoolingSummary from './PoolCoolingSummary.vue'
 import PoolUsageCharts from './PoolUsageCharts.vue'
 
 const props = defineProps<{ accounts: DirectoryAccount[], mode: 'records' | 'summary' }>()
+// 备用票从未转正的记录没有窗口；已转正的窗口从第一次业务访问算起。
+function stateText(row: UsageRecord) {
+  if (row.verifiedAt == null)
+    return row.probeEndedAt == null ? '检测中' : '未形成窗口'
+  if (row.standby && row.activatedAt == null)
+    return row.retiredAt == null ? '备用中' : '备用票已丢弃'
+  return row.retiredAt == null ? '使用中' : '已结束'
+}
 const emit = defineEmits<{ records: [] }>()
 const data = shallowRef<PoolStatistics>()
 const error = shallowRef('')
@@ -119,6 +127,14 @@ function drillGateway(value: string) {
   batch.value = ''
   emit('records')
 }
+// 最近 24 小时图里点某个账号的网关：先切换账号（会清空网关筛选），再设网关。
+async function drillWindow(value: { accountId: string, gateway: string }) {
+  if (account.value !== value.accountId) {
+    account.value = value.accountId
+    await nextTick()
+  }
+  drillGateway(value.gateway)
+}
 function drillBatch(value: string) {
   batch.value = value
   gateway.value = ''
@@ -188,14 +204,14 @@ usePluginPolling(() => refresh(true), computed(() => active.value ? 10_000 : 0))
     </p>
     <div v-if="data" class="flex flex-wrap items-center justify-between gap-2 text-cp-sm">
       <span class="font-emphasis">窗口总时长 {{ duration(data.summary.windowSeconds) }}</span>
-      <span class="text-cp-xs text-cp-text-secondary">有效窗口从首次访问计至停止接新请求，进行中计至当前</span>
+      <span class="text-cp-xs text-cp-text-secondary">窗口时长计至最后一次确认可用；使用中的窗口计至当前，备用票转正的窗口从第一次业务访问算起</span>
     </div>
     <p v-if="data && (data.collectionGaps || data.summary.missing.windowSeconds)" class="text-cp-xs text-cp-warning-text">
       部分窗口记录缺失，合计仅包含已知时长
     </p>
     <template v-if="tab === 'summary'">
       <PoolCoolingSummary v-if="data?.coolingAnalysis" :data="data.coolingAnalysis" />
-      <PoolUsageCharts v-if="data" :gateways="data.gateways" :batches="data.batches" @gateway="drillGateway" @batch="drillBatch" />
+      <PoolUsageCharts v-if="data" :gateways="data.gateways" :recent="data.recentWindows ?? []" :names="names" @gateway="drillGateway" @window="drillWindow" />
       <BaseTable :columns="batchColumns" :rows="data?.batches ?? []" :loading="loading" empty-text="选择账号查看每批轮转">
         <template #number="{ row }">
           第 {{ row.number }} 批
@@ -221,11 +237,11 @@ usePluginPolling(() => refresh(true), computed(() => active.value ? 10_000 : 0))
         <span class="font-mono">{{ row.gateway }}</span><span class="block text-cp-xs text-cp-text-secondary">第 {{ row.batchNumber }} 批</span>
       </template>
       <template #period="{ row }">
-        <span v-if="row.verifiedAt != null" class="text-cp-xs text-cp-text-secondary">{{ time(row.firstContactAt) }}<br>{{ row.retiredAt == null ? '使用中' : time(row.retiredAt) }}</span>
+        <span v-if="row.verifiedAt != null && row.windowStartAt != null" class="text-cp-xs text-cp-text-secondary">{{ time(row.windowStartAt) }}<br>{{ row.windowEndAt != null ? time(row.windowEndAt) : row.retiredAt == null ? '使用中' : time(row.retiredAt) }}</span>
         <span v-else class="text-cp-xs text-cp-text-secondary">—</span>
       </template>
       <template #state="{ row }">
-        {{ row.verifiedAt == null ? row.probeEndedAt == null ? '检测中' : '未形成窗口' : row.retiredAt == null ? '使用中' : '已结束' }}<span v-if="row.partial" class="block text-cp-xs text-cp-text-secondary">部分计入范围</span>
+        {{ stateText(row) }}<span v-if="row.partial" class="block text-cp-xs text-cp-text-secondary">部分计入范围</span>
       </template>
       <template #actions="{ row }">
         <BaseButton size="sm" variant="ghost" :aria-expanded="expanded.includes(row.id)" @click="toggle(row.id)">
@@ -235,7 +251,11 @@ usePluginPolling(() => refresh(true), computed(() => active.value ? 10_000 : 0))
       <template #expanded="{ row }">
         <div class="space-y-3 py-3">
           <div class="flex flex-wrap gap-x-5 gap-y-2 text-cp-xs text-cp-text-secondary">
+            <span v-if="row.standby">备用票拿到 {{ time(row.standbyAt) }}</span>
+            <span v-if="row.standby">启用 {{ time(row.activatedAt) }}</span>
             <span>验证可用 {{ time(row.verifiedAt) }}</span>
+            <span>最后确认可用 {{ time(row.lastConfirmedAt) }}</span>
+            <span>窗口时长 {{ duration(row.windowSeconds) }}</span>
             <span>结束原因 {{ row.reason ? reasonLabels[row.reason] ?? row.reason : '—' }}</span>
             <span>检测结果 {{ row.probeResult === '21' ? '21 满血' : row.probeResult === '29' ? '29 降智' : row.probeResult === 'failed' ? '未通过' : '待结果' }}</span>
           </div>

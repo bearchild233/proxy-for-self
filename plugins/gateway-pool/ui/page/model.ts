@@ -16,6 +16,9 @@ export interface Settings {
   windowSeconds: number
   initialRestSeconds: number
   maximumRestSeconds: number
+  /** 复测仍降智时的升档方式：加性每次加一个步长，乘性每次翻倍。 */
+  backoffMode: 'additive' | 'multiplicative'
+  backoffStepSeconds: number
   probeIntervalMs: number
   probeModel: string
   poolDirect: boolean
@@ -43,7 +46,7 @@ export interface GroupEvent {
   finishedAt?: number | null
 }
 
-export type PairState = 'unknown' | 'preparing' | 'ready' | 'draining' | 'cooling'
+export type PairState = 'unknown' | 'preparing' | 'standby' | 'ready' | 'draining' | 'cooling'
 
 export interface Pair {
   coolingSummary?: CoolingSummary
@@ -53,11 +56,24 @@ export interface Pair {
   generation?: string
   restUntil?: number | null
   restSeconds?: number
+  /** 当前静置所在的档；检测失败的短静置不改档。 */
+  tierSeconds?: number | null
+  /** 本次静置开始时的起始档。 */
+  startTierSeconds?: number | null
   learnedRestSeconds?: number | null
   inFlight: number
   firstContactAt?: number | null
   lastContactAt?: number | null
   retiredReason?: string
+  /** 备用票：拿到时间与丢弃时间。 */
+  standbyAt?: number | null
+  standbyExpiresAt?: number | null
+  /** 备用票转正后，窗口从第一次业务访问开始计时。 */
+  fromStandby?: boolean
+  activatedAt?: number | null
+  windowStartedAt?: number | null
+  /** 准备中的组合是备用票。 */
+  standbyPlan?: boolean
   ticketModels?: string[]
   cookieExpiresAt?: number | null
 }
@@ -120,6 +136,7 @@ export interface DirectoryAccount {
 
 export const stateLabels: Record<PairState, string> = {
   ready: '服务中',
+  standby: '备用票',
   preparing: '检测中',
   draining: '排空中',
   cooling: '静置中',
@@ -144,6 +161,11 @@ export function duration(seconds?: number | null): string {
 export function clock(seconds: number): string {
   const value = Math.max(0, Math.floor(seconds))
   return `${Math.floor(value / 60)}:${String(value % 60).padStart(2, '0')}`
+}
+
+// 窗口计时起点：备用票转正的窗口从第一次业务访问算起，其余从首次接触算起。
+export function windowStart(pair: Pair): number | null {
+  return (pair.fromStandby ? pair.windowStartedAt : pair.firstContactAt) ?? null
 }
 
 export function gatewayNumber(gateway: string): string {

@@ -1,14 +1,14 @@
 <script setup lang="ts">
 import type { EChartsOption } from 'echarts'
-import type { GatewaySummary, UsageBatch } from '../history'
+import type { GatewaySummary, RecentWindow } from '../history'
 import { computed } from 'vue'
 import BaseEmpty from '@/components/base/BaseEmpty.vue'
 import BaseChart from '@/components/charts/BaseChart.vue'
 import { useChartPalette } from '@/composables/useChartPalette'
 import { duration } from '../model'
 
-const props = defineProps<{ gateways: GatewaySummary[], batches: UsageBatch[] }>()
-const emit = defineEmits<{ gateway: [value: string], batch: [value: string] }>()
+const props = defineProps<{ gateways: GatewaySummary[], recent: RecentWindow[], names: Map<string, string> }>()
+const emit = defineEmits<{ gateway: [value: string], window: [value: { accountId: string, gateway: string }] }>()
 const { palette } = useChartPalette()
 const colors = computed(() => [palette.value.info, palette.value.success, palette.value.warning, palette.value.reasoning, palette.value.danger])
 const slices = computed(() => [...props.gateways].sort((a, b) => b.windowSeconds - a.windowSeconds).map((row, index) => ({ ...row, color: colors.value[index % colors.value.length] })))
@@ -24,21 +24,18 @@ const ringOption = computed<EChartsOption>(() => ({
     data: slices.value.filter(row => row.windowSeconds > 0).map(row => ({ name: row.gateway, value: row.windowSeconds, itemStyle: { color: row.color, borderColor: palette.value.surface, borderWidth: 2 } })),
   }],
 }))
-const batchOption = computed<EChartsOption>(() => ({
-  animation: false,
-  tooltip: { trigger: 'axis', renderMode: 'richText', valueFormatter: value => duration(Number(value)) },
-  legend: { top: 0, textStyle: { color: palette.value.textSecondary, fontSize: 12 } },
-  grid: { left: 70, right: 24, top: 40, bottom: 28 },
-  xAxis: { type: 'value', name: '秒', axisLabel: { color: palette.value.textMuted }, splitLine: { lineStyle: { color: palette.value.grid } } },
-  yAxis: { type: 'category', inverse: true, data: props.batches.map(batch => `第 ${batch.number} 批`), axisLabel: { color: palette.value.textPrimary }, axisLine: { show: false }, axisTick: { show: false } },
-  series: [{
-    name: '窗口总时长',
-    type: 'bar',
-    barMaxWidth: 16,
-    itemStyle: { color: palette.value.info },
-    data: props.batches.map(batch => batch.windowSeconds),
-  }],
-}))
+// 最近 24 小时每个账号各网关的窗口时长，按账号分组，组内从长到短。
+const recentGroups = computed(() => {
+  const groups = new Map<string, { accountId: string, total: number, rows: RecentWindow[] }>()
+  for (const row of props.recent) {
+    const group = groups.get(row.accountId) ?? { accountId: row.accountId, total: 0, rows: [] }
+    group.total += row.windowSeconds
+    group.rows.push(row)
+    groups.set(row.accountId, group)
+  }
+  return [...groups.values()].map(group => ({ ...group, rows: [...group.rows].sort((a, b) => b.windowSeconds - a.windowSeconds) }))
+})
+const recentMax = computed(() => Math.max(1, ...props.recent.map(row => row.windowSeconds)))
 </script>
 
 <template>
@@ -73,22 +70,32 @@ const batchOption = computed<EChartsOption>(() => ({
         窗口总时长 {{ duration(total) }}<span v-if="missing"> · {{ missing }} 条含缺失数据，比例为已知时长占比</span>
       </p>
     </section>
-    <section class="min-w-0 rounded-cp-card bg-cp-bg-container p-4 shadow-cp-card" aria-label="账号每批轮转时长">
+    <section class="min-w-0 rounded-cp-card bg-cp-bg-container p-4 shadow-cp-card" aria-label="最近 24 小时各账号网关窗口时长">
       <div class="mb-3 flex items-center justify-between gap-2">
         <h4 class="text-cp-sm font-emphasis">
-          每批窗口总时长
+          最近 24 小时窗口时长
         </h4>
-        <span class="text-cp-xs text-cp-text-secondary">本页批次</span>
+        <span class="text-cp-xs text-cp-text-secondary">每个账号各网关</span>
       </div>
-      <div v-if="batches.length" class="max-h-80 overflow-auto">
-        <BaseChart :option="batchOption" :height="Math.max(220, batches.length * 55 + 70)" />
+      <div v-if="recentGroups.length" class="max-h-80 space-y-3 overflow-auto">
+        <div v-for="group in recentGroups" :key="group.accountId">
+          <div class="mb-1 flex items-center justify-between gap-2 text-cp-xs">
+            <span class="font-emphasis text-cp-text">{{ names.get(group.accountId) ?? group.accountId }}</span>
+            <span class="tabular-nums text-cp-text-secondary">合计 {{ duration(group.total) }}</span>
+          </div>
+          <button v-for="row in group.rows" :key="row.gateway" type="button" class="flex w-full items-center gap-2 rounded-cp px-1 py-1 text-left hover:bg-cp-fill-tertiary" @click="emit('window', { accountId: row.accountId, gateway: row.gateway })">
+            <span class="w-24 shrink-0 font-mono text-cp-xs">{{ row.gateway }}</span>
+            <span class="h-1.5 flex-1 overflow-hidden rounded-full bg-cp-fill-tertiary">
+              <i class="block h-full rounded-full bg-cp-info" :style="{ width: `${Math.max(2, row.windowSeconds / recentMax * 100)}%` }" />
+            </span>
+            <span class="w-20 shrink-0 text-right text-cp-xs tabular-nums text-cp-text-secondary">{{ duration(row.windowSeconds) }}</span>
+          </button>
+        </div>
       </div>
-      <BaseEmpty v-else size="sm" surface="none" title="当前范围暂无批次" />
-      <div class="mt-3 flex flex-wrap gap-2">
-        <button v-for="batch in batches" :key="batch.id" type="button" class="rounded-cp bg-cp-fill-tertiary px-2 py-1 text-cp-xs text-cp-text-secondary hover:text-cp-primary-text" @click="emit('batch', batch.id)">
-          查看第 {{ batch.number }} 批
-        </button>
-      </div>
+      <BaseEmpty v-else size="sm" surface="none" title="最近 24 小时暂无窗口" />
+      <p class="mt-3 text-cp-xs text-cp-text-secondary">
+        不受上方账号与时间筛选影响，口径同窗口时长
+      </p>
     </section>
   </div>
 </template>

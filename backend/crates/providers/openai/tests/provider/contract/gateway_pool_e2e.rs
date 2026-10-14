@@ -1,7 +1,7 @@
 //! 真实的网关池插件进程（`plugins/gateway-pool`）通过 Unix socket 接管 OpenAI Provider 的请求路径：
 //! 账号、额度与上游探测经内核能力（真实 `KernelCapabilities` + `OpenAiPluginUpstream`），
 //! 上游与池服务是测试替身。主路径：打票成功 → 业务请求带上插件给的 Cookie 与 state →
-//! 29 换网关 → 请求结束。
+//! 29 换网关 → 请求结束；之后窗口用满，后台只准备备用票，当前窗口再遇到 29 时备用票立即接手。
 //!
 //! 需要先构建插件二进制（`scripts/build-plugins-local.sh <仓库> 4096 3 build gateway-pool`），
 //! 所以默认忽略（CI 的 `cargo test --test main` 不构建插件），运行时加 `-- --ignored`。
@@ -137,7 +137,7 @@ impl PluginCapabilities for Capabilities {
         self.fetches.lock().unwrap().push(params);
         let (path, query) = url.split_once('?').unwrap_or((&url, ""));
         let body = if path.ends_with("/gateways") {
-            let gateways = ["unified-142", "unified-143"].map(|name| {
+            let gateways = ["unified-142", "unified-143", "unified-144"].map(|name| {
                 json!({"name": name, "pair_ready": true, "valid_for_s": 3600, "datacenter_country": "US"})
             });
             json!({ "gateways": gateways })
@@ -183,9 +183,12 @@ async fn admin(runtime: &PluginRuntime, method: &str, params: Value) -> Value {
 async fn gateway_pool_plugin_routes_a_request_with_ticket_switch_and_finish() {
     // ---- 上游替身：探测与业务请求都走 /codex/responses，按 Cookie 里的网关区分 ----
     let upstream = MockServer::start().await;
+    // 第二阶段把 unified-143 也判为降智，用来触发备用票接手。
+    let degrade_143 = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let degrade = degrade_143.clone();
     Mock::given(method("POST"))
         .and(path("/codex/responses"))
-        .respond_with(|request: &wiremock::Request| {
+        .respond_with(move |request: &wiremock::Request| {
             let body = captured_request_body(request);
             let gateway = request
                 .headers
@@ -212,7 +215,9 @@ async fn gateway_pool_plugin_routes_a_request_with_ticket_switch_and_finish() {
             assert_eq!(state, Some(format!("boot-{gateway}").as_str()));
             let template =
                 ResponseTemplate::new(200).insert_header("content-type", "text/event-stream");
-            if gateway == "unified-142" {
+            if gateway == "unified-142"
+                || (gateway == "unified-143" && degrade.load(std::sync::atomic::Ordering::SeqCst))
+            {
                 template
                     .insert_header(
                         "x-codex-turn-state",
@@ -354,37 +359,43 @@ async fn gateway_pool_plugin_routes_a_request_with_ticket_switch_and_finish() {
         )),
         ClientRoutingScope::all_accounts(),
     ));
-    let context = AttemptContext::new(
-        RequestAttemptContext::new(
-            ModelRequestId::new("req_gateway_pool_e2e").unwrap(),
-            ClientApiKeyId::new("key_gateway_pool").unwrap(),
-        ),
-        NonZeroU32::new(1).unwrap(),
-        SystemTime::now() + BUDGET,
-        account_policy(),
-        AccountAttemptContext::new(BTreeSet::new(), None, None).with_account_scope(scope),
-        None,
-        CancellationToken::new(),
-    );
     let body = json!({"model": PROBE_MODEL, "input": "hello", "client_metadata": {"x-codex-turn-state": "client-state-must-not-win", "keep": "yes"}});
-    let operation = Operation::Generate(GenerateRequest::from_protocol_payload(
-        ProtocolPayload::json_object("openai", body.as_object().unwrap().clone())
-            .unwrap()
-            .with_original_json(Bytes::from(body.to_string()))
-            .with_context(Map::from_iter([("use_websocket".into(), json!(false))])),
-    ));
-    let mut stream = provider
-        .execute(planned_request("openai", operation), context)
-        .await
-        .expect("plugin routes the request");
-    assert_eq!(stream.metadata().provider_account_id().as_str(), ACCOUNT);
-    let mut answer = String::new();
-    while let Some(event) = stream.next().await {
-        if let Some(wire) = event.expect("stream event").wire_event() {
-            answer.push_str(&wire.data().to_string());
+    let run_request = |request_id: &'static str| {
+        let (provider, scope, body) = (&provider, scope.clone(), body.clone());
+        async move {
+            let context = AttemptContext::new(
+                RequestAttemptContext::new(
+                    ModelRequestId::new(request_id).unwrap(),
+                    ClientApiKeyId::new("key_gateway_pool").unwrap(),
+                ),
+                NonZeroU32::new(1).unwrap(),
+                SystemTime::now() + BUDGET,
+                account_policy(),
+                AccountAttemptContext::new(BTreeSet::new(), None, None).with_account_scope(scope),
+                None,
+                CancellationToken::new(),
+            );
+            let operation = Operation::Generate(GenerateRequest::from_protocol_payload(
+                ProtocolPayload::json_object("openai", body.as_object().unwrap().clone())
+                    .unwrap()
+                    .with_original_json(Bytes::from(body.to_string()))
+                    .with_context(Map::from_iter([("use_websocket".into(), json!(false))])),
+            ));
+            let mut stream = provider
+                .execute(planned_request("openai", operation), context)
+                .await
+                .expect("plugin routes the request");
+            assert_eq!(stream.metadata().provider_account_id().as_str(), ACCOUNT);
+            let mut answer = String::new();
+            while let Some(event) = stream.next().await {
+                if let Some(wire) = event.expect("stream event").wire_event() {
+                    answer.push_str(&wire.data().to_string());
+                }
+            }
+            answer
         }
-    }
-    drop(stream);
+    };
+    let answer = run_request("req_gateway_pool_e2e").await;
     assert!(answer.contains("complete good answer"), "{answer}");
     assert!(!answer.contains("BAD ANSWER"), "{answer}");
 
@@ -467,6 +478,72 @@ async fn gateway_pool_plugin_routes_a_request_with_ticket_switch_and_finish() {
         .collect();
     assert_eq!(classifications.len(), 2);
     assert!(classifications.contains(&json!("29")) && classifications.contains(&json!("21")));
+
+    // ---- 备用票：窗口用满后只准备备用票，当前窗口继续服务；再遇到 29 时备用票立即接手，不再找票 ----
+    admin(&runtime, "configure", json!({"windowSeconds": 1})).await;
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let answer = run_request("req_gateway_pool_e2e_standby").await;
+    assert!(answer.contains("complete good answer"), "{answer}");
+    let pair_state = |view: &Value, gateway: &str| {
+        view["pairs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|pair| pair["gateway"] == gateway)
+            .map(|pair| pair["state"].clone())
+    };
+    let mut standby_view = Value::Null;
+    until_async(&runtime, |view| {
+        standby_view = view.clone();
+        pair_state(view, "unified-144") == Some(json!("standby"))
+    })
+    .await;
+    assert_eq!(
+        pair_state(&standby_view, "unified-143"),
+        Some(json!("ready"))
+    );
+    // 备用票不接业务请求；它的取 S0 与重放已经完成。
+    let seen = upstream.received_requests().await.unwrap().len();
+    degrade_143.store(true, std::sync::atomic::Ordering::SeqCst);
+    let answer = run_request("req_gateway_pool_e2e_swap").await;
+    assert!(answer.contains("complete good answer"), "{answer}");
+    assert!(!answer.contains("BAD ANSWER"), "{answer}");
+    let requests = upstream.received_requests().await.unwrap();
+    let after: Vec<(String, bool)> = requests[seen..]
+        .iter()
+        .map(|request| {
+            let gateway = gateway_of(request.headers["cookie"].to_str().unwrap()).unwrap();
+            let probe = captured_request_body(request)["input"][0]["content"][0]["text"] == "hi";
+            (gateway, probe)
+        })
+        .collect();
+    // 只有降智的那次业务请求和备用票上的重放，没有任何新的打票。
+    assert_eq!(
+        after,
+        vec![
+            ("unified-143".to_owned(), false),
+            ("unified-144".to_owned(), false)
+        ]
+    );
+    until_idle(&runtime).await;
+    let view = admin(&runtime, "read", json!({"limit": 100})).await;
+    assert_eq!(pair_state(&view, "unified-143"), Some(json!("cooling")));
+    assert_eq!(pair_state(&view, "unified-144"), Some(json!("ready")));
+}
+
+/// 轮询管理页读取，直到条件成立。
+async fn until_async(runtime: &PluginRuntime, mut done: impl FnMut(&Value) -> bool) {
+    timeout(BUDGET, async {
+        loop {
+            let view = admin(runtime, "read", json!({"limit": 100})).await;
+            if done(&view) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("condition not reached in time");
 }
 
 /// 请求结束通知是异步投递的：等所有窗口的在途数归零。

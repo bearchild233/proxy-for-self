@@ -25,6 +25,7 @@ const open = defineModel<boolean>({ default: false })
 const draft = ref<Settings>(structuredCopy(props.settings))
 const initialHours = ref(2)
 const maximumHours = ref(24)
+const stepMinutes = ref(60)
 const gatewayText = ref('')
 const token = ref('')
 const showOverrides = ref(false)
@@ -39,6 +40,7 @@ watch(open, (value) => {
   draft.value = structuredCopy(props.settings)
   initialHours.value = props.settings.initialRestSeconds / 3600
   maximumHours.value = props.settings.maximumRestSeconds / 3600
+  stepMinutes.value = Math.max(1, Math.round((props.settings.backoffStepSeconds ?? 3600) / 60))
   gatewayText.value = props.settings.gateways.join('\n')
   token.value = ''
   showOverrides.value = Object.keys(props.settings.poolAccountIds).length > 0
@@ -64,6 +66,13 @@ const modeOptions = [
   { label: '懒模式', value: 'lazy' },
   { label: '持续模式', value: 'continuous' },
 ]
+const backoffOptions = [
+  { label: '加性', value: 'additive' },
+  { label: '乘性', value: 'multiplicative' },
+]
+const backoffHint = computed(() => draft.value.backoffMode === 'multiplicative'
+  ? '复测仍降智时静置翻倍，直到最长静置。'
+  : `复测仍降智时每次加 ${stepMinutes.value} 分钟，直到最长静置。`)
 const modeHint = computed(() => draft.value.mode === 'lazy'
   ? '没有请求时不找票；窗口到期后由下一个请求触发准备。'
   : '近期有流量的账号在空闲时也按窗口轮换，切换更及时，但会多发检测请求。')
@@ -97,6 +106,8 @@ function submit() {
     poolAccountIds: overrides,
     initialRestSeconds: initialHours.value * 3600,
     maximumRestSeconds: maximumHours.value * 3600,
+    backoffMode: draft.value.backoffMode ?? 'additive',
+    backoffStepSeconds: Math.round(stepMinutes.value) * 60,
     poolToken: token.value || undefined,
   })
 }
@@ -173,7 +184,7 @@ function submit() {
           </BaseFormItem>
         </div>
         <p class="text-cp-xs text-cp-text-tertiary">
-          打票模型以 low 发送 hi 检测网关；窗口到期后开始准备下一个组合，新组合验证通过后未发送的请求切换过去，已发送的请求照常完成。
+          打票模型以 low 发送 hi 检测网关；窗口用满后只准备一张备用票，当前窗口继续服务，遇到降智、失败或 Cookie 到期时备用票立即接手；备用票超过 50 分钟未启用就丢弃。
         </p>
       </section>
 
@@ -189,8 +200,16 @@ function submit() {
             <BaseNumberInput v-model="maximumHours" label="最长静置" unit="小时" :min="0.25" :max="24" :step="1" />
           </BaseFormItem>
         </div>
+        <div class="grid gap-4 sm:grid-cols-2">
+          <BaseFormItem label="升档方式">
+            <BaseSegmented v-model="draft.backoffMode" label="升档方式" :options="backoffOptions" class="max-w-60" />
+          </BaseFormItem>
+          <BaseFormItem v-if="draft.backoffMode !== 'multiplicative'" label="加性步长">
+            <BaseNumberInput v-model="stepMinutes" label="加性步长" unit="分钟" :min="1" :max="1440" :step="5" />
+          </BaseFormItem>
+        </div>
         <p class="text-cp-xs text-cp-text-tertiary">
-          按账号×网关计时，从最后一次访问结束起算。复测仍降智或失败则翻倍；连续两轮在同一档恢复后，以后从该档开始。
+          按账号×网关计时，从最后一次访问结束起算。{{ backoffHint }}起始档是上次静置后恢复时的档；连续两次在同一档恢复，下次起始档降一档，不低于初始静置。检测失败固定静置 5 分钟，不升档。
         </p>
       </section>
 

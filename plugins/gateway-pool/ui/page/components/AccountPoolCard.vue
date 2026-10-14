@@ -1,12 +1,13 @@
 <script setup lang="ts">
-import type { CatalogEntry, CoolingVisit, Pair } from '../model'
+import type { CatalogEntry, Pair } from '../model'
 import { ChevronDown, Radio, Ticket } from '@lucide/vue'
 import { computed, shallowRef } from 'vue'
 import BaseTag from '@/components/base/BaseTag.vue'
-import { historyTime } from '../history'
-import { clock, duration, gatewayNumber, stateLabels } from '../model'
+import { clock, duration, gatewayNumber, stateLabels, windowStart } from '../model'
+import PoolGatewayDetail from './PoolGatewayDetail.vue'
 
 const props = defineProps<{
+  accountId: string
   name: string
   pairs: Pair[]
   windowSeconds: number
@@ -21,24 +22,36 @@ const selectedGateway = shallowRef('')
 const recordedGateways = computed(() => props.pairs.filter(pair => pair.coolingSummary?.visits.length).length)
 const current = computed(() => props.pairs.find(pair => pair.state === 'ready'))
 const preparing = computed(() => props.pairs.find(pair => pair.state === 'preparing'))
+const standby = computed(() => props.pairs.find(pair => pair.state === 'standby'))
+const standbyLeft = computed(() => standby.value?.standbyExpiresAt == null ? null : standby.value.standbyExpiresAt - props.now)
 const cooling = computed(() => props.pairs.filter(pair => pair.state === 'cooling' && (pair.restUntil ?? 0) > props.now))
 const available = computed(() => props.pairs.filter(pair => pair.state === 'unknown' || (pair.state === 'cooling' && (pair.restUntil ?? 0) <= props.now)))
 const nextRecovery = computed(() => Math.min(...cooling.value.map(pair => pair.restUntil ?? Infinity)))
-const elapsed = computed(() => current.value?.firstContactAt ? props.now - current.value.firstContactAt : 0)
+// 备用票转正的窗口从第一次业务访问开始计时，备用期间不计入。
+const started = computed(() => current.value ? windowStart(current.value) : null)
+const elapsed = computed(() => started.value ? props.now - started.value : 0)
 const progress = computed(() => Math.min(1, elapsed.value / Math.max(1, props.windowSeconds)))
 const cookieEnding = computed(() => current.value?.cookieExpiresAt != null && current.value.cookieExpiresAt - props.now <= 60)
-const overdue = computed(() => elapsed.value >= props.windowSeconds || cookieEnding.value)
+const windowOver = computed(() => started.value != null && elapsed.value >= props.windowSeconds)
+const overdue = computed(() => windowOver.value || cookieEnding.value)
 const idle = computed(() => current.value?.lastContactAt ? props.now - current.value.lastContactAt : 0)
-// 窗口用完后的三种情形：正在准备、懒模式等待下个请求、持续模式等待准备。
+// 窗口用满后只准备备用票，当前窗口继续服务；备用票在 29、失败或 Cookie 到期时接手。
 const phase = computed(() => {
-  if (!overdue.value)
-    return { text: '满血窗口', tone: 'text-cp-text-secondary', bar: 'bg-cp-success' }
-  const reason = cookieEnding.value && elapsed.value < props.windowSeconds ? 'Cookie 即将到期' : '窗口已用完'
+  if (!overdue.value) {
+    const waiting = current.value?.fromStandby && started.value == null
+    return { text: waiting ? '备用票已启用 · 等待第一个请求' : '满血窗口', tone: 'text-cp-text-secondary', bar: 'bg-cp-success' }
+  }
+  const reason = cookieEnding.value && !windowOver.value ? 'Cookie 即将到期' : '窗口已用完'
+  if (standby.value) {
+    const left = standbyLeft.value
+    const suffix = left != null && left <= 0 ? '已过期，等待丢弃' : `剩余 ${duration(left)}`
+    return { text: `${reason} · 备用票 ${standby.value.gateway} 就绪，${suffix}`, tone: 'text-cp-success-text', bar: 'bg-cp-success' }
+  }
   if (preparing.value)
-    return { text: `${reason}，正在准备下一个网关`, tone: 'text-cp-info-text', bar: 'bg-cp-info' }
+    return { text: `${reason}，正在准备${preparing.value.standbyPlan ? '备用票' : '下一个网关'}`, tone: 'text-cp-info-text', bar: 'bg-cp-info' }
   if (props.mode === 'lazy')
-    return { text: `${reason} · 下个请求到来时切换`, tone: 'text-cp-text-tertiary', bar: 'bg-cp-text-quaternary' }
-  return { text: `${reason}，等待准备下一个`, tone: 'text-cp-warning-text', bar: 'bg-cp-warning' }
+    return { text: `${reason} · 下个请求到来时准备备用票`, tone: 'text-cp-text-tertiary', bar: 'bg-cp-text-quaternary' }
+  return { text: `${reason}，等待准备备用票`, tone: 'text-cp-warning-text', bar: 'bg-cp-warning' }
 })
 // 当前组合的票：打票模型自带，其余是窗口内按需拿到的。
 const tickets = computed(() => current.value ? [props.probeModel, ...(current.value.ticketModels ?? []).filter(model => model !== props.probeModel)] : [])
@@ -49,7 +62,7 @@ const cookieLeft = computed(() => current.value?.cookieExpiresAt ? current.value
 const fresh = computed(() => (props.catalog?.gateways ?? [])
   .filter(entry => !props.pairs.some(pair => pair.gateway === entry.gateway))
   .map(entry => ({ accountId: '', gateway: entry.gateway, state: 'unknown', inFlight: 0 }) as Pair))
-const order: Record<string, number> = { ready: 0, preparing: 1, draining: 2, cooling: 3, unknown: 4 }
+const order: Record<string, number> = { ready: 0, standby: 1, preparing: 2, draining: 3, cooling: 4, unknown: 5 }
 const sorted = computed(() => [...props.pairs, ...fresh.value].sort((a, b) =>
   order[a.state] - order[b.state] || (a.restUntil ?? 0) - (b.restUntil ?? 0) || a.gateway.localeCompare(b.gateway, undefined, { numeric: true })))
 const selected = computed(() => sorted.value.find(pair => pair.gateway === selectedGateway.value))
@@ -57,6 +70,8 @@ const selected = computed(() => sorted.value.find(pair => pair.gateway === selec
 function chipClass(pair: Pair) {
   if (pair.state === 'ready')
     return 'border-cp-success-border bg-cp-success-container text-cp-success-on-container'
+  if (pair.state === 'standby')
+    return 'border-dashed border-cp-success-border bg-cp-success-container text-cp-success-on-container'
   if (pair.state === 'preparing')
     return 'border-cp-info-border bg-cp-info-container text-cp-info-on-container'
   if (pair.state === 'draining')
@@ -74,28 +89,13 @@ function chipTitle(pair: Pair) {
     parts.push('当前不在池服务目录中')
   if (pair.state === 'cooling' && pair.restUntil)
     parts.push(pair.restUntil > props.now ? `还需静置 ${duration(pair.restUntil - props.now)}` : '静置已结束，可重新检测')
+  if (pair.state === 'standby' && pair.standbyExpiresAt != null)
+    parts.push(pair.standbyExpiresAt > props.now ? `备用票 ${duration(pair.standbyExpiresAt - props.now)} 后丢弃` : '备用票已过期，等待丢弃')
   if (pair.restSeconds)
-    parts.push(`当前档位 ${duration(pair.restSeconds)}`)
+    parts.push(`当前档位 ${duration(pair.tierSeconds ?? pair.restSeconds)}`)
   if (pair.learnedRestSeconds)
-    parts.push(`已学习起点 ${duration(pair.learnedRestSeconds)}`)
-  if (pair.retiredReason === '29')
-    parts.push('上次退役原因：降智信号')
-  else if (pair.retiredReason === 'probe_failed')
-    parts.push('上次退役原因：检测失败')
+    parts.push(`起始档 ${duration(pair.learnedRestSeconds)}`)
   return parts.join('\n')
-}
-function visitResult(visit: CoolingVisit) {
-  if (visit.result === '21')
-    return '21 · 已观测恢复'
-  if (visit.result === '29')
-    return '29 · 未恢复'
-  if (visit.result === 'failed')
-    return '访问失败'
-  return '访问中 · 待结果'
-}
-function idleSince(pair: Pair) {
-  const current = pair.coolingSummary?.current
-  return current?.probeAt == null ? current?.startedAt : null
 }
 </script>
 
@@ -120,6 +120,9 @@ function idleSince(pair: Pair) {
               </template>
               <template v-else-if="preparing">
                 正在检测 <span class="font-mono">{{ preparing.gateway }}</span>
+              </template>
+              <template v-if="standby && current">
+                · 备用 <span class="font-mono text-cp-text">{{ standby.gateway }}</span>
               </template>
               <template v-else>
                 暂无可用网关
@@ -174,6 +177,7 @@ function idleSince(pair: Pair) {
       </div>
       <div class="mb-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-cp-xs text-cp-text-secondary">
         <span class="flex items-center gap-1.5"><i class="size-2.5 rounded-sm bg-cp-success" />服务中</span>
+        <span class="flex items-center gap-1.5"><i class="size-2.5 rounded-sm border border-dashed border-cp-success bg-cp-success-container" />备用票</span>
         <span class="flex items-center gap-1.5"><i class="size-2.5 rounded-sm bg-cp-info" />检测中</span>
         <span class="flex items-center gap-1.5"><i class="size-2.5 rounded-sm bg-cp-warning" />排空中</span>
         <span class="flex items-center gap-1.5"><i class="size-2.5 rounded-sm bg-cp-fill-secondary" />静置中</span>
@@ -195,22 +199,10 @@ function idleSince(pair: Pair) {
           <span v-if="pair.state === 'cooling' && (pair.restUntil ?? 0) > now" class="text-cp-xs tabular-nums">{{ duration((pair.restUntil ?? 0) - now) }}</span>
         </button>
       </div>
-      <div v-if="selected" class="mt-3 rounded-cp bg-cp-fill-quaternary p-3">
-        <div class="flex flex-wrap items-center justify-between gap-2 text-cp-xs text-cp-text-secondary">
-          <span class="font-emphasis text-cp-text">{{ selected.gateway }} · 冷却与实际再访问</span>
-          <span>当前档位 {{ duration(selected.restSeconds) }} · 学习起点 {{ selected.learnedRestSeconds ? duration(selected.learnedRestSeconds) : '未形成' }}</span>
-        </div>
-        <p v-if="selected.state === 'cooling'" class="mt-2 text-cp-xs text-cp-text-secondary">
-          本次静置起点 {{ historyTime(idleSince(selected)) }} · 计划可访问 {{ historyTime(selected.restUntil) }}
-          <span v-if="(selected.restUntil ?? 0) <= now"> · 已到期，尚未再次访问，恢复状态未知</span>
-        </p>
-        <p v-if="selected.coolingSummary?.visits[0]" class="mt-2 text-cp-xs text-cp-text-secondary">
-          最近实际间隔 {{ duration(selected.coolingSummary.visits[0].idleSeconds) }} · {{ visitResult(selected.coolingSummary.visits[0]) }}
-        </p>
-        <p v-else class="mt-2 text-cp-xs text-cp-text-secondary">
-          尚无再次访问记录
-        </p>
-      </div>
+      <PoolGatewayDetail v-if="selected?.accountId" :account-id="accountId" :pair="selected" :now="now" />
+      <p v-else-if="selected" class="mt-3 text-cp-xs text-cp-text-secondary">
+        {{ selected.gateway }} · 尚未访问，没有静置记录
+      </p>
       <p v-if="!pairs.length" class="text-cp-xs text-cp-text-tertiary">
         这个账号还没有访问过任何网关。
       </p>

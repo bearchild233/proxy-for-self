@@ -251,6 +251,7 @@ usePluginPolling(loadDirectory, shallowRef(60_000))
           <BaseTable v-if="accountCards.length" :columns="accountColumns" :rows="accountCards" reorderable :reorder-disabled="savingQueue" @reorder="saveOrder">
             <template #account="{ row }">
               <AccountPoolCard
+                :account-id="row.id"
                 :name="row.name"
                 :pairs="row.pairs"
                 :window-seconds="settings?.windowSeconds ?? 180"
