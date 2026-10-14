@@ -45,6 +45,9 @@ STOP_CALL_SLACK_SECONDS = 10  # systemctl stop 的外层执行超时 = shutdownS
 MAX_MANIFEST_BYTES = 65536  # 与控制面 static_plugins 的 plugin.json 上限保持一致
 MAX_RESOURCE_BYTES = 4 * 1024 * 1024  # 与控制面 static_plugins 的单文件上限保持一致
 DEFAULT_UNIT_DIRECTORY = "/etc/systemd/system"
+# systemd 不展开 ExecStart 可执行路径中的变量，运行目录里的二进制统一用固定文件名，
+# 模板单元写成 <runtime_root>/%i/service。
+RUNTIME_BINARY_NAME = "service"
 
 
 def now() -> str:
@@ -269,7 +272,7 @@ class ServicePlugins:
     # ----- 运行目录、env、drop-in、systemd -----
 
     def _runtime_binary(self, instance: str, service: dict) -> Path:
-        return Path(self.config["runtime_root"]) / instance / service["name"]
+        return Path(self.config["runtime_root"]) / instance / RUNTIME_BINARY_NAME
 
     def _stage(self, instance: str, root: Path, manifest: dict, service: dict) -> None:
         """复制二进制到 root 所有的运行目录，并校验复制结果的哈希与 ELF 头。"""
@@ -282,7 +285,7 @@ class ServicePlugins:
             shutil.rmtree(runtime)
         runtime.mkdir(mode=0o755)
         os.chmod(runtime, 0o755)
-        target = runtime / service["name"]
+        target = runtime / RUNTIME_BINARY_NAME
         shutil.copyfile(root / service["binary"], target)
         os.chmod(target, 0o755)
         if _sha256(target) != manifest["resources"][service["binary"]] or not is_x86_64_elf(target):

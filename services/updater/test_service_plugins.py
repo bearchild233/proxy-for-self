@@ -153,10 +153,10 @@ class ServiceTests(unittest.TestCase):
         env = (self.root / "etc/proxy-for-self/plugins/services" / f"{instance}.env").read_text().splitlines()
         self.assertIn("CPR_PLUGIN_SHUTDOWN_MS=30000", env)
         self.assertIn(f"CPR_PLUGIN_SOCKET={self.root / 'sock' / ID / (instance + '.sock')}", env)
-        self.assertIn(f"PLUGIN_BINARY={self.root / 'runtime' / instance / 'example-echo'}", env)
+        self.assertIn(f"PLUGIN_BINARY={self.root / 'runtime' / instance / 'service'}", env)
         dropin = (self.root / "units" / f"proxy-for-self-plugin@{instance}.service.d" / "limits.conf").read_text()
         self.assertEqual(dropin, "[Service]\nMemoryMax=64M\nTimeoutStopSec=35\n")
-        copied = self.root / "runtime" / instance / "example-echo"
+        copied = self.root / "runtime" / instance / "service"
         self.assertEqual(copied.stat().st_mode & 0o777, 0o755)
         self.assertEqual(copied.read_bytes(), (self.root / "store" / ID / "releases" / version / "service/example-echo").read_bytes())
         self.assertEqual((self.root / "data" / ID).stat().st_mode & 0o777, 0o700)
@@ -277,7 +277,7 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(self.run_operation(manager, "enable")["status"], "succeeded")
         self.assertTrue(self.registry()["enabled"])
         self.assertTrue(manager.state["plugins"][ID]["enabled"])
-        runtime_binary = self.root / "runtime" / instance_name(ID, version) / "example-echo"
+        runtime_binary = self.root / "runtime" / instance_name(ID, version) / "service"
         runtime_binary.write_bytes(elf(b"changed"))
         self.run_operation(manager, "disable")
         operation = self.run_operation(manager, "enable")
