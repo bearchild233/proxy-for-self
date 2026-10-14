@@ -14,6 +14,8 @@ use sqlx::postgres::PgPoolOptions;
 #[tokio::test]
 async fn encrypted_credentials_are_randomized_authenticated_and_scope_bound() {
     const CHILD_DATABASE: &str = "CPR_VAULT_TEST_DATABASE";
+    // 父进程持有守卫直到子进程结束；子进程内的 Bundle 同样取得网关实例锁。
+    let _instance = crate::support::gateway_instance_guard().await;
     let Some(database_url) = crate::support::test_env("CPR_TEST_DATABASE_URL") else {
         return;
     };

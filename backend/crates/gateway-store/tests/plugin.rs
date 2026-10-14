@@ -8,6 +8,8 @@ use crate::postgres::TestDatabase;
 
 #[tokio::test]
 async fn directory_matches_admin_status_and_reads_current_group_membership() {
+    // 取得 Bundle 会占用网关实例锁，需与同进程其他 Bundle 测试串行。
+    let _instance = crate::support::gateway_instance_guard().await;
     let Some(redis_url) = crate::support::test_env("CPR_TEST_REDIS_URL") else {
         return;
     };

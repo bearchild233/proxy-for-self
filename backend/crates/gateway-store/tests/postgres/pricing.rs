@@ -8,7 +8,16 @@ use serde_json::json;
 
 use super::TestDatabase;
 
-async fn pricing_store(name: &str) -> Option<(TestDatabase, gateway_store::StoreBundle)> {
+/// 守卫必须排在元组第一位：局部变量按声明逆序释放，这样守卫在 Bundle 关闭之后才释放。
+/// Bundle 启动时占用进程内共享的网关实例锁。
+async fn pricing_store(
+    name: &str,
+) -> Option<(
+    tokio::sync::MutexGuard<'static, ()>,
+    TestDatabase,
+    gateway_store::StoreBundle,
+)> {
+    let instance = crate::support::gateway_instance_guard().await;
     let redis_url = crate::support::test_env("CPR_TEST_REDIS_URL")?;
     let database = TestDatabase::create(name).await?;
     let mut database_url = url::Url::parse(
@@ -31,7 +40,7 @@ async fn pricing_store(name: &str) -> Option<(TestDatabase, gateway_store::Store
     let runtime = tempfile::tempdir().unwrap();
     config.resolve_and_validate(runtime.path()).unwrap();
     let bundle = gateway_store::initialize(config).await.unwrap();
-    Some((database, bundle))
+    Some((instance, database, bundle))
 }
 
 #[tokio::test]
@@ -41,7 +50,7 @@ async fn shared_order_preserves_hidden_items_paginates_and_location_survives_rel
         ClientApiKeyListQuery, ClientApiKeyRepository as _, ClientApiKeySort,
         ClientApiKeySortDirection, ClientApiKeySortField, PgClientApiKeyRepository,
     };
-    let Some((database, bundle)) = pricing_store("shared_order").await else {
+    let Some((_instance, database, bundle)) = pricing_store("shared_order").await else {
         return;
     };
     let settings = bundle.admin_ports().settings();
@@ -137,7 +146,7 @@ async fn shared_order_preserves_hidden_items_paginates_and_location_survives_rel
 
 #[tokio::test]
 async fn concurrent_price_edits_preserve_other_models_and_sync_preserves_manual_prices() {
-    let Some((database, bundle)) = pricing_store("pricing").await else {
+    let Some((_instance, database, bundle)) = pricing_store("pricing").await else {
         return;
     };
     let settings = bundle.admin_ports().settings();
@@ -244,7 +253,7 @@ async fn concurrent_price_edits_preserve_other_models_and_sync_preserves_manual_
 
 #[tokio::test]
 async fn deleting_pricing_removes_both_layers_and_preserves_other_models_and_frozen_snapshots() {
-    let Some((database, bundle)) = pricing_store("pricing_delete").await else {
+    let Some((_instance, database, bundle)) = pricing_store("pricing_delete").await else {
         return;
     };
     let settings = bundle.admin_ports().settings();
@@ -328,7 +337,7 @@ async fn deleting_pricing_removes_both_layers_and_preserves_other_models_and_fro
 
 #[tokio::test]
 async fn concurrent_pricing_syncs_merge_selected_changes_and_remove_only_selected_models() {
-    let Some((database, bundle)) = pricing_store("pricing_selection").await else {
+    let Some((_instance, database, bundle)) = pricing_store("pricing_selection").await else {
         return;
     };
     let settings = bundle.admin_ports().settings();

@@ -18,3 +18,11 @@ fn running_in_ci() -> bool {
         .ok()
         .is_some_and(|value| !matches!(value.as_str(), "" | "0" | "false"))
 }
+
+/// 进程内网关实例互斥：`StoreBundle` 启动时取得 PostgreSQL 网关实例锁（`pg_try_advisory_lock(1129337426, 1)`，排他），
+/// 锁随 Bundle 持有至释放。同一测试进程内并行的 Bundle 会互相争用该锁，因此取得 Bundle 的测试必须持有本守卫直到测试结束。
+static GATEWAY_INSTANCE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+pub(crate) async fn gateway_instance_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    GATEWAY_INSTANCE_LOCK.lock().await
+}
