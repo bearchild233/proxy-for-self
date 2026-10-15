@@ -981,3 +981,46 @@ fn summary_lists_the_last_24_hours_of_window_seconds_per_account_and_gateway() {
     let summary = harness.stats(json!({"view": "summary"}));
     assert_eq!(summary["recentWindows"], json!([]));
 }
+
+#[test]
+fn cooling_reset_cancels_or_shortens_the_current_rest_and_records_it() {
+    let harness = Harness::history();
+    harness.call_ok(
+        "configure",
+        json!({"gateways": ["unified-142"], "initialRestSeconds": 7200, "maximumRestSeconds": 86400}),
+    );
+    harness.probe("29", json!({}));
+    let pair = harness.pair_of("A", "unified-142");
+    assert_eq!(pair["state"], json!("cooling"));
+    let last = pair["lastContactAt"].as_f64().unwrap();
+    let tier = pair["tierSeconds"].clone();
+    // 缩短：只缩不延长，档位不变；周期最后一步同步新的到期时间。
+    let reply = harness.call_ok("cooling.reset", json!({"restSeconds": 3600}));
+    assert_eq!(reply["changed"], json!(1));
+    let pair = harness.pair_of("A", "unified-142");
+    assert_num(&pair["restUntil"], last + 3600.0);
+    assert_eq!(pair["tierSeconds"], tier);
+    assert_eq!(pair["restAdjustedReason"], json!("shortened"));
+    let summary = harness.view(json!({"accountId": "A"}))["pairs"][0]["coolingSummary"].clone();
+    assert_num(&summary["current"]["dueAt"], last + 3600.0);
+    assert_eq!(
+        harness.call_ok("cooling.reset", json!({"restSeconds": 7200}))["changed"],
+        json!(0)
+    );
+    // 取消：立即可复测。
+    let reply = harness.call_ok("cooling.reset", json!({"accountId": "A"}));
+    assert_eq!(reply["changed"], json!(1));
+    let pair = harness.pair_of("A", "unified-142");
+    assert_num(&pair["restUntil"], harness.now());
+    assert_eq!(pair["restAdjustedReason"], json!("cancelled"));
+    assert_eq!(
+        harness.call_ok("cooling.reset", json!({}))["changed"],
+        json!(0)
+    );
+    assert!(
+        harness
+            .call("cooling.reset", json!({"restSeconds": 10}))
+            .is_err()
+    );
+    assert!(harness.call("cooling.reset", json!({"other": 1})).is_err());
+}

@@ -34,6 +34,7 @@ pub fn dispatch(
         }
         "queue.update" => Ok((store.update_queue(data)?, None)),
         "history.read" => Ok((store.statistics(data)?, None)),
+        "cooling.reset" => Ok((store.reset_cooling(data)?, None)),
         other => Err(Failure::NotSupported(other.to_owned())),
     }
 }

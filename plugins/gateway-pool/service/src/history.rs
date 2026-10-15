@@ -384,6 +384,58 @@ fn sync_batch(db: &Connection, item: &Object, now: Num) -> Result<(), Failure> {
     Ok(())
 }
 
+/// 手动调整静置（取消或缩短）后，把进行中周期最后一步的到期时间与计划时长改成新值，并记下调整时刻。
+pub(crate) fn adjust_cooling(
+    db: &Connection,
+    pair: &Object,
+    now: f64,
+    reason: &str,
+) -> Result<(), Failure> {
+    let account = str_field(pair, "accountId").unwrap_or_default();
+    let gateway = str_field(pair, "gateway").unwrap_or_default();
+    let Some(row) = one(
+        db,
+        "SELECT id,data FROM gp_cooling WHERE account=? AND gateway=? AND recovered IS NULL ORDER BY id DESC LIMIT 1",
+        vec![text(account), text(gateway)],
+    )?
+    else {
+        return Ok(());
+    };
+    let mut data = decode_object(&string_of(&row, "data"))?;
+    let Some(step) = data
+        .get_mut("steps")
+        .and_then(Value::as_array_mut)
+        .and_then(|steps| steps.last_mut())
+        .and_then(Value::as_object_mut)
+    else {
+        return Ok(());
+    };
+    if !step.get("probeAt").is_none_or(Value::is_null) {
+        return Ok(());
+    }
+    set(
+        step,
+        "dueAt",
+        pair.get("restUntil").cloned().unwrap_or(Value::Null),
+    );
+    set(
+        step,
+        "plannedSeconds",
+        pair.get("restSeconds").cloned().unwrap_or(Value::Null),
+    );
+    set(step, "adjustedAt", json!(now));
+    set(step, "adjustedReason", json!(reason));
+    exec(
+        db,
+        "UPDATE gp_cooling SET data=? WHERE id=?",
+        vec![
+            text(&encode(&Value::Object(data))),
+            sql_of(row.get("id").unwrap_or(&Value::Null)),
+        ],
+    )?;
+    Ok(())
+}
+
 fn sync_cooling(db: &Connection, pair: &Object, item: &Object) -> Result<(), Failure> {
     let account = str_field(pair, "accountId").unwrap_or_default();
     let gateway = str_field(pair, "gateway").unwrap_or_default();

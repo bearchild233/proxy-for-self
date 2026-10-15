@@ -52,5 +52,6 @@
 - 新增后端接口给插件用：`operations.json` 加映射 → 插件 `plugin.json` 声明 → 控制面无需改代码；纯 UI 包可直接热更新，但**平台缺少该能力时必须先升级平台**，不能删清单声明绕过校验。
 - 新增宿主操作：同时改 `frontend/src/plugins/PluginFrame.vue`（`hostOperation`）与本包的 `ui.ts` / `component-ui.ts` 类型；这是平台升级。
 - 新增需要替换的主壳模块：在 `scripts/build-plugin.mjs` 的 `replacements` 表登记，并保持两端导出签名一致。
+- 服务插件新增页面管理能力 `<插件ID>.<方法>`（不经 `operations.json`，由控制面转给插件进程）时，内置插件仍要把能力名加进 `policies.json` 对应插件的 `capabilities`，否则安装时被“能力超出平台策略”拒绝；这同样是平台升级。
 - `policies.json` 变更要同步控制面部署包（`scripts/package-plugin-platform.py`）和 [插件平台](../plugin-migration.md) 的插件分类表。
 - 校验：`node scripts/check-plugin.mjs <插件>`、`node scripts/build-plugin.mjs <插件>`；`frontend/plugin-tests/component-packages.test.mjs` 覆盖组件包约束。

@@ -1,12 +1,13 @@
 <script setup lang="ts">
 import type { AccountQueue, DirectoryAccount, PoolView } from './model'
-import { Activity, Hourglass, Network, Settings2, Shuffle } from '@lucide/vue'
+import { Activity, Hourglass, Network, RotateCcw, Settings2, Shuffle } from '@lucide/vue'
 import { usePluginPolling } from '@sdk/polling'
 import { call } from '@sdk/ui'
 import { useIntervalFn } from '@vueuse/core'
 import { computed, onMounted, ref, shallowRef } from 'vue'
 import BaseButton from '@/components/base/BaseButton.vue'
 import BaseCard from '@/components/base/BaseCard.vue'
+import BaseConfirmModal from '@/components/base/BaseConfirmModal.vue'
 import BaseEmpty from '@/components/base/BaseEmpty.vue'
 import BasePageHeader from '@/components/base/BasePageHeader.vue'
 import BaseSegmented from '@/components/base/BaseSegmented.vue'
@@ -27,6 +28,8 @@ const error = shallowRef('')
 const saving = shallowRef(false)
 const savingQueue = shallowRef(false)
 const settingsOpen = shallowRef(false)
+const resetOpen = shallowRef(false)
+const resetting = shallowRef(false)
 const tab = shallowRef('accounts')
 const now = shallowRef(Date.now() / 1000)
 useIntervalFn(() => {
@@ -54,6 +57,24 @@ function queueEntry(id: string) {
 const accountColumns = defineTableColumns<(typeof accountCards.value)[number]>([
   { key: 'account', label: '账号与网关', kind: 'custom', size: '4xl' },
 ])
+// 取消全部网关正在进行的静置：组合立即可复测，档位不变。
+async function resetCooling() {
+  if (resetting.value)
+    return
+  resetting.value = true
+  try {
+    const result = await call<{ changed: number }>('gateway-pool.cooling.reset', {})
+    toast.success(result.changed ? `已取消 ${result.changed} 个网关的静置` : '没有正在静置的网关')
+    resetOpen.value = false
+  }
+  catch (cause) {
+    toast.error(cause instanceof Error ? cause.message : '取消静置失败')
+  }
+  finally {
+    resetting.value = false
+    void refresh()
+  }
+}
 // 每次保存队列递增；保存前已发出的读取返回时版本已变，丢弃旧结果，避免开关被旧数据拨回去。
 let queueVersion = 0
 async function saveQueue(payload: { accountIds: string[] } | { accountId: string, enabled: boolean }) {
@@ -196,6 +217,12 @@ usePluginPolling(loadDirectory, shallowRef(60_000))
           <BaseTag :type="enabledGroups.length ? 'success' : 'neutral'" size="lg" round>
             {{ enabledGroups.length ? `已用于 ${enabledGroups.map(group => group.name).join('、')}` : '未选择分组' }}
           </BaseTag>
+          <BaseButton :disabled="!view || !stats.cooling" @click="resetOpen = true">
+            <template #icon>
+              <RotateCcw class="size-4" />
+            </template>
+            取消静置
+          </BaseButton>
           <BaseButton :disabled="!settings" @click="settingsOpen = true">
             <template #icon>
               <Settings2 class="size-4" />
@@ -309,6 +336,14 @@ usePluginPolling(loadDirectory, shallowRef(60_000))
       :accounts="accounts"
       :saving="saving"
       @save="save"
+    />
+    <BaseConfirmModal
+      v-model="resetOpen"
+      title="取消全部静置"
+      :description="`${stats.cooling} 个网关正在静置。取消后立即可复测，静置档位不变，复测仍降智会照常重新静置。`"
+      confirm-text="取消静置"
+      :loading="resetting"
+      @confirm="resetCooling"
     />
   </div>
 </template>

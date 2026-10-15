@@ -328,6 +328,77 @@ impl Store {
         })
     }
 
+    /// `cooling.reset`：手动调整正在静置的组合。不带 `restSeconds` 时取消本次静置（立即可复测）；
+    /// 带 `restSeconds` 时把本次静置缩短到“最后一次访问 + restSeconds”（只缩短不延长）。
+    /// 可选 `accountId` 只处理该账号。档位与起始档不变，复测结果照常按退避规则计算。
+    pub fn reset_cooling(&self, data: &Object) -> Result<Value, Failure> {
+        const FIELDS: [&str; 2] = ["accountId", "restSeconds"];
+        if data.keys().any(|key| !FIELDS.contains(&key.as_str())) {
+            return Failure::invalid("静置调整参数无效");
+        }
+        let account = match data.get("accountId") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(id)) if !id.is_empty() && id.len() <= 128 => Some(id.clone()),
+            Some(_) => return Failure::invalid("accountId 无效"),
+        };
+        let rest = match data.get("restSeconds") {
+            None | Some(Value::Null) => None,
+            Some(value) => match value.as_f64() {
+                Some(seconds)
+                    if seconds.is_finite()
+                        && (60.0..=86400.0).contains(&seconds)
+                        && !value.is_boolean() =>
+                {
+                    Some(seconds)
+                }
+                _ => return Failure::invalid("restSeconds 应为 60–86400 秒"),
+            },
+        };
+        let now = self.now_num();
+        self.write(|db| {
+            let (sql, args) = match &account {
+                Some(id) => ("SELECT data FROM pairs WHERE account=?", vec![text(id)]),
+                None => ("SELECT data FROM pairs", Vec::new()),
+            };
+            let mut changed = 0_u64;
+            for row in rows(db, sql, args)? {
+                let mut pair = decode_object(&string_of(&row, "data"))?;
+                if str_field(&pair, "state") != Some("cooling") {
+                    continue;
+                }
+                let Some(until) = num_field(&pair, "restUntil") else {
+                    continue;
+                };
+                if until.le(now) {
+                    continue;
+                }
+                let (target, reason) = match rest {
+                    None => (now, "cancelled"),
+                    Some(seconds) => {
+                        let Some(last) = num_field(&pair, "lastContactAt") else {
+                            continue;
+                        };
+                        let capped = last.plus(Num::Float(seconds)).max(now);
+                        if !capped.lt(until) {
+                            continue;
+                        }
+                        set(&mut pair, "restSeconds", Num::Float(seconds).to_json());
+                        (capped, "shortened")
+                    }
+                };
+                set(&mut pair, "restUntil", target.to_json());
+                set(&mut pair, "restAdjustedAt", now.to_json());
+                set(&mut pair, "restAdjustedReason", json!(reason));
+                self.save(db, &pair)?;
+                history::record(db, |db| {
+                    history::adjust_cooling(db, &pair, now.as_f64(), reason)
+                })?;
+                changed += 1;
+            }
+            Ok(json!({"changed": changed}))
+        })
+    }
+
     /// 账号退出调度（停用、额度耗尽）：服务中、准备中的组合和备用票一起退役并静置。
     pub(crate) fn retire_account(
         &self,

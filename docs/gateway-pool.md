@@ -97,7 +97,7 @@
 
 **状态机**（`runtime.rs::Store::runtime` 的 `dispatch_action`）：动作 `config` `active` `quota` `plan` `claim` `reserve` `material` `ticket` `sent` `probeAttempt` `ticketResult` `probeResult` `businessResult` `invalidate` `finish` `regroup` `regroupResult` `recoveryCheck` `recoveryResult`；每个动作开头先回收过期租约、清理过期材料与票。组合状态 `unknown` `preparing` `standby` `ready` `draining` `cooling`：`standby.rs` 负责备用票到达（`publish_standby`）、转正（`promote_standby`）、过期与丢弃；`policy.rs` 负责 21/29 判定、窗口起点与到期、退役（`retire` + `settle`）和退避档（`escalate` / `recover` / `lower`）、候选排序；`queue.rs` 负责共用队列与“一轮”清单；`history.rs` 把组合状态同步为 `gp_windows` 等历史行（保存点写入，失败只记缺口，不回滚调度），`history_query.rs::window_figures` 是窗口时长唯一口径。改组合状态一律经 `Store::save`（同步历史并更新队列），退役必须经 `policy::retire` + `policy::settle`。
 
-**管理方法**（`admin.rs::dispatch`，仅管理员角色）：`read`（页面数据：账号、组合、设置、分组变动；不带账号/网关筛选的全量读取里，每个组合的 `coolingSummary` 只有 `recorded`，完整冷却摘要只在筛选时返回，保证响应在 1 MiB 单帧上限内）、`configure`（校验 `settings.rs` 后保存并返回新归属）、`queue.update`（优先级顺序与参与开关）、`history.read`（统计查询）；控制面把页面能力 `gateway-pool.<方法>` 转为这些调用。
+**管理方法**（`admin.rs::dispatch`，仅管理员角色）：`read`（页面数据：账号、组合、设置、分组变动；不带账号/网关筛选的全量读取里，每个组合的 `coolingSummary` 只有 `recorded`，完整冷却摘要只在筛选时返回，保证响应在 1 MiB 单帧上限内）、`configure`（校验 `settings.rs` 后保存并返回新归属）、`queue.update`（优先级顺序与参与开关）、`history.read`（统计查询）、`cooling.reset`（手动调整正在进行的静置：不带参数取消全部，`accountId` 只处理该账号，`restSeconds` 把本次静置缩短到最后访问后该秒数；档位与起始档不变，周期最后一步记下调整时刻）；控制面把页面能力 `gateway-pool.<方法>` 转为这些调用。
 
 **页面**（`ui/page/`）：`GatewayPoolPage.vue` 用 `usePluginPolling` 每 10 秒读 `gateway-pool.read`、每 60 秒读账号/分组目录；标签页“账号与网关 / 分组变动 / 轮转明细 / 轮转统计”；拖动排序与开关走 `gateway-pool.queue.update`，设置弹窗走 `gateway-pool.configure`，统计组件走 `gateway-pool.history.read`。
 

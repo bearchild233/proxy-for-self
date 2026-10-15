@@ -1,8 +1,8 @@
 {
-  "id": "gateway-pool", "version": "0.5.2", "protocol": 2, "kind": "ui", "sdk": 1,
+  "id": "gateway-pool", "version": "0.5.3", "protocol": 2, "kind": "ui", "sdk": 1,
   "runtime": "vue-component", "hostApi": 1,
   "pages": [{"id":"main","title":"网关池","entry":"ui/module.js","roles":["admin"],"route":"/extensions/gateway-pool"}],
-  "capabilities": ["gateway-pool.read","gateway-pool.history.read","gateway-pool.queue.update","gateway-pool.configure","account-groups.get.admin.account-groups","accounts.get.admin.accounts"],
+  "capabilities": ["gateway-pool.read","gateway-pool.history.read","gateway-pool.queue.update","gateway-pool.configure","gateway-pool.cooling.reset","account-groups.get.admin.account-groups","accounts.get.admin.accounts"],
   "service": {
     "binary": "service/gateway-pool",
     "kernelApi": {"major": 0, "minMinor": 6},
@@ -13,6 +13,6 @@
   },
   "releasedAt": "2026-10-14T23:30:00+08:00",
   "releaseNotes": [
-    "修复网关较多时页面显示“服务暂不可用”：全量读取不再附带每个网关的完整冷却记录，响应控制在管理连接单帧上限内"
+    "页面新增“取消静置”：一键取消全部网关正在进行的静置，立即可复测，档位不变"
   ]
 }
