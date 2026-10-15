@@ -19,7 +19,7 @@ const props = defineProps<{
 
 const expanded = shallowRef(false)
 const selectedGateway = shallowRef('')
-const recordedGateways = computed(() => props.pairs.filter(pair => pair.coolingSummary?.visits.length).length)
+const recordedGateways = computed(() => props.pairs.filter(pair => pair.coolingSummary?.recorded ?? !!pair.coolingSummary?.visits?.length).length)
 const current = computed(() => props.pairs.find(pair => pair.state === 'ready'))
 const preparing = computed(() => props.pairs.find(pair => pair.state === 'preparing'))
 const standby = computed(() => props.pairs.find(pair => pair.state === 'standby'))

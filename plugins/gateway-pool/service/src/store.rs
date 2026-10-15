@@ -404,6 +404,13 @@ impl Store {
                 let account_id = string_of(&pair, "accountId");
                 let gateway_id = string_of(&pair, "gateway");
                 let summary = history_query::cooling_summary(db, &account_id, &gateway_id)?;
+                // 全量读取只带“是否有再访问记录”：600+ 组合的完整摘要会让响应超过管理连接的单帧上限（1 MiB）。
+                // 按账号或网关筛选时仍返回完整摘要。
+                let summary = if account.is_none() && gateway.is_none() {
+                    json!({"recorded": summary["visits"].as_array().is_some_and(|visits| !visits.is_empty())})
+                } else {
+                    summary
+                };
                 set(&mut pair, "coolingSummary", summary);
                 let models: Vec<Value> = if str_field(&pair, "state") == Some("ready") {
                     let generation = pair.get("generation").cloned().unwrap_or(Value::Null);

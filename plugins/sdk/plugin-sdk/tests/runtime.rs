@@ -98,6 +98,8 @@ impl Plugin for TestPlugin {
     }
     async fn admin_call(&self, ctx: Context, params: AdminCallParams) -> RpcResult<Value> {
         match params.method.as_str() {
+            // 结果超过单帧上限：运行时必须改回错误响应，不能让调用方等到超时。
+            "huge" => Ok(Value::String("x".repeat(MAX_FRAME_BYTES))),
             "slow" => {
                 // 先登记释放等待者再通知已进入，测试释放时每个等待者都已注册，许可不会丢失。
                 let released = self.0.release.notified();
@@ -867,6 +869,11 @@ async fn admin_connection_allows_only_health_and_admin_call() {
     let f = Fixture::start();
     let kernel = f.connect(Some(KernelSlot::A)).await;
     let admin_conn = f.connect_as(None, ConnectionRole::Admin).await;
+    let error = admin_conn
+        .call::<_, Value>("admin.call", &admin("huge", json!(null)), BUDGET)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, INTERNAL);
     let empty = EmptyParams {};
     assert!(
         admin_conn

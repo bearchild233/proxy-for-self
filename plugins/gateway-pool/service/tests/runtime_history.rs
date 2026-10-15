@@ -381,18 +381,21 @@ fn card_read_after_due_is_passive_and_waits_for_actual_visit() {
     harness.advance(10.0);
     let before = pair_rows(&harness);
     // 读取页面不得触发运行动作：组合与租约都保持原样。
-    let summary = harness.view(json!({}))["pairs"][0]["coolingSummary"].clone();
+    let summary = harness.view(json!({"accountId": "A"}))["pairs"][0]["coolingSummary"].clone();
     assert_eq!(summary["visits"], json!([]));
     assert_eq!(summary["current"]["probeAt"], Value::Null);
     assert_num(&summary["current"]["startedAt"], last_end);
     assert_eq!(before, pair_rows(&harness));
     assert_eq!(harness.count("leases"), 0);
     harness.probe("21", json!({}));
-    let summary = harness.view(json!({}))["pairs"][0]["coolingSummary"].clone();
+    let summary = harness.view(json!({"accountId": "A"}))["pairs"][0]["coolingSummary"].clone();
     assert_eq!(summary["current"], Value::Null);
     assert_num(&summary["visits"][0]["idleSeconds"], 10.0);
     assert_num(&summary["visits"][0]["afterDueSeconds"], 9.0);
     assert_eq!(summary["visits"][0]["result"], json!("21"));
+    // 全量读取只带是否有再访问记录，避免响应超过管理连接单帧上限。
+    let compact = harness.view(json!({}))["pairs"][0]["coolingSummary"].clone();
+    assert_eq!(compact, json!({"recorded": true}));
 }
 
 #[test]
@@ -653,7 +656,7 @@ fn cooling_views_skip_steps_without_a_due_time() {
             ],
         )
         .expect("insert cycle with a step lacking dueAt");
-    let summary = harness.view(json!({}))["pairs"][0]["coolingSummary"].clone();
+    let summary = harness.view(json!({"accountId": "A"}))["pairs"][0]["coolingSummary"].clone();
     let visits = summary["visits"].as_array().expect("visits");
     assert_eq!(visits.len(), 1);
     assert_num(&visits[0]["probeAt"], 9600.0);

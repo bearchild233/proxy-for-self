@@ -6,10 +6,12 @@ export interface CoolingVisit extends CoolingStep {
   afterDueSeconds: number
 }
 
+/** 全量读取只有 `recorded`；按账号或网关筛选时带完整的当前步骤与最近再访问。 */
 export interface CoolingSummary {
-  current: CoolingStep | null
-  visits: CoolingVisit[]
-  hasMore: boolean
+  recorded?: boolean
+  current?: CoolingStep | null
+  visits?: CoolingVisit[]
+  hasMore?: boolean
 }
 export interface Settings {
   mode: 'lazy' | 'continuous'

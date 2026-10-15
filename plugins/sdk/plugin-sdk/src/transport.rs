@@ -130,7 +130,20 @@ impl Peer {
             Ok(value) => ResponsePayload::Result(value),
             Err(error) => ResponsePayload::Error(error),
         };
-        self.send(&Message::Response { id, payload }).await
+        let response = Message::Response { id, payload };
+        // 结果超过单帧上限时改回一个错误，不能让调用方一直等到超时。
+        if encode_frame(&response).is_err() {
+            return self
+                .send(&Message::Response {
+                    id,
+                    payload: ResponsePayload::Error(RpcError::new(
+                        INTERNAL,
+                        "response exceeds MAX_FRAME_BYTES",
+                    )),
+                })
+                .await;
+        }
+        self.send(&response).await
     }
 }
 
