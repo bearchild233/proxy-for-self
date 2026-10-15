@@ -42,8 +42,8 @@ async function addServiceBinary(serviceManifest, destination) {
   if (declared !== name) throw new Error('服务 crate 的包名必须与 service.binary 的文件名一致')
   const linuxRoot = toWsl(root)
   const script = `${linuxRoot}/scripts/build-plugins-local.sh`
-  // 安装包沿用 plugins/Cargo.toml 的正式 release 配置，避免快速本地构建产物超出既有单文件上限。
-  execFileSync('wsl.exe', ['-d', wslDistribution, '-u', 'root', '--', 'env', 'CARGO_PROFILE_RELEASE_LTO=thin', 'CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1', 'bash', script, linuxRoot, '4096', '3', 'release', name], { stdio: 'inherit' })
+  // 安装包沿用 plugins/Cargo.toml 的正式 release 配置（fat LTO），避免产物超出插件存储与 updater 的 4 MiB 单文件上限。
+  execFileSync('wsl.exe', ['-d', wslDistribution, '-u', 'root', '--', 'env', 'CARGO_PROFILE_RELEASE_LTO=fat', 'CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1', 'bash', script, linuxRoot, '4096', '3', 'release', name], { stdio: 'inherit' })
   const built = `/work/proxy-for-self/plugins-target/release/${name}`
   const target = path.join(destination, binary)
   await mkdir(path.dirname(target), { recursive: true })

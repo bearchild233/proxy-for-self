@@ -28,6 +28,6 @@ needless_collect = { level = "deny", priority = 7 }
 
 [profile.release]
 strip = "symbols"
-lto = "thin"
+lto = "fat"
 codegen-units = 1
 panic = "abort"
