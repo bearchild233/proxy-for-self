@@ -24,7 +24,7 @@
 
 **A/B 槽**（`slots.py`）：`SlotController.deploy` 按阶段（preparing → candidate 启动并连续健康 → 切入口 → draining → idle）持久化状态；`SystemdCaddyDriver` 用 systemctl 启停槽、用 Caddy 配置 API 的 ETag 条件更新唯一网关 upstream 并核对进程身份；切换确认前失败先恢复旧入口再停候选，确认后排空失败只保留 `draining`；`resume` 恢复中断阶段，`boot` 开机协调只启动活动槽。
 
-**UI 插件包存储**（`static_plugins.py::StaticPluginStore`，由控制面进程使用）：`plugins/<id>/active.json`（enabled / current / previous）、`releases/<sha256>/` 不可变版本目录、`.leases/` 页面租约（24 小时过期，最多 128 个）；`install` 校验 tar（路径穿越、链接、单文件 4 MiB / 总 16 MiB、`protocol: 2` 清单、资源哈希、`runtime` / `hostApi`、`worker` 与 `policyWorker` 授权（策略后台只允许 `backup`、`pricing`，固定为包内 worker/policy.py）、页面与路由、能力不超出平台策略、`service` 段）后原子切换；`action` 做启用/停用/卸载/回退（基础模块不可停用，回退校验期望版本防止误回退）；`cleanup` 只保留当前版、上一版和有租约的版本。
+**UI 插件包存储**（`static_plugins.py::StaticPluginStore`，由控制面进程使用）：`plugins/<id>/active.json`（enabled / current / previous）、`releases/<sha256>/` 不可变版本目录、`.leases/` 页面租约（24 小时过期，最多 128 个）；`install` 校验 tar（路径穿越、链接、单文件 16 MiB / 总 32 MiB、`protocol: 2` 清单、资源哈希、`runtime` / `hostApi`、`worker` 与 `policyWorker` 授权（策略后台只允许 `backup`、`pricing`，固定为包内 worker/policy.py）、页面与路由、能力不超出平台策略、`service` 段）后原子切换；`action` 做启用/停用/卸载/回退（基础模块不可停用，回退校验期望版本防止误回退）；`cleanup` 只保留当前版、上一版和有租约的版本。
 
 **原生 Worker 管理**（`plugins.py::PluginManager`）：每个 Worker 一个 root 管理的根目录（`state.json`、`activity.lock`、`runtime/`），操作流程“关闭准入 → 取全流活动锁排空 → 停旧 Worker → 原子替换 runtime → 检查自动重启策略与私有 `healthz`（15 秒）→ 开放准入”，失败回滚旧目录与启用状态；Worker 单元不得被主网关 Requires / BindsTo。`plugin_registry.py::PluginRegistry` 热加载 `plugins.registry` JSON，提供目录、页面与 RPC（经 Worker 私有 socket，上限 512 KiB，共用活动锁共享模式），身份限 `admin` / `key` / `device`。`package_plugin.py` 把验证过的 Linux Python 3.10 Worker 环境打成运行包。
 
@@ -63,6 +63,6 @@
 
 - 任何写操作都保持“固定字段、不接受路径/命令/下载地址”；新增动作先加到 `Handler` 的白名单，再在 `Updater` 内加互斥判断。
 - 服务插件的时序（先启动新实例、健康通过后才改注册表、再停旧实例）不要调换；注册表写入必须原子。
-- 校验上限（清单 64 KiB、单文件 4 MiB）要与 `static_plugins.py` 和 `service_plugins.py` 两处保持一致。
+- 校验上限（清单 64 KiB、单文件 16 MiB、整包 32 MiB）要与 `static_plugins.py` 和 `service_plugins.py` 两处保持一致。
 - 协议版本变化同步 `kernel_protocol.py` / `service_manifest.py` 与 `backend/crates/kernel-protocol`。
 - 恢复路径一次失败后禁止循环重启；A/B 的 `attention` 状态需要人工检查。

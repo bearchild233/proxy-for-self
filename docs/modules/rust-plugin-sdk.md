@@ -26,7 +26,7 @@
 
 | 文件 | 职责 |
 | --- | --- |
-| `plugins/Cargo.toml` | workspace 成员、共享依赖版本（serde / serde_json / tokio）、lints、release 配置（fat LTO、`panic = abort`；服务二进制须小于插件存储与 updater 的 4 MiB 单文件上限） |
+| `plugins/Cargo.toml` | workspace 成员、共享依赖版本（serde / serde_json / tokio）、lints、release 配置（fat LTO、`panic = abort`；服务二进制须小于插件存储与 updater 的 16 MiB 单文件上限） |
 | `plugins/package.json` | 插件目录的 Node 元数据（私有包标记） |
 | `plugins/sdk/README.md` | SDK 使用说明、基准测量、依赖许可证表 |
 | `plugins/sdk/plugin-sdk/src/lib.rs` `plugin.rs` `runtime.rs` `client.rs` `transport.rs` `testing.rs` | 见上 |

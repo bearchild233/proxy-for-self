@@ -43,7 +43,7 @@ PROBE_INTERVAL_SECONDS = 0.25  # 健康探测失败后再次探测前的等待�
 SYSTEMCTL_TIMEOUT_SECONDS = 60  # daemon-reload、start、is-active 等 systemctl 调用的执行超时
 STOP_CALL_SLACK_SECONDS = 10  # systemctl stop 的外层执行超时 = shutdownSeconds + STOP_MARGIN_SECONDS + 本余量，避免外层先于 systemd 超时
 MAX_MANIFEST_BYTES = 65536  # 与控制面 static_plugins 的 plugin.json 上限保持一致
-MAX_RESOURCE_BYTES = 4 * 1024 * 1024  # 与控制面 static_plugins 的单文件上限保持一致
+MAX_RESOURCE_BYTES = 16 * 1024 * 1024  # 与控制面 static_plugins 的单文件上限保持一致
 DEFAULT_UNIT_DIRECTORY = "/etc/systemd/system"
 # systemd 不展开 ExecStart 可执行路径中的变量，运行目录里的二进制统一用固定文件名，
 # 模板单元写成 <runtime_root>/%i/service。

@@ -16,8 +16,9 @@ from service_manifest import validate_service
 
 ID = re.compile(r"[a-z][a-z0-9-]{0,63}\Z")
 VERSION = re.compile(r"[0-9a-f]{64}\Z")
-MAX_FILE = 4 * 1024 * 1024
-MAX_BUNDLE = 16 * 1024 * 1024
+# 单文件上限按服务插件二进制（fat LTO 后约 4 MB）留足余量；与 service_plugins.MAX_RESOURCE_BYTES 保持一致。
+MAX_FILE = 16 * 1024 * 1024
+MAX_BUNDLE = 32 * 1024 * 1024
 
 class PluginVersionChangedError(ValueError):
     pass
