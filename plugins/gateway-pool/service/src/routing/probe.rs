@@ -120,6 +120,10 @@ impl Pool {
                 if pool.past(until) || pool.is_stopped() {
                     break;
                 }
+                // 请求触发的找票只为还在等待的请求服务；请求结束后不再继续消耗候选网关。
+                if demand && !pool.request_waiting(&account) {
+                    break;
+                }
                 // 候选失败后立即尝试下一组合，不等待下一次周期。
                 tokio::time::sleep(Duration::from_millis(settings.probe_interval_ms)).await;
                 let Ok(next_settings) = pool.settings().await else {
@@ -159,6 +163,16 @@ impl Pool {
             }
         });
         Ok(())
+    }
+
+    /// 账号最近是否还有请求在等待窗口（`route.prepare` 轮询时刷新）。
+    fn request_waiting(&self, account: &str) -> bool {
+        let now = self.now();
+        self.active
+            .lock()
+            .expect("active lock")
+            .get(account)
+            .is_some_and(|at| now - *at < super::REQUEST_IDLE_SECONDS)
     }
 
     /// 请求截止时间（Unix 秒）是否已过。

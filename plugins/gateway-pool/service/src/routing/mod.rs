@@ -52,6 +52,9 @@ const HOOK_BUDGET: Duration = Duration::from_millis(1500);
 /// `route.select` 记录的请求状态在没有截止时间可用时的保留时间。
 // 011 已确认：未收到请求截止时间前保留 600 秒。
 const SELECT_KEEP_SECONDS: f64 = 600.0;
+/// 请求触发的找票在账号没有请求还在等待（最近这段时间内没有 `route.prepare` 轮询）后停止。
+/// 内核等待窗口时按 `retry_after_ms`（默认 50 毫秒）反复轮询；客户端断开或请求放弃后轮询停止。
+const REQUEST_IDLE_SECONDS: f64 = 10.0;
 
 /// 池设置中请求路径用到的字段（`config` 动作的结果，含池服务凭证）。
 #[derive(Clone)]

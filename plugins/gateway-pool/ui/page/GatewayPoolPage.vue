@@ -54,10 +54,17 @@ function queueEntry(id: string) {
 const accountColumns = defineTableColumns<(typeof accountCards.value)[number]>([
   { key: 'account', label: '账号与网关', kind: 'custom', size: '4xl' },
 ])
+// 每次保存队列递增；保存前已发出的读取返回时版本已变，丢弃旧结果，避免开关被旧数据拨回去。
+let queueVersion = 0
 async function saveQueue(payload: { accountIds: string[] } | { accountId: string, enabled: boolean }) {
   if (savingQueue.value || !view.value)
     return
   savingQueue.value = true
+  queueVersion++
+  const previous = view.value.accountQueue
+  // 开关先在页面上生效，保存失败再恢复。
+  if ('accountId' in payload && queueEntry(payload.accountId))
+    view.value.accountQueue = { ...previous, accounts: previous.accounts.map(item => item.accountId === payload.accountId ? { ...item, enabled: payload.enabled } : item) }
   try {
     // 首次操作开关时先保存完整可见顺序，避免新登记的账号跳到列表顶部。
     if ('accountId' in payload && accountCards.value.some(card => !queueEntry(card.id))) {
@@ -66,11 +73,14 @@ async function saveQueue(payload: { accountIds: string[] } | { accountId: string
     view.value.accountQueue = await call<AccountQueue>('gateway-pool.queue.update', { ...payload, revision: view.value.accountQueue.revision })
   }
   catch (cause) {
+    if (view.value)
+      view.value.accountQueue = previous
     toast.error(cause instanceof Error ? cause.message : '保存账号队列失败')
   }
   finally {
     savingQueue.value = false
-    await refresh()
+    // 整页数据较大，后台刷新，不阻塞开关。
+    void refresh()
   }
 }
 async function saveOrder(change: { originalIds: string[], orderedIds: string[] }) {
@@ -107,9 +117,10 @@ const tabOptions = [
 async function refresh() {
   if (savingQueue.value)
     return
+  const version = queueVersion
   try {
     const response = await call<PoolView>('gateway-pool.read', { limit: 200 })
-    if (savingQueue.value)
+    if (savingQueue.value || version !== queueVersion)
       return
     view.value = response
     error.value = ''
