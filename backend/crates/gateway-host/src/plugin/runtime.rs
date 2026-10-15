@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use gateway_core::{
     lifecycle::CancellationToken,
-    plugin::{Ownership, PluginCapabilities, PluginHooks},
+    plugin::{Ownership, PluginCapabilities, PluginHooks, watch_matches},
 };
 use kernel_protocol::*;
 use serde::{Serialize, de::DeserializeOwned};
@@ -207,6 +207,17 @@ impl PluginHooks for PluginRuntime {
         } else {
             Ownership::Watched { plugins }
         }
+    }
+
+    /// 调用方已确认账号不归任何插件所有；按各插件的监控规则（含 `*`、`!分组`）汇总监控者。
+    fn watchers(&self, account_groups: &[String]) -> Vec<String> {
+        let state = self.state.lock().expect("plugin state");
+        state
+            .entries
+            .values()
+            .filter(|entry| watch_matches(&entry.snapshot.watched_groups, account_groups))
+            .map(|entry| entry.registration.id.clone())
+            .collect()
     }
 
     async fn route_select(

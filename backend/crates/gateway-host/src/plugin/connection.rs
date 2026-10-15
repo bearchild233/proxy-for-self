@@ -5,7 +5,7 @@ use super::{
 };
 use gateway_core::{
     lifecycle::CancellationToken,
-    plugin::{PluginAccess, PluginCapabilities},
+    plugin::{PluginAccess, PluginCapabilities, watch_matches},
 };
 use kernel_protocol::*;
 use std::{
@@ -341,6 +341,29 @@ impl PluginAccess for Access {
                     .collect()
             })
             .unwrap_or_default()
+    }
+    /// 自己所有的分组直接放行；否则账号不能归其他插件所有，并且要命中监控规则（含 `*`、`!分组`）。
+    fn allows(&self, account_groups: &[String]) -> bool {
+        let state = self.state.lock().expect("plugin state");
+        let Some(entry) = state
+            .entries
+            .get(&self.id)
+            .filter(|entry| entry.registration.enabled)
+        else {
+            return false;
+        };
+        if account_groups
+            .iter()
+            .any(|group| entry.snapshot.owned_groups.contains(group))
+        {
+            return true;
+        }
+        let owned_elsewhere = state.entries.values().any(|other| {
+            account_groups
+                .iter()
+                .any(|group| other.snapshot.owned_groups.contains(group))
+        });
+        !owned_elsewhere && watch_matches(&entry.snapshot.watched_groups, account_groups)
     }
     fn fetch_hosts(&self) -> Vec<String> {
         self.state

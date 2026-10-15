@@ -16,6 +16,7 @@ struct Controls {
     select: Mutex<Vec<RouteSelectParams>>,
     preferred: Mutex<Vec<String>>,
     blocked: Mutex<Vec<String>>,
+    ordinary: Mutex<Vec<String>>,
     pinned: Mutex<Option<PinnedDecision>>,
     prepare: Mutex<Vec<RoutePrepareParams>>,
     prepares: Mutex<VecDeque<RoutePrepareResult>>,
@@ -78,6 +79,7 @@ impl Plugin for TestPlugin {
                     .clone()
                     .unwrap_or(PinnedDecision::Stay)
             }),
+            ordinary: self.0.ordinary.lock().unwrap().clone(),
         })
     }
     async fn route_prepare(
@@ -413,6 +415,30 @@ async fn select_order_blocked_prepare_materials_and_finish() {
     assert!(finish.first_byte_ms.is_some());
     f.controls.blocked.lock().unwrap().clear();
     assert_eq!(f.execute(f.ordinary_context(), false).await.unwrap().0, B);
+}
+
+#[tokio::test]
+async fn ordinary_member_skips_prepare_and_uses_plain_upstream() {
+    let f = Fixture::new(
+        vec![
+            (A, "grp_00000000000000000000000000000001"),
+            (B, "grp_00000000000000000000000000000001"),
+        ],
+        true,
+    )
+    .await;
+    *f.controls.blocked.lock().unwrap() = vec![B.into()];
+    *f.controls.ordinary.lock().unwrap() = vec![A.into()];
+    f.upstream(successful()).await;
+    assert_eq!(f.execute(f.ordinary_context(), false).await.unwrap().0, A);
+    assert!(f.controls.prepare.lock().unwrap().is_empty());
+    let requests = f.server.received_requests().await.unwrap();
+    assert!(
+        requests[0]
+            .headers
+            .get("cookie")
+            .is_none_or(|cookie| cookie != "fixture=plugin")
+    );
 }
 
 #[tokio::test]

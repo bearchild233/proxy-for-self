@@ -49,6 +49,17 @@ async fn queue_order_disabled_and_exhausted_accounts_control_the_preferred_list(
         vec![(SECOND.to_owned(), "queue_disabled".to_owned())]
     );
     assert!(disabled.blocked[0].reason.message.contains("停用"));
+
+    // 允许降智使用：不阻塞也不进 preferred，交给内核按普通账号调度。
+    let update = object_of(
+        json!({"revision": rig.queue_revision(), "accountId": SECOND,
+        "enabled": true, "degradedUse": true}),
+    );
+    dispatch(&rig.store, "queue.update", &update).expect("degraded use");
+    let ordinary = rig.select("req_d", &[ACCOUNT, SECOND], false, None).await;
+    assert_eq!(ordinary.preferred, vec![ACCOUNT]);
+    assert!(ordinary.blocked.is_empty());
+    assert_eq!(ordinary.ordinary, vec![SECOND]);
 }
 
 /// Key 的授权范围外的账号不会进入候选，也不会被登记进队列。

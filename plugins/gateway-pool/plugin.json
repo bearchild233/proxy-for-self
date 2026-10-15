@@ -1,5 +1,5 @@
 {
-  "id": "gateway-pool", "version": "0.5.3", "protocol": 2, "kind": "ui", "sdk": 1,
+  "id": "gateway-pool", "version": "0.6.0", "protocol": 2, "kind": "ui", "sdk": 1,
   "runtime": "vue-component", "hostApi": 1,
   "pages": [{"id":"main","title":"网关池","entry":"ui/module.js","roles":["admin"],"route":"/extensions/gateway-pool"}],
   "capabilities": ["gateway-pool.read","gateway-pool.history.read","gateway-pool.queue.update","gateway-pool.configure","gateway-pool.cooling.reset","account-groups.get.admin.account-groups","accounts.get.admin.accounts"],

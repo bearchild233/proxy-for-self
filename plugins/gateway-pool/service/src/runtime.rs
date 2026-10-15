@@ -751,13 +751,21 @@ impl Store {
     ) -> Result<Availability, Failure> {
         if let Some(row) = one(
             db,
-            "SELECT enabled,quota_exhausted FROM gp_account_queue WHERE account=?",
+            "SELECT enabled,degraded_use,quota_exhausted FROM gp_account_queue WHERE account=?",
             vec![text(account)],
         )? {
             if !truthy(row.get("enabled")) {
                 return Ok(Availability::blocked(Reason {
                     code: "queue_disabled",
                     message: "该账号已在网关池队列中停用".to_owned(),
+                    next_recovery_at: None,
+                }));
+            }
+            // 允许降智使用：不打票，route.select 把它交给内核按普通账号调度。
+            if truthy(row.get("degraded_use")) {
+                return Ok(Availability::blocked(Reason {
+                    code: "degraded_use",
+                    message: "该账号允许降智使用，按普通账号调度".to_owned(),
                     next_recovery_at: None,
                 }));
             }
@@ -1649,7 +1657,8 @@ impl Store {
         settings: &Object,
         now: Num,
     ) -> Result<Value, Failure> {
-        if !truthy(settings.get("dynamicGroups")) {
+        // 停用或允许降智使用的账号不做恢复检测，否则可能被移回正常分组、绕过开关被正常使用。
+        if !truthy(settings.get("dynamicGroups")) || !queue::allowed(db, account)? {
             return Ok(Value::Null);
         }
         let row = one(

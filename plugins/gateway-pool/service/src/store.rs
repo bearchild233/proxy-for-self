@@ -63,7 +63,8 @@ impl ManualClock {
     }
 }
 
-/// 网关池归属：`ownedGroups` 来自 `groupIds`；动态分组开启时 `watchedGroups` 为正常分组。
+/// 网关池归属：`ownedGroups` 来自 `groupIds`。动态分组开启时 `watchedGroups` 含正常分组（恢复移组需要它的授权），
+/// 监控全部普通账号时再加 `*`，不监控的分组以 `!分组` 列出；内核按这些规则决定观察哪些普通账号。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ownership {
     pub owned_groups: Vec<String>,
@@ -90,7 +91,20 @@ fn ownership_of(settings: &Object) -> Ownership {
                 && str_field(settings, "degradedGroupId")
                     .is_some_and(|degraded| !degraded.is_empty() && degraded != normal) =>
         {
-            vec![normal.to_owned()]
+            let mut watched = vec![normal.to_owned()];
+            if str_field(settings, "watchScope") != Some("normal") {
+                watched.push("*".to_owned());
+            }
+            watched.extend(
+                settings
+                    .get("unwatchedGroupIds")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(|group| format!("!{group}")),
+            );
+            watched
         }
         _ => Vec::new(),
     };
@@ -320,7 +334,9 @@ impl Store {
     pub fn update_queue(&self, data: &Object) -> Result<Value, Failure> {
         self.write(|db| {
             let result = queue::update(db, data)?;
-            if data.get("enabled") == Some(&Value::Bool(false)) {
+            if data.get("enabled") == Some(&Value::Bool(false))
+                || data.get("degradedUse") == Some(&Value::Bool(true))
+            {
                 let settings = effective_settings(db, false)?;
                 self.retire_account(db, &string_of(data, "accountId"), &settings, "account_left")?;
             }

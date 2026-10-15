@@ -199,7 +199,7 @@ async fn protocol_six_eligibility_uses_probe_model_and_refreshes_missing_quota()
 async fn confirmation_expires_after_twenty_seconds_and_watchers_follow_configuration() {
     let clock = gateway_pool::ManualClock::new(now_secs());
     let rig = Rig::start_clock("observe-expiry", settings(), clock.clock()).await;
-    assert_eq!(rig.store.ownership().unwrap().watched_groups, vec![NORMAL]);
+    assert_eq!(rig.store.ownership().unwrap().watched_groups, vec![NORMAL, "*"]);
     rig.fake.set_probe(|_| probe_result(Some(200), None));
     assert_eq!(call(&rig, &observe()).await, ResponseObserveResult::Accept);
     clock.advance(19.0);

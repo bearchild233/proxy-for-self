@@ -38,6 +38,9 @@ pub struct RouteSelectResult {
     pub live: Vec<String>,
     pub blocked: Vec<BlockedAccount>,
     pub pinned_decision: Option<PinnedDecision>,
+    /// 本次按普通账号调度的成员：内核不再为它们调用请求钩子，直接走普通选号与上游。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ordinary: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

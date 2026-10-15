@@ -39,10 +39,9 @@ pub async fn require_account(
 ) -> Result<(), RpcError> {
     ProviderAccountId::new(id).map_err(|_| RpcError::new(INVALID_PARAMS, "accountId"))?;
     let rows = accounts.read(Some(&[id.to_owned()]), None).await?;
-    let groups = access.groups();
     if !rows
         .iter()
-        .any(|row| row.id == id && row.groups.iter().any(|group| groups.contains(group)))
+        .any(|row| row.id == id && access.allows(&row.groups))
     {
         return Err(RpcError::new(FORBIDDEN, "account outside plugin groups"));
     }
@@ -67,11 +66,10 @@ impl PluginCapabilities for KernelCapabilities {
                     .accounts
                     .read(params.ids.as_deref(), params.model.as_deref())
                     .await?;
-                let groups = access.groups();
                 encode(AccountsReadResult {
                     accounts: rows
                         .into_iter()
-                        .filter(|row| row.groups.iter().any(|group| groups.contains(group)))
+                        .filter(|row| access.allows(&row.groups))
                         .collect(),
                 })
             }

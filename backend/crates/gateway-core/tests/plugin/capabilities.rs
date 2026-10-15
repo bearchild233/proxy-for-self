@@ -323,3 +323,21 @@ fn fetch_host_scheme_port_size_and_parameter_validation() {
         );
     });
 }
+
+#[test]
+fn watch_rules_cover_all_accounts_and_exclusions_win() {
+    let rules = |items: &[&str]| {
+        items
+            .iter()
+            .map(|item| item.to_string())
+            .collect::<Vec<_>>()
+    };
+    assert!(watch_matches(&rules(&[G]), &[G]));
+    assert!(!watch_matches(&rules(&[G]), &[H]));
+    assert!(watch_matches(&rules(&["*"]), &[H]));
+    assert!(watch_matches(&rules(&["*"]), &[] as &[&str]));
+    let excluded = format!("!{H}");
+    assert!(!watch_matches(&rules(&["*", &excluded]), &[G, H]));
+    assert!(!watch_matches(&rules(&[G, &excluded]), &[G, H]));
+    assert!(watch_matches(&rules(&["*", &excluded]), &[G]));
+}

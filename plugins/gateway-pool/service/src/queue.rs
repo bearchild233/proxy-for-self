@@ -19,6 +19,15 @@ pub const DDL: &str = "
 
 pub fn install(db: &Connection) -> Result<(), Failure> {
     db.execute_batch(DDL)?;
+    // 0.6.0 新增“允许降智使用”：开启的账号不打票，由内核按普通账号调度。
+    let has = db
+        .prepare("SELECT 1 FROM pragma_table_info('gp_account_queue') WHERE name='degraded_use'")?
+        .exists([])?;
+    if !has {
+        db.execute_batch(
+            "ALTER TABLE gp_account_queue ADD COLUMN degraded_use INTEGER NOT NULL DEFAULT 0",
+        )?;
+    }
     Ok(())
 }
 
@@ -80,6 +89,7 @@ pub fn view(db: &Connection) -> Result<Value, Failure> {
         json!({
             "accountId": row.get("account").cloned().unwrap_or(Value::Null),
             "enabled": truthy(row.get("enabled")),
+            "degradedUse": truthy(row.get("degraded_use")),
             "quotaExhausted": truthy(row.get("quota_exhausted")),
             "reason": row.get("reason").cloned().unwrap_or(Value::Null),
         })
@@ -90,7 +100,13 @@ pub fn view(db: &Connection) -> Result<Value, Failure> {
 
 /// `update`：手动排序或切换单个账号。revision 不一致时拒绝，避免覆盖其他页面的修改。
 pub fn update(db: &Connection, data: &Object) -> Result<Value, Failure> {
-    const FIELDS: [&str; 4] = ["revision", "accountIds", "accountId", "enabled"];
+    const FIELDS: [&str; 5] = [
+        "revision",
+        "accountIds",
+        "accountId",
+        "enabled",
+        "degradedUse",
+    ];
     if data.keys().any(|key| !FIELDS.contains(&key.as_str())) {
         return Failure::invalid("账号队列参数无效");
     }
@@ -99,7 +115,10 @@ pub fn update(db: &Connection, data: &Object) -> Result<Value, Failure> {
         return Failure::invalid("账号队列已变化，请刷新后重试");
     }
     if let Some(accounts) = data.get("accountIds") {
-        if data.contains_key("accountId") || data.contains_key("enabled") {
+        if data.contains_key("accountId")
+            || data.contains_key("enabled")
+            || data.contains_key("degradedUse")
+        {
             return Failure::invalid("不能同时排序和切换账号");
         }
         let ids = identifiers(accounts)?;
@@ -127,33 +146,49 @@ pub fn update(db: &Connection, data: &Object) -> Result<Value, Failure> {
             Some(Value::String(account)) if account_id(account) => account.clone(),
             _ => return Failure::invalid("账号列表无效"),
         };
-        let Some(enabled) = data.get("enabled").and_then(Value::as_bool) else {
+        // 参与开关与“允许降智使用”可以单独或一起切换。
+        let flags = [("enabled", "enabled"), ("degradedUse", "degraded_use")];
+        let mut updates = Vec::new();
+        for (field, column) in flags {
+            match data.get(field) {
+                None => {}
+                Some(Value::Bool(value)) => updates.push((column, *value)),
+                Some(_) => return Failure::invalid("账号开关无效"),
+            }
+        }
+        if updates.is_empty() {
             return Failure::invalid("账号开关无效");
-        };
+        }
         register(db, std::slice::from_ref(&account))?;
-        exec(
-            db,
-            "UPDATE gp_account_queue SET enabled=? WHERE account=?",
-            vec![
-                rusqlite::types::Value::Integer(i64::from(enabled)),
-                text(&account),
-            ],
-        )?;
+        for (column, value) in updates {
+            exec(
+                db,
+                &format!("UPDATE gp_account_queue SET {column}=? WHERE account=?"),
+                vec![
+                    rusqlite::types::Value::Integer(i64::from(value)),
+                    text(&account),
+                ],
+            )?;
+        }
     }
     changed(db)?;
     view(db)
 }
 
-/// `allowed`：账号未停用且额度未耗尽；未登记的账号视为可用。
+/// `allowed`：账号能否打票——未停用、未允许降智使用且额度未耗尽；未登记的账号视为可用。
 pub fn allowed(db: &Connection, account: &str) -> Result<bool, Failure> {
     Ok(
         match one(
             db,
-            "SELECT enabled,quota_exhausted FROM gp_account_queue WHERE account=?",
+            "SELECT enabled,degraded_use,quota_exhausted FROM gp_account_queue WHERE account=?",
             vec![text(account)],
         )? {
             None => true,
-            Some(row) => truthy(row.get("enabled")) && !truthy(row.get("quota_exhausted")),
+            Some(row) => {
+                truthy(row.get("enabled"))
+                    && !truthy(row.get("degraded_use"))
+                    && !truthy(row.get("quota_exhausted"))
+            }
         },
     )
 }

@@ -1,6 +1,6 @@
 # example-echo 插件（示例服务插件）
 
-<!-- doc-sync paths: plugins/example-echo -->
+<!-- doc-sync paths: plugins/example-echo reviewed: f5b6b52 -->
 
 ## 职责与边界
 
@@ -12,7 +12,7 @@
 ## 实现逻辑
 
 `plugins/example-echo/service/src/main.rs`：
-- `Echo` 实现 `Plugin`：`route_select` 原样返回候选账号作为优先顺序（有固定账号则 `Stay`）；`route_prepare` 返回 `Fail{not_supported}`；`response_head` 返回 `Accept`；`admin_call` 把参数原样返回（页面能力 `example-echo.echo` 经控制面转发到这里，用来验证管理连接链路）。
+- `Echo` 实现 `Plugin`：`route_select` 原样返回候选账号作为优先顺序（有固定账号则 `Stay`，`ordinary` 为空）；`route_prepare` 返回 `Fail{not_supported}`；`response_head` 返回 `Accept`；`admin_call` 把参数原样返回（页面能力 `example-echo.echo` 经控制面转发到这里，用来验证管理连接链路）。
 - `main`：读取环境变量 `CPR_PLUGIN_SHUTDOWN_MS` 作为关停预算（SDK 要求必须显式提供），构造 `Descriptor`（ID `example-echo`、`kernel_api{major: KERNEL_API.0, min_minor: 5}`、四个钩子、能力 `log`、不声明归属分组），`Server::bind(Settings::from_env()?, …).run()` 监听 SIGTERM。
 - 清单 `plugins/example-echo/plugin.json`：`kind: ui` 且 `pages: []`，`service.binary = service/example-echo`、`kernelApi {major 0, minMinor 5}`、能力 `["log"]`、`fetchHosts []`、`memoryMax 64M`、`shutdownSeconds 30`；`capabilities` 里的 `example-echo.echo` 是服务插件自有管理能力（`<插件ID>.<方法>`）。
 

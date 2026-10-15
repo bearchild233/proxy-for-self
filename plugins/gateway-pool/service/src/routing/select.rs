@@ -107,7 +107,7 @@ impl Pool {
             })
             .collect();
 
-        let (mut preferred, mut live) = (Vec::new(), Vec::new());
+        let (mut preferred, mut live, mut ordinary) = (Vec::new(), Vec::new(), Vec::new());
         if !candidate_json.is_empty() {
             let value = self
                 .runtime(json!({"action": "active", "candidates": candidate_json}))
@@ -131,6 +131,13 @@ impl Pool {
             preferred = ids(&value["accounts"]);
             live = ids(&value["live"]);
             for item in value["blocked"].as_array().into_iter().flatten() {
+                // 允许降智使用的账号不算阻塞，交给内核按普通账号调度。
+                if item["code"] == "degraded_use"
+                    && let Some(id) = item["accountId"].as_str().filter(|id| known.contains(id))
+                {
+                    ordinary.push(id.to_owned());
+                    continue;
+                }
                 if let (Some(id), Some(failure)) =
                     (item["accountId"].as_str(), PoolFailure::from_block(item))
                     && known.contains(id)
@@ -140,10 +147,14 @@ impl Pool {
             }
         }
 
-        let pinned_decision = params
-            .pinned
-            .as_deref()
-            .map(|bound| pinned_decision(bound, &preferred, &live, params.ordinary_available));
+        let ordinary_available = params.ordinary_available || !ordinary.is_empty();
+        let pinned_decision = params.pinned.as_deref().map(|bound| {
+            if ordinary.iter().any(|id| id == bound) {
+                PinnedDecision::Stay
+            } else {
+                pinned_decision(bound, &preferred, &live, ordinary_available)
+            }
+        });
 
         // 记下候选，供后续 `route.prepare` 的 plan/claim 判断账号能否让位。
         let expires = self.now() + SELECT_KEEP_SECONDS;
@@ -158,7 +169,7 @@ impl Pool {
             });
         state.expires = state.expires.max(expires);
         state.alternatives = preferred.clone();
-        state.ordinary = params.ordinary_available;
+        state.ordinary = ordinary_available;
         drop(requests);
 
         Ok(RouteSelectResult {
@@ -166,6 +177,7 @@ impl Pool {
             live,
             blocked,
             pinned_decision,
+            ordinary,
         })
     }
 }

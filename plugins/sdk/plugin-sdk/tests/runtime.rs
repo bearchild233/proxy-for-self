@@ -71,6 +71,7 @@ impl Plugin for TestPlugin {
             live: vec![],
             blocked: vec![],
             pinned_decision: params.pinned.map(|_| PinnedDecision::Stay),
+            ordinary: vec![],
         })
     }
     async fn route_prepare(

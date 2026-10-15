@@ -15,6 +15,7 @@ impl Plugin for Echo {
             live: vec![],
             blocked: vec![],
             pinned_decision: params.pinned.map(|_| PinnedDecision::Stay),
+            ordinary: vec![],
         })
     }
     async fn route_prepare(

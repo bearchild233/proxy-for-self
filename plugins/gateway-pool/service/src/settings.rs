@@ -82,6 +82,12 @@ pub fn prepare(previous: &Object, data: &Object) -> Result<Object, Failure> {
             return Failure::invalid(&format!("{field}无效"));
         }
     }
+    if !matches!(str_field(&settings, "watchScope"), Some("all" | "normal")) {
+        return Failure::invalid("降智检测范围无效");
+    }
+    if !settings.get("unwatchedGroupIds").is_some_and(group_list) {
+        return Failure::invalid("不检测的分组无效");
+    }
     let dynamic = matches!(settings.get("dynamicGroups"), Some(Value::Bool(true)));
     if dynamic {
         let normal = str_field(&settings, "normalGroupId").unwrap_or_default();

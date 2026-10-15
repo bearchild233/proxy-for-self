@@ -18,7 +18,7 @@ OpenAI / Codex Provider（crate `provider-openai`）：独占 OpenAI credential 
 3. 发送：`transport/request.rs` 把 Core `Generate` operation 严格编码为 Codex Responses wire；`transport/headers.rs` 按运行时画像组装官方头和账号身份头；`transport/client*.rs`（HTTP/SSE）或 `transport/websocket/`（WS）发送。是否走 WS 由账号/Key 策略和 `session_transport.rs`（根会话连续 WS 失败预算，耗尽后保持 HTTP）决定。
 4. 响应：`transport/canonical.rs` 把上游 SSE 旁路解码为 canonical event，原始字节同时保留（`cold_response_stream`）；`provider/observation.rs` 归一化请求/响应/transport 观测；`transport/usage.rs` 解析用量并折算计费（`openai_billing_breakdown`）。提交边界前最多保留 64 KiB 原始 chunk 与短暂的结构事件，期间收到明确拒绝可无感换号。
 5. 失败：`provider/failure.rs` 做上游失败分类、恢复决策与稳定错误投影：额度拒绝先隔离账号再投影 `ClientReplayRequired`（丢弃未交付错误帧，让客户端提交完整历史开新链）；WS 分阶段错误与重试退避；账号反馈（`apply_failure`）和权威额度刷新调度。
-6. 插件路由：`provider/plugin_routing.rs` 是通用插件桥，`plugin_routing` 开启时在选号前调 `route.select`、选中后 `route.prepare`、收到响应头后 `response.head`、结束 `request.finish`，观察分组账号收到头后调 `response.observe`；只维护资格、交付和重放边界（每请求最多 4 次尝试、已提交后忽略 retry/switch、不可安全重放时不执行），不解释业务原因码。`provider/replay.rs` 约束跨账号只重放完整、可移植的输入。
+6. 插件路由：`provider/plugin_routing.rs` 是通用插件桥，`plugin_routing` 开启时在选号前调 `route.select`、选中后 `route.prepare`、收到响应头后 `response.head`、结束 `request.finish`，不归任何插件所有的账号按 `PluginHooks::watchers` 得到监控插件，收到头后调 `response.observe`；`route.select` 结果里的 `ordinary` 账号不计入池成员与归属，按普通账号选号、直连上游、不调请求钩子；只维护资格、交付和重放边界（每请求最多 4 次尝试、已提交后忽略 retry/switch、不可安全重放时不执行），不解释业务原因码。`provider/replay.rs` 约束跨账号只重放完整、可移植的输入。
 
 **WebSocket**（`src/transport/websocket/`）：`pool/`（连接池：reservation / lease / 状态 / 维护与驱逐监督）、`pump.rs`（常驻后台泵，对齐官方 CLI 的连接管理）、`handshake.rs`（opening 与首帧）、`coordinator.rs`（pre-send / post-send 与池、熔断编排）、`breaker.rs`（冷建连 origin 级熔断）、`exchange/`（帧交换、流式转发、结果归约）、`model.rs`（请求与续接模型）、`audit.rs`。WS pool 与 continuation 按凭据版本隔离。
 

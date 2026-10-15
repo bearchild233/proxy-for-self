@@ -14,7 +14,7 @@
 - 消息（`src/message.rs`）：`Message` 为 `request{id,method,params}`、`response{id,result|error}`、`notify{method,params}` 三种，按 `kind` 标签区分；两端各自编号。错误码固定六个：`not_supported` `invalid_params` `unavailable` `timeout` `forbidden` `internal`。
 - 版本与握手：`HelloParams`（内核发出：`kernelApi`、内核版本与槽位、`role`）与 `HelloResult`（插件返回：插件 ID 与内容版本、SDK 版本、`kernelApi{major,minMinor}`、`hooks`、`capabilities`、`ownedGroups`、`watchedGroups`）。`is_compatible`：主版本相同、插件要求的最低次版本不高于内核；0.x 期间最低次版本必须 ≥ 4。`ConnectionRole` 缺省 `kernel`，`admin` 只允许 `health` 与 `admin.call`（协议 0.5）。`ownership.changed` 通知携带最新归属与观察分组。
 - 钩子（`src/hooks.rs`）：
-  - `route.select`：入参候选账号、是否有普通账号可用、固定账号；结果 `preferred`（优先顺序）、`live`（持窗账号）、`blocked`（不可用账号与原因）、`pinnedDecision`（`stay`/`escape`）。
+  - `route.select`：入参候选账号、是否有普通账号可用、固定账号；结果 `preferred`（优先顺序）、`live`（持窗账号）、`blocked`（不可用账号与原因）、`pinnedDecision`（`stay`/`escape`）、可选 `ordinary`（本次按普通账号调度的成员，内核不再为它们调用请求钩子；旧内核忽略该字段，这些账号仍按池成员处理并失败关闭）。`watchedGroups` 条目除具体分组外可用 `*`（所有不归插件所有的账号）与 `!分组`（排除），规则见 [gateway-core](gateway-core.md)。
   - `route.prepare`：入参账号、尝试序号、期限、是否可安全重放；结果为 `use{accountId,leaseId,upstream{cookie,turnState}}`、`wait{retryAfterMs,reason}`、`fail{reason}`。
   - `response.head`：入参状态码、是否返回 turn state、Set-Cookie、耗时；结果 `accept` / `retry{delayMs}` / `switch` / `fail`。
   - `request.finish`：通知，携带结果（completed/failed/cancelled/interrupted）、耗时、首字节耗时、用量。

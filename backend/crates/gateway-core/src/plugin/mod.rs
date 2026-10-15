@@ -34,9 +34,35 @@ pub enum Ownership {
     NotOwned,
 }
 
+/// 监控规则：`*` 表示所有不归任何插件所有的账号，`!分组` 表示带该分组的账号不监控（优先于其余规则），
+/// 其余条目是具体分组。调用方负责先排除归其他插件所有的账号。
+pub fn watch_matches<G: AsRef<str>>(rules: &[String], account_groups: &[G]) -> bool {
+    let has = |group: &str| account_groups.iter().any(|own| own.as_ref() == group);
+    if rules
+        .iter()
+        .filter_map(|rule| rule.strip_prefix('!'))
+        .any(has)
+    {
+        return false;
+    }
+    rules.iter().any(|rule| rule == "*" || has(rule))
+}
+
 #[async_trait]
 pub trait PluginHooks: Send + Sync {
     fn ownership(&self, group: &str) -> Ownership;
+    /// 不归任何插件所有的账号由哪些插件监控；默认只按逐个分组的 `Watched` 汇总。
+    fn watchers(&self, account_groups: &[String]) -> Vec<String> {
+        let mut plugins = Vec::new();
+        for group in account_groups {
+            if let Ownership::Watched { plugins: found } = self.ownership(group) {
+                plugins.extend(found);
+            }
+        }
+        plugins.sort();
+        plugins.dedup();
+        plugins
+    }
     async fn route_select(
         &self,
         plugin: &str,
@@ -75,6 +101,11 @@ pub trait PluginCapabilities: Send + Sync {
 pub trait PluginAccess: Send + Sync {
     fn id(&self) -> &str;
     fn groups(&self) -> Vec<String>;
+    /// 能力调用能否访问带这些分组的账号；默认按 `groups()` 求交集。
+    fn allows(&self, account_groups: &[String]) -> bool {
+        let groups = self.groups();
+        account_groups.iter().any(|group| groups.contains(group))
+    }
     fn fetch_hosts(&self) -> Vec<String>;
 }
 

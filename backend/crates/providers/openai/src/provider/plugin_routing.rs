@@ -41,19 +41,20 @@ pub(super) async fn select(
     let mut excluded = Vec::new();
     for account in &candidates {
         let mut owners = BTreeMap::new();
-        let mut watchers = BTreeSet::new();
-        if let Some(entry) = context
+        let groups: Vec<String> = context
             .account_scope()
             .and_then(|scope| scope.directory().account(account.id()))
-        {
-            for group in entry.group_ids() {
-                match hooks.ownership(group.as_str()) {
-                    Ownership::Owned { plugin, available } => {
-                        owners.insert(plugin, available);
-                    }
-                    Ownership::Watched { plugins } => watchers.extend(plugins),
-                    Ownership::NotOwned => {}
-                }
+            .map(|entry| {
+                entry
+                    .group_ids()
+                    .iter()
+                    .map(|group| group.as_str().to_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for group in &groups {
+            if let Ownership::Owned { plugin, available } = hooks.ownership(group) {
+                owners.insert(plugin, available);
             }
         }
         if owners.len() > 1 {
@@ -70,10 +71,12 @@ pub(super) async fn select(
                 unavailable_plugins.insert(plugin);
                 excluded.push(account.id().clone());
             }
-        } else if !watchers.is_empty() {
-            selection
-                .watchers
-                .insert(account.id().clone(), watchers.into_iter().collect());
+        } else {
+            // 不归任何插件所有的账号按监控规则（具体分组、`*`、`!分组`）决定由谁观察响应。
+            let watchers = hooks.watchers(&groups);
+            if !watchers.is_empty() {
+                selection.watchers.insert(account.id().clone(), watchers);
+            }
         }
     }
     for (plugin, accounts) in &grouped {
@@ -127,10 +130,21 @@ pub(super) async fn select(
                 selection.preferred.push(account.clone());
             }
         }
-        selection.members.extend(accounts.iter().cloned());
+        // 插件指定按普通账号调度的成员不进入池成员：选号把它们当普通账号，也不再调用请求钩子。
+        let members: Vec<_> = accounts
+            .iter()
+            .filter(|id| {
+                !result
+                    .ordinary
+                    .iter()
+                    .any(|ordinary| ordinary == id.as_str())
+            })
+            .cloned()
+            .collect();
+        selection.members.extend(members.iter().cloned());
         selection
             .owners
-            .extend(accounts.iter().cloned().map(|id| (id, plugin.clone())));
+            .extend(members.into_iter().map(|id| (id, plugin.clone())));
     }
     if !conflicting_plugins.is_empty()
         && candidates

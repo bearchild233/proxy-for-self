@@ -77,7 +77,7 @@ async function resetCooling() {
 }
 // 每次保存队列递增；保存前已发出的读取返回时版本已变，丢弃旧结果，避免开关被旧数据拨回去。
 let queueVersion = 0
-async function saveQueue(payload: { accountIds: string[] } | { accountId: string, enabled: boolean }) {
+async function saveQueue(payload: { accountIds: string[] } | { accountId: string, enabled?: boolean, degradedUse?: boolean }) {
   if (savingQueue.value || !view.value)
     return
   savingQueue.value = true
@@ -85,7 +85,7 @@ async function saveQueue(payload: { accountIds: string[] } | { accountId: string
   const previous = view.value.accountQueue
   // 开关先在页面上生效，保存失败再恢复。
   if ('accountId' in payload && queueEntry(payload.accountId))
-    view.value.accountQueue = { ...previous, accounts: previous.accounts.map(item => item.accountId === payload.accountId ? { ...item, enabled: payload.enabled } : item) }
+    view.value.accountQueue = { ...previous, accounts: previous.accounts.map(item => item.accountId === payload.accountId ? { ...item, ...payload } : item) }
   try {
     // 首次操作开关时先保存完整可见顺序，避免新登记的账号跳到列表顶部。
     if ('accountId' in payload && accountCards.value.some(card => !queueEntry(card.id))) {
@@ -301,6 +301,7 @@ usePluginPolling(loadDirectory, shallowRef(60_000))
                 <template #actions>
                   <div class="flex flex-col items-end gap-1">
                     <BaseSwitch :model-value="queueEntry(row.id)?.enabled ?? true" :disabled="savingQueue" :label="`${row.name}参与网关池`" @update:model-value="saveQueue({ accountId: row.id, enabled: $event })" />
+                    <BaseSwitch :model-value="queueEntry(row.id)?.degradedUse ?? false" :disabled="savingQueue" label="允许降智使用" show-label @update:model-value="saveQueue({ accountId: row.id, degradedUse: $event })" />
                     <span v-if="queueEntry(row.id)?.quotaExhausted" class="text-cp-xs text-cp-text-tertiary">额度已用完</span>
                   </div>
                 </template>

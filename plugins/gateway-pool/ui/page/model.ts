@@ -33,6 +33,10 @@ export interface Settings {
   dynamicGroups?: boolean
   normalGroupId?: string
   degradedGroupId?: string
+  /** 降智检测范围：all 为全部普通账号，normal 只检查正常分组。 */
+  watchScope?: 'all' | 'normal'
+  /** 带这些分组的普通账号不做降智检测。 */
+  unwatchedGroupIds?: string[]
 }
 
 /** 一次自动分组调整的记录；status 为 pending 表示已决定、尚未回报结果。 */
@@ -115,7 +119,8 @@ export interface Switch {
 
 export interface AccountQueue {
   revision: number
-  accounts: { accountId: string, enabled: boolean, quotaExhausted: boolean, reason: string | null }[]
+  /** degradedUse：允许降智使用，开启时不打票、按普通账号调度。 */
+  accounts: { accountId: string, enabled: boolean, degradedUse?: boolean, quotaExhausted: boolean, reason: string | null }[]
 }
 
 export interface PoolView {

@@ -327,6 +327,28 @@ fn recovery_check_ignores_generations_with_degraded_signals_or_expired_material(
     );
 }
 
+/// 停用的账号不做恢复检测：否则会被移回正常分组，绕过开关被正常使用。
+#[test]
+fn disabled_account_is_never_claimed_for_recovery() {
+    let harness = pool();
+    dynamic_groups(&harness);
+    let claim = harness.rt("claim", json!({"demand": true}));
+    harness.rt("sent", json!({"leaseId": claim["leaseId"]}));
+    harness.rt(
+        "probeResult",
+        json!({"leaseId": claim["leaseId"], "status": 200, "stateReturned": false, "paired": true,
+               "gatewayMatches": true,
+               "material": {"state": "s0", "cookie": "__oailb=x; __cflb=y", "expires": harness.now() + 3000.0}}),
+    );
+    harness.rt("finish", json!({"leaseId": claim["leaseId"]}));
+    harness.call_ok(
+        "queue.update",
+        json!({"revision": harness.queue_revision(), "accountId": "A", "enabled": false}),
+    );
+    harness.advance(481.0);
+    assert_eq!(harness.rt("recoveryCheck", json!({}))["check"], Value::Null);
+}
+
 #[test]
 fn interrupted_recovery_claim_expires_after_five_minutes_across_restart() {
     let mut harness = pool();

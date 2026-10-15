@@ -77,6 +77,18 @@ const modeHint = computed(() => draft.value.mode === 'lazy'
   ? '没有请求时不找票；窗口到期后由下一个请求触发准备。'
   : '近期有流量的账号在空闲时也按窗口轮换，切换更及时，但会多发检测请求。')
 
+const watchScopeOptions = [
+  { label: '全部普通账号', value: 'all' },
+  { label: '只检查正常分组', value: 'normal' },
+]
+function toggleUnwatched(id: string, checked: boolean) {
+  const ids = new Set(draft.value.unwatchedGroupIds ?? [])
+  if (checked)
+    ids.add(id)
+  else
+    ids.delete(id)
+  draft.value.unwatchedGroupIds = [...ids]
+}
 function toggleGroup(id: string, checked: boolean) {
   const ids = new Set(draft.value.groupIds)
   if (checked)
@@ -100,6 +112,8 @@ function submit() {
     dynamicGroups: draft.value.dynamicGroups ?? false,
     normalGroupId: draft.value.normalGroupId ?? '',
     degradedGroupId: draft.value.degradedGroupId ?? '',
+    watchScope: draft.value.watchScope ?? 'all',
+    unwatchedGroupIds: draft.value.unwatchedGroupIds ?? [],
     groupIds: draft.value.groupIds,
     gateways: gateways.value,
     poolUrl: draft.value.poolUrl.trim(),
@@ -156,6 +170,23 @@ function submit() {
           <BaseFormItem label="降智分组" description="确认降智的账号移到这里">
             <BaseSelect v-model="draft.degradedGroupId" aria-label="降智分组" :options="groupOptions" searchable />
           </BaseFormItem>
+        </div>
+        <div v-if="draft.dynamicGroups" class="grid gap-2">
+          <BaseSegmented :model-value="draft.watchScope ?? 'all'" label="降智检测范围" :options="watchScopeOptions" class="max-w-80" @update:model-value="draft.watchScope = $event as 'all' | 'normal'" />
+          <p class="text-cp-xs text-cp-text-tertiary">
+            {{ (draft.watchScope ?? 'all') === 'all' ? '检查所有不归网关池管理的账号；不在正常分组的账号降智时只加入降智分组，恢复后加入正常分组。' : '只检查正常分组里的账号。' }}
+          </p>
+          <span class="text-cp-sm text-cp-text">不检测的分组</span>
+          <div class="grid gap-2 sm:grid-cols-2">
+            <BaseCheckbox
+              v-for="group in groups.filter(item => !draft.groupIds.includes(item.id))"
+              :key="group.id"
+              :label="group.name"
+              show-label
+              :model-value="(draft.unwatchedGroupIds ?? []).includes(group.id)"
+              @update:model-value="toggleUnwatched(group.id, $event)"
+            />
+          </div>
         </div>
         <p v-if="dynamicProblem" role="alert" class="text-cp-xs text-cp-error-text">
           {{ dynamicProblem }}

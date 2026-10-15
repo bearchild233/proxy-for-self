@@ -205,7 +205,31 @@ fn ownership_follows_group_scope_and_the_dynamic_normal_group() {
         ),
     )
     .expect("configure dynamic groups");
-    assert_eq!(ownership.expect("ownership").watched_groups, vec!["g1"]);
+    // 默认监控全部普通账号：正常分组之外再登记 `*`。
+    assert_eq!(
+        ownership.expect("ownership").watched_groups,
+        vec!["g1", "*"]
+    );
+    let (_, ownership) = gateway_pool::dispatch(
+        &harness.store,
+        "configure",
+        &common::object_of(json!({"watchScope": "normal", "unwatchedGroupIds": ["g3"]})),
+    )
+    .expect("configure watch scope");
+    assert_eq!(
+        ownership.expect("ownership").watched_groups,
+        vec!["g1", "!g3"]
+    );
+    let (_, ownership) = gateway_pool::dispatch(
+        &harness.store,
+        "configure",
+        &common::object_of(json!({"watchScope": "all"})),
+    )
+    .expect("configure watch scope");
+    assert_eq!(
+        ownership.expect("ownership").watched_groups,
+        vec!["g1", "*", "!g3"]
+    );
 
     let (_, ownership) =
         gateway_pool::dispatch(&harness.store, "read", &common::object_of(json!({})))

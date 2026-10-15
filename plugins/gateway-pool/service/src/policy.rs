@@ -25,6 +25,8 @@ pub fn defaults() -> Object {
         "dynamicGroups": false,
         "normalGroupId": "",
         "degradedGroupId": "",
+        "watchScope": "all",
+        "unwatchedGroupIds": [],
         "recoverySeconds": 480,
         "recoveryPauseSeconds": 3600,
         "backoffMode": "additive",
