@@ -19,7 +19,7 @@ PostgreSQL、Redis、S3/R2 与 `pg_dump` 的适配层：把 Core / Admin / Provi
 4. 组装 `AdminStorePorts`、`CoreStorePorts`、`ProviderStorePorts`，注册 Worker 贡献与健康探针。`complete_startup` 在 Core 恢复完成、监听前调用（槽模式完成启动屏障）。
 
 **PostgreSQL 仓库**（`src/postgres/`，每个文件是对应表的唯一 owner）：
-- `provider_accounts/`：账号与 credential。`repository.rs` 实现 Core/Admin 端口和事务（`upsert`、`rotate_provider_account_in_transaction` 带 credential revision CAS、批量调度更新、删除、归档恢复），`rows.rs` 行解码与校验，`admin_queries.rs` 管理列表分页 read model，`admin_adapter.rs` 是 Admin 账号端口适配，`core_adapter.rs` 是 Core `ProviderAccountStore` 适配，`runtime.rs` 把持久事实与 Redis 冷却合成账号状态，`quota_forecast.rs` 只读采样，`mapping.rs` 领域映射。修改共享行解析字段（`ACCOUNT_SELECT` 等）要核对所有 SELECT 调用方，包括分组成员。
+- `provider_accounts/`：账号与 credential。`repository.rs` 实现 Core/Admin 端口和事务（`upsert`、`rotate_provider_account_in_transaction` 带 credential revision CAS、批量调度更新、删除、归档恢复、分组移动——插件经 `groups.move` 发起的移动审计操作者记 `plugin:<id>`，其他来源记 `gateway_pool`），`rows.rs` 行解码与校验，`admin_queries.rs` 管理列表分页 read model，`admin_adapter.rs` 是 Admin 账号端口适配，`core_adapter.rs` 是 Core `ProviderAccountStore` 适配，`runtime.rs` 把持久事实与 Redis 冷却合成账号状态，`quota_forecast.rs` 只读采样，`mapping.rs` 领域映射。修改共享行解析字段（`ACCOUNT_SELECT` 等）要核对所有 SELECT 调用方，包括分组成员。
 - `client_keys.rs`（Key 与绑定、reveal、金额窗口）、`client_budgets.rs`（按 Key 串行检查并幂等累计 USD 费用）、`key_bindings.rs`（固定账号绑定和 Key 级插件设置）、`account_groups.rs`、`proxies.rs`（命名代理，账号保留解析后的 URL）。
 - `execution.rs` 与 `execution_buffer.rs`：`model_requests` 生命周期与最终用量/费用；写入经有界队列异步落库，队列满/不可用丢弃可恢复观测并计数。`ops_events.rs`、`retention.rs`（终态请求、事件、审计的保留清理）。
 - `observability/`：Dashboard / Usage / Ops / 账号用量查询族，`query_budget.rs` 限制管理观测占用的连接槽位，`usage_facts.rs` 是“完整交付”用量口径的唯一谓词（排除预热记录）。

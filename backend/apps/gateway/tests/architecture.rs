@@ -200,7 +200,7 @@ const ADAPTER_PUBLIC_MODULES: &[(&str, &[&str])] = &[
     ("crates/gateway-store", &["backup", "postgres", "redis"]),
     (
         "crates/providers/openai",
-        &["config", "credential", "gateway_pool", "transport"],
+        &["config", "credential", "transport"],
     ),
     ("crates/providers/xai", &["credential", "transport"]),
 ];

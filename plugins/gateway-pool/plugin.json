@@ -1,9 +1,8 @@
 {
-  "id": "gateway-pool", "version": "0.5.0", "protocol": 2, "kind": "ui", "sdk": 1,
+  "id": "gateway-pool", "version": "0.5.1", "protocol": 2, "kind": "ui", "sdk": 1,
   "runtime": "vue-component", "hostApi": 1,
   "pages": [{"id":"main","title":"网关池","entry":"ui/module.js","roles":["admin"],"route":"/extensions/gateway-pool"}],
   "capabilities": ["gateway-pool.read","gateway-pool.history.read","gateway-pool.queue.update","gateway-pool.configure","account-groups.get.admin.account-groups","accounts.get.admin.accounts"],
-  "policyWorker": "worker/policy.py",
   "service": {
     "binary": "service/gateway-pool",
     "kernelApi": {"major": 0, "minMinor": 6},
@@ -14,10 +13,6 @@
   },
   "releasedAt": "2026-10-14T23:30:00+08:00",
   "releaseNotes": [
-    "窗口用满后只准备一张备用票，当前窗口继续服务；遇到降智、失败或 Cookie 到期时备用票立即接手，备用票超过 50 分钟未启用会丢弃并静置",
-    "静置退避可选加性（默认，每次加一个步长）或乘性（翻倍）；起始档记住上次恢复时的档，连续两次在同一档恢复后降一档；检测失败固定静置 5 分钟，不升档",
-    "窗口时长计到最后一次确认可用的时刻，空闲的窗口不再随查询时间增长；备用票转正的窗口从第一次业务访问算起",
-    "网关详情显示当前档、起始档与完整静置历史，轮转明细增加备用票时间与结束原因，轮转统计改为最近 24 小时各账号网关的窗口时长",
-    "启动时把没有结束时间的残留业务访问标为中断"
+    "移除已停用的 Python 策略文件，功能与 0.5.0 相同"
   ]
 }

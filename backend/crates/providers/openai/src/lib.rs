@@ -2,7 +2,6 @@
 
 mod admin;
 pub mod config;
-pub mod gateway_pool;
 mod plugin;
 mod provider;
 pub use plugin::OpenAiPluginUpstream;
@@ -47,8 +46,6 @@ pub use transport::{
 
 /// OpenAI 初始化后交给组装根的最小能力集。
 pub struct ProviderBundle {
-    #[cfg(feature = "gateway-pool-experiment")]
-    gateway_pool_experiment: Option<gateway_pool::GatewayPoolExperiment>,
     plugin_upstream: Arc<dyn gateway_core::plugin::PluginUpstream>,
     core_provider: Arc<CodexProvider>,
     admin_provider: Arc<dyn ProviderAdmin>,
@@ -199,30 +196,6 @@ pub async fn initialize(
             profile.clone(),
         ),
     ));
-    if config.plugin_routing && config.gateway_pool.is_some() {
-        tracing::warn!("openai.plugin_routing overrides openai.gateway_pool");
-    }
-    let gateway_pool = if !config.plugin_routing
-        && let Some(configuration) = config.gateway_pool.as_ref()
-    {
-        Some(
-            gateway_pool::GatewayPoolService::new(
-                configuration,
-                repository.clone(),
-                transport::CodexBackendClient::new(
-                    http.clone(),
-                    config.base_url().to_owned(),
-                    profile.clone(),
-                ),
-                Arc::clone(&quota),
-                ports.group_mover(),
-            )
-            .await
-            .map_err(|_| OpenAiInitializeError::Transport)?,
-        )
-    } else {
-        None
-    };
     let core_provider = Arc::new(
         CodexProvider::new(
             selector,
@@ -237,7 +210,6 @@ pub async fn initialize(
         )
         .map_err(OpenAiInitializeError::Provider)?
         .with_session_identity(session_identity)
-        .with_gateway_pool(gateway_pool.clone())
         .with_plugin_routing(config.plugin_routing)
         .with_pinned_cli_profile(config.pinned_cli_profile.clone())
         .with_excel_plugin_state_file(config.excel_plugin_state_file.clone())
@@ -302,7 +274,7 @@ pub async fn initialize(
         websocket_pool,
         desktop_release_status,
     ));
-    let mut worker_contributions = provider::worker_contributions(
+    let worker_contributions = provider::worker_contributions(
         refresh,
         quota,
         catalog,
@@ -318,19 +290,8 @@ pub async fn initialize(
         profile_statistics,
     )
     .map_err(|_| OpenAiInitializeError::Worker)?;
-    #[cfg(feature = "gateway-pool-experiment")]
-    let gateway_pool_experiment = gateway_pool
-        .clone()
-        .map(gateway_pool::GatewayPoolExperiment::new);
-    if let Some(service) = gateway_pool {
-        worker_contributions.push(
-            provider::gateway_pool_worker(service).map_err(|_| OpenAiInitializeError::Worker)?,
-        );
-    }
 
     Ok(ProviderBundle {
-        #[cfg(feature = "gateway-pool-experiment")]
-        gateway_pool_experiment,
         plugin_upstream,
         core_provider,
         admin_provider,
@@ -347,10 +308,6 @@ impl ProviderBundle {
         self.plugin_upstream.clone()
     }
 
-    #[cfg(feature = "gateway-pool-experiment")]
-    pub fn gateway_pool_experiment(&self) -> Option<gateway_pool::GatewayPoolExperiment> {
-        self.gateway_pool_experiment.clone()
-    }
     #[must_use]
     pub fn core_provider(&self) -> Arc<dyn Provider> {
         self.core_provider.clone()

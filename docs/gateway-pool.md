@@ -101,11 +101,9 @@
 
 **页面**（`ui/page/`）：`GatewayPoolPage.vue` 用 `usePluginPolling` 每 10 秒读 `gateway-pool.read`、每 60 秒读账号/分组目录；标签页“账号与网关 / 分组变动 / 轮转明细 / 轮转统计”；拖动排序与开关走 `gateway-pool.queue.update`，设置弹窗走 `gateway-pool.configure`，统计组件走 `gateway-pool.history.read`。
 
-**旧实现**：`services/plugin_host/gateway_pool*.py` 与 `plugins/gateway-pool/worker/policy.py` 是 Python 控制面时代的实现，清单带 `service` 段时不再使用，回退到无服务段的旧包才会走到；内核侧旧传输桥 `backend/crates/providers/openai/src/gateway_pool.rs` 在 `openai.plugin_routing` 打开时被跳过。均在 P2 删除。
-
 ## 实现位置
 
-网关池是 Rust 服务插件（`plugins/gateway-pool/`，清单 `plugin.json`）。内核经 socket 调用插件的请求路径钩子；管理页经控制面 `admin.call` 转发到插件的管理方法。插件对外访问（账号、额度、上游探测、池服务）全部经内核能力，状态保存在插件自己的 SQLite（`state.sqlite3`，管理视图不返回 state、Cookie、账号 Token 或池服务凭证）。旧的 Python 控制面实现（`services/plugin_host/gateway_pool*.py`、`worker/policy.py`）与网关内的 `backend/crates/providers/openai/src/gateway_pool.rs` 路径已停用，P2 删除。
+网关池是 Rust 服务插件（`plugins/gateway-pool/`，清单 `plugin.json`）。内核经 socket 调用插件的请求路径钩子；管理页经控制面 `admin.call` 转发到插件的管理方法。插件对外访问（账号、额度、上游探测、池服务）全部经内核能力，状态保存在插件自己的 SQLite（`state.sqlite3`，管理视图不返回 state、Cookie、账号 Token 或池服务凭证）。
 
 `plugins/gateway-pool/service/src/`：
 
@@ -153,7 +151,7 @@ plugins:
   registry_path: /etc/proxy-for-self-kernel/registry.json
   ownership_cache_path: /var/lib/api-hub/plugins/plugin-ownership.json
 openai:
-  plugin_routing: true   # 打开后覆盖旧的 openai.gateway_pool
+  plugin_routing: true   # 网关池经插件钩子参与选号；旧的 openai.gateway_pool 段已无效
 ```
 
 - 网关进程需加入 `proxy-for-self-plugin-ipc` 组（连接插件 socket），并对归属缓存目录有写权限（单元 `ReadWritePaths`）。
@@ -167,9 +165,8 @@ openai:
 
 - 插件服务：`scripts/build-plugins-local.sh <仓库路径> 4096 3 test gateway-pool`，覆盖状态机、备用票、退避、历史口径、设置、队列与钩子；`... clippy gateway-pool` 做 clippy。
 - 内核端到端：`backend/crates/providers/openai/tests/provider/contract/gateway_pool_e2e.rs`（`gateway_pool_plugin_` 开头的忽略用例，真实插件进程加临时 PostgreSQL）。
-- 旧路径（P2 删除前仍在仓库）：`python -m unittest discover -s services/plugin_host -p "test_*.py"`，`provider-openai` 的 `admin::gateway_pool` 用例。
 - 前端：`node scripts/check-plugin.mjs gateway-pool`、`node scripts/build-plugin.mjs gateway-pool`、相关 lint 与 `pnpm --dir frontend typecheck`。
-- 本机预览（模拟数据尚未包含备用票字段）：构建主壳和插件后运行 `python -X utf8 scripts/preview-gateway-pool.py`，入口 `http://127.0.0.1:18335/extensions/gateway-pool`。使用真实主壳、插件包和统计库，账号与事件为模拟数据，无真实 Rust 网关或上游连接；每次启动新建隔离库。
+- 本机页面预览：暂无专用脚本（旧预览依赖已删除的 Python 实现）；需要时用 `docs/plugin-stage.md` 的隔离测试环境起真实插件进程。
 
 ## 尚未验证
 

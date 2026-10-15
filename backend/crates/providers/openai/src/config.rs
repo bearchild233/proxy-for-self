@@ -53,10 +53,7 @@ pub struct OpenAiConfig {
     /// 保留固定 CLI 身份，每日跟随官方稳定版本；失败保留上次版本。
     #[serde(default)]
     pub pinned_cli_auto_update: bool,
-    /// 本机插件控制面的数据能力入口；不接受客户端指定地址。
-    #[serde(default)]
-    pub gateway_pool: Option<crate::gateway_pool::GatewayPoolConfig>,
-    /// 使用插件钩子路由；启用时完全跳过旧网关池服务。
+    /// 使用插件钩子路由（网关池等服务插件经内核钩子参与选号）。旧配置里的 `gateway_pool` 段已无效，反序列化时忽略。
     #[serde(default)]
     pub plugin_routing: bool,
     #[serde(skip)]
@@ -73,13 +70,6 @@ impl OpenAiConfig {
         self.ws_pool.validate()?;
         self.quota.validate()?;
         self.auth.validate()?;
-        if !self.plugin_routing
-            && let Some(config) = &self.gateway_pool
-        {
-            config
-                .validate()
-                .map_err(|_| OpenAiConfigError::InvalidField("openai.gateway_pool"))?;
-        }
         if let Some(profile) = &self.pinned_cli_profile
             && (profile.client_kind != crate::transport::profile::selection::ClientKind::Cli
                 || semver::Version::parse(&profile.codex_version).is_err()
@@ -171,7 +161,6 @@ impl Default for OpenAiConfig {
             excel_plugin_state_file: None,
             pinned_cli_profile: None,
             pinned_cli_auto_update: false,
-            gateway_pool: None,
             plugin_routing: false,
             identity_secret_path: PathBuf::new(),
         }

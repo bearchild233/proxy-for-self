@@ -36,19 +36,17 @@ OpenAI / Codex Provider（crate `provider-openai`）：独占 OpenAI credential 
 
 **后台 Worker**（`src/provider/workers.rs`）：OAuth 刷新（30 秒）、额度与目录健康（30 秒）、模型目录与 ETag、Desktop / CLI 发布检查、账号生命周期维护（60 秒）；owner 常量集中在该文件。
 
-**旧网关池传输桥**（`src/gateway_pool.rs`，feature `gateway-pool-experiment` 与 `openai.gateway_pool` 配置）：Python 控制面时代的实现；`openai.plugin_routing` 打开时完全跳过，P2 删除。不要在其上加功能。
-
 ## 文件表
 
 | 文件或目录 | 职责 |
 | --- | --- |
 | `src/lib.rs` | `initialize`、`ProviderBundle`、对外 re-export |
-| `src/config.rs` | `OpenAiConfig`：`api`、`ws_pool`、`quota`、`auth`、`stream_max_retries`、`residency`、`excel_worker_socket`、`excel_plugin_state_file`、`pinned_cli_profile`、`pinned_cli_auto_update`、`gateway_pool`、`plugin_routing` |
+| `src/config.rs` | `OpenAiConfig`：`api`、`ws_pool`、`quota`、`auth`、`stream_max_retries`、`residency`、`excel_worker_socket`、`excel_plugin_state_file`、`pinned_cli_profile`、`pinned_cli_auto_update`、`plugin_routing`（旧配置里的 `gateway_pool` 段被忽略） |
 | `src/admin/mod.rs` | `OpenAiAdminProvider`（实现 `ProviderAdmin`）：导入、OAuth、刷新、个人资料、头像、重置卡、模型政策；`OpenAiOAuthPendingStore` |
 | `src/provider/` | Provider 适配：`mod.rs`、`execution.rs`、`failure.rs`、`observation.rs`、`plugin_routing.rs`、`replay.rs`、`excel.rs`、`workers.rs` |
 | `src/credential/` | 账号 credential、选号、刷新、额度、目录、资料、OAuth（见上） |
 | `src/transport/` | 上游 transport、画像、协议类型（`protocol/`）、WebSocket |
-| `src/session_transport.rs` `src/plugin.rs` `src/gateway_pool.rs` | 见上 |
+| `src/session_transport.rs` `src/plugin.rs` | 见上 |
 
 ## 数据、配置与接口
 

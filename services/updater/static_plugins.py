@@ -139,7 +139,7 @@ class StaticPluginStore:
         if worker is not None and (not isinstance(worker, str) or worker not in resources or not worker.endswith('.py') or not self.policies[plugin_id].get('worker')):
             raise ValueError("后台逻辑未授权")
         policy_worker = manifest.get('policyWorker')
-        if policy_worker is not None and (plugin_id not in {'backup', 'pricing', 'gateway-pool'} or policy_worker != 'worker/policy.py' or policy_worker not in resources):
+        if policy_worker is not None and (plugin_id not in {'backup', 'pricing'} or policy_worker != 'worker/policy.py' or policy_worker not in resources):
             raise ValueError('策略后台未授权')
         pages = manifest.get("pages", [])
         # 服务插件可以没有页面（例如只提供能力的后台服务）；纯界面插件仍需至少一个页面。

@@ -1330,7 +1330,7 @@ pub(crate) async fn move_account_group_in_pool(
             id: format!("audit_{}", uuid::Uuid::now_v7().simple()),
             actor_kind: crate::postgres::AdminAuditActorKind::System,
             actor_admin_user_id: None,
-            // 插件身份与原因由内核能力端口构造；旧网关池仍沿用原审计操作者。
+            // 插件身份与原因由内核能力端口构造；其他来源沿用原审计操作者。
             actor_ref: if request.reason.starts_with("plugin:") {
                 request.reason.clone()
             } else {

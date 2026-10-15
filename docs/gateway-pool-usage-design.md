@@ -215,10 +215,10 @@ UI 复用现有基础组件、主题 Token、圆角、日期与时长工具。�
 | --- | --- | --- |
 | `plugins/gateway-pool/ui/page/` | 页面入口、图表、明细/批次表、网关冷却汇总、类型与查询逻辑 | 网关池 UI 包 |
 | `plugins/gateway-pool/plugin.json` | 新统计能力、版本、发布时间、说明 | 同一 UI 包 |
-| `services/plugin_host/gateway_pool.py` 与历史模块 | 记录事实、使用段/批次/冷却持久化、分页/汇总 | 插件控制面 |
-| `services/plugin_host/server.py` | 统计能力分发与参数校验，保留旧读取合同 | 插件控制面 |
+| `plugins/gateway-pool/service/src/history.rs`、`history_query.rs` | 记录事实、使用段/批次/冷却持久化、分页/汇总 | 网关池服务插件 |
+| `services/plugin_host/server.py` | 把 `gateway-pool.*` 转给服务插件 | 插件控制面 |
 | `packages/plugin-sdk/policies.json` / `operations.json` | 授权并登记统计能力 | 宿主平台 |
-| `providers/openai/src/gateway_pool.rs`，必要的 `provider/execution.rs` 计时位置 | 区分探测/拿票/业务，发送与流终态时间、结果、版本化回报 | Rust 网关 |
+| `backend/crates/providers/openai/src/provider/plugin_routing.rs`（钩子桥） | 区分探测/拿票/业务，发送与流终态时间、结果经钩子回报 | Rust 网关 |
 
 统计能力为 `gateway-pool.history.read`，明确声明使缺少统计支持的旧平台在安装阶段拒绝新包。原有 `gateway-pool.read` 合同保留。
 
@@ -240,7 +240,7 @@ UI 复用现有基础组件、主题 Token、圆角、日期与时长工具。�
 
 实际历史使用独立的 `gp_batches`、`gp_windows`、`gp_segments`、`gp_accesses`、`gp_cooling` 表，保留采集起点和缺口数。查询以 WAL 只读快照完成，采集写入用保存点隔离，不改调度策略。默认统计全账号全网关，账号汇总选中一个账号后显示分布图和批次图。
 
-预览使用 `scripts/preview-gateway-pool.py`，入口 `http://127.0.0.1:18335/extensions/gateway-pool`。主壳、组件插件、能力授权和 SQLite 统计均使用当前实现；登录身份、账号和访问事件为隔离模拟数据。没有启动完整 Rust/PostgreSQL/Redis 测试平台，也没有真实上游访问。旧 8767 HTML 页面不作为本次预览。
+页面验收用本机隔离测试环境（见 [插件测试环境](plugin-stage.md)），起真实网关池服务进程。
 
 ## 11. 实施次序与成功标准
 

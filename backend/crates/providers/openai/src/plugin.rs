@@ -139,8 +139,8 @@ impl PluginUpstream for OpenAiPluginUpstream {
                 .client
                 .for_account(&account)
                 .map_err(|_| RpcError::new(UNAVAILABLE, "account egress unavailable"))?;
-            let mut request = crate::gateway_pool::hi_request(&params.model)
-                .ok_or_else(|| RpcError::new(INVALID_PARAMS, "model"))?;
+            let mut request =
+                hi_request(&params.model).ok_or_else(|| RpcError::new(INVALID_PARAMS, "model"))?;
             crate::transport::request::scope_request_to_account(
                 &mut request,
                 &credential.installation_id,
@@ -314,4 +314,13 @@ fn no_response(kind: &str, started: tokio::time::Instant) -> UpstreamProbeResult
         retry_after_ms: None,
         duration_ms: started.elapsed().as_millis() as u64,
     }
+}
+
+/// 插件探测用的最小请求：固定提示词、无工具、低推理强度。
+fn hi_request(model: &str) -> Option<crate::transport::protocol::responses::CodexResponsesRequest> {
+    Some(crate::transport::protocol::responses::CodexResponsesRequest::from_body(
+        serde_json::json!({"model":model,"input":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}],"instructions":"Do not use external tools.","tools":[],"stream":true,"store":false,"reasoning":{"effort":"low"}})
+            .as_object()
+            .cloned()?,
+    ))
 }

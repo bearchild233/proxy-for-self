@@ -111,7 +111,6 @@ pub use failure::openai_failure_affects_account_score;
 use failure::*;
 pub(crate) use observation::build_cookie_header as plugin_cookie_header;
 use observation::*;
-pub(crate) use workers::gateway_pool_worker;
 pub(crate) use workers::worker_contributions;
 
 const PROVIDER_NAME: &str = "openai";
@@ -161,7 +160,6 @@ pub struct CodexProvider {
     excel_worker: Option<Client>,
     excel_plugin_state_file: Option<std::path::PathBuf>,
     pinned_cli_profile: Option<crate::transport::profile::CodexWireProfile>,
-    gateway_pool: Option<Arc<crate::gateway_pool::GatewayPoolService>>,
     plugin_routing: bool,
     plugin_hooks: std::sync::OnceLock<Arc<dyn gateway_core::plugin::PluginHooks>>,
 }
@@ -229,7 +227,6 @@ impl CodexProvider {
             excel_worker: None,
             excel_plugin_state_file: None,
             pinned_cli_profile: None,
-            gateway_pool: None,
             plugin_routing: false,
             plugin_hooks: std::sync::OnceLock::new(),
         })
@@ -237,14 +234,6 @@ impl CodexProvider {
 
     pub(crate) fn with_session_identity(mut self, identity: CodexSessionIdentity) -> Self {
         self.session_identity = Some(identity);
-        self
-    }
-
-    pub(crate) fn with_gateway_pool(
-        mut self,
-        service: Option<Arc<crate::gateway_pool::GatewayPoolService>>,
-    ) -> Self {
-        self.gateway_pool = service;
         self
     }
 
@@ -539,36 +528,6 @@ impl Provider for CodexProvider {
         } else {
             plugin_routing::Selection::default()
         };
-        let pool_selection = if !self.plugin_routing
-            && let Some(service) = self.gateway_pool.as_ref()
-        {
-            service.selection(&context).await.map_err(|_| {
-                provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent)
-            })?
-        } else {
-            crate::gateway_pool::GatewayPoolSelection::default()
-        };
-        // 续接原账号没有窗口而本 Key 的窗口在别的账号上、或原账号已不可调度但还有退路时，
-        // 交给核心按原有安全规则恢复历史；不能把 previous_response_id 或工具状态直接交给
-        // 另一个账号。原账号自己持窗，或没有任何退路时留在原账号，由网关池给出具体原因。
-        if context.continuation_attempt() == ContinuationAttempt::Native
-            && let Some(ContinuationBinding::Pinned(binding)) = context.continuation()
-            && pool_selection.members.contains(binding.account())
-            && {
-                let bound = binding.account();
-                let bound_live = pool_selection.live.contains(bound);
-                let live_elsewhere = pool_selection.live.iter().any(|id| id != bound);
-                let bound_unusable = !pool_selection.preferred.contains(bound);
-                (live_elsewhere && !bound_live)
-                    || (bound_unusable
-                        && (pool_selection.ordinary || !pool_selection.preferred.is_empty()))
-            }
-        {
-            return Err(provider_error(
-                ProviderErrorKind::NoEligibleAccount,
-                UpstreamSendState::NotSent,
-            ));
-        }
         let selection_started_at = Instant::now();
         let lease = self
             .selector
@@ -582,23 +541,14 @@ impl Provider for CodexProvider {
                 cyber_policy_session_key.as_ref(),
                 session_affinity.as_ref(),
                 requires_websocket,
-                if self.plugin_routing {
-                    &plugin_selection.preferred
-                } else {
-                    &pool_selection.preferred
-                },
-                if self.plugin_routing {
-                    &plugin_selection.members
-                } else {
-                    &pool_selection.members
-                },
+                &plugin_selection.preferred,
+                &plugin_selection.members,
             )
             .await
             .map_err(map_selection_error)?;
         let account_selection_wait_ms =
             u64::try_from(selection_started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
         let lease = Arc::new(lease);
-        let pool_enabled = pool_selection.members.contains(lease.account_id());
         let plugin_owner = plugin_selection.owners.get(lease.account_id()).cloned();
         let plugin_watchers = plugin_selection
             .watchers
@@ -754,23 +704,6 @@ impl Provider for CodexProvider {
         } else {
             requested_transport
         };
-        let transport = if pool_enabled {
-            // 判据依赖 HTTP 200 响应头，WS 没有逐次响应头，不能误判成 21，直接拒绝。
-            if requirement.requires_websocket()
-                || !matches!(
-                    lease.authentication(),
-                    crate::credential::CodexRuntimeAuthentication::OAuth(_)
-                )
-            {
-                return Err(provider_error(
-                    ProviderErrorKind::Unsupported,
-                    UpstreamSendState::NotSent,
-                ));
-            }
-            CodexProviderTransport::HttpOnly
-        } else {
-            transport
-        };
         let transport = if plugin_owner.is_some() {
             // 当前响应头钩子采用 HTTP 合同，连接局部续接不能降级为 HTTP。
             if requirement.requires_websocket() {
@@ -849,12 +782,6 @@ impl Provider for CodexProvider {
             plugin_owner,
             plugin_watchers,
             plugin_routing: self.plugin_routing,
-            gateway_pool: pool_enabled.then(|| self.gateway_pool.clone()).flatten(),
-            // 普通账号：HTTP 响应上做降智检测，必要时兜底并自动调整分组。
-            degradation_watch: (!self.plugin_routing && !pool_enabled)
-                .then(|| self.gateway_pool.clone())
-                .flatten(),
-            pool_fallback: pool_selection.fallback_for(lease.account_id()),
         });
         let stream = ProviderStream::new(metadata, events, lease);
         Ok(if allows_account_state_mutation {

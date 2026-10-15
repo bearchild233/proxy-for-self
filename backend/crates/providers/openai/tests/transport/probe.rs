@@ -143,22 +143,3 @@ async fn full_diagnostic_preserves_completed_cache_usage() {
     );
     task.await.unwrap();
 }
-#[cfg(feature = "gateway-pool-experiment")]
-#[tokio::test]
-async fn cache_diagnostic_retains_error_code_without_error_message() {
-    const BODY: &str = "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"test_error\",\"message\":\"secret material never retained\"}}}\n\n";
-    let (base, task) = server(Some(BODY)).await;
-    let result = client(base)
-        .cache_observation(
-            &request(),
-            CodexRequestContext::auxiliary("Bearer demo", Some("demo"), "cache", None),
-        )
-        .await
-        .unwrap();
-    assert_eq!(result.status, 200);
-    assert!(result.usage.is_none());
-    let failure = result.stream_failure.unwrap();
-    assert_eq!(failure["code"], "test_error");
-    assert!(!failure.to_string().contains("secret material"));
-    task.await.unwrap();
-}

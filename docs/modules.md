@@ -33,10 +33,6 @@
 | `services/plugin_host/jobs.py` | 后台任务（Worker 子进程）管理 | [plugin-host](modules/plugin-host.md) |
 | `services/plugin_host/service_calls.py` | 服务插件管理调用经管理连接转给插件进程 | [plugin-host](modules/plugin-host.md) |
 | `services/plugin_host/policy_runner.py` | 网关调用的备份 / 定价策略进程入口 | [plugin-host](modules/plugin-host.md) |
-| `services/plugin_host/gateway_pool.py` | 旧 Python 网关池状态机（停用，P2 删除） | [plugin-host](modules/plugin-host.md) |
-| `services/plugin_host/gateway_pool_history.py` | 旧网关池历史写入（停用，P2 删除） | [plugin-host](modules/plugin-host.md) |
-| `services/plugin_host/gateway_pool_history_query.py` | 旧网关池历史只读投影（停用，P2 删除） | [plugin-host](modules/plugin-host.md) |
-| `services/plugin_host/gateway_pool_queue.py` | 旧网关池共用账号队列（停用，P2 删除） | [plugin-host](modules/plugin-host.md) |
 | `services/updater` | root 运行的独立更新与插件监督：网关更新 / A/B 槽发布、UI 插件包存储、原生 Worker 管理、服务插件监督、登录防护 | [updater](modules/updater.md) |
 | `services/updater/updater.py` | 主程序：状态机、私有 socket 服务、旧单实例更新 | [updater](modules/updater.md) |
 | `services/updater/slots.py` | A/B 槽发布 CLI（准备、验收、切入口、排空、恢复） | [updater](modules/updater.md) |
@@ -114,7 +110,6 @@
 | `scripts/plugin-stage-wsl.py` | WSL 内启动测试网关（隔离 PostgreSQL / Redis，不接受生产地址） | 由 `start-plugin-stage.ps1` 调用 |
 | `scripts/plugin-stage-excel.py` | 本机 Excel Worker 生命周期适配器（准备 / 安装 / 状态） | 控制面 `--local-excel-wsl` 与测试环境 |
 | `scripts/preview-plugin-stage.py` | 回环 UI 夹具：在测试环境上叠加演示数据 | 人工查看界面效果 |
-| `scripts/preview-gateway-pool.py` | 网关池页面预览：真实主壳 + 插件包 + 模拟数据，不接网关 | 网关池界面开发 |
 | `scripts/test-plugin-stage.py` | 测试环境接口冒烟：鉴权、来源、能力边界、资源、分组 CRUD | 本机集成验证 |
 | `scripts/test-plugin-lifecycle.py` | 角色、可选插件生命周期与配置检查 | 本机集成验证 |
 | `scripts/test-plugin-hot-update.py` | 单包热更新、租约、坏包拒绝、回退，网关 PID 不变 | 本机集成验证 |

@@ -39,54 +39,23 @@ class DiagnosticRules(unittest.TestCase):
 
 
 class PlatformContracts(unittest.TestCase):
-    def test_gateway_pool_permissions_and_private_endpoint(self):
-        from http.client import HTTPConnection
-        from server import BoundedServer, Handler
-        import threading
+    def test_gateway_pool_permissions(self):
         manifest = json.loads((REPO/'plugins/gateway-pool/plugin.json').read_text(encoding='utf-8'))
-        manifest.pop('service', None)  # 固定验证旧包的 Python 路径与内部接口。
+        calls = MagicMock()
+        calls.call.return_value = {'revision': 1}
+        self.platform.service_calls = calls
         with patch.object(self.platform.store, 'state', return_value={'enabled':True,'current':'version'}), patch.object(self.platform.store, 'manifest', return_value=manifest):
-            with self.assertRaises(PermissionError):
-                self.platform.call('gateway-pool','version','gateway-pool.configure',{},'session','key','http://localhost')
-            with self.assertRaises(PermissionError):
-                self.platform.call('accounts','version','gateway-pool.read',{},'session','admin','http://localhost')
-            for plugin,role in [('gateway-pool','key'),('accounts','admin')]:
-                with self.assertRaises(PermissionError):
-                    self.platform.call(plugin,'version','gateway-pool.history.read',{},'session',role,'http://localhost')
-            status,body,_ = self.platform.call('gateway-pool','version','gateway-pool.history.read',{},'session','admin','http://localhost')
+            for method in ('configure', 'read', 'history.read', 'queue.update'):
+                for plugin,role in [('gateway-pool','key'),('accounts','admin')]:
+                    with self.assertRaises(PermissionError):
+                        self.platform.call(plugin,'version','gateway-pool.'+method,{},'session',role,'http://localhost')
+                old = {**manifest,'capabilities':[c for c in manifest['capabilities'] if c!='gateway-pool.'+method]}
+                with patch.object(self.platform.store,'manifest',return_value=old), self.assertRaises(PermissionError):
+                    self.platform.call('gateway-pool','version','gateway-pool.'+method,{},'session','admin','http://localhost')
+            calls.call.assert_not_called()
+            status,body,_=self.platform.call('gateway-pool','version','gateway-pool.queue.update',{'revision':0,'accountIds':[]},'session','admin','http://localhost')
             self.assertEqual(status,200)
-            self.assertEqual(json.loads(body)['version'],2)
-            old = {**manifest,'capabilities':[c for c in manifest['capabilities'] if c!='gateway-pool.history.read']}
-            with patch.object(self.platform.store,'manifest',return_value=old), self.assertRaises(PermissionError):
-                self.platform.call('gateway-pool','version','gateway-pool.history.read',{},'session','admin','http://localhost')
-            for plugin,role in [('gateway-pool','key'),('accounts','admin')]:
-                with self.assertRaises(PermissionError):
-                    self.platform.call(plugin,'version','gateway-pool.queue.update',{},'session',role,'http://localhost')
-            with patch.object(self.platform.gateway_pool,'update_queue',return_value={'revision':1,'accounts':[]}) as update:
-                status,body,_=self.platform.call('gateway-pool','version','gateway-pool.queue.update',{'revision':0,'accountIds':[]},'session','admin','http://localhost')
-                self.assertEqual(status,200)
-                update.assert_called_once_with({'revision':0,'accountIds':[]})
-            old={**manifest,'capabilities':[c for c in manifest['capabilities'] if c!='gateway-pool.queue.update']}
-            with patch.object(self.platform.store,'manifest',return_value=old), self.assertRaises(PermissionError):
-                self.platform.call('gateway-pool','version','gateway-pool.queue.update',{},'session','admin','http://localhost')
-        with patch.object(self.platform.store,'action',return_value={'enabled':False}), patch.object(self.platform.gateway_pool,'interrupt_history') as interrupt:
-            self.platform.lifecycle.begin('gateway-pool','disable','session','http://localhost')
-            interrupt.assert_called_once_with('disabled')
-        server = BoundedServer(('127.0.0.1',0),Handler)
-        server.platform = self.platform
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        try:
-            for authorization, expected in [('',403),('Bearer wrong',403),('Bearer '+self.platform.gateway_pool_key,200)]:
-                connection = HTTPConnection(*server.server_address, timeout=2)
-                with patch.object(self.platform.gateway_pool,'runtime',return_value={'enabled':False}):
-                    connection.request('POST','/api/plugin-platform/internal/gateway-pool',json.dumps({'action':'config'}),{'Authorization':authorization})
-                    response = connection.getresponse()
-                    self.assertEqual(response.status,expected)
-                    response.read()
-                connection.close()
-        finally:
-            server.shutdown();server.server_close();thread.join()
+            calls.call.assert_called_once_with('gateway-pool','queue.update',{'revision':0,'accountIds':[]},'admin')
 
     def test_forward_supplies_trusted_proxy_address_and_resets_context(self):
         connection = MagicMock()

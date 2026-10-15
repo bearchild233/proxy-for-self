@@ -5,7 +5,6 @@ from ipaddress import ip_address
 import base64
 import gzip
 import hashlib
-import hmac
 from http.client import HTTPConnection, HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -19,8 +18,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from jobs import Jobs
 from lifecycle import Lifecycle
 from service_calls import ServiceCalls
-from gateway_pool import GatewayPool
-import secrets
 import tarfile
 import tempfile
 from urllib.parse import urlencode, urlsplit
@@ -60,17 +57,6 @@ class Platform:
         # 内核注册表由 updater 写入；未配置时服务插件的管理调用不可用。
         self.service_calls = ServiceCalls(service_registry) if service_registry else None
         self.data_lock = threading.RLock()
-        self.gateway_pool = GatewayPool(self.root, self.store)
-        key_path = self.root / 'gateway-pool-runtime.key'
-        try:
-            with key_path.open('x', encoding='ascii') as output:
-                key_path.chmod(0o640)
-                output.write(secrets.token_hex(32))
-        except FileExistsError:
-            pass
-        self.gateway_pool_key = key_path.read_text(encoding='ascii').strip()
-        if not re.fullmatch('[0-9a-f]{64}', self.gateway_pool_key):
-            raise ValueError('网关池本机能力密钥无效')
 
     def register(self, registration):
         plugin_id=registration.get('id')
@@ -175,24 +161,11 @@ class Platform:
         if name.startswith('gateway-pool.'):
             if role != 'admin' or plugin_id != 'gateway-pool':
                 raise PermissionError('没有网关池管理权限')
-            # 页面租约可能仍指向旧包；执行后端以当前安装版本为准，回退旧包即恢复 Python。
+            # 页面租约可能仍指向旧包；执行后端以当前安装版本为准。
             manifest = self.store.manifest(plugin_id)
         if name.startswith('gateway-pool.') and manifest.get('service') is None:
-            if name == 'gateway-pool.configure':
-                value = self.gateway_pool.configure(data)
-            elif name == 'gateway-pool.queue.update':
-                value = self.gateway_pool.update_queue(data)
-            elif name == 'gateway-pool.read':
-                value = self.gateway_pool.view(data.get('accountId'), data.get('gateway'), data.get('limit', 100), data.get('before'))
-                value['settings'] = self.gateway_pool.settings_for_ui()
-            elif name == 'gateway-pool.history.read':
-                try:
-                    value = self.gateway_pool.statistics(data)
-                except ValueError as error:
-                    return 400, json.dumps({'error':str(error)}, ensure_ascii=False).encode(), None
-            else:
-                raise PermissionError('网关池能力未注册')
-            return 200, json.dumps(value, ensure_ascii=False).encode(), None
+            # 网关池只由服务插件实现；没有服务段的旧包不再有执行后端。
+            raise ConnectionError('网关池服务插件未安装')
         if name.startswith(plugin_id + '.') and manifest.get('service') is not None:
             # 服务插件的管理能力：仅管理员；参数原样经管理连接的 admin.call 转给插件进程。
             if role != 'admin':
@@ -296,16 +269,6 @@ class Handler(BaseHTTPRequestHandler):
     def dispatch(self):
         self.connection.settimeout(15)
         platform = self.server.platform
-        if urlsplit(self.path).path == '/api/plugin-platform/internal/gateway-pool':
-            if self.command != 'POST' or not hmac.compare_digest(self.headers.get('Authorization', ''), 'Bearer '+platform.gateway_pool_key):
-                raise PermissionError('本机能力未授权')
-            size = int(self.headers.get('Content-Length', '0'))
-            if not 0 < size <= 65536:
-                raise ValueError('本机消息大小无效')
-            message = json.loads(self.rfile.read(size))
-            if not isinstance(message, dict):
-                raise ValueError('本机消息必须为对象')
-            return self.reply(platform.gateway_pool.runtime(message))
         origin = self.server.origin
         if self.headers.get('Host') != urlsplit(origin).netloc:
             raise PermissionError('请求主机无效')

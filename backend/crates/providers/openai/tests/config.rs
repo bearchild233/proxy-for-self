@@ -12,12 +12,11 @@ fn plugin_routing_defaults_off_and_ignores_legacy_pool_configuration() {
     config
         .resolve_and_validate(Path::new("/tmp/plugin-test"))
         .unwrap();
+    // 旧网关池已删除：关闭插件路由时旧配置段同样被忽略，不再校验。
     config.plugin_routing = false;
-    assert!(
-        config
-            .resolve_and_validate(Path::new("/tmp/plugin-test"))
-            .is_err()
-    );
+    config
+        .resolve_and_validate(Path::new("/tmp/plugin-test"))
+        .unwrap();
 }
 
 #[test]

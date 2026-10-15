@@ -186,11 +186,6 @@ pub(super) struct ColdResponse {
     pub(super) websocket_retry_count: u32,
     pub(super) stream_max_retries: u32,
     pub(super) session_capture: Option<OpenAiSessionCapture>,
-    pub(super) gateway_pool: Option<Arc<crate::gateway_pool::GatewayPoolService>>,
-    /// 普通账号的降智检测；只有网关池服务存在且账号不在降智组时才有。
-    pub(super) degradation_watch: Option<Arc<crate::gateway_pool::GatewayPoolService>>,
-    /// 本 Key 内可替代该降智账号的退路，由选号阶段的结果得出。
-    pub(super) pool_fallback: crate::gateway_pool::Fallback,
 }
 
 pub(super) struct ColdJsonResponse {
@@ -450,222 +445,6 @@ pub(crate) fn merged_cookie_header(existing: Option<&str>, updates: &[String]) -
     })
 }
 
-struct GatewayPoolAttempt<'a> {
-    service: &'a Arc<crate::gateway_pool::GatewayPoolService>,
-    fallback: &'a crate::gateway_pool::Fallback,
-    client: &'a CodexBackendClient,
-    request: &'a mut CodexResponsesRequest,
-    context: &'a AttemptContext,
-    lease: &'a CodexCredentialLease,
-    account: &'a ProviderAccount,
-    authorization: &'a SecretString,
-    selection: CodexAccountSelectionTelemetry<'a>,
-}
-
-impl GatewayPoolAttempt<'_> {
-    async fn send(
-        self,
-        held: &mut Option<crate::gateway_pool::GatewayPoolGuard>,
-    ) -> Result<CodexBackendStreamingResponse, CodexHandshakeAttemptError> {
-        let Self {
-            service,
-            fallback,
-            client,
-            request,
-            context,
-            lease,
-            account,
-            authorization,
-            selection,
-        } = self;
-        let trace = context.trace();
-        let safe_replay = request_replay_safe(request);
-        let mut sent = false;
-        loop {
-            let route = tokio::select! {
-                biased;
-                _ = context.cancellation().cancelled() => return Err(CodexHandshakeAttemptError::Cancelled),
-                _ = tokio::time::sleep(remaining(context.deadline()).ok_or(CodexHandshakeAttemptError::Timeout)?) => return Err(CodexHandshakeAttemptError::Timeout),
-                route = service.route(account, context.deadline(), context.cancellation(), fallback) => route,
-            };
-            let unavailable_with = |failure: Option<&crate::gateway_pool::PoolFailure>| {
-                let mut error = provider_error(
-                    ProviderErrorKind::Unavailable,
-                    if sent {
-                        UpstreamSendState::Sent
-                    } else {
-                        UpstreamSendState::NotSent
-                    },
-                );
-                if let Some(failure) = failure {
-                    // 原因码与中文说明进入错误诊断，管理员在错误排查里直接可见。
-                    error = error.with_diagnostic(
-                        gateway_core::error::ProviderDiagnostic::new(format!(
-                            "网关池：{}",
-                            failure.message
-                        ))
-                        .with_classification("gateway_pool", failure.code),
-                    );
-                }
-                CodexHandshakeAttemptError::Policy(if sent && safe_replay {
-                    error.with_replay_safe()
-                } else {
-                    error
-                })
-            };
-            let unavailable = || unavailable_with(None);
-            let mut guard = route.map_err(|failure| unavailable_with(Some(&failure)))?;
-            // 窗口由打票模型验证；其他模型在本窗口内只需拿到自己的 state。
-            let model = request
-                .body()
-                .get("model")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
-            if guard
-                .use_model(
-                    &model,
-                    client,
-                    account,
-                    authorization.expose_secret(),
-                    lease.installation_id(),
-                )
-                .await
-                .is_err()
-            {
-                guard.finish().await;
-                return Err(unavailable());
-            }
-            request.passthrough_headers.remove("x-codex-turn-state");
-            request.turn_state = Some(guard.state().to_owned());
-            // 原生 HTTP 直接发送 original_json；仅改 body 视图不能覆盖实体中的旧 state。
-            if let Some(original) = &request.original_json {
-                let mut entity: Value = serde_json::from_slice(original).map_err(|_| {
-                    CodexHandshakeAttemptError::Policy(provider_error(
-                        ProviderErrorKind::Protocol,
-                        UpstreamSendState::NotSent,
-                    ))
-                })?;
-                if let Some(metadata) = entity
-                    .get_mut("client_metadata")
-                    .and_then(Value::as_object_mut)
-                    && metadata.contains_key("x-codex-turn-state")
-                {
-                    metadata.insert(
-                        "x-codex-turn-state".to_owned(),
-                        Value::String(guard.state().to_owned()),
-                    );
-                    request.original_json = Some(
-                        serde_json::to_vec(&entity)
-                            .map_err(|_| {
-                                CodexHandshakeAttemptError::Policy(provider_error(
-                                    ProviderErrorKind::Protocol,
-                                    UpstreamSendState::NotSent,
-                                ))
-                            })?
-                            .into(),
-                    );
-                }
-            }
-            // 同一材料在头部与已有 metadata 投影中保持一致，其余客户端 metadata 保留。
-            if let Some(Value::Object(metadata)) = request.body_mut().get_mut("client_metadata")
-                && metadata.contains_key("x-codex-turn-state")
-            {
-                metadata.insert(
-                    "x-codex-turn-state".to_owned(),
-                    Value::String(guard.state().to_owned()),
-                );
-            }
-            let mut wire = codex_request_context(
-                request,
-                context.request_id().as_str(),
-                account,
-                lease.installation_id(),
-                authorization,
-                None,
-                selection,
-            )
-            .with_trace(&trace);
-            wire.turn_state = Some(guard.state());
-            wire.cookie_header = Some(guard.cookie());
-            let send_allowed = guard.sent().await.map_err(|_| {
-                CodexHandshakeAttemptError::Policy(provider_error(
-                    ProviderErrorKind::Unavailable,
-                    if sent {
-                        UpstreamSendState::Sent
-                    } else {
-                        UpstreamSendState::NotSent
-                    },
-                ))
-            })?;
-            if !send_allowed {
-                guard.finish().await;
-                continue;
-            }
-            let started = Instant::now();
-            sent = true;
-            let response = create_response_attempt(
-                client,
-                request,
-                wire,
-                account.id().as_str(),
-                context.deadline(),
-                context.cancellation(),
-            )
-            .await;
-            let response = match response {
-                Ok(response) => response,
-                Err(error) => {
-                    // 401/429/网络异常不是降智；沿用原有的错误反馈及重试策略。
-                    let status = match &error {
-                        CodexHandshakeAttemptError::Client(error) => {
-                            error.upstream_failure().map_or(0, |failure| {
-                                failure.status.map_or(0, |status| status.as_u16())
-                            })
-                        }
-                        _ => 0,
-                    };
-                    let _ = guard.observe(status, false, &[], started.elapsed()).await;
-                    return Err(error);
-                }
-            };
-            let status = response.diagnostics.status_code.unwrap_or(0);
-            let state_returned = response
-                .response_metadata
-                .client_headers
-                .iter()
-                .any(|(name, _)| name.eq_ignore_ascii_case("x-codex-turn-state"));
-            let cookies = response.set_cookie_headers.clone();
-            // 明确的 29 信号先关闭响应，再写统计；不让持久化 RPC 延迟取消上游生成。
-            let mut response = if status == 200 && state_returned {
-                drop(response);
-                None
-            } else {
-                Some(response)
-            };
-            let accepted = guard
-                .observe(status, state_returned, &cookies, started.elapsed())
-                .await;
-            if accepted == Ok(Some(true))
-                && let Some(response) = response.take()
-            {
-                // 租约保持到整个客户流结束。此处不读取、不关闭正常 SSE。
-                *held = Some(guard);
-                return Ok(response);
-            }
-            drop(response);
-            // 在任何下游输出前取消不合格响应，再由同账号的其他网关承接。
-            guard.finish().await;
-            if !safe_replay || accepted != Ok(Some(false)) {
-                return Err(CodexHandshakeAttemptError::Policy(provider_error(
-                    ProviderErrorKind::Unavailable,
-                    UpstreamSendState::Sent,
-                )));
-            }
-        }
-    }
-}
-
 pub(super) async fn create_json_attempt(
     request: &ColdJsonResponse,
     account: &ProviderAccount,
@@ -922,9 +701,6 @@ fn cold_response_stream_inner(
         websocket_retry_count,
         stream_max_retries,
         mut session_capture,
-        gateway_pool,
-        degradation_watch,
-        pool_fallback,
     } = response;
     Box::pin(async_stream::try_stream! {
         let cyber_policy_scope = lease.cyber_policy_scope().cloned();
@@ -958,7 +734,6 @@ fn cold_response_stream_inner(
         );
         let request_transport_requirement = transport_requirement(&request);
         let trace = context.trace();
-        let mut pool_guard = None;
         let response = if let Some((hooks, plugin)) = plugin_hooks.as_ref().zip(plugin_owner.as_ref()) {
             plugin_routing::Attempt {
                 hooks: hooks.as_ref(), plugin, client: &client, request: &mut request,
@@ -966,8 +741,6 @@ fn cold_response_stream_inner(
                 authorization: &authorization, selection: account_selection,
                 finish: finish.as_ref().expect("owned plugin finish"), failure_context: &failure_context,
             }.send().await
-        } else if let Some(service) = gateway_pool.as_ref() {
-            GatewayPoolAttempt { service, fallback: &pool_fallback, client: &client, request: &mut request, context: &context, lease: &lease, account: &active_account, authorization: &authorization, selection: account_selection }.send(&mut pool_guard).await
         } else {
             if plugin_routing && context.plugin_attempt_budget().claim().is_none() {
                 Err(plugin_routing::unavailable("", "plugin_unavailable", "上游尝试预算已耗尽", false))?;
@@ -1052,58 +825,6 @@ fn cold_response_stream_inner(
             && response.transport != CodexBackendTransport::WebSocket {
             plugin_routing::observe(hooks.as_ref(), &plugin_watchers, &context, &active_account, &request, &mut response).await?;
         }
-        // 普通账号降智检测：带 state 的 HTTP 请求又返回 state，先用返回的 state 做一次短确认。
-        // 确认降智则兜底：未输出、可安全重放且无续接约束时放弃本次响应交给核心换号；其余情况
-        // 照常交付，但仍记录信号并按配置调整分组。没带 state 的请求（如首条）默认当作正常。
-        if let Some(watch) = degradation_watch.as_ref()
-            && response.transport == CodexBackendTransport::HttpSse
-            && !response.is_json
-            && response.diagnostics.status_code == Some(200)
-            && request_carried_turn_state(&request)
-            && let Some(returned_state) = response_turn_state(&response)
-            && watch.dynamic_groups().await
-        {
-            let model = request
-                .body()
-                .get("model")
-                .and_then(Value::as_str)
-                .unwrap_or_else(|| upstream_model.as_str())
-                .to_owned();
-            let cookie = merged_cookie_header(
-                cookie_header.as_ref().map(ExposeSecret::expose_secret),
-                &response.set_cookie_headers,
-            );
-            let verdict = watch
-                .confirm_degraded(
-                    &client,
-                    &active_account,
-                    authorization.expose_secret(),
-                    lease.installation_id(),
-                    &model,
-                    &returned_state,
-                    cookie.as_deref(),
-                )
-                .await;
-            if verdict == crate::gateway_pool::Confirmation::Confirmed {
-                watch.report_degraded(active_account.id(), &model);
-                let may_abort = context.continuation_attempt() == ContinuationAttempt::None
-                    && context.required_account().is_none()
-                    && !context.is_diagnostic_required_account()
-                    && request_replay_safe(&request);
-                if may_abort {
-                    drop(response);
-                    Err(provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::Sent)
-                        .with_pre_delivery_retry()
-                        .with_diagnostic(
-                            gateway_core::error::ProviderDiagnostic::new(
-                                "网关池：账号返回降智信号（带 state 的请求又返回 state，确认请求同样如此），本次请求交给其他账号重放",
-                            )
-                            .with_classification("gateway_pool", "account_degraded"),
-                        ))?;
-                    return;
-                }
-            }
-        }
         if let Some(capture) = session_capture.as_mut() {
             capture.continuation_scope = Some(if capture.response_store {
                 OpenAiContinuationScope::Persisted
@@ -1133,7 +854,6 @@ fn cold_response_stream_inner(
             );
         }
         if allows_account_state_mutation
-            && pool_guard.is_none()
             && plugin_owner.is_none()
             && !response.set_cookie_headers.is_empty()
             && let Ok(outcome) = selector
@@ -1167,7 +887,6 @@ fn cold_response_stream_inner(
                 }
                 raw.extend_from_slice(&chunk);
             }
-            if let Some(guard) = &pool_guard { guard.end_access("completed"); }
             let meta = json_response_meta(&raw, context.request_id().as_str(), upstream_model.as_str());
             yield ProviderEvent::canonical(GatewayEvent::Started(meta.clone()));
             if let Some(usage) = json_response_usage(&raw) {
@@ -1208,7 +927,6 @@ fn cold_response_stream_inner(
         let mut pre_commit_events = PreCommitClientEvents::new();
         loop {
             let Some(stream_deadline) = remaining(context.deadline()) else {
-                if let Some(guard) = &pool_guard { guard.end_access("failed"); }
                 if allows_account_state_mutation {
                     synchronize_passive_quota(
                         &quota,
@@ -1257,9 +975,6 @@ fn cold_response_stream_inner(
                     continue;
                 }
                 Err(mut failure) => {
-                    if let Some(guard) = &pool_guard {
-                        guard.end_access(if cancellation.is_cancelled() { "cancelled" } else { "failed" });
-                    }
                     let updates = take_rate_limit_updates(rate_limit_updates.as_ref()).await;
                     let rate_limits_changed = if updates.is_empty() {
                         false
@@ -1343,14 +1058,6 @@ fn cold_response_stream_inner(
                 }
             };
             // 原样透传可能把 canonical Completed 延迟到 EOF；收到实际终态就固定计时。
-            if let Some(guard) = &pool_guard {
-                if canonical_failure.is_some() || terminal_response_is_incomplete(&events) {
-                    guard.end_access("failed");
-                } else if events.iter().any(|event| terminal_response_output(event).is_some())
-                    || events.iter().flat_map(ProviderEvent::canonical_facts).any(|event| matches!(event, GatewayEvent::Completed(_))) {
-                    guard.end_access("completed");
-                }
-            }
             let metadata_merge = merge_response_metadata_updates(
                 response_metadata_updates.as_ref(),
                 &mut session_capture,
@@ -1478,11 +1185,6 @@ fn cold_response_stream_inner(
                 (events, Some((error, semantic_output_seen)))
             }
         };
-        if let Some(guard) = &pool_guard {
-            let completed = events.iter().any(|event| terminal_response_output(event).is_some())
-                || events.iter().flat_map(ProviderEvent::canonical_facts).any(|event| matches!(event, GatewayEvent::Completed(_)));
-            guard.end_access(if canonical_failure.is_some() || terminal_response_is_incomplete(&events) { "failed" } else if completed { "completed" } else { "interrupted" });
-        }
         let terminal_failure = canonical_failure.map(|(error, semantic_output_seen)| {
             log_canonical_upstream_error(
                 UpstreamErrorLogContext::new(

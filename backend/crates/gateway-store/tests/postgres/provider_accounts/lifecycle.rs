@@ -129,7 +129,10 @@ async fn reauthorize_account(
                     PreparedCredentialRotationFacts {
                         account_id: id,
                         provider_kind,
-                        expected_credential_revision: gateway_admin::model::Revision::new(expected_revision).unwrap(),
+                        expected_credential_revision: gateway_admin::model::Revision::new(
+                            expected_revision,
+                        )
+                        .unwrap(),
                         replacement_identity: None,
                         name: account_id.to_owned(),
                         email: Some(format!("{account_id}@example.invalid")),
@@ -256,7 +259,10 @@ async fn oauth_reauthorization_of_an_archived_account_leaves_archive_and_enables
     assert_eq!(archived.archived.as_deref(), Some("false"));
     assert_eq!(archived.archive_reason, None);
     // 保留上次归档时间，与“恢复到主列表”一致。
-    assert_eq!(archived.archived_at.as_deref(), Some("2026-10-01T00:00:00Z"));
+    assert_eq!(
+        archived.archived_at.as_deref(),
+        Some("2026-10-01T00:00:00Z")
+    );
     assert_eq!(archived.credential_state, "ready");
     assert_eq!(archived.credential_revision, 2);
     assert_eq!(archived.last_error_reason, None);
@@ -265,7 +271,10 @@ async fn oauth_reauthorization_of_an_archived_account_leaves_archive_and_enables
     let fields = audit_fields(&database, "reauth_archived").await;
     assert_eq!(fields.len(), 1);
     for expected in ["credentials", "enabled", "restore_archived"] {
-        assert!(fields[0].iter().any(|field| field == expected), "{fields:?}");
+        assert!(
+            fields[0].iter().any(|field| field == expected),
+            "{fields:?}"
+        );
     }
 
     reauthorize_account(&database, "acct_reauth_plain", 1, "reauth_plain")
