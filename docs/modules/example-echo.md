@@ -1,6 +1,6 @@
 # example-echo 插件（示例服务插件）
 
-<!-- doc-sync paths: plugins/example-echo reviewed: f5b6b52 -->
+<!-- doc-sync paths: plugins/example-echo reviewed: 50090c4 -->
 
 ## 职责与边界
 
