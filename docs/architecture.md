@@ -658,6 +658,6 @@ RUST_MIN_STACK=16777216 cargo +1.97.0 test --manifest-path backend/Cargo.toml --
 
 服务插件（微内核）：业务功能以独立进程运行，由 updater 按 systemd 模板单元监督，经 Unix socket 与内核通信。内核从 root 管理的注册表读取插件 socket 与授权，在请求路径的钩子（`route.select`、`route.prepare`、`response.head`、`request.finish`、`response.observe`）调用插件，并向插件提供受限能力（`accounts.read`、`quota.read`、`upstream.probe`、`http.fetch`、`groups.move`、`log`）；凭据、出口与响应提交边界始终留在内核。插件按声明的分组接管账号：已启用但未连接时这些账号失败关闭，禁用或卸载后账号交还默认调度。管理页的 `<插件ID>.*` 能力由控制面经管理连接转给插件的 `admin.call`。协议与生命周期见 [微内核设计](microkernel.md)，部署见 [插件平台安装](../deploy/plugin-platform/README.md)。
 
-网关池是第一个服务插件（Rust，`plugins/gateway-pool/service/`）：负责账号×网关的找票、21/29 判定、备用票、静置退避、降智确认、恢复检测与动态分组，私有 SQLite 保存组合、租约、材料与历史。内核在 `openai.plugin_routing` 打开时按 Key 冻结目录把网关池分组的账号交给插件选择与准备，降智账号优先，全部不可用后普通候选按原策略继续；已发送请求和严格续接保持原安全边界。旧的 Python 控制面状态机与网关内传输桥在插件路由打开时不再使用，P2 删除。规则与判据见 [网关池插件](gateway-pool.md)。
+网关池是第一个服务插件（Rust，`plugins/gateway-pool/service/`）：负责账号×网关的找票、21/29 判定、备用票、静置退避、降智确认、恢复检测与动态分组，私有 SQLite 保存组合、租约、材料与历史。内核在 `openai.plugin_routing` 打开时按 Key 冻结目录把网关池分组的账号交给插件选择与准备，降智账号优先，全部不可用后普通候选按原策略继续；已发送请求和严格续接保持原安全边界。插件路由关闭时不经过任何网关池。规则与判据见 [网关池插件](gateway-pool.md)。
 
 账号选择先处理资格和真实并发，再按亲和/权重/同权重策略决定账号。请求间隔只由原子租约裁决；间隔未到等待原账号，等待后重读资格与并发，不消费并发排队名额、不因间隔改变会话绑定。严格续接仍固定原状态拥有者。

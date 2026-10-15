@@ -28,5 +28,5 @@
 
 - updater 配置的 `service_plugins` 段登记存储、运行、socket、数据目录和每个服务插件的能力上限（`allow`），`store_root` 指向控制面插件存储下的 `plugins` 目录。updater 单元若启用 `ProtectSystem`，须用 drop-in 把 env 目录（`/etc/proxy-for-self/plugins/services`）和内核注册表所在目录加入 `ReadWritePaths`，否则激活会在写 env 文件时失败。
 - 内核注册表放在网关用户可以读到的 root 目录（生产为 `/etc/proxy-for-self-kernel/registry.json`，目录 0755、文件 0644）；`/etc/proxy-for-self` 为 0700，不能放在其下。控制面以 `--service-registry` 读取同一文件。
-- 网关槽配置增加 `plugins.registry_path`、`plugins.ownership_cache_path`（两槽共用、网关用户可写的目录）和 `openai.plugin_routing: true`；槽单元的 `SupplementaryGroups` 加入连接组，`ReadWritePaths` 加入归属缓存目录。两槽都要改，未改的槽只能运行旧网关池路径。
-- 从旧 Python 网关池迁移时，先在插件数据目录用 SQLite 备份接口复制 `gateway-pool-runtime/state.sqlite3` 为 `state.sqlite3`，再激活服务实例，最后做网关 A/B。
+- 网关槽配置增加 `plugins.registry_path`、`plugins.ownership_cache_path`（两槽共用、网关用户可写的目录）和 `openai.plugin_routing: true`；槽单元的 `SupplementaryGroups` 加入连接组，`ReadWritePaths` 加入归属缓存目录。两槽都要改，未改的槽不经过网关池。
+- 插件数据目录里的 `state.sqlite3` 由服务实例自行建表；升级或回退前用 SQLite 在线备份接口做快照。
