@@ -229,6 +229,7 @@ fn probe(id: &str, timeout_ms: u64) -> UpstreamProbeParams {
         cookie: Some("fixture=1".into()),
         include_account_cookies: false,
         timeout_ms,
+        request_id: None,
     }
 }
 async fn wait_requests(server: &MockServer, count: usize) {
@@ -274,8 +275,18 @@ async fn probe_success_maps_headers_uses_hi_and_persists_passive_quota() {
     assert_eq!(result.retry_after_ms, None);
     let requests = server.received_requests().await.unwrap();
     let request = &requests[0];
+    // 与旧网关池探测一致：不带会话头，请求 ID 未指定时由内核生成。
+    assert!(request.headers.get("session-id").is_none());
     assert!(
-        uuid::Uuid::parse_str(request.headers.get("session-id").unwrap().to_str().unwrap()).is_ok()
+        uuid::Uuid::parse_str(
+            request
+                .headers
+                .get("x-client-request-id")
+                .unwrap()
+                .to_str()
+                .unwrap()
+        )
+        .is_ok()
     );
     assert_eq!(
         request.headers.get("chatgpt-account-id").unwrap(),
@@ -299,21 +310,36 @@ async fn probe_success_maps_headers_uses_hi_and_persists_passive_quota() {
         body["client_metadata"]["x-codex-installation-id"],
         credential.installation_id
     );
-    let first_session = request.headers.get("session-id").unwrap().clone();
+    // 插件传入的请求 ID 原样作为上游请求 ID，bootstrap 与重放因此属于同一次打票。
     f.upstream
         .probe(
             &Access(Mutex::new(true)),
             &Directory,
-            probe("acct_a", 30000),
+            UpstreamProbeParams {
+                request_id: Some("probe_fixture-1".into()),
+                ..probe("acct_a", 30000)
+            },
         )
         .await
         .unwrap();
-    assert_ne!(
-        server.received_requests().await.unwrap()[1]
-            .headers
-            .get("session-id")
-            .unwrap(),
-        &first_session
+    let second = &server.received_requests().await.unwrap()[1];
+    assert!(second.headers.get("session-id").is_none());
+    assert_eq!(
+        second.headers.get("x-client-request-id").unwrap(),
+        "probe_fixture-1"
+    );
+    assert!(
+        f.upstream
+            .probe(
+                &Access(Mutex::new(true)),
+                &Directory,
+                UpstreamProbeParams {
+                    request_id: Some("bad id".into()),
+                    ..probe("acct_a", 30000)
+                },
+            )
+            .await
+            .is_err()
     );
 
     assert!(f.store.has_quota("acct_a"));

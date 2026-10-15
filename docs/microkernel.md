@@ -139,7 +139,7 @@ Rust 插件放在独立 workspace `plugins/Cargo.toml`，共用 `kernel-protocol
 
 | 能力 | 内容 | 限制 |
 | --- | --- | --- |
-| `upstream.probe` | 用指定账号发一次只读响应头的探测请求，可带 turn state 和 Cookie；返回状态码、是否返回 state、新 state、Set-Cookie、限流头 | 只能用插件负责的账号；按账号限速；走账号出口；不返回 AT |
+| `upstream.probe` | 用指定账号发一次只读响应头的探测请求，可带 turn state、Cookie 和上游请求 ID（`requestId`，不带会话头）；返回状态码、是否返回 state、新 state、Set-Cookie、限流头 | 只能用插件负责的账号；按账号限速；走账号出口；不返回 AT |
 | `http.fetch` | 访问清单白名单内的外部地址（如池服务），可选直连或指定账号出口 | 只限白名单主机；响应大小上限 |
 | `accounts.read` | 读取负责账号的状态、分组、上游账号 ID；可带 `model`，逐账号返回该模型是否允许（协议 0.6） | 只读，不含凭据 |
 | `groups.move` | 在插件声明的分组之间移动账号 | 只限声明的分组，写审计 |

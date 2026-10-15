@@ -186,6 +186,7 @@ impl Pool {
             cookie,
             include_account_cookies: false,
             timeout_ms: 20_000,
+            request_id: None,
         })
         .await
         .ok()

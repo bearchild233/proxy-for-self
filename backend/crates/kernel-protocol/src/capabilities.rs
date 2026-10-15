@@ -11,6 +11,9 @@ pub struct UpstreamProbeParams {
     #[serde(default)]
     pub include_account_cookies: bool,
     pub timeout_ms: u64,
+    /// 同一次打票的 bootstrap 与重放共用的上游请求 ID；省略时内核为每次探测生成新的。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

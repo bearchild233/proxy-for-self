@@ -45,6 +45,7 @@ impl Pool {
         model: &str,
         state: Option<&str>,
         cookie: Option<&str>,
+        request_id: Option<&str>,
     ) -> Option<Observation> {
         if self.is_stopped() {
             return None;
@@ -57,6 +58,7 @@ impl Pool {
                 cookie: cookie.map(str::to_owned),
                 include_account_cookies: false,
                 timeout_ms: PROBE_ATTEMPT_MS,
+                request_id: request_id.map(str::to_owned),
             })
             .await
             .ok()?;
@@ -292,13 +294,15 @@ impl Pool {
         if cookie_gateway(&cookie).as_deref() != Some(pair.gateway.as_str()) {
             return Err("cookie_host");
         }
+        // bootstrap 与重放共用一个上游请求 ID（与旧实现一致），重放才是同一会话里的第二次请求。
+        let request_id = self.new_id();
         let first = self
             .probe_headers(
                 caps,
                 &row,
                 pair,
                 lease,
-                &settings.probe_model,
+                (&settings.probe_model, &request_id),
                 None,
                 &cookie,
             )
@@ -320,7 +324,7 @@ impl Pool {
                 &row,
                 pair,
                 lease,
-                &settings.probe_model,
+                (&settings.probe_model, &request_id),
                 Some(&state),
                 &paired_cookie,
             )
@@ -352,7 +356,7 @@ impl Pool {
         row: &AccountSummary,
         pair: &Pair,
         lease: &str,
-        model: &str,
+        (model, request_id): (&str, &str),
         state: Option<&str>,
         cookie: &str,
     ) -> Result<Observation, &'static str> {
@@ -381,7 +385,7 @@ impl Pool {
             let started = Instant::now();
             let mut timing = AccessTiming::new(access_id, self.now());
             let observed = self
-                .send_probe(caps, &row.id, model, state, Some(cookie))
+                .send_probe(caps, &row.id, model, state, Some(cookie), Some(request_id))
                 .await;
             timing.end(if observed.is_some() {
                 "headers"

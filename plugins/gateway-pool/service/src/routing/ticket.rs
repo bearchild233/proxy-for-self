@@ -177,7 +177,7 @@ impl Pool {
         let started = Instant::now();
         let mut timing = AccessTiming::new(access_id, self.now());
         let observed = self
-            .send_probe(caps, account, model, None, Some(&base.cookie))
+            .send_probe(caps, account, model, None, Some(&base.cookie), None)
             .await;
         timing.end(if observed.is_some() {
             "headers"

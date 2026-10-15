@@ -146,14 +146,26 @@ impl PluginUpstream for OpenAiPluginUpstream {
                 &credential.installation_id,
                 crate::transport::request::RequestAccountScope::Unknown,
             );
-            let session = uuid::Uuid::new_v4().to_string();
+            // 与旧网关池探测一致：只带请求 ID、不带会话 ID；同一次打票的两次探测由插件传入同一个请求 ID。
+            let request_id = match params.request_id.as_deref() {
+                Some(id)
+                    if !id.is_empty()
+                        && id.len() <= 128
+                        && id
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') =>
+                {
+                    id.to_owned()
+                }
+                Some(_) => return Err(RpcError::new(INVALID_PARAMS, "requestId")),
+                None => uuid::Uuid::new_v4().to_string(),
+            };
             let mut context = CodexRequestContext::auxiliary(
                 authorization.expose_secret(),
                 account.upstream_account_id(),
-                &session,
+                &request_id,
                 Some(&credential.installation_id),
             );
-            context.session_id = Some(&session);
             context.turn_state = params.turn_state.as_deref();
             let own_cookie = if params.include_account_cookies {
                 crate::provider::plugin_cookie_header(&credential.cookies)

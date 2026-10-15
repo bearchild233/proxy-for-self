@@ -83,6 +83,7 @@ impl Pool {
                 cookie: cookie_pairs(&params.set_cookies),
                 include_account_cookies: true,
                 timeout_ms: PROBE_ATTEMPT_MS,
+                request_id: None,
             })
             .await
         {
