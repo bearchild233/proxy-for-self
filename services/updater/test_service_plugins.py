@@ -426,14 +426,14 @@ class UpdaterWiringTests(unittest.TestCase):
 
 
 class WritableScopeTests(unittest.TestCase):
-    """写入范围收窄：注册表与服务 env 只位于 /etc/proxy-for-self/plugins/ 下，单元不得放开整个 /etc/proxy-for-self。"""
+    """写入范围收窄：服务 env 位于 /etc/proxy-for-self/plugins/ 下，内核注册表位于网关可读的 /etc/proxy-for-self-kernel/；单元不得放开整个 /etc/proxy-for-self。"""
 
     ROOT = Path(__file__).resolve().parents[2]
 
-    def test_example_config_writes_registry_and_env_only_under_plugins_directory(self):
+    def test_example_config_writes_registry_and_env_only_under_scoped_directories(self):
         config = json.loads((self.ROOT / "services/updater/config.example.json").read_text(encoding="utf-8"))
         services = config["service_plugins"]
-        self.assertEqual(services["registry_file"], "/etc/proxy-for-self/plugins/registry.json")
+        self.assertEqual(services["registry_file"], "/etc/proxy-for-self-kernel/registry.json")
         self.assertEqual(services["env_directory"], "/etc/proxy-for-self/plugins/services")
 
     def test_updater_unit_grants_plugins_directory_not_whole_proxy_for_self_directory(self):
@@ -441,6 +441,7 @@ class WritableScopeTests(unittest.TestCase):
         paths = [item for line in unit.splitlines() if line.startswith("ReadWritePaths=")
                  for item in line.split("=", 1)[1].split()]
         self.assertIn("-/etc/proxy-for-self/plugins", paths)
+        self.assertIn("-/etc/proxy-for-self-kernel", paths)
         self.assertNotIn("-/etc/proxy-for-self", paths)
 
     def test_deployed_units_use_the_same_registry_and_env_locations(self):
