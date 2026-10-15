@@ -11,12 +11,12 @@ import BaseConfirmModal from '@/components/base/BaseConfirmModal.vue'
 import BaseEmpty from '@/components/base/BaseEmpty.vue'
 import BasePageHeader from '@/components/base/BasePageHeader.vue'
 import BaseSegmented from '@/components/base/BaseSegmented.vue'
-import BaseSwitch from '@/components/base/BaseSwitch.vue'
 import { defineTableColumns } from '@/components/base/BaseTable/columns'
 import BaseTable from '@/components/base/BaseTable/index.vue'
 import BaseTag from '@/components/base/BaseTag.vue'
 import { toast } from '@/components/base/BaseToast'
 import AccountPoolCard from './components/AccountPoolCard.vue'
+import AccountQueueActions from './components/AccountQueueActions.vue'
 import PoolGroupEvents from './components/PoolGroupEvents.vue'
 import PoolSettingsModal from './components/PoolSettingsModal.vue'
 import PoolStatistics from './components/PoolStatistics.vue'
@@ -299,11 +299,14 @@ usePluginPolling(loadDirectory, shallowRef(60_000))
                 :now="now"
               >
                 <template #actions>
-                  <div class="flex flex-col items-end gap-1">
-                    <BaseSwitch :model-value="queueEntry(row.id)?.enabled ?? true" :disabled="savingQueue" :label="`${row.name}参与网关池`" @update:model-value="saveQueue({ accountId: row.id, enabled: $event })" />
-                    <BaseSwitch :model-value="queueEntry(row.id)?.degradedUse ?? false" :disabled="savingQueue" label="允许降智使用" show-label @update:model-value="saveQueue({ accountId: row.id, degradedUse: $event })" />
-                    <span v-if="queueEntry(row.id)?.quotaExhausted" class="text-cp-xs text-cp-text-tertiary">额度已用完</span>
-                  </div>
+                  <AccountQueueActions
+                    :name="row.name"
+                    :enabled="queueEntry(row.id)?.enabled ?? true"
+                    :degraded-use="queueEntry(row.id)?.degradedUse ?? false"
+                    :quota-exhausted="queueEntry(row.id)?.quotaExhausted ?? false"
+                    :saving="savingQueue"
+                    @save="saveQueue({ accountId: row.id, ...$event })"
+                  />
                 </template>
               </AccountPoolCard>
             </template>
