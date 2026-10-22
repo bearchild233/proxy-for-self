@@ -165,10 +165,10 @@ function submit() {
         </div>
         <div v-if="draft.dynamicGroups" class="grid gap-4 sm:grid-cols-2">
           <BaseFormItem label="正常分组" description="恢复后账号回到这里">
-            <BaseSelect v-model="draft.normalGroupId" aria-label="正常分组" :options="groupOptions" searchable />
+            <BaseSelect :model-value="draft.normalGroupId ?? ''" aria-label="正常分组" :options="groupOptions" searchable @update:model-value="draft.normalGroupId = $event" />
           </BaseFormItem>
           <BaseFormItem label="降智分组" description="确认降智的账号移到这里">
-            <BaseSelect v-model="draft.degradedGroupId" aria-label="降智分组" :options="groupOptions" searchable />
+            <BaseSelect :model-value="draft.degradedGroupId ?? ''" aria-label="降智分组" :options="groupOptions" searchable @update:model-value="draft.degradedGroupId = $event" />
           </BaseFormItem>
         </div>
         <div v-if="draft.dynamicGroups" class="grid gap-2">
