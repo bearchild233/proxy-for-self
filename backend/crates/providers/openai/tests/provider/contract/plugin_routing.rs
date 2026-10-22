@@ -158,6 +158,7 @@ fn reason() -> Reason {
 }
 
 struct Fixture {
+    store: Arc<MemoryAccountStore>,
     root: tempfile::TempDir,
     runtime: Arc<PluginRuntime>,
     task: tokio::task::JoinHandle<std::io::Result<()>>,
@@ -243,6 +244,7 @@ impl Fixture {
         let provider = provider_with_base_url(&store, server.uri()).with_plugin_routing(true);
         provider.set_plugin_hooks(runtime.clone());
         Self {
+            store,
             root,
             runtime,
             task,
@@ -258,6 +260,37 @@ impl Fixture {
             .respond_with(response)
             .mount(&self.server)
             .await;
+    }
+
+    async fn protect(&self, id: &str) {
+        self.store.set_quota_protection(
+            id,
+            gateway_core::account::AccountQuotaProtection::new(true, 90).unwrap(),
+        );
+        let account = self.store.account(id).unwrap();
+        let now = SystemTime::now();
+        let reset = (now + BUDGET + Duration::from_secs(3600))
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        self.store
+            .compare_and_swap_quota(QuotaObservation {
+                plan_type: None,
+                account_id: account.id().clone(),
+                expected_revision: account.revision(),
+                quota: OpaqueProviderData::new(
+                    json!({"rate_limit": {
+                        "allowed": true, "primary_window": {"used_percent": 95, "reset_at": reset}
+                    }})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                ),
+                observed_at: now,
+                state: QuotaState::allowed(now),
+            })
+            .await
+            .unwrap();
     }
     fn context(
         &self,
@@ -415,6 +448,59 @@ async fn select_order_blocked_prepare_materials_and_finish() {
     assert!(finish.first_byte_ms.is_some());
     f.controls.blocked.lock().unwrap().clear();
     assert_eq!(f.execute(f.ordinary_context(), false).await.unwrap().0, B);
+}
+
+#[tokio::test]
+async fn quota_protection_reports_exhaustion_before_any_owned_or_watched_upstream_request() {
+    for owned in [true, false] {
+        let f = Fixture::new(vec![(A, "grp_00000000000000000000000000000001")], owned).await;
+        f.protect(A).await;
+        let error = f.execute(f.ordinary_context(), false).await.err().unwrap();
+        assert_eq!(
+            error.kind(),
+            ProviderErrorKind::QuotaExhausted,
+            "owned {owned}"
+        );
+        assert_eq!(error.send_state(), UpstreamSendState::NotSent);
+        assert!(f.controls.prepare.lock().unwrap().is_empty());
+        assert!(f.controls.observed.lock().unwrap().is_empty());
+        assert!(f.server.received_requests().await.unwrap().is_empty());
+        assert_eq!(
+            f.store.account(A).unwrap().quota().access(),
+            QuotaAccessState::Allowed
+        );
+    }
+}
+
+#[tokio::test]
+async fn quota_protection_skips_owned_account_and_preserves_required_account_semantics() {
+    let f = Fixture::new(
+        vec![
+            (A, "grp_00000000000000000000000000000001"),
+            (B, "grp_00000000000000000000000000000002"),
+        ],
+        true,
+    )
+    .await;
+    f.protect(A).await;
+    f.upstream(successful()).await;
+    assert_eq!(f.execute(f.ordinary_context(), false).await.unwrap().0, B);
+    assert!(f.controls.prepare.lock().unwrap().is_empty());
+    let requests_before = f.server.received_requests().await.unwrap().len();
+    let required = f.context(
+        "req_protection_required",
+        CancellationToken::new(),
+        Some(A),
+        None,
+        Default::default(),
+    );
+    let error = f.execute(required, false).await.err().unwrap();
+    assert_eq!(error.kind(), ProviderErrorKind::QuotaExhausted);
+    assert_eq!(
+        f.server.received_requests().await.unwrap().len(),
+        requests_before
+    );
+    assert!(f.controls.prepare.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

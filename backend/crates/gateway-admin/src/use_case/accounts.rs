@@ -574,6 +574,7 @@ impl AccountsService for DefaultAccountsService {
             self.accounts
                 .batch_update_accounts(
                     BatchUpdateAccounts {
+                        quota_protection: None,
                         expiry_priority: None,
                         restore_archived: false,
                         account_ids: vec![account_id.to_string()],
@@ -1053,6 +1054,7 @@ fn map_reset_credits_error_after_refresh(
 /// 账号目录中单个账号 quota 读取失败时使用的空额度投影。
 fn empty_quota() -> ProviderQuota {
     ProviderQuota {
+        protection_used_percent: None,
         credits: None,
         plan_type: None,
         observed_at: None,

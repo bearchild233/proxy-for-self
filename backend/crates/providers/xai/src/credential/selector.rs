@@ -193,24 +193,45 @@ impl GrokAccountSessionSelector {
             };
             let mut candidates = catalog_eligible
                 .into_iter()
-                .filter(|account| !runtime_cooldowns.contains_key(account.id()))
                 .map(|account| {
                     let health = self
                         .account_feedback
                         .scheduling_signals(&self.provider_kind, account.id());
+                    let quota_signals = self.quota.scheduling_signals(&account);
                     let signals = scheduling
                         .signals()
                         .get(account.id())
                         .cloned()
                         .ok_or(GrokSessionSelectorError::Unavailable)?
-                        .with_provider_quota(self.quota.scheduling_signals(&account))
+                        .with_provider_quota(quota_signals)
                         .with_runtime_health(health.0, health.1);
+                    let reached = !diagnostic
+                        && account.quota_protection().reached(
+                            quota_signals.and_then(|signals| signals.protection_used_percent()),
+                        );
+                    let account = account.with_quota_protection_reached(reached);
                     Ok(AccountCandidate { account, signals })
                 })
                 .collect::<Result<Vec<_>, GrokSessionSelectorError>>()?;
             if let Some(required) = request.required_account() {
                 candidates.retain(|candidate| candidate.account.id() == required);
             }
+            // 冷却不能遮住账号额度状态；先按完整请求范围判定，再沿原路径跳过冷却账号。
+            // 混合池仍可能在冷却结束后恢复，不能因只剩保护账号就误报整个池额度耗尽。
+            let mut statuses = candidates
+                .iter()
+                .filter(|candidate| !request.excluded_accounts().contains(candidate.account.id()))
+                .map(|candidate| {
+                    candidate
+                        .account
+                        .status_projection(SystemTime::now(), candidate.signals.cooldown)
+                        .status
+                });
+            let quota_exhausted = !diagnostic
+                && statuses.next() == Some(gateway_core::account::AccountStatus::QuotaExhausted)
+                && statuses
+                    .all(|status| status == gateway_core::account::AccountStatus::QuotaExhausted);
+            candidates.retain(|candidate| !runtime_cooldowns.contains_key(candidate.account.id()));
 
             let affinity_account = request.affinity().and_then(|affinity| {
                 candidates
@@ -363,6 +384,9 @@ impl GrokAccountSessionSelector {
             }
             if capacity_denied {
                 return Err(GrokSessionSelectorError::CapacityUnavailable { retry_after });
+            }
+            if quota_exhausted {
+                return Err(GrokSessionSelectorError::QuotaExhausted);
             }
             // 钉死账号时只看该账号，否则取最早退出 cooldown 的候选。
             let cooled = match request.required_account() {

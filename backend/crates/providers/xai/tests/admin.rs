@@ -398,6 +398,69 @@ async fn xai_admin_provider_restores_full_pending_envelope_and_binds_owner() {
 }
 
 #[tokio::test]
+async fn xai_quota_protection_presentation_shares_provider_observation_and_period_validity() {
+    let store = MemoryProviderAccountStore::shared();
+    let input = create_input("protection_view", "subject-protection-view");
+    seed_input(&store, &input).await.unwrap();
+    let account = store.account(&input.account_id).unwrap();
+    let bundle = provider_xai::initialize(provider_ports_with(
+        store.clone(),
+        Arc::new(TestOAuthPending::default()),
+    ))
+    .await
+    .unwrap();
+    let now = SystemTime::now();
+    for (age, reset_after, used, expected) in [
+        (0, Some(600), Some(95.0), Some(95.0)),
+        (660, Some(600), Some(95.0), None),
+        (0, Some(-60), Some(95.0), None),
+        (0, None, None, None),
+        (0, None, Some(100.0), Some(100.0)),
+    ] {
+        let period_end = reset_after.map(|seconds| {
+            (DateTime::<Utc>::from(now) + chrono::Duration::seconds(seconds)).to_rfc3339()
+        });
+        let mut config = Map::new();
+        if let Some(used) = used {
+            config.insert("creditUsagePercent".to_owned(), json!(used));
+        }
+        if let Some(end) = period_end {
+            config.insert("currentPeriod".to_owned(), json!({"end": end}));
+        }
+        let observed_at = now - Duration::from_secs(age);
+        store
+            .compare_and_swap_quota(gateway_core::account::QuotaObservation {
+                plan_type: None,
+                account_id: account.id().clone(),
+                expected_revision: account.revision(),
+                quota: OpaqueProviderData::new(Map::from_iter([(
+                    "config".to_owned(),
+                    Value::Object(config),
+                )])),
+                observed_at,
+                state: gateway_core::account::QuotaState::observed_unknown(observed_at),
+            })
+            .await
+            .unwrap();
+        let view = bundle
+            .admin_provider()
+            .quota(ProviderQuotaRequest {
+                account_id: account.id().clone(),
+                refresh: false,
+                rolling_usage: None,
+            })
+            .await
+            .unwrap_or_else(|error| {
+                panic!("age {age}, reset {reset_after:?}, usage {used:?}: {error:?}")
+            });
+        assert_eq!(
+            view.protection_used_percent, expected,
+            "age {age}, reset {reset_after:?}, usage {used:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn xai_admin_provider_projects_cached_quota_models_and_canonical_export() {
     let store = Arc::new(MemoryProviderAccountStore::default());
     let input = create_input("admin_projection", "subject-admin-projection");
@@ -634,6 +697,7 @@ fn provider_ports_with_catalog(
 fn account_record(account: &ProviderAccount) -> AccountRecord {
     let now = Utc::now();
     AccountRecord {
+        quota_protection: Default::default(),
         lifecycle: Default::default(),
         notes: None,
         model_access: Default::default(),

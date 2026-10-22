@@ -456,8 +456,8 @@ config 返回 `{ name, plaintextKey }`，仅读取服务端会话绑定的当前
 | `POST` | `/api/admin/accounts/refresh` | `{ accountId }` | 手工刷新 OAuth credential（`idToken` / `accessToken` / `refreshToken`），不刷新额度 |
 | `POST` | `/api/admin/accounts/recover` | `{ accountId }` | 停用账号只启用调度；已启用账号强制清除本地错误/额度/cooldown 事实，不访问上游 |
 | `POST` | `/api/admin/accounts/rotate` | OpenAI rotation 字段 | 更新指定 OpenAI 账号的 OAuth token 或 API Key 上游设置 |
-| `POST` | `/api/admin/accounts/update` | `{ accountId, name?, enabled, concurrencyLimit, weight, groupIds, notes?, modelAccess?, outboundProxyId?, outboundProxyUrl? }` | 一次更新账号名称、备注、调度状态、并发上限（`null` 表示继承运行参数）、权重（1–100）、所属分组与出站代理 |
-| `POST` | `/api/admin/accounts/batch-update` | `{ accountIds, enabled?, concurrencyLimit?, weight?, expiryPriority?, restoreArchived?, groupIds?, modelAccess?, outboundProxyId?, outboundProxyUrl? }` | 一次事务更新所选账号；仅修改提供的字段，至少提供一项修改 |
+| `POST` | `/api/admin/accounts/update` | `{ accountId, name?, enabled, concurrencyLimit, weight, groupIds, notes?, modelAccess?, quotaProtection?, outboundProxyId?, outboundProxyUrl? }` | 一次更新账号名称、备注、调度状态、并发上限（`null` 表示继承运行参数）、权重（1–100）、所属分组、养号政策与出站代理 |
+| `POST` | `/api/admin/accounts/batch-update` | `{ accountIds, enabled?, concurrencyLimit?, weight?, expiryPriority?, restoreArchived?, groupIds?, modelAccess?, quotaProtection?, outboundProxyId?, outboundProxyUrl? }` | 一次事务更新所选账号；仅修改提供的字段，至少提供一项修改 |
 | `POST` | `/api/admin/accounts/delete` | `{ provider, accountIds }` | 批量删除 1–200 个账号 |
 | `GET` | `/api/admin/accounts/quota` | `accountId` | 读取当前额度，不强制访问上游 |
 | `GET` | `/api/admin/accounts/quota-forecast` | `accountId` | 按需读取周/月容量预测、源窗口剩余估算与采样依据，不刷新上游额度 |
@@ -486,6 +486,8 @@ config 返回 `{ name, plaintextKey }`，仅读取服务端会话绑定的当前
 - `status`: `normal`、`quota_exhausted`、`rate_limited`、`disabled`、`error`；
 - `sortBy`: `email`、`status`、`planType`、`usage`、`lastUsedAt`、`expiresAt`；
 - `sortDirection`: `asc`、`desc`。
+
+养号配置为 `quotaProtection: { enabled, usedPercentLimit }`，默认关闭、使用上限 90，阈值只允许 1–99 的整数。更新省略此字段保留原配置，关闭仍保存阈值；API Key rotation 的 `settings` 使用同一合同。账号详情和列表的 `quotaProtectionReached` 单独表示已触发本地保护，官方状态及额度窗口不变。网关根据有效账号级额度阻止新调度，保留现有额度耗尽错误合同；未知或过期额度不能保证预留，在途与观测延迟可能导致超过阈值。
 
 账号限流详情在 `quota` 中返回：`rateLimitReason` 为 `upstream_rate_limit`（上游临时限流）、
 `capacity_freeze`（容量错误触发自动冻结）或 `null`。`recoveryProbeRequired` 表示解除冻结是否需要成功探测；

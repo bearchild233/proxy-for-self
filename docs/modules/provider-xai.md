@@ -11,6 +11,8 @@ xAI（Grok Build）Provider（crate `provider-xai`）：官方 Grok Build OAuth 
 
 ## 实现逻辑
 
+**账号养号**：billing 快照的账号使用率通过同一有效信号路径供选号与 Admin 展示消费，缓存有效期同时受十分钟观测期和 billing 周期结束限制；过期观测与已结束周期不触发保护，使用率仍遵守上游 0–100 的解析合同。普通与固定选号在过滤临时冷却前识别完整允许范围是否均已额度耗尽，避免固定保护账号误报为冷却；混合账号池仍保留可恢复冷却的原语义。保护走 `QuotaExhausted`、`NotSent`，不修改真实额度与 credential 状态，显式诊断保持既有旁路。
+
 **一次推理**（`src/provider/`）：`mod.rs::GrokBuildProvider` 实现 `Provider`。选号 `credential/selector.rs`（账号 session 选择、Redis lease、失败反馈）；`transport/request/` 把 OpenAI Responses 请求转换为 Grok Build wire：`mod.rs` 入口与协调，`model.rs`（模型能力与参数）、`tools.rs`（Codex custom 工具与 Grok function 工具双向转换，超限或转换失败终止流）、`history.rs`（OpenAI history 重建与清理）、`identity.rs`（会话身份、租户隔离与缓存路由）、`schema.rs`（工具 JSON Schema 校验与数值归一化）、`response.rs`（Grok 输出恢复为 Responses 所需状态）。`provider/stream.rs` 执行 inference / compaction 流并校验终态；`transport/canonical.rs` 把官方 Grok Responses SSE 转为 canonical event；`transport/compaction.rs` 处理压缩请求；`provider/failure.rs` 做失败分类、账号反馈和恢复决策；`provider/continuation.rs` 与 `src/reasoning_replay.rs` 处理续接与账号隔离的 reasoning replay。默认 `store: false` 的续接由现有会话 owner 重放完整历史；原生续接按上游约束处理 `instructions` 与 `previous_response_id`。
 
 **transport**（`src/transport/`）：`network.rs` 是显式账号出口的 HTTP 栈（禁用重定向与业务重试，官方 host 的 DNS rebinding 防护，OAuth 只允许 `auth.x.ai:443`，Responses SSE transport）；`egress.rs` 有界管理出口 client 与 OIDC JWKS 单飞的生命周期；`inference.rs` 推理请求/响应与 transport 指标；`catalog.rs` 官方 Grok CLI proxy 模型目录 wire 与快照；`profile.rs` / `client_profile.rs` Grok CLI 运行时 wire 画像（发布版本与用户选择分别维护，不回写 YAML）；`headers.rs` `session.rs` `config.rs`（固定官方 inference 配置）。

@@ -2,6 +2,7 @@ mod lifecycle;
 mod location;
 mod model_access;
 mod proxy;
+mod quota_protection;
 mod selection;
 mod selection_diagnostics;
 

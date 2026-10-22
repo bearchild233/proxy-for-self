@@ -255,6 +255,16 @@ impl MemoryProviderAccountStore {
             .map(|stored| stored.account.clone())
     }
 
+    pub fn set_quota_protection(
+        &self,
+        id: &ProviderAccountId,
+        protection: gateway_core::account::AccountQuotaProtection,
+    ) {
+        let mut accounts = lock(&self.accounts);
+        let stored = accounts.get_mut(id).expect("seeded account");
+        stored.account = stored.account.clone().with_quota_protection(protection);
+    }
+
     pub fn set_scheduling(
         &self,
         id: &ProviderAccountId,
@@ -679,6 +689,7 @@ fn rebuild_account(previous: &ProviderAccount, replacement: AccountReplacement) 
         replacement.last_error_message,
     )
     .with_scheduling(previous.concurrency_limit(), previous.weight())
+    .with_quota_protection(previous.quota_protection())
     .with_refresh_schedule(replacement.has_refresh_token, replacement.next_refresh_at)
     .with_outbound_proxy(previous.outbound_proxy().cloned())
 }

@@ -1070,6 +1070,7 @@ async fn openai_admin_provider_projects_official_codex_quota_and_independent_buc
         .filter(|window| window.group == "monthly")
         .collect::<Vec<_>>();
 
+    assert_eq!(quota.protection_used_percent, Some(91.0));
     assert_eq!(monthly.len(), 1);
     assert!(monthly.iter().any(|window| {
         window.label == "月额度"
@@ -1605,6 +1606,7 @@ fn provider_ports_with_catalog(
 fn account_record(account: &ProviderAccount) -> AccountRecord {
     let now = Utc::now();
     AccountRecord {
+        quota_protection: Default::default(),
         lifecycle: Default::default(),
         notes: None,
         model_access: Default::default(),

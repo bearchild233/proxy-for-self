@@ -12,6 +12,8 @@ OpenAI / Codex Provider（crate `provider-openai`）：独占 OpenAI credential 
 
 ## 实现逻辑
 
+**账号养号**：额度调度投影只从仍有效的 account-wide 窗口取最大使用率，主、周、月任一窗口达到账号上限就阻止新调度；独立的 code review 等桶不触发全账号保护。有重置时间的窗口独立到期，无重置时间的观测最多有效十分钟；排序的四舍五入不影响阈值判断。普通、固定、续接与插件选定路径在最终准入检查保护，沿用既有 `QuotaExhausted` 错误和安全恢复合同。Admin 展示使用同一投影，不把本地保护持久化成上游用尽。
+
 **一次推理 attempt**（`src/provider/`）：
 1. `mod.rs::CodexProvider` 实现 `gateway_core::engine::provider::Provider`。`execute` 先按 operation 分派：模型请求走 `execution.rs`，Images / Search / 原生 JSON 端点走 `execute_image` / `execute_search` / `execute_raw_json_endpoint`，Excel 范围的 Key 走 `excel.rs`。
 2. 选号：`credential/selector.rs::CodexCredentialSelector::select` 综合账号启停与归档、credential 状态、quota 信号、Redis cooldown、并发上限与账号租约（`CodexCredentialLease`）、权重/请求间隔/会话亲和（`credential/affinity.rs` 派生不透明亲和键）、管理员模型政策（先于额度/亲和/租约）、cyber-policy 作用域。`plugin_candidates` 把候选交给插件钩子。

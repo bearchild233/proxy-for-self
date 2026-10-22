@@ -349,6 +349,7 @@ impl AccountRuntimeSignals {
 /// Provider 从私有 quota JSON 投影出的中立调度事实。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AccountQuotaSignals {
+    protection_used_percent: Option<u8>,
     reset_at: Option<SystemTime>,
     remaining_rank: Option<u64>,
 }
@@ -360,12 +361,27 @@ impl AccountQuotaSignals {
         Self {
             reset_at,
             remaining_rank,
+            protection_used_percent: None,
         }
     }
 
     #[must_use]
     pub const fn reset_at(self) -> Option<SystemTime> {
         self.reset_at
+    }
+
+    #[must_use]
+    pub fn with_protection_used_percent(mut self, used: Option<f64>) -> Self {
+        // 阈值为整数，向下取整保留精确比较语义，89.999% 不提前触发90%。
+        self.protection_used_percent = used
+            .filter(|used| used.is_finite() && *used >= 0.0)
+            .map(|used| used.min(100.0).floor() as u8);
+        self
+    }
+
+    #[must_use]
+    pub fn protection_used_percent(self) -> Option<f64> {
+        self.protection_used_percent.map(f64::from)
     }
 
     #[must_use]

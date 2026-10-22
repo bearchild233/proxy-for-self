@@ -126,7 +126,14 @@ export interface AccountModelAccess {
   models: string[]
 }
 
+export interface AccountQuotaProtection {
+  enabled: boolean
+  usedPercentLimit: number
+}
+
 export interface Account {
+  quotaProtection?: AccountQuotaProtection
+  quotaProtectionReached?: boolean
   outboundProxyEndpoint: string | null
   id: string
   name: string
@@ -391,6 +398,7 @@ interface AccountResetCreditConsumeParam extends AccountIdParam {
 }
 
 interface AccountUpdateParam {
+  quotaProtection?: AccountQuotaProtection
   name?: string
   outboundProxyUrl?: string
   outboundProxyId?: string
@@ -404,6 +412,7 @@ interface AccountUpdateParam {
 }
 
 interface AccountBatchUpdateParam {
+  quotaProtection?: AccountQuotaProtection
   expiryPriority?: boolean
   restoreArchived?: boolean
   outboundProxyUrl?: string

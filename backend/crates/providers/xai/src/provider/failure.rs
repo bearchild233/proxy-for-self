@@ -405,6 +405,12 @@ pub(super) fn map_selection_error(error: GrokSessionSelectorError) -> ProviderEr
             "account is at its concurrency or request-interval limit".to_owned(),
             "account_capacity_busy",
         ),
+        GrokSessionSelectorError::QuotaExhausted => {
+            return provider_error(
+                ProviderErrorKind::QuotaExhausted,
+                UpstreamSendState::NotSent,
+            );
+        }
         GrokSessionSelectorError::NoEligibleSession => (
             None,
             "no account is eligible for the requested model".to_owned(),

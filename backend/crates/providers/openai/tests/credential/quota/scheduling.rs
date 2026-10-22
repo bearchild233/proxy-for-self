@@ -276,3 +276,128 @@ async fn reset_window_should_not_clear_confirmed_exhaustion() {
         QuotaAccessState::Exhausted
     );
 }
+
+#[tokio::test]
+async fn protection_signal_ignores_independent_review_bucket_but_preserves_its_rank() {
+    let store = Arc::new(MemoryAccountStore::default());
+    create_account(&store, "acct_protection_buckets").await;
+    let account = store.account("acct_protection_buckets").unwrap();
+    let now = SystemTime::now();
+    let reset = timestamp(now + Duration::from_secs(3600));
+    store
+        .compare_and_swap_quota(QuotaObservation {
+            plan_type: None,
+            account_id: account.id().clone(),
+            expected_revision: account.revision(),
+            quota: OpaqueProviderData::new(
+                json!({
+                    "rate_limit": {"allowed": true, "primary_window": {
+                        "used_percent": 89.999, "reset_at": reset
+                    }},
+                    "code_review_rate_limit": {"allowed": false, "limit_reached": true,
+                        "primary_window": {"used_percent": 100, "reset_at": reset}}
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+            observed_at: now,
+            state: QuotaState::allowed(now),
+        })
+        .await
+        .unwrap();
+    let account = store.account("acct_protection_buckets").unwrap();
+    let service = quota_service(&store);
+    service
+        .prepare_scheduling(std::slice::from_ref(&account))
+        .await;
+    let signals = service.scheduling_signals(&account).expect("known quota");
+    assert_eq!(
+        signals.remaining_rank(),
+        Some(0),
+        "existing rank still includes review"
+    );
+    assert_eq!(signals.protection_used_percent(), Some(89.0));
+    assert!(
+        !gateway_core::account::AccountQuotaProtection::new(true, 90)
+            .unwrap()
+            .reached(signals.protection_used_percent())
+    );
+    assert_eq!(
+        store
+            .account("acct_protection_buckets")
+            .unwrap()
+            .quota()
+            .access(),
+        QuotaAccessState::Allowed
+    );
+}
+
+#[tokio::test]
+async fn protection_signal_uses_highest_live_account_window_and_discards_expired_evidence() {
+    for (primary, age_minutes, reset_expired, expected) in [
+        (95.0, 1, false, Some(95.0)),
+        (95.0, 1, true, Some(74.0)),
+        (95.0, 41, true, Some(74.0)),
+    ] {
+        let store = Arc::new(MemoryAccountStore::default());
+        let now = SystemTime::now();
+        let reset = if reset_expired {
+            now - Duration::from_secs(60)
+        } else {
+            now + Duration::from_secs(3600)
+        };
+        let account = persist_snapshot(
+            &store,
+            "acct_protection_window",
+            now - Duration::from_secs(age_minutes * 60),
+            json!({
+                "allowed": true,
+                "primary_window": {"used_percent": primary, "reset_at": timestamp(reset)},
+                "secondary_window": {"used_percent": 74,
+                    "reset_at": timestamp(now + Duration::from_secs(86400))}
+            }),
+        )
+        .await;
+        let service = quota_service(&store);
+        service
+            .prepare_scheduling(std::slice::from_ref(&account))
+            .await;
+        assert_eq!(
+            service
+                .scheduling_signals(&account)
+                .and_then(|signals| signals.protection_used_percent()),
+            expected
+        );
+    }
+}
+
+#[tokio::test]
+async fn protection_signal_for_undated_windows_expires_independently_of_a_live_weekly_window() {
+    for (age_minutes, expected) in [(1, 95.0), (41, 74.0)] {
+        let store = Arc::new(MemoryAccountStore::default());
+        let now = SystemTime::now();
+        let account = persist_snapshot(
+            &store,
+            "acct_protection_undated",
+            now - Duration::from_secs(age_minutes * 60),
+            json!({
+                "allowed": true,
+                "primary_window": {"used_percent": 95},
+                "secondary_window": {"used_percent": 74,
+                    "reset_at": timestamp(now + Duration::from_secs(86400))}
+            }),
+        )
+        .await;
+        let service = quota_service(&store);
+        service
+            .prepare_scheduling(std::slice::from_ref(&account))
+            .await;
+        assert_eq!(
+            service
+                .scheduling_signals(&account)
+                .and_then(|signals| signals.protection_used_percent()),
+            Some(expected)
+        );
+    }
+}

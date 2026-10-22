@@ -169,6 +169,10 @@ impl CodexAccountQuotaSnapshot {
         self.quota
     }
 
+    pub(crate) fn scheduling_signals(&self) -> Option<AccountQuotaSignals> {
+        scheduling_signals_from_snapshot(self)
+    }
+
     /// 将已持久化的规范化事实覆盖到 raw JSON 展示快照上。
     #[must_use]
     pub(crate) const fn with_quota_state(mut self, quota: QuotaState) -> Self {
@@ -301,10 +305,19 @@ pub(crate) fn quota_scheduling_signals(
 ) -> Option<AccountQuotaSignals> {
     let now = SystemTime::now();
     let mut remaining_rank: Option<u64> = None;
+    let mut protection_used: Option<f64> = None;
     let mut reset_at: Option<SystemTime> = None;
     for window in &snapshot.windows {
         if quota_window_ttl(window, snapshot.observed_at(), now).is_none() {
             continue;
+        }
+        // 养号只看账号级额度，code_review 等独立桶不能耗尽整个账号。
+        if window.is_account_wide()
+            && let Some(used) = window
+                .used_percent()
+                .filter(|used| used.is_finite() && *used >= 0.0)
+        {
+            protection_used = Some(protection_used.map_or(used, |current| current.max(used)));
         }
         let window_reset_at = window.reset_at().map(SystemTime::from);
         if let Some(used) = window
@@ -318,8 +331,11 @@ pub(crate) fn quota_scheduling_signals(
             reset_at = Some(reset_at.map_or(reset, |current| current.min(reset)));
         }
     }
-    if remaining_rank.is_some() || reset_at.is_some() {
-        Some(AccountQuotaSignals::new(reset_at, remaining_rank))
+    if remaining_rank.is_some() || reset_at.is_some() || protection_used.is_some() {
+        Some(
+            AccountQuotaSignals::new(reset_at, remaining_rank)
+                .with_protection_used_percent(protection_used),
+        )
     } else {
         None
     }

@@ -3,6 +3,7 @@ import type { AccountRow } from '../constants'
 import type { ApiKeyAccountForm } from '../utils/upstreamApiKey'
 import type { AccountGroup, AccountModelAccess } from '@/api'
 
+import AccountPlanBadge from '@kit/accounts/AccountPlanBadge.vue'
 import BaseButton from '@/components/base/BaseButton.vue'
 import BaseFormItem from '@/components/base/BaseForm/FormItem.vue'
 import BaseInput from '@/components/base/BaseInput.vue'
@@ -11,7 +12,7 @@ import BaseTextarea from '@/components/base/BaseTextarea.vue'
 import ProviderIconGroup from '@/components/ProviderIconGroup.vue'
 import AccountApiKeyFields from './AccountApiKeyFields.vue'
 import AccountIdentityCell from './AccountIdentityCell.vue'
-import AccountPlanBadge from '@kit/accounts/AccountPlanBadge.vue'
+import AccountQuotaProtectionFields from './AccountQuotaProtectionFields.vue'
 import AccountSettingsFields from './AccountSettingsFields.vue'
 
 defineProps<{
@@ -21,6 +22,7 @@ defineProps<{
   saving: boolean
   configurationLoading: boolean
   configurationReady: boolean
+  quotaProtectionSupported: boolean
 }>()
 
 const emit = defineEmits<{
@@ -32,6 +34,8 @@ const apiKey = defineModel<ApiKeyAccountForm>('apiKey', { required: true })
 const name = defineModel<string>('name', { required: true })
 const notes = defineModel<string>('notes', { required: true })
 const enabled = defineModel<boolean>('enabled', { required: true })
+const quotaProtectionEnabled = defineModel<boolean>('quotaProtectionEnabled', { required: true })
+const quotaProtectionLimit = defineModel<string>('quotaProtectionLimit', { required: true })
 const concurrencyLimit = defineModel<string>('concurrencyLimit', { required: true })
 const modelAccess = defineModel<AccountModelAccess | undefined>('modelAccess', { required: true })
 const weight = defineModel<string>('weight', { required: true })
@@ -105,6 +109,12 @@ const selectedGroupIds = defineModel<string[]>('selectedGroupIds', { required: t
           :disabled="saving"
         />
       </BaseFormItem>
+      <AccountQuotaProtectionFields
+        v-model:enabled="quotaProtectionEnabled"
+        v-model:used-percent-limit="quotaProtectionLimit"
+        :supported="quotaProtectionSupported"
+        :disabled="saving"
+      />
     </div>
 
     <template #footer>

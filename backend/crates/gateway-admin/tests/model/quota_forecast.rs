@@ -56,6 +56,7 @@ fn window(key: &str, days: u64) -> ProviderQuotaWindow {
 
 fn quota(windows: Vec<ProviderQuotaWindow>) -> ProviderQuota {
     ProviderQuota {
+        protection_used_percent: None,
         credits: None,
         plan_type: None,
         observed_at: Some(now()),

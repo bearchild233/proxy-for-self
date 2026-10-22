@@ -11,6 +11,8 @@
 
 ## 实现逻辑
 
+**养号设置**：账号编辑弹窗的 `AccountQuotaProtectionFields.vue` 提供每账号开关和 1–99 的整数使用上限，默认 90%，默认关闭。达到阈值时由网关拒绝新调度，界面通过独立的 `quotaProtectionReached` 标注本地保护，不改写官方额度与状态。关闭时保留打开表单时已保存的阈值，隐藏输入不阻止关闭；未修改养号时省略该字段，分组窄更新与批量普通设置不覆盖它。旧网关缺少合法 `quotaProtection` 时禁用控件；保存后回读验证，无法确认时不显示成功。无有效额度时不能保证预留，在途与观测延迟也可能超过阈值。
+
 页面入口 `ui/page/index.vue`：表格列插槽、删除确认框、归档/当前视图切换、批量操作栏；所有数据流经 composables：
 - `useAccountsQuery`：`usePagedQuery` 分页（默认 20 条），参数含 `archived`、搜索、provider、状态、分组、需处理（attention）、排序；30 秒页面可见时后台静默同步，并按需补查订阅（缓存）；`summary` 驱动概览卡。
 - `useAccountMutations`：删除（单个/批量同一接口 `accounts.delete`，按 provider 分组）、导出、刷新凭据、刷新额度、恢复状态、主动重置额度。

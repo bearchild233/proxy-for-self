@@ -1,4 +1,5 @@
 mod lifecycle;
+mod quota_protection;
 use std::{
     collections::BTreeMap,
     num::NonZeroU32,
@@ -1190,6 +1191,7 @@ async fn terminal_admin_mutations_keep_revision_account_and_audit_atomic() {
     let result = store
         .update_account(
             UpdateAccount {
+                quota_protection: None,
                 name: None,
                 notes: None,
                 model_access: Default::default(),
@@ -1275,6 +1277,7 @@ async fn account_proxy_edits_preserve_credentials_and_clear_egress_without_audit
         request_id: "proxy-edit".to_owned(),
     };
     let command = UpdateAccount {
+        quota_protection: None,
         name: None,
         notes: None,
         model_access: Default::default(),
@@ -1299,6 +1302,7 @@ async fn account_proxy_edits_preserve_credentials_and_clear_egress_without_audit
     store
         .update_account(
             UpdateAccount {
+                quota_protection: None,
                 name: None,
                 outbound_proxy: Some(gateway_admin::model::proxies::AccountProxySelection::Url(
                     gateway_core::account::OutboundProxy::parse(
@@ -1316,6 +1320,7 @@ async fn account_proxy_edits_preserve_credentials_and_clear_egress_without_audit
     store
         .update_account(
             UpdateAccount {
+                quota_protection: None,
                 name: None,
                 outbound_proxy: Some(gateway_admin::model::proxies::AccountProxySelection::Direct),
                 ..command
@@ -1350,6 +1355,7 @@ async fn account_notes_round_trip_and_survive_import_and_scheduling_updates() {
         request_id: "notes-edit".to_owned(),
     };
     let command = UpdateAccount {
+        quota_protection: None,
         name: None,
         account_id: "acct_notes".to_owned(),
         notes: Some("  团队备用\n下月续费  ".to_owned()),
@@ -1382,6 +1388,7 @@ async fn account_notes_round_trip_and_survive_import_and_scheduling_updates() {
     store
         .update_account(
             UpdateAccount {
+                quota_protection: None,
                 name: None,
                 notes: None,
                 ..command.clone()
@@ -1393,6 +1400,7 @@ async fn account_notes_round_trip_and_survive_import_and_scheduling_updates() {
     store
         .batch_update_accounts(
             BatchUpdateAccounts {
+                quota_protection: None,
                 expiry_priority: None,
                 restore_archived: false,
                 account_ids: vec!["acct_notes".to_owned()],
@@ -1460,6 +1468,7 @@ async fn account_notes_round_trip_and_survive_import_and_scheduling_updates() {
     store
         .update_account(
             UpdateAccount {
+                quota_protection: None,
                 name: None,
                 notes: Some(" \n\t ".to_owned()),
                 ..command
@@ -1504,6 +1513,7 @@ async fn invalid_account_notes_roll_back_scheduling_revision_and_audit() {
     let result = admin_account_store(&database.pool)
         .update_account(
             UpdateAccount {
+                quota_protection: None,
                 name: None,
                 account_id: "acct_notes".to_owned(),
                 notes: Some("备".repeat(501)),
@@ -1633,6 +1643,7 @@ async fn account_enable_preserves_facts_and_explicit_recovery_clears_them() {
     let enabled = store
         .batch_update_accounts(
             BatchUpdateAccounts {
+                quota_protection: None,
                 expiry_priority: None,
                 restore_archived: false,
                 account_ids: vec!["acct_recovery".to_owned()],
@@ -1766,6 +1777,7 @@ async fn terminal_batch_update_replaces_state_and_groups_once_or_rolls_back_ever
     let result = store
         .batch_update_accounts(
             BatchUpdateAccounts {
+                quota_protection: None,
                 expiry_priority: None,
                 restore_archived: false,
                 model_access: Default::default(),
@@ -1808,6 +1820,7 @@ async fn terminal_batch_update_replaces_state_and_groups_once_or_rolls_back_ever
     store
         .batch_update_accounts(
             BatchUpdateAccounts {
+                quota_protection: None,
                 expiry_priority: None,
                 restore_archived: false,
                 model_access: Default::default(),
@@ -2543,6 +2556,7 @@ async fn provider_account_admin_mutations_are_scoped_audited_and_atomic() {
 
     let revision = repository
         .batch_update_provider_accounts_admin(BatchUpdateProviderAccountsAdmin {
+            quota_protection: None,
             expiry_priority: None,
             restore_archived: false,
             name: None,
@@ -2615,6 +2629,7 @@ async fn credential_rotation_and_settings_share_one_transaction() {
     .await
     .expect("seed group");
     let settings = UpdateAccount {
+        quota_protection: None,
         name: None,
         account_id: ACCOUNT_ID.to_owned(),
         notes: Some("统一保存".to_owned()),
@@ -2669,6 +2684,7 @@ async fn credential_rotation_and_settings_share_one_transaction() {
             "missing_group",
             2,
             UpdateAccount {
+                quota_protection: None,
                 name: None,
                 enabled: true,
                 group_ids: vec![
@@ -2681,6 +2697,7 @@ async fn credential_rotation_and_settings_share_one_transaction() {
             "missing_proxy",
             2,
             UpdateAccount {
+                quota_protection: None,
                 name: None,
                 outbound_proxy: Some(AccountProxySelection::Saved("missing_proxy".to_owned())),
                 ..settings.clone()
@@ -2690,6 +2707,7 @@ async fn credential_rotation_and_settings_share_one_transaction() {
             "stale_credential",
             1,
             UpdateAccount {
+                quota_protection: None,
                 name: None,
                 enabled: true,
                 notes: Some("must not persist".to_owned()),
@@ -3373,6 +3391,7 @@ async fn proxy_edit_preserves_an_inflight_token_refresh() {
     admin_account_store(&database.pool)
         .update_account(
             UpdateAccount {
+                quota_protection: None,
                 name: None,
                 notes: None,
                 model_access: Default::default(),
@@ -3567,6 +3586,7 @@ async fn model_access_only_batch_update_preserves_other_settings_and_survives_re
     .expect("policy");
     let store = admin_account_store(&database.pool);
     let command = BatchUpdateAccounts {
+        quota_protection: None,
         expiry_priority: None,
         restore_archived: false,
         account_ids: vec![input.id.clone()],
@@ -3617,6 +3637,7 @@ async fn model_access_only_batch_update_preserves_other_settings_and_survives_re
     store
         .batch_update_accounts(
             BatchUpdateAccounts {
+                quota_protection: None,
                 expiry_priority: None,
                 restore_archived: false,
                 model_access: Some(AccountModelAccess::all()),

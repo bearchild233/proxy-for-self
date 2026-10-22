@@ -12,6 +12,8 @@
 
 ## 实现逻辑
 
+**账号养号准入**：`account/quota_protection.rs` 的 `AccountQuotaProtection` 保存独立开关与 1–99 整数上限，默认关闭、阈值 90。Provider 从有效账号级额度产生保护使用率，选号时以临时 `QuotaExhausted` 事实阻止新请求，不回写真实额度；停用和认证错误仍优先于额度，额度优先于临时冷却。固定账号、原生续接与插件选定账号使用同一准入事实，既有发送、续接和安全恢复边界保持不变。策略关闭或有效窗口重置后按新事实恢复。
+
 **启动**（`src/lib.rs::initialize`）：先按配置恢复 Client Key 准入热状态（`restore_client_admission_startup`，从 `model_requests` 重建 Redis 并发/RPM 计数），再用 `RuntimeSnapshotCompiler` 编译首个 `RuntimeSnapshot`，失败直接拒绝启动；组装 `DefaultExecutionService`，并返回 `CoreBundle`（执行服务、Key 校验器、快照控制、账号探测、健康探针、周期对账 Worker 贡献）。
 
 **一次推理请求**（`src/engine/`）：
@@ -41,7 +43,7 @@
 | `src/engine/` | 请求生命周期：`mod.rs`（`ModelRequestId`、`ExecutionStore` 端口、attempt 值对象）、`execution.rs`（执行服务）、`coordinator.rs`（重试/提交边界）、`admission.rs` `budget.rs`（Key 准入与金额端口）、`continuation.rs`、`observation.rs`、`probe.rs`、`provider.rs`（`Provider` trait、`ProviderRegistry`、事件流） |
 | `src/routing/` | `mod.rs`（模型 ID、`RoutingPlan`、`ProviderCandidate`）、`catalog.rs`（Provider 目录合同）、`snapshot.rs`（快照事实、编译、发布） |
 | `src/runtime/mod.rs` | 快照句柄、发布器、revision 订阅与对账判定 |
-| `src/account/` | 账号值对象与端口：`model.rs`（账号、并发、权重、凭据状态）、`scope.rs`、`selection.rs`、`model_access.rs`、`lifecycle.rs`、`proxy.rs`（出口代理值对象）、`location.rs`、`store.rs` |
+| `src/account/` | 账号值对象与端口：`model.rs`（账号、并发、权重、凭据状态）、`scope.rs`、`selection.rs`、`quota_protection.rs`（养号准入政策）、`model_access.rs`、`lifecycle.rs`、`proxy.rs`（出口代理值对象）、`location.rs`、`store.rs` |
 | `src/policy/` | Client Key 策略与限额（`mod.rs`）、Codex 最低版本（`client_version.rs`）、入口容量（`inference_limits.rs`） |
 | `src/provider_ports/mod.rs` | Provider 运行时需要的中立存储端口：调度状态、租约、冷却、会话亲和、circuit、凭据状态缓存、运行策略、分组移动等 |
 | `src/event.rs` `src/operation/` `src/error.rs` `src/upstream.rs` | canonical event、operation 与能力要求、稳定错误分类、发送状态 |

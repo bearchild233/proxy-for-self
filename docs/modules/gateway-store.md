@@ -12,6 +12,8 @@ PostgreSQL、Redis、S3/R2 与 `pg_dump` 的适配层：把 Core / Admin / Provi
 
 ## 实现逻辑
 
+**养号配置持久化**：迁移 0025 为 `provider_accounts` 追加独立的 `quota_protection_json`，默认关闭、阈值 90，并校验开关、整数类型与 1–99 范围。Core 与 Admin 的列表、详情、可调度目录、分组成员共享解析都读取该列；单个、批量和 API Key 凭据轮换与原设置、revision、审计处于同一事务。省略字段以及重新导入保留既有配置，不写入上游额度。槽启动仍严格比较全部迁移，0025 后不能用只含 0024 的旧二进制冷启动；新增列不是可直接滚动迁移的保证。
+
 **启动**（`src/bundle.rs::initialize`）：
 1. 校验配置；非槽模式 `connect_and_migrate`（sqlx 迁移，已应用迁移的字节必须与 `_sqlx_migrations` 一致），槽模式（`deployment_slot: a|b`）只 `connect_for_slot` 校验 schema、不运行迁移，并获取每槽独立锁和共享存活锁（`PgSlotGuard`）。非槽模式持有会话级排他实例锁，冷启动执行中断恢复（`recover_after_restart`）。
 2. 初始化 vault（`store.vault_key_file` 为可选项，未配置则按明文读写，已加密的行缺少密钥时拒绝读取）：读取 `store.vault_key_file`（32 字节十六进制主密钥，绝对路径、文件大小受限），`src/vault.rs` 用 HMAC 派生加密密钥与查找密钥，AES-256-GCM 加密 Provider credential JSON 与 Client Key 明文（前缀 `hubenc1:`，AAD 绑定行 ID）；冷启动时 `migrate_existing` 把遗留明文行加密。
@@ -46,7 +48,7 @@ PostgreSQL、Redis、S3/R2 与 `pg_dump` 的适配层：把 Core / Admin / Provi
 
 ## 数据、配置与接口
 
-- 主要表：`admin_users` `admin_audit_events` `client_api_keys` `runtime_settings` `provider_accounts` `account_groups` `account_group_accounts` `client_api_key_groups` `model_requests` `ops_events` `backup_settings` `backup_records`，其余见 `backend/migrations/`（0001–0024）。
+- 主要表：`admin_users` `admin_audit_events` `client_api_keys` `runtime_settings` `provider_accounts` `account_groups` `account_group_accounts` `client_api_key_groups` `model_requests` `ops_events` `backup_settings` `backup_records`，其余见 `backend/migrations/`（0001–0025）。
 - 配置段 `store`：`vault_key_file`、`database.url|password`、`redis.url|password`、`pool.*`、`deployment_slot`；环境变量 `CPR_DATABASE_URL` `CPR_REDIS_URL` `CPR_DATABASE_PASSWORD` `CPR_REDIS_PASSWORD`。
 - 测试需要 `CPR_TEST_DATABASE_URL` / `CPR_TEST_REDIS_URL`；本地缺失时 PG/Redis 用例静默跳过，CI 缺失则失败（见 `backend/migrations/README.md`）。
 

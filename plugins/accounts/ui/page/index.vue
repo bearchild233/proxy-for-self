@@ -173,6 +173,9 @@ const {
   name: editingName,
   notes: editingNotes,
   schedulingEnabled,
+  quotaProtectionSupported,
+  quotaProtectionEnabled,
+  quotaProtectionLimit,
   concurrencyLimit: editingConcurrencyLimit,
   weight: editingWeight,
   modelAccess: editingModelAccess,
@@ -339,6 +342,13 @@ const singleDeleteDescription = computed(() => pendingDeleteAccount.value?.lifec
                 :recovery-probe-required="row.quota.recoveryProbeRequired"
                 :next-refresh-at="row.nextRefreshAt"
               />
+              <span
+                v-if="row.quotaProtectionReached"
+                class="mt-1 block text-cp-xs text-cp-warning-text"
+                :title="`养号使用阈值 ${row.quotaProtection?.usedPercentLimit ?? 90}%，已暂停分配新请求；真实上游额度见用量详情`"
+              >
+                养号阈值已达
+              </span>
             </template>
 
             <template #usage="{ row }">
@@ -451,12 +461,15 @@ const singleDeleteDescription = computed(() => pendingDeleteAccount.value?.lifec
       v-model:name="editingName"
       v-model:notes="editingNotes"
       v-model:enabled="schedulingEnabled"
+      v-model:quota-protection-enabled="quotaProtectionEnabled"
+      v-model:quota-protection-limit="quotaProtectionLimit"
       v-model:concurrency-limit="editingConcurrencyLimit"
       v-model:weight="editingWeight"
       v-model:model-access="editingModelAccess"
       v-model:proxy-mode="editingProxyMode"
       v-model:proxy-id="editingProxyId"
       v-model:selected-group-ids="editingGroupIds"
+      :quota-protection-supported="quotaProtectionSupported"
       :configuration-loading="configurationLoading"
       :configuration-ready="configurationReady"
       :account="editingAccount"

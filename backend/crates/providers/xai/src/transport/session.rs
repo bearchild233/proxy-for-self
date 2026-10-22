@@ -432,6 +432,8 @@ pub enum GrokSessionSelectorError {
     /// 没有会话同时满足模型、状态与排除约束。
     #[error("no eligible Grok Build session is available")]
     NoEligibleSession,
+    #[error("Grok account quota is exhausted")]
+    QuotaExhausted,
     /// 所有可用会话当前均被租出或处于限速间隔。
     #[error("Grok Build session capacity is unavailable")]
     CapacityUnavailable {

@@ -7,6 +7,7 @@ import { toast } from '@/components/base/BaseToast'
 import { useAsyncAction } from '@/composables/useAsyncAction'
 import { useRequestState } from '@/composables/useRequestState'
 import { accountModelAccessError } from '../utils/modelAccess'
+import { parseQuotaProtection, quotaProtectionMatches, supportsQuotaProtection } from '../utils/quotaProtection'
 import { concurrencyLimitInput, parseAccountSchedulingForm } from '../utils/schedulingForm'
 import { apiKeyAccountError, emptyApiKeyAccountForm } from '../utils/upstreamApiKey'
 
@@ -22,6 +23,9 @@ export function useAccountEditor(options: {
   const name = shallowRef('')
   const notes = shallowRef('')
   const schedulingEnabled = shallowRef(true)
+  const quotaProtectionSupported = shallowRef(false)
+  const quotaProtectionEnabled = shallowRef(false)
+  const quotaProtectionLimit = shallowRef('90')
   const concurrencyLimit = shallowRef('')
   const weight = shallowRef('1')
   const modelAccess = ref<AccountModelAccess | undefined>()
@@ -37,12 +41,20 @@ export function useAccountEditor(options: {
   const savedConfiguration = shallowRef<ApiKeyConfiguration>()
   let originalSettings = ''
   let originalGroups = ''
+  let originalQuotaProtection = ''
+  let savedQuotaProtectionLimit = 90
+
+  function quotaProtectionSettings() {
+    // 关闭时不提交隐藏输入，保留打开表单时已保存的阈值。
+    return parseQuotaProtection(quotaProtectionEnabled.value, quotaProtectionEnabled.value ? quotaProtectionLimit.value : String(savedQuotaProtectionLimit))
+  }
 
   function settingsFingerprint() {
     return JSON.stringify({
       name: name.value.trim(),
       notes: notes.value.trim(),
       enabled: schedulingEnabled.value,
+      quotaProtection: quotaProtectionSupported.value ? quotaProtectionSettings() : undefined,
       concurrencyLimit: concurrencyLimit.value.trim() === '' ? null : Number(concurrencyLimit.value),
       weight: Number(weight.value),
       modelAccess: { mode: modelAccess.value?.mode ?? 'all', models: [...new Set(modelAccess.value?.models ?? [])].sort() },
@@ -88,6 +100,11 @@ export function useAccountEditor(options: {
     proxyMode.value = 'preserve'
     proxyId.value = ''
     schedulingEnabled.value = account.enabled
+    quotaProtectionSupported.value = supportsQuotaProtection(account.quotaProtection)
+    quotaProtectionEnabled.value = account.quotaProtection?.enabled ?? false
+    quotaProtectionLimit.value = String(account.quotaProtection?.usedPercentLimit ?? 90)
+    savedQuotaProtectionLimit = quotaProtectionSupported.value ? account.quotaProtection!.usedPercentLimit : 90
+    originalQuotaProtection = JSON.stringify(quotaProtectionSettings())
     concurrencyLimit.value = concurrencyLimitInput(account.concurrencyLimit)
     weight.value = String(account.weight)
     modelAccess.value = { ...account.modelAccess, models: [...account.modelAccess.models] }
@@ -137,6 +154,16 @@ export function useAccountEditor(options: {
     }
 
     const groupsChanged = groupsFingerprint() !== originalGroups
+    const quotaProtection = quotaProtectionSettings()
+    const quotaProtectionChanged = JSON.stringify(quotaProtection) !== originalQuotaProtection
+    if (quotaProtectionChanged && !quotaProtectionSupported.value) {
+      toast.warning('当前网关不支持养号设置，请先更新网关')
+      return
+    }
+    if (quotaProtectionSupported.value && !quotaProtection) {
+      toast.warning('养号阈值必须为 1 至 99 的整数百分比')
+      return
+    }
     const settingsChanged = settingsFingerprint() !== originalSettings || proxyMode.value !== 'preserve'
     const connectionChanged = isApiKey && (
       apiKey.value.apiKey !== ''
@@ -155,6 +182,7 @@ export function useAccountEditor(options: {
         notes: notes.value,
         outboundProxyId: proxyMode.value === 'preserve' ? undefined : proxyMode.value === 'direct' ? '' : proxyId.value.trim(),
         enabled: schedulingEnabled.value,
+        quotaProtection: quotaProtectionChanged && quotaProtectionSupported.value && quotaProtection ? quotaProtection : undefined,
         concurrencyLimit: scheduling.values.concurrencyLimit,
         weight: scheduling.values.weight,
         modelAccess: modelAccess.value,
@@ -169,6 +197,12 @@ export function useAccountEditor(options: {
       }
       else {
         await updateAccount(settings)
+      }
+      if (quotaProtectionChanged && quotaProtection) {
+        // 旧网关可能忽略未知字段；回读确认后才宣告成功，保留未确认的表单供用户重试。
+        const detail = await getAccountDetail({ accountId })
+        if (!quotaProtectionMatches(detail.account.quotaProtection, quotaProtection))
+          throw new Error('未确认养号设置已保存，请检查网关支持并重新读取账号；其他账号修改可能已保存')
       }
       showEditModal.value = false
       toast.success('账号已更新')
@@ -190,12 +224,17 @@ export function useAccountEditor(options: {
     proxyMode.value = 'preserve'
     proxyId.value = ''
     schedulingEnabled.value = true
+    quotaProtectionSupported.value = false
+    quotaProtectionEnabled.value = false
+    quotaProtectionLimit.value = '90'
     concurrencyLimit.value = ''
     weight.value = '1'
     modelAccess.value = undefined
     selectedGroupIds.value = []
     originalSettings = ''
     originalGroups = ''
+    originalQuotaProtection = ''
+    savedQuotaProtectionLimit = 90
   })
 
   return {
@@ -207,6 +246,9 @@ export function useAccountEditor(options: {
     name,
     notes,
     schedulingEnabled,
+    quotaProtectionSupported,
+    quotaProtectionEnabled,
+    quotaProtectionLimit,
     concurrencyLimit,
     weight,
     modelAccess,

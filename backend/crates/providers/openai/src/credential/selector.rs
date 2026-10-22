@@ -525,6 +525,7 @@ impl CodexCredentialSelector {
                     let health = self
                         .account_feedback
                         .scheduling_signals(&self.provider_kind, account.id());
+                    let quota_signals = self.quota.scheduling_signals(&account);
                     let signals = scheduling
                         .signals()
                         .get(account.id())
@@ -538,9 +539,14 @@ impl CodexCredentialSelector {
                             failure_rate_basis_points: None,
                             first_output_latency_ms: None,
                         })
-                        .with_provider_quota(self.quota.scheduling_signals(&account))
+                        .with_provider_quota(quota_signals)
                         .with_rate_limit(rate_limits.get(account.id()).copied().flatten())
                         .with_runtime_health(health.0, health.1);
+                    let reached = !diagnostic
+                        && account.quota_protection().reached(
+                            quota_signals.and_then(|signals| signals.protection_used_percent()),
+                        );
+                    let account = account.with_quota_protection_reached(reached);
                     AccountCandidate { account, signals }
                 })
                 .collect::<Vec<_>>();

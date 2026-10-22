@@ -123,6 +123,16 @@ impl PluginUpstream for OpenAiPluginUpstream {
             if account.authentication_kind() != "oauth" {
                 return Err(RpcError::new(FORBIDDEN, "OAuth required"));
             }
+            self.quota
+                .prepare_scheduling(std::slice::from_ref(&account))
+                .await;
+            if account.quota_protection().reached(
+                self.quota
+                    .scheduling_signals(&account)
+                    .and_then(|signals| signals.protection_used_percent()),
+            ) {
+                return Err(RpcError::new(UNAVAILABLE, "quota_exhausted"));
+            }
             if !account.model_access().allows(&params.model) {
                 return Err(RpcError::new(FORBIDDEN, "model not allowed"));
             }

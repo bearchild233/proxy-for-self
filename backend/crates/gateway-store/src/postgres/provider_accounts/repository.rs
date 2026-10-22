@@ -142,7 +142,7 @@ impl ProviderAccountRepository for PgProviderAccountRepository {
         let rows = sqlx::query(
             "select location_country, location_region, location_city, location_timezone, outbound_proxy_url, id, provider_kind, name, notes, email, upstream_user_id,
                     upstream_account_id, plan_type, authentication_kind, credential_revision, has_refresh_token,
-                    access_token_expires_at, next_refresh_at, enabled, concurrency_limit, weight, lifecycle_json, model_access_json, credential_state,
+                    access_token_expires_at, next_refresh_at, enabled, concurrency_limit, weight, lifecycle_json, quota_protection_json, model_access_json, credential_state,
                     credential_observed_at, quota_access_state, quota_evidence,
                     quota_access_observed_at, quota_reset_at,
                     quota_observed_at, last_error_reason, last_error_message, created_at, updated_at
@@ -630,6 +630,16 @@ impl ProviderAccountAdminRepository for PgProviderAccountRepository {
                     &settings.group_ids,
                 )
                 .await?;
+                if let Some(protection) = settings.quota_protection {
+                    sqlx::query(
+                        "update provider_accounts set quota_protection_json=$2 where id=any($1)",
+                    )
+                    .bind(ids)
+                    .bind(sqlx::types::Json(protection))
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(|_| postgres_unavailable("set quota protection"))?;
+                }
                 if let Some(notes) = settings.notes.as_deref() {
                     update_provider_account_notes_in_transaction(&mut transaction, ids, notes)
                         .await?;
@@ -691,6 +701,12 @@ impl ProviderAccountAdminRepository for PgProviderAccountRepository {
                 command.outbound_proxy.as_ref(),
             )
             .await?;
+            if let Some(protection) = command.quota_protection {
+                sqlx::query("update provider_accounts set quota_protection_json=$2 where id=any($1)")
+                    .bind(&command.account_ids).bind(sqlx::types::Json(protection))
+                    .execute(&mut *transaction).await
+                    .map_err(|_| postgres_unavailable("set quota protection"))?;
+            }
             if command.expiry_priority == Some(true) {
                 let valid: i64 = sqlx::query_scalar("select count(*) from provider_accounts where id=any($1)
                     and provider_kind='openai' and authentication_kind='oauth' and lower(plan_type)='plus'")

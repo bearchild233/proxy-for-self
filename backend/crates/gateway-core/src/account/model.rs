@@ -763,6 +763,8 @@ const fn status_projection(status: AccountStatus) -> AccountStatusProjection {
 /// 账号持久事实；代理认证信息只通过显式 secret accessor 读取。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderAccount {
+    quota_protection: super::AccountQuotaProtection,
+    quota_protection_reached: bool,
     lifecycle: Option<Box<super::AccountLifecycle>>,
     id: ProviderAccountId,
     provider: ProviderKind,
@@ -814,6 +816,8 @@ impl ProviderAccount {
             concurrency_limit: None,
             weight: AccountWeight::DEFAULT,
             lifecycle: None,
+            quota_protection: super::AccountQuotaProtection::DISABLED,
+            quota_protection_reached: false,
             model_access: super::AccountModelAccess::all(),
             credential_state: CredentialState::Unknown,
             quota: QuotaState::unknown(),
@@ -837,6 +841,24 @@ impl ProviderAccount {
         self.email = email;
         self.upstream_account_id = upstream_account_id;
         self.plan_type = plan_type;
+        self
+    }
+
+    #[must_use]
+    pub fn with_quota_protection(mut self, protection: super::AccountQuotaProtection) -> Self {
+        self.quota_protection = protection;
+        self
+    }
+
+    #[must_use]
+    pub const fn quota_protection(&self) -> super::AccountQuotaProtection {
+        self.quota_protection
+    }
+
+    /// 只叠加本次准入事实，不写回上游额度或凭据状态。
+    #[must_use]
+    pub const fn with_quota_protection_reached(mut self, reached: bool) -> Self {
+        self.quota_protection_reached = reached;
         self
     }
 
@@ -1054,7 +1076,7 @@ impl ProviderAccount {
         now: SystemTime,
         cooldown: Option<AccountCooldown>,
     ) -> AccountStatusProjection {
-        resolve_account_status(
+        let mut projection = resolve_account_status(
             &AccountStatusFacts {
                 enabled: self.enabled,
                 credential_state: self.credential_state,
@@ -1065,7 +1087,17 @@ impl ProviderAccount {
                 last_error_message: self.last_error_message.clone(),
             },
             now,
-        )
+        );
+        if self.quota_protection_reached
+            && matches!(
+                projection.status,
+                AccountStatus::Normal | AccountStatus::RateLimited
+            )
+        {
+            projection.status = AccountStatus::QuotaExhausted;
+            projection.cooldown = None;
+        }
+        projection
     }
 }
 

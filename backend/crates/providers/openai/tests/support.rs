@@ -139,6 +139,17 @@ impl MemoryAccountStore {
             .with_scheduling(concurrency_limit, weight);
     }
 
+    pub(crate) fn set_quota_protection(
+        &self,
+        id: &str,
+        protection: gateway_core::account::AccountQuotaProtection,
+    ) {
+        let id = ProviderAccountId::new(id).expect("valid account ID");
+        let mut accounts = self.accounts.lock().expect("account store lock");
+        let stored = accounts.get_mut(&id).expect("seeded account");
+        stored.account = stored.account.clone().with_quota_protection(protection);
+    }
+
     pub(crate) fn set_egress(
         &self,
         id: &str,
@@ -651,6 +662,7 @@ fn rebuild_account(current: &ProviderAccount, rebuild: AccountRebuild) -> Provid
         rebuild.last_error_message,
     )
     .with_scheduling(current.concurrency_limit(), current.weight())
+    .with_quota_protection(current.quota_protection())
     .with_outbound_proxy(current.outbound_proxy().cloned())
     .with_request_location(current.request_location().cloned())
     .with_lifecycle(current.lifecycle().clone())

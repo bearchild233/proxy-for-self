@@ -2460,6 +2460,30 @@ async fn selector_capacity_failure_occurs_before_visible_upstream_send() {
 }
 
 #[tokio::test]
+async fn selector_quota_protection_uses_standard_exhaustion_without_upstream_send() {
+    let transport = StubInferenceTransport::success();
+    let provider = provider(
+        StubSelector::failing(GrokSessionSelectorError::QuotaExhausted),
+        transport.clone(),
+    )
+    .await;
+    let error = match provider
+        .execute(
+            provider_request("xai"),
+            context(CancellationToken::new(), None),
+        )
+        .await
+    {
+        Ok(_) => panic!("quota protection must reject selection"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), ProviderErrorKind::QuotaExhausted);
+    assert_eq!(error.send_state(), UpstreamSendState::NotSent);
+    assert!(error.client_visible_upstream_error().is_none());
+    assert_eq!(transport.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn selection_failures_carry_a_distinguishable_client_error_code() {
     let cases = [
         (

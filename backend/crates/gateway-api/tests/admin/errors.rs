@@ -469,6 +469,7 @@ mod provider {
         };
         AccountPageItem {
             account: AccountRecord {
+                quota_protection: Default::default(),
                 lifecycle: Default::default(),
                 notes: None,
                 model_access: Default::default(),

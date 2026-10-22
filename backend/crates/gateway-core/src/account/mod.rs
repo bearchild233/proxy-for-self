@@ -6,6 +6,8 @@ pub use location::{InvalidRequestLocation, RequestLocation};
 mod lifecycle;
 pub use lifecycle::AccountLifecycle;
 mod model;
+mod quota_protection;
+pub use quota_protection::AccountQuotaProtection;
 mod model_access;
 pub use model_access::{
     AccountModelAccess, AccountModelAccessMode, InvalidAccountModelAccess,

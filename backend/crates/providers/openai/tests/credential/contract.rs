@@ -53,6 +53,169 @@ fn create_account(store: &Arc<MemoryAccountStore>, id: &str, token: &str) {
     }));
 }
 
+fn seed_protected_quota(store: &Arc<MemoryAccountStore>, id: &str, used: f64, enabled: bool) {
+    let config = gateway_core::account::AccountQuotaProtection::new(enabled, 90).unwrap();
+    store.set_quota_protection(id, config);
+    let account = store.account(id).unwrap();
+    let now = SystemTime::now();
+    let reset = (now + Duration::from_secs(3600))
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    block_on(
+        store.compare_and_swap_quota(QuotaObservation {
+            plan_type: None,
+            account_id: account.id().clone(),
+            expected_revision: account.revision(),
+            quota: OpaqueProviderData::new(
+                json!({"rate_limit": {
+                    "allowed": true,
+                    "primary_window": {"used_percent": used, "reset_at": reset}
+                }})
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+            observed_at: now,
+            state: QuotaState::allowed(now),
+        }),
+    )
+    .expect("persist real allowed quota");
+}
+
+#[test]
+fn quota_protection_reserves_quota_at_the_threshold_without_mutating_upstream_access() {
+    for (used, enabled, blocked) in [
+        (89.999, true, false),
+        (90.0, true, true),
+        (99.0, false, false),
+    ] {
+        let store = Arc::new(MemoryAccountStore::default());
+        create_account(&store, "acct_primary", "at-primary");
+        seed_protected_quota(&store, "acct_primary", used, enabled);
+        let selector = selector(&store, Arc::new(TestLeaseCoordinator::default()));
+        let context = attempt(BTreeSet::new());
+        let result = block_on(selector.select(&SelectCodexCredential {
+            upstream_model: "gpt-5.4",
+            request_url: &Url::parse("https://chatgpt.com/backend-api/codex/responses").unwrap(),
+            attempt: &context,
+            session_affinity_key: None,
+        }));
+        if blocked {
+            assert!(
+                matches!(result, Err(CredentialSelectionError::QuotaExhausted)),
+                "usage {used}, enabled {enabled}: {result:?}"
+            );
+        } else {
+            assert!(
+                result.is_ok(),
+                "usage {used}, enabled {enabled}: {result:?}"
+            );
+        }
+        assert_eq!(
+            store.account("acct_primary").unwrap().quota().access(),
+            QuotaAccessState::Allowed
+        );
+    }
+}
+
+#[test]
+fn quota_protection_uses_an_available_alternative_but_never_escapes_a_required_account() {
+    let store = Arc::new(MemoryAccountStore::default());
+    create_account(&store, "acct_primary", "at-primary");
+    create_account(&store, "acct_other", "at-other");
+    seed_protected_quota(&store, "acct_primary", 95.0, true);
+    let selector = selector(&store, Arc::new(TestLeaseCoordinator::default()));
+    let url = Url::parse("https://chatgpt.com/backend-api/codex/responses").unwrap();
+    let context = attempt(BTreeSet::new());
+    let lease = block_on(selector.select(&SelectCodexCredential {
+        upstream_model: "gpt-5.4",
+        request_url: &url,
+        attempt: &context,
+        session_affinity_key: None,
+    }))
+    .expect("fallback remains usable");
+    assert_eq!(lease.account_id().as_str(), "acct_other");
+    drop(lease);
+    let pinned = attempt_with_required(
+        BTreeSet::new(),
+        Some(ProviderAccountId::new("acct_primary").unwrap()),
+    );
+    assert!(matches!(
+        block_on(selector.select(&SelectCodexCredential {
+            upstream_model: "gpt-5.4",
+            request_url: &url,
+            attempt: &pinned,
+            session_affinity_key: None,
+        })),
+        Err(CredentialSelectionError::QuotaExhausted)
+    ));
+}
+
+#[test]
+fn quota_protection_does_not_disguise_busy_alternatives_as_all_quota_exhausted() {
+    let store = Arc::new(MemoryAccountStore::default());
+    create_account(&store, "acct_primary", "at-primary");
+    create_account(&store, "acct_other", "at-other");
+    seed_protected_quota(&store, "acct_primary", 95.0, true);
+    let leases = Arc::new(TestLeaseCoordinator::default());
+    *leases.in_flight.lock().unwrap() = 2;
+    let selector = selector(&store, leases);
+    let context = attempt(BTreeSet::new());
+    assert!(matches!(
+        block_on(selector.select(&SelectCodexCredential {
+            upstream_model: "gpt-5.4",
+            request_url: &Url::parse("https://chatgpt.com/backend-api/codex/responses").unwrap(),
+            attempt: &context,
+            session_affinity_key: None,
+        })),
+        Err(CredentialSelectionError::CapacityUnavailable { .. })
+    ));
+}
+
+#[test]
+fn native_continuation_surfaces_protection_exhaustion_without_selecting_the_fallback() {
+    let store = Arc::new(MemoryAccountStore::default());
+    create_account(&store, "acct_original", "at-original");
+    create_account(&store, "acct_fallback", "at-fallback");
+    seed_protected_quota(&store, "acct_original", 95.0, true);
+    let selector = selector(&store, Arc::new(TestLeaseCoordinator::default()));
+    let continuation = NativeContinuationPin::new(
+        PreviousResponseId::new("previous-response"),
+        PreviousResponseId::new("upstream-response"),
+        ClientApiKeyId::new("key_codex_contract").unwrap(),
+        ProviderKind::new("openai").unwrap(),
+        ProviderAccountId::new("acct_original").unwrap(),
+    );
+    let context = AttemptContext::new(
+        RequestAttemptContext::new(
+            ModelRequestId::new("req_native_protection").unwrap(),
+            ClientApiKeyId::new("key_codex_contract").unwrap(),
+        ),
+        NonZeroU32::new(1).unwrap(),
+        SystemTime::now() + Duration::from_secs(30),
+        account_policy(),
+        AccountAttemptContext::new(BTreeSet::new(), None, None)
+            .with_account_scope(contract_account_scope()),
+        Some(ContinuationBinding::Pinned(continuation)),
+        CancellationToken::new(),
+    );
+    let result = block_on(selector.select(&SelectCodexCredential {
+        upstream_model: "gpt-5.4",
+        request_url: &Url::parse("https://chatgpt.com/backend-api/codex/responses").unwrap(),
+        attempt: &context,
+        session_affinity_key: None,
+    }));
+    assert!(matches!(
+        result,
+        Err(CredentialSelectionError::QuotaExhausted)
+    ));
+    assert_eq!(
+        store.account("acct_original").unwrap().quota().access(),
+        QuotaAccessState::Allowed
+    );
+}
+
 #[test]
 fn snapshot_capacity_blocker_reports_busy_without_queueing() {
     let store = Arc::new(MemoryAccountStore::default());

@@ -62,6 +62,7 @@ pub struct ListQuery {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BatchUpdateAccountsRequest {
+    pub quota_protection: Option<gateway_core::account::AccountQuotaProtection>,
     pub expiry_priority: Option<bool>,
     #[serde(default)]
     pub restore_archived: bool,
@@ -121,7 +122,8 @@ impl BatchUpdateAccountsRequest {
             .map(parse_concurrency_limit)
             .transpose()?;
         self.weight.map(parse_account_weight).transpose()?;
-        if self.expiry_priority.is_none()
+        if self.quota_protection.is_none()
+            && self.expiry_priority.is_none()
             && !self.restore_archived
             && self.enabled.is_none()
             && self.concurrency_limit.is_none()
@@ -139,6 +141,7 @@ impl BatchUpdateAccountsRequest {
     pub(super) fn into_command(self) -> Result<BatchUpdateAccounts, WireValidationError> {
         self.validate()?;
         Ok(BatchUpdateAccounts {
+            quota_protection: self.quota_protection,
             expiry_priority: self.expiry_priority,
             restore_archived: self.restore_archived,
             outbound_proxy: proxy_selection(self.outbound_proxy_id, self.outbound_proxy_url)?,
@@ -275,6 +278,8 @@ pub struct AccountSummaryView {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountView {
+    pub quota_protection: gateway_core::account::AccountQuotaProtection,
+    pub quota_protection_reached: bool,
     pub outbound_proxy_endpoint: Option<String>,
     pub id: String,
     pub name: String,

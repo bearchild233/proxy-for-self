@@ -12,6 +12,8 @@
 
 ## 实现逻辑
 
+**账号政策类型**：`frontend/src/api/modules/accounts.ts` 定义可选 `quotaProtection` 与 `quotaProtectionReached`，供账号插件跨版本读取；更新和批量更新允许携带完整的开关及整数阈值。实际编辑、旧网关兼容与保存核验由 accounts 插件负责，主壳不参与选号或额度判定。
+
 **启动**（`main.ts`）：注册 `v-loading` 指令、Pinia、`useThemeStore().initializeTheme()`、路由、`authPlugin`（挂载 401 会话失效处理），挂载 `App.vue`。
 
 **路由与登录**（`router/`）：几乎所有受保护路由（`/`、`/accounts`、`/proxies`、`/groups`、`/keys`、`/usage`、`/theme`、`/settings*`、`/extensions/:plugin/:page?`、独立的 `/key-usage`）都指向同一个 `PluginRoute.vue`，由插件页面声明的 `route` 决定显示谁；`/settings/plugins` 是主壳自带的 `PluginManager.vue`。`beforeEach`：先 `checkAuth`（本机预览 origin 下自动走 `/api/plugin-platform/local-login`），未登录跳 `/login`（带 `redirect`），Key 身份只能进 `/key-usage`，管理员访问 `/key-usage` 回仪表盘。管理员与 Key 共用 `/api/auth/*`，Auth Store 只有一份。

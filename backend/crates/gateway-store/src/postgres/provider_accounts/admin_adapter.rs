@@ -292,6 +292,9 @@ impl PgAdminAccountStore {
         };
         let mut changed_fields = vec!["credentials".to_owned()];
         if let Some(settings) = &settings {
+            if settings.quota_protection.is_some() {
+                changed_fields.push("quota_protection".to_owned());
+            }
             changed_fields
                 .extend(["enabled", "concurrency_limit", "weight", "groups"].map(str::to_owned));
             if settings.model_access.is_some() {
@@ -704,6 +707,9 @@ impl AccountStore for PgAdminAccountStore {
             "weight".to_owned(),
             "groups".to_owned(),
         ];
+        if command.quota_protection.is_some() {
+            changed_fields.push("quota_protection".to_owned());
+        }
         if command.model_access.is_some() {
             changed_fields.push("model_access".to_owned());
         }
@@ -719,6 +725,7 @@ impl AccountStore for PgAdminAccountStore {
         let config_revision = self
             .accounts
             .batch_update_provider_accounts_admin(BatchUpdateProviderAccountsAdmin {
+                quota_protection: command.quota_protection,
                 expiry_priority: None,
                 restore_archived: false,
                 name: command.name,
@@ -882,6 +889,9 @@ impl AccountStore for PgAdminAccountStore {
                 changed_fields.push(field.to_owned());
             }
         }
+        if command.quota_protection.is_some() {
+            changed_fields.push("quota_protection".to_owned());
+        }
         if command.model_access.is_some() {
             changed_fields.push("model_access".to_owned());
         }
@@ -891,6 +901,7 @@ impl AccountStore for PgAdminAccountStore {
         let config_revision = self
             .accounts
             .batch_update_provider_accounts_admin(BatchUpdateProviderAccountsAdmin {
+                quota_protection: command.quota_protection,
                 expiry_priority: command.expiry_priority,
                 restore_archived: command.restore_archived,
                 name: None,

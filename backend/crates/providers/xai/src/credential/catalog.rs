@@ -176,6 +176,12 @@ impl GrokQuotaSnapshot {
     pub const fn billing(&self) -> &GrokBillingPresentation {
         &self.billing
     }
+
+    /// 展示与真实准入共用观测时效，避免过期百分比仍显示为本地保护。
+    pub(crate) fn scheduling_signals(&self) -> Option<AccountQuotaSignals> {
+        quota_projection_ttl(self)?;
+        quota_scheduling_signals(self.billing())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -261,14 +267,14 @@ impl GrokQuotaSchedulingProjection {
     }
 
     fn observe(&self, snapshot: &GrokQuotaSnapshot) -> bool {
-        let Some(remaining_ttl) = quota_projection_ttl(snapshot.observed_at()) else {
+        let Some(remaining_ttl) = quota_projection_ttl(snapshot) else {
             return false;
         };
         self.replace(
             snapshot.account_id().clone(),
             snapshot.credential_revision(),
             remaining_ttl,
-            quota_scheduling_signals(snapshot.billing()),
+            snapshot.scheduling_signals(),
         );
         true
     }
@@ -278,7 +284,7 @@ impl GrokQuotaSchedulingProjection {
         target: &GrokQuotaHydrationTarget,
         snapshot: &GrokQuotaSnapshot,
     ) -> bool {
-        let Some(remaining_ttl) = quota_projection_ttl(snapshot.observed_at()) else {
+        let Some(remaining_ttl) = quota_projection_ttl(snapshot) else {
             return false;
         };
         let mut state = self
@@ -298,7 +304,7 @@ impl GrokQuotaSchedulingProjection {
             snapshot.account_id().clone(),
             snapshot.credential_revision(),
             remaining_ttl,
-            quota_scheduling_signals(snapshot.billing()),
+            snapshot.scheduling_signals(),
         );
         true
     }
@@ -1290,21 +1296,30 @@ fn quota_snapshot_from_observation(observation: &QuotaObservation) -> Option<Gro
     })
 }
 
-fn quota_projection_ttl(observed_at: DateTime<Utc>) -> Option<Duration> {
-    let age = SystemTime::now()
-        .duration_since(SystemTime::from(observed_at))
+fn quota_projection_ttl(snapshot: &GrokQuotaSnapshot) -> Option<Duration> {
+    let now = SystemTime::now();
+    let age = now
+        .duration_since(SystemTime::from(snapshot.observed_at()))
         .unwrap_or(Duration::ZERO);
-    QUOTA_SCHEDULING_TTL
-        .checked_sub(age)
-        .filter(|remaining| !remaining.is_zero())
+    let observation_ttl = QUOTA_SCHEDULING_TTL.checked_sub(age)?;
+    // 进程缓存也必须在官方周期边界失效，不能把旧周期的养号保护延长至缓存 TTL。
+    let remaining = match billing_period_end(snapshot.billing()) {
+        Some(period_end) => observation_ttl.min(period_end.duration_since(now).ok()?),
+        None => observation_ttl,
+    };
+    (!remaining.is_zero()).then_some(remaining)
+}
+
+fn billing_period_end(billing: &GrokBillingPresentation) -> Option<SystemTime> {
+    billing
+        .period_end()
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| SystemTime::from(value.to_utc()))
 }
 
 fn quota_scheduling_signals(billing: &GrokBillingPresentation) -> Option<AccountQuotaSignals> {
     let now = SystemTime::now();
-    let period_end = billing
-        .period_end()
-        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-        .map(|value| SystemTime::from(value.to_utc()));
+    let period_end = billing_period_end(billing);
     let observation_expired = period_end.is_some_and(|period_end| period_end <= now);
     let remaining_rank = (!observation_expired)
         .then(|| {
@@ -1315,8 +1330,13 @@ fn quota_scheduling_signals(billing: &GrokBillingPresentation) -> Option<Account
         })
         .flatten();
     let reset_at = period_end.filter(|reset_at| *reset_at > now);
-    (remaining_rank.is_some() || reset_at.is_some())
-        .then(|| AccountQuotaSignals::new(reset_at, remaining_rank))
+    (remaining_rank.is_some() || reset_at.is_some()).then(|| {
+        AccountQuotaSignals::new(reset_at, remaining_rank).with_protection_used_percent(
+            (!observation_expired)
+                .then(|| billing.used_percent())
+                .flatten(),
+        )
+    })
 }
 
 /// 把 xAI billing 文档归一化为访问结论。缺少正反证据时返回 Unknown，

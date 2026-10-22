@@ -94,6 +94,7 @@ pub enum AccountGroupFilter {
 /// 账号公共存储投影；Provider 专属字段不进入此结构。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountRecord {
+    pub quota_protection: gateway_core::account::AccountQuotaProtection,
     pub lifecycle: gateway_core::account::AccountLifecycle,
     pub id: String,
     pub provider_kind: ProviderKind,
@@ -231,6 +232,7 @@ pub struct AccountSummary {
 /// 账号可编辑事实的一次性替换命令。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateAccount {
+    pub quota_protection: Option<gateway_core::account::AccountQuotaProtection>,
     pub name: Option<String>,
     pub account_id: String,
     /// 缺省保留备注；空字符串清空备注。
@@ -253,6 +255,7 @@ pub struct AccountUpdateResult {
 /// 仅修改显式字段的批量账号设置命令。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BatchUpdateAccounts {
+    pub quota_protection: Option<gateway_core::account::AccountQuotaProtection>,
     pub expiry_priority: Option<bool>,
     pub restore_archived: bool,
     pub account_ids: Vec<String>,

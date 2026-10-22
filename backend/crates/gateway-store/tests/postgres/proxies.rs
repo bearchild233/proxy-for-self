@@ -169,6 +169,7 @@ fn success() -> ProxyTestResult {
 
 fn update(account_id: &str, selection: AccountProxySelection) -> UpdateAccount {
     UpdateAccount {
+        quota_protection: None,
         name: None,
         notes: None,
         model_access: Default::default(),
@@ -822,6 +823,7 @@ async fn legacy_urls_join_one_catalog_entry_and_invalid_batch_rolls_back() {
         admin
             .batch_update_accounts(
                 BatchUpdateAccounts {
+                    quota_protection: None,
                     expiry_priority: None,
                     restore_archived: false,
                     model_access: Default::default(),

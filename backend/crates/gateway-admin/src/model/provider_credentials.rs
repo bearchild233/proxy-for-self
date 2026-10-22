@@ -753,6 +753,8 @@ pub struct ProviderCreditBalance {
 /// Provider 已解析的 quota 结果及其不透明差异字段。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProviderQuota {
+    /// Provider 按调度时效规则解析的账号级使用率；展示层不重新解释窗口。
+    pub protection_used_percent: Option<f64>,
     /// 展示用 Credits 余额；不参与账号额度访问结论。
     pub credits: Option<ProviderCreditBalance>,
     /// 上游额度响应明确提供的套餐，可用于补全账号展示。

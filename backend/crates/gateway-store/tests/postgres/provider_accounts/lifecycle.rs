@@ -21,6 +21,7 @@ async fn lifecycle_cas_archive_filter_and_restore_preserve_base_weight() {
         request_id: "lifecycle".to_owned(),
     };
     let command = BatchUpdateAccounts {
+        quota_protection: None,
         account_ids: vec![id.to_string()],
         expiry_priority: Some(true),
         restore_archived: false,
@@ -78,6 +79,7 @@ async fn lifecycle_cas_archive_filter_and_restore_preserve_base_weight() {
     store
         .batch_update_accounts(
             BatchUpdateAccounts {
+                quota_protection: None,
                 expiry_priority: None,
                 restore_archived: true,
                 ..command

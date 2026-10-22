@@ -12,6 +12,8 @@
 
 ## 实现逻辑
 
+**养号 HTTP 合同**：账号详情与列表返回 `quotaProtection { enabled, usedPercentLimit }` 和独立的 `quotaProtectionReached`。单个更新、批量更新与 API Key 轮换设置接受完整政策对象，阈值只允许 1–99 的整数，省略字段保留配置。展示投影只消费 Provider 给出的有效使用率，不改写上游 `quota` 或账号五态。请求校验测试覆盖单个更新、只改政策的批量更新、范围、类型、缺失成员和未知成员。
+
 **Router 装配**（`src/lib.rs::initialize`）：`/healthz`、OpenAI 数据面（`/v1/*`）、管理面（`/api/admin/*`）、统一登录（`/api/auth/*`）、Key 自助用量（`/api/key-usage/*`）、插件控制面（`/api/plugins*`、`/api/plugin-devices/*`），其余走静态资源（`ServeDir` + `index.html` 回退，目录来自配置或 `CPR_WEB_DIST_DIR`）。外层依次叠加：可选 CORS（仅 GET/POST、显式头）、可选请求超时、trace（info span 带 request_id）、请求 ID 生成与回传、来源解析中间件。
 
 **来源解析**（`src/client_ip.rs`）：只信任配置的 `trusted_proxy_ips` 对端提供的唯一合法 `X-Real-IP`，清除其他来源头，把规范化地址写入 `ConnectInfo`，HTTP 与 WS 共用；`/healthz` 对可信代理允许无来源头。

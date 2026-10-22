@@ -284,6 +284,49 @@ mod batch_update {
     use serde_json::json;
 
     #[test]
+    fn quota_protection_updates_validate_the_policy_and_preserve_omission() {
+        let single = json!({
+            "accountId": "acct_protected", "enabled": true,
+            "concurrencyLimit": null, "weight": 50, "groupIds": []
+        });
+        let omitted: UpdateAccountRequest = serde_json::from_value(single.clone()).unwrap();
+        assert!(omitted.quota_protection.is_none());
+        for enabled in [false, true] {
+            for limit in [1, 90, 99] {
+                let policy = json!({"enabled": enabled, "usedPercentLimit": limit});
+                let batch: BatchUpdateAccountsRequest = serde_json::from_value(json!({
+                    "accountIds": ["acct_protected"], "quotaProtection": policy
+                }))
+                .unwrap();
+                batch.validate().expect("policy-only batch mutation");
+                assert_eq!(batch.quota_protection.unwrap().used_percent_limit(), limit);
+                let mut input = single.clone();
+                input["quotaProtection"] = policy;
+                let request: UpdateAccountRequest = serde_json::from_value(input).unwrap();
+                request.validate().expect("single policy mutation");
+            }
+        }
+        for policy in [
+            json!({"enabled":true,"usedPercentLimit":0}),
+            json!({"enabled":true,"usedPercentLimit":100}),
+            json!({"enabled":true,"usedPercentLimit":90.5}),
+            json!({"enabled":true}),
+            json!({"enabled":"true","usedPercentLimit":90}),
+            json!({"enabled":true,"usedPercentLimit":90,"extra":true}),
+        ] {
+            let mut input = single.clone();
+            input["quotaProtection"] = policy.clone();
+            assert!(serde_json::from_value::<UpdateAccountRequest>(input).is_err());
+            assert!(
+                serde_json::from_value::<BatchUpdateAccountsRequest>(json!({
+                    "accountIds": ["acct_protected"], "quotaProtection": policy
+                }))
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn batch_update_should_accept_complete_atomic_payload() {
         let request: BatchUpdateAccountsRequest = serde_json::from_value(json!({
             "accountIds": ["acct_openai", "acct_xai"],

@@ -98,6 +98,7 @@ struct SelectorFixture {
     coordinator: Arc<SchedulingCoordinator>,
     cooldowns: Arc<MemoryCooldownPort>,
     feedback: Arc<AccountFeedbackStats>,
+    quota: Arc<provider_xai::GrokCredentialQuotaService>,
 }
 
 impl SelectorFixture {
@@ -161,7 +162,7 @@ impl SelectorFixture {
             gateway_core::routing::ProviderKind::new("xai").expect("provider"),
             repository.clone(),
             catalog_cache,
-            quota,
+            Arc::clone(&quota),
             lease_port,
             cooldowns.clone(),
             Arc::clone(&feedback),
@@ -173,6 +174,7 @@ impl SelectorFixture {
             coordinator,
             cooldowns,
             feedback,
+            quota,
         }
     }
 
@@ -278,6 +280,227 @@ impl SelectorFixture {
             .expect("persist quota");
         assert_eq!(outcome, QuotaWriteOutcome::Updated);
     }
+}
+
+#[tokio::test]
+async fn quota_protection_reserves_usage_without_changing_official_quota() {
+    for (usage, enabled, blocked) in [
+        (89.999, true, false),
+        (90.0, true, true),
+        (99.0, false, false),
+    ] {
+        let fixture = SelectorFixture::new(&["protected"]).await;
+        let id = account_id("protected");
+        fixture.store.set_quota_protection(
+            &id,
+            gateway_core::account::AccountQuotaProtection::new(enabled, 90).unwrap(),
+        );
+        fixture
+            .seed_quota(&id, usage, Duration::from_secs(600))
+            .await;
+        let original_quota = fixture.store.account(&id).unwrap().quota();
+        let result = fixture
+            .selector
+            .select(fixture.request(BTreeSet::new()))
+            .await;
+        if blocked {
+            assert!(matches!(
+                result,
+                Err(GrokSessionSelectorError::QuotaExhausted)
+            ));
+            assert!(fixture.coordinator.requests.lock().unwrap().is_empty());
+        } else {
+            assert!(
+                result.is_ok(),
+                "usage {usage}, enabled {enabled}: {result:?}"
+            );
+        }
+        assert_eq!(fixture.store.account(&id).unwrap().quota(), original_quota);
+    }
+}
+
+#[tokio::test]
+async fn quota_protection_selects_an_alternative_but_preserves_the_required_owner() {
+    let fixture = SelectorFixture::new(&["protected", "available"]).await;
+    let id = account_id("protected");
+    fixture.store.set_quota_protection(
+        &id,
+        gateway_core::account::AccountQuotaProtection::new(true, 90).unwrap(),
+    );
+    fixture
+        .seed_quota(&id, 95.0, Duration::from_secs(600))
+        .await;
+    let session = fixture
+        .selector
+        .select(fixture.request(BTreeSet::new()))
+        .await
+        .unwrap();
+    assert_eq!(session.account_id(), &account_id("available"));
+    let result = fixture
+        .selector
+        .select(fixture.request_with_required(BTreeSet::new(), Some(id.clone())))
+        .await;
+    assert!(matches!(
+        result,
+        Err(GrokSessionSelectorError::QuotaExhausted)
+    ));
+    fixture.store.set_quota_protection(
+        &id,
+        gateway_core::account::AccountQuotaProtection::new(false, 90).unwrap(),
+    );
+    let resumed = fixture
+        .selector
+        .select(fixture.request_with_required(BTreeSet::new(), Some(id.clone())))
+        .await
+        .unwrap();
+    assert_eq!(resumed.account_id(), &id);
+}
+
+#[tokio::test]
+async fn quota_protection_precedes_account_and_model_cooldown_for_a_required_owner() {
+    for model_cooldown in [false, true] {
+        let fixture = SelectorFixture::new(&["protected", "available"]).await;
+        let id = account_id("protected");
+        fixture
+            .seed_quota(&id, 95.0, Duration::from_secs(600))
+            .await;
+        let session = fixture
+            .selector
+            .select(fixture.request_with_required(BTreeSet::new(), Some(id.clone())))
+            .await
+            .unwrap();
+        let failure = if model_cooldown {
+            GrokCredentialFailure::ModelQuotaExhausted {
+                upstream_model: UpstreamModelId::new("grok-4.5").unwrap(),
+                retry_after: Some(Duration::from_secs(60)),
+            }
+        } else {
+            GrokCredentialFailure::RateLimited {
+                retry_after: Some(Duration::from_secs(60)),
+            }
+        };
+        fixture.selector.record_failure(&session, failure).await;
+        fixture.store.set_quota_protection(
+            &id,
+            gateway_core::account::AccountQuotaProtection::new(true, 90).unwrap(),
+        );
+        let result = fixture
+            .selector
+            .select(fixture.request_with_required(BTreeSet::new(), Some(id)))
+            .await;
+        assert!(matches!(
+            result,
+            Err(GrokSessionSelectorError::QuotaExhausted)
+        ));
+        assert_eq!(fixture.coordinator.requests.lock().unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn quota_protection_does_not_hide_cooling_or_busy_alternatives() {
+    let fixture = SelectorFixture::new(&["protected", "recoverable"]).await;
+    let id = account_id("protected");
+    let recoverable = account_id("recoverable");
+    fixture.store.set_quota_protection(
+        &id,
+        gateway_core::account::AccountQuotaProtection::new(true, 90).unwrap(),
+    );
+    fixture
+        .seed_quota(&id, 95.0, Duration::from_secs(600))
+        .await;
+    let session = fixture
+        .selector
+        .select(fixture.request_with_required(BTreeSet::new(), Some(recoverable.clone())))
+        .await
+        .unwrap();
+    fixture
+        .coordinator
+        .denied
+        .lock()
+        .unwrap()
+        .insert(recoverable);
+    let busy = fixture
+        .selector
+        .select(fixture.request(BTreeSet::new()))
+        .await;
+    assert!(matches!(
+        busy,
+        Err(GrokSessionSelectorError::CapacityUnavailable { .. })
+    ));
+    fixture
+        .selector
+        .record_failure(
+            &session,
+            GrokCredentialFailure::RateLimited {
+                retry_after: Some(Duration::from_secs(60)),
+            },
+        )
+        .await;
+    let cooling = fixture
+        .selector
+        .select(fixture.request(BTreeSet::new()))
+        .await;
+    assert!(matches!(
+        cooling,
+        Err(GrokSessionSelectorError::AccountCoolingDown { .. })
+    ));
+}
+
+#[tokio::test]
+async fn quota_protection_releases_the_cached_account_at_its_period_boundary() {
+    let fixture = SelectorFixture::new(&["protected"]).await;
+    let id = account_id("protected");
+    fixture.store.set_quota_protection(
+        &id,
+        gateway_core::account::AccountQuotaProtection::new(true, 90).unwrap(),
+    );
+    fixture.seed_quota(&id, 95.0, Duration::from_secs(1)).await;
+    let blocked = fixture
+        .selector
+        .select(fixture.request(BTreeSet::new()))
+        .await;
+    assert!(matches!(
+        blocked,
+        Err(GrokSessionSelectorError::QuotaExhausted)
+    ));
+    tokio::time::sleep(Duration::from_millis(1_050)).await;
+    let resumed = fixture
+        .selector
+        .select(fixture.request(BTreeSet::new()))
+        .await
+        .unwrap();
+    assert_eq!(resumed.account_id(), &id);
+}
+
+#[tokio::test]
+async fn quota_protection_resumes_after_a_new_lower_usage_observation() {
+    let fixture = SelectorFixture::new(&["protected"]).await;
+    let id = account_id("protected");
+    fixture.store.set_quota_protection(
+        &id,
+        gateway_core::account::AccountQuotaProtection::new(true, 90).unwrap(),
+    );
+    fixture
+        .seed_quota(&id, 95.0, Duration::from_secs(600))
+        .await;
+    let blocked = fixture
+        .selector
+        .select(fixture.request(BTreeSet::new()))
+        .await;
+    assert!(matches!(
+        blocked,
+        Err(GrokSessionSelectorError::QuotaExhausted)
+    ));
+    fixture
+        .seed_quota(&id, 10.0, Duration::from_secs(600))
+        .await;
+    fixture.quota.read_account(&id).await.unwrap().unwrap();
+    let resumed = fixture
+        .selector
+        .select(fixture.request(BTreeSet::new()))
+        .await
+        .unwrap();
+    assert_eq!(resumed.account_id(), &id);
 }
 
 #[tokio::test]
