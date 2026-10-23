@@ -1,13 +1,18 @@
 <script setup lang="ts">
 import { computed } from 'vue'
+import BaseButton from '@/components/base/BaseButton.vue'
 import BaseInput from '@/components/base/BaseInput.vue'
 import BaseSwitch from '@/components/base/BaseSwitch.vue'
-import { parseQuotaProtection } from '../utils/quotaProtection'
+import { parseQuotaProtection, QUOTA_PROTECTION_PRESETS } from '../utils/quotaProtection'
 
 defineProps<{ supported: boolean, disabled: boolean }>()
 const enabled = defineModel<boolean>('enabled', { required: true })
 const usedPercentLimit = defineModel<string>('usedPercentLimit', { required: true })
 const parsed = computed(() => parseQuotaProtection(enabled.value, usedPercentLimit.value))
+
+function selectPreset(value: number) {
+  usedPercentLimit.value = String(value)
+}
 </script>
 
 <template>
@@ -34,6 +39,20 @@ const parsed = computed(() => parseQuotaProtection(enabled.value, usedPercentLim
           :aria-invalid="!parsed"
         />
         <span>% 后暂停分配新请求<span v-if="parsed">，目标保留 {{ 100 - parsed.usedPercentLimit }}%</span></span>
+      </div>
+      <div class="flex flex-wrap items-center gap-2 text-cp-sm text-cp-text-secondary">
+        <span>常用比例</span>
+        <BaseButton
+          v-for="preset in QUOTA_PROTECTION_PRESETS"
+          :key="preset"
+          size="sm"
+          :variant="parsed?.usedPercentLimit === preset ? 'primary' : 'secondary'"
+          :disabled="disabled"
+          :aria-pressed="parsed?.usedPercentLimit === preset"
+          @click="selectPreset(preset)"
+        >
+          {{ preset }}%
+        </BaseButton>
       </div>
       <p v-if="!parsed" role="alert" class="m-0 text-cp-sm text-cp-error">
         请输入 1 至 99 的整数百分比。

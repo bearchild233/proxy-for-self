@@ -1,5 +1,7 @@
 import type { AccountQuotaProtection } from '@/api'
 
+export const QUOTA_PROTECTION_PRESETS = [85, 90, 95] as const
+
 export function supportsQuotaProtection(value: unknown): value is AccountQuotaProtection {
   if (!value || typeof value !== 'object')
     return false

@@ -5,7 +5,7 @@ import { stripTypeScriptTypes } from 'node:module'
 // eslint-disable-next-line test/no-import-node-test -- 复用仓库内置 runner
 import test from 'node:test'
 import * as Vue from 'vue'
-import { parseQuotaProtection, quotaProtectionMatches, supportsQuotaProtection } from '../../plugins/accounts/ui/page/utils/quotaProtection.ts'
+import { parseQuotaProtection, QUOTA_PROTECTION_PRESETS, quotaProtectionMatches, supportsQuotaProtection } from '../../plugins/accounts/ui/page/utils/quotaProtection.ts'
 
 function loadComposable(path, name, deps) {
   const code = stripTypeScriptTypes(readFileSync(new URL(path, import.meta.url), 'utf8'), { mode: 'strip' })
@@ -84,6 +84,7 @@ function batchFixture() {
 }
 
 test('quota threshold accepts only integer percentages 1 through 99', () => {
+  assert.deepEqual(QUOTA_PROTECTION_PRESETS, [85, 90, 95])
   for (const input of ['', ' ', '0', '100', '-1', '+90', '90.5', '90.0', 'NaN', 'Infinity', '1e1', '0x5a'])
     assert.equal(parseQuotaProtection(true, input), null, input)
   assert.deepEqual(parseQuotaProtection(false, '90'), { enabled: false, usedPercentLimit: 90 })
