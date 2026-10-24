@@ -358,7 +358,16 @@ const singleDeleteDescription = computed(() => pendingDeleteAccount.value?.lifec
             <template #subscription="{ row }">
               <div class="flex flex-col gap-1 text-cp-xs leading-normal">
                 <AccountSubscriptionCell :account="row" :state="subscriptionStates[row.id]" compact />
-                <span class="text-cp-text-secondary">权重 {{ row.effectiveWeight }}</span>
+                <div class="flex items-center gap-2">
+                  <span class="text-cp-text-secondary">权重 {{ row.effectiveWeight }}</span>
+                  <span
+                    v-if="row.quotaProtection?.enabled"
+                    class="rounded-cp-sm bg-cp-success-container px-1.5 text-cp-success-on-container"
+                    :title="`养号已开启，使用达到 ${row.quotaProtection.usedPercentLimit}% 后暂停分配新请求`"
+                  >
+                    养号
+                  </span>
+                </div>
               </div>
             </template>
 

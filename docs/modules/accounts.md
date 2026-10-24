@@ -21,6 +21,8 @@
 - `useAccountLifecycle`：归档视图“恢复到主列表”（`batch-update {restoreArchived:true}`）与临期优先开关。
 - `useAccountImportTasks`：后台导入任务轮询、详情与停止；`useAccountPersonalInfo` `useAccountSubscriptions` `useAccountQuotaForecast` `useAccountResetCredits`：个人资料、订阅周期、额度预测、重置卡（幂等键、未决消费防重复）。
 
+订阅 / 权重列在权重后为 `quotaProtection.enabled` 的账号显示“养号”标记，悬停展示该账号的停止使用阈值；关闭或旧网关未返回养号设置时不显示。状态列的“养号阈值已达”仍单独表示当前额度观测已触发保护。
+
 组件在 `ui/page/components/`，按职责分：`AccountFilters`（筛选与批量按钮，归档视图换成“恢复选中/删除选中”）、`AccountTableActions`（主列表行操作）、`AccountArchivedActions`（归档行：重新授权/恢复/删除）、`AccountStatusBadge/`（状态徽标与 presenter）、`AccountQuotaSummaryCell/`（用量列）、`AccountQuotaPanel/`（展开区额度与重置卡）、`AccountUsagePanel`、`AccountProfileModal/`、`AccountQuotaForecastModal/`、`AccountCreateModal/`（导入与 OAuth）、`AccountImportTasks/`、`AccountModelAccessField` 等。
 
 账号身份单元格 `AccountIdentityCell` 的套餐/自定义元信息与备注分别渲染：列表把套餐放在次行时，仍展示 API 返回的非空备注，溢出内容由 `AccountNotesPopover` 展开。`showNotes` 控制备注显示；无备注时维持原有邮箱回退与次行元信息布局。备注展示不修改账号数据。
