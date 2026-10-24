@@ -972,6 +972,98 @@ async fn openai_admin_projects_free_plan_from_cached_quota_when_account_claims_o
 }
 
 #[tokio::test]
+async fn openai_admin_protection_usage_matches_distinct_window_admission_and_period_validity() {
+    for (short_used, weekly_used, expired_short, expected_blocked) in [
+        (94.999_f64, 96.999_f64, false, false),
+        (95.0, 96.0, false, true),
+        (94.0, 97.0, false, true),
+        (99.0, 96.0, true, false),
+    ] {
+        let store = Arc::new(MemoryAccountStore::default());
+        store
+            .seed_oauth_credential(ImportCodexOAuthCredential {
+                account_id: "acct_admin_protection".to_owned(),
+                name: "admin protection".to_owned(),
+                secret: secret("admin-protection-access"),
+                verified_account: profile("chatgpt-admin-protection"),
+                next_refresh_at: None,
+                enabled: true,
+            })
+            .await;
+        let policy = gateway_core::account::AccountQuotaProtection::new(true, 90)
+            .unwrap()
+            .with_window_limits(95, 97)
+            .unwrap();
+        store.set_quota_protection("acct_admin_protection", policy);
+        let account = store.account("acct_admin_protection").unwrap();
+        let now = SystemTime::now();
+        let timestamp = |time: SystemTime| {
+            time.duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        };
+        let reset = timestamp(now + Duration::from_secs(3600));
+        let short_reset = if expired_short {
+            timestamp(now - Duration::from_secs(60))
+        } else {
+            reset
+        };
+        store.compare_and_swap_quota(QuotaObservation {
+            plan_type: None,
+            account_id: account.id().clone(),
+            expected_revision: account.revision(),
+            quota: OpaqueProviderData::new(json!({
+                "rate_limit": {"allowed": true,
+                    "primary_window": {"used_percent": weekly_used, "limit_window_seconds": 604_800, "reset_at": reset},
+                    "secondary_window": {"used_percent": short_used, "limit_window_seconds": 18_000, "reset_at": short_reset}},
+                "code_review_rate_limit": {"primary_window": {"used_percent": 100,
+                    "limit_window_seconds": 604_800, "reset_at": reset}}
+            }).as_object().unwrap().clone()),
+            observed_at: now,
+            state: QuotaState::allowed(now),
+        }).await.unwrap();
+        let config = valid_config();
+        let bundle = provider_openai::initialize(
+            config.config.clone(),
+            provider_ports_with(Arc::clone(&store), Arc::new(TestOAuthPending::default())),
+        )
+        .await
+        .unwrap();
+        let quota = bundle
+            .admin_provider()
+            .quota(ProviderQuotaRequest {
+                account_id: account.id().clone(),
+                refresh: false,
+                rolling_usage: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            quota.protection_usage.short_term_used_percent(),
+            (!expired_short).then_some(short_used.floor())
+        );
+        assert_eq!(
+            quota.protection_usage.weekly_used_percent(),
+            Some(weekly_used.floor())
+        );
+        assert_eq!(quota.protection_usage.other_used_percent(), None);
+        assert_eq!(
+            policy.reached_usage(quota.protection_usage),
+            expected_blocked
+        );
+        assert!(!quota.limit_reached);
+        assert_eq!(
+            store
+                .account("acct_admin_protection")
+                .unwrap()
+                .quota()
+                .access(),
+            gateway_core::account::QuotaAccessState::Allowed
+        );
+    }
+}
+
+#[tokio::test]
 async fn openai_admin_provider_projects_official_codex_quota_and_independent_buckets_with_chinese_labels()
  {
     let store = Arc::new(MemoryAccountStore::default());
@@ -1070,7 +1162,7 @@ async fn openai_admin_provider_projects_official_codex_quota_and_independent_buc
         .filter(|window| window.group == "monthly")
         .collect::<Vec<_>>();
 
-    assert_eq!(quota.protection_used_percent, Some(91.0));
+    assert_eq!(quota.protection_usage.other_used_percent(), Some(91.0));
     assert_eq!(monthly.len(), 1);
     assert!(monthly.iter().any(|window| {
         window.label == "月额度"

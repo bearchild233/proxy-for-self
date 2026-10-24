@@ -12,7 +12,7 @@ OpenAI / Codex Provider（crate `provider-openai`）：独占 OpenAI credential 
 
 ## 实现逻辑
 
-**账号养号**：额度调度投影只从仍有效的 account-wide 窗口取最大使用率，主、周、月任一窗口达到账号上限就阻止新调度；独立的 code review 等桶不触发全账号保护。有重置时间的窗口独立到期，无重置时间的观测最多有效十分钟；排序的四舍五入不影响阈值判断。普通、固定、续接与插件选定路径在最终准入检查保护，沿用既有 `QuotaExhausted` 错误和安全恢复合同。Admin 展示使用同一投影，不把本地保护持久化成上游用尽。
+**账号养号**：只从仍有效的account-wide窗口按实际时长分类到短期/周/其它三路，各类取最大使用率。5小时与7天分别比较自己的阈值，不能用primary/secondary位置推断周期，也不重复进入legacy比较；月及其它周期沿用legacy。任一有效窗口触发就阻止新调度，独立code review等桶不触发全账号保护。有reset的窗口独立到期，无reset的观测最多十分钟；排序四舍五入不影响阈值判断。普通、固定、续接、插件选定路径及探测复用 `reached_usage`，沿用 `QuotaExhausted` 和安全恢复合同。Admin展示消费同一投影，不把本地保护持久化为上游用尽。
 
 **一次推理 attempt**（`src/provider/`）：
 1. `mod.rs::CodexProvider` 实现 `gateway_core::engine::provider::Provider`。`execute` 先按 operation 分派：模型请求走 `execution.rs`，Images / Search / 原生 JSON 端点走 `execute_image` / `execute_search` / `execute_raw_json_endpoint`，Excel 范围的 Key 走 `excel.rs`。

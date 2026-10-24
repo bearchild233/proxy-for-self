@@ -242,6 +242,82 @@ async fn wait_requests(server: &MockServer, count: usize) {
     .unwrap();
 }
 #[tokio::test]
+async fn probe_uses_distinct_window_limits_and_ignores_expired_and_independent_buckets() {
+    for (short_used, weekly_used, expired, blocked) in [
+        (94.999, 96.999, false, false),
+        (95.0, 96.0, false, true),
+        (94.0, 97.0, false, true),
+        (99.0, 96.0, true, false),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/codex/responses"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let f = Fixture::new(server.uri()).await;
+        f.store.set_quota_protection(
+            "acct_a",
+            gateway_core::account::AccountQuotaProtection::new(true, 90)
+                .unwrap()
+                .with_window_limits(95, 97)
+                .unwrap(),
+        );
+        let account = f.store.account("acct_a").unwrap();
+        let now = std::time::SystemTime::now();
+        let reset = |time: std::time::SystemTime| {
+            time.duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        };
+        let short_reset = if expired {
+            now - Duration::from_secs(60)
+        } else {
+            now + Duration::from_secs(3600)
+        };
+        f.store.compare_and_swap_quota(gateway_core::account::QuotaObservation {
+            plan_type: None,
+            account_id: account.id().clone(),
+            expected_revision: account.revision(),
+            quota: gateway_core::account::OpaqueProviderData::new(json!({
+                "rate_limit": {"allowed": true,
+                    "primary_window": {"used_percent": weekly_used, "limit_window_seconds": 604_800,
+                        "reset_at": reset(now + Duration::from_secs(86400))},
+                    "secondary_window": {"used_percent": short_used, "limit_window_seconds": 18_000,
+                        "reset_at": reset(short_reset)}},
+                "code_review_rate_limit": {"primary_window": {"used_percent": 100,
+                    "limit_window_seconds": 18_000, "reset_at": reset(now + Duration::from_secs(3600))}}
+            }).as_object().unwrap().clone()),
+            observed_at: now,
+            state: gateway_core::account::QuotaState::allowed(now),
+        }).await.unwrap();
+        let result = f
+            .upstream
+            .probe(
+                &Access(Mutex::new(true)),
+                &Directory,
+                probe("acct_a", 30000),
+            )
+            .await;
+        if blocked {
+            let error = result.unwrap_err();
+            assert_eq!(
+                (error.code.as_str(), error.message.as_str()),
+                (UNAVAILABLE, "quota_exhausted")
+            );
+            assert!(server.received_requests().await.unwrap().is_empty());
+        } else {
+            assert_eq!(result.unwrap().status, Some(200));
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        }
+        assert_eq!(
+            f.store.account("acct_a").unwrap().quota().access(),
+            gateway_core::account::QuotaAccessState::Allowed
+        );
+    }
+}
+
+#[tokio::test]
 async fn probe_success_maps_headers_uses_hi_and_persists_passive_quota() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

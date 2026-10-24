@@ -1839,7 +1839,7 @@ async fn accounts_should_fill_missing_plan_from_quota_without_overriding_known_s
     ] {
         let provider = FakeProviderAdmin::new("openai", events());
         provider.set_quota(ProviderQuota {
-            protection_used_percent: None,
+            protection_usage: gateway_core::account::AccountQuotaProtectionUsage::UNKNOWN,
             credits: None,
             plan_type: quota_plan.map(str::to_owned),
             ..empty_quota()
@@ -1885,7 +1885,7 @@ async fn accounts_list_should_degrade_quota_failure_to_empty_window_without_drop
     let events = events();
     let openai = FakeProviderAdmin::new("openai", events.clone());
     openai.set_quota(ProviderQuota {
-        protection_used_percent: None,
+        protection_usage: gateway_core::account::AccountQuotaProtectionUsage::UNKNOWN,
         credits: None,
         plan_type: None,
         observed_at: Some(Utc::now()),
@@ -2022,7 +2022,7 @@ async fn accounts_list_should_map_unknown_credential_to_error_not_normal() {
 async fn accounts_list_should_not_derive_rate_limited_from_provider_quota_view() {
     let provider = FakeProviderAdmin::new("openai", events());
     provider.set_quota(ProviderQuota {
-        protection_used_percent: None,
+        protection_usage: gateway_core::account::AccountQuotaProtectionUsage::UNKNOWN,
         credits: None,
         plan_type: None,
         observed_at: Some(Utc::now()),
@@ -2073,7 +2073,7 @@ async fn accounts_list_should_not_derive_rate_limited_from_provider_quota_view()
 async fn accounts_list_should_not_derive_exhaustion_from_provider_quota_view() {
     let provider = FakeProviderAdmin::new("openai", events());
     provider.set_quota(ProviderQuota {
-        protection_used_percent: None,
+        protection_usage: gateway_core::account::AccountQuotaProtectionUsage::UNKNOWN,
         credits: None,
         plan_type: None,
         observed_at: Some(Utc::now()),
@@ -2212,7 +2212,7 @@ async fn quota_forecast_mid_cycle_sampling_accepts_small_reset_jitter_but_not_a_
     let added = now - TimeDelta::hours(5);
     let provider = FakeProviderAdmin::new("openai", events());
     provider.set_quota(ProviderQuota {
-        protection_used_percent: None,
+        protection_usage: gateway_core::account::AccountQuotaProtectionUsage::UNKNOWN,
         credits: None,
         plan_type: Some("pro".to_owned()),
         observed_at: Some(observed),
@@ -2363,7 +2363,7 @@ async fn accounts_list_should_attach_local_usage_to_quota_windows() {
     let provider = FakeProviderAdmin::new("openai", events());
     let reset_at = Utc::now() + TimeDelta::hours(1);
     provider.set_quota(ProviderQuota {
-        protection_used_percent: None,
+        protection_usage: gateway_core::account::AccountQuotaProtectionUsage::UNKNOWN,
         credits: None,
         plan_type: None,
         observed_at: Some(Utc::now()),
@@ -2524,7 +2524,7 @@ async fn accounts_list_should_not_attach_account_usage_to_model_specific_quota_w
     let provider = FakeProviderAdmin::new("openai", events());
     let reset_at = Utc::now() + TimeDelta::days(7);
     provider.set_quota(ProviderQuota {
-        protection_used_percent: None,
+        protection_usage: gateway_core::account::AccountQuotaProtectionUsage::UNKNOWN,
         credits: None,
         plan_type: None,
         observed_at: Some(Utc::now()),
@@ -2782,7 +2782,7 @@ pub(super) fn document() -> ProviderDocument {
 
 fn empty_quota() -> ProviderQuota {
     ProviderQuota {
-        protection_used_percent: None,
+        protection_usage: gateway_core::account::AccountQuotaProtectionUsage::UNKNOWN,
         credits: None,
         plan_type: None,
         observed_at: None,

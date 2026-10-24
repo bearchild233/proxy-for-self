@@ -12,7 +12,7 @@
 
 ## 实现逻辑
 
-**账号养号政策**：`UpdateAccount` 和 `BatchUpdateAccounts` 的可选 `quota_protection` 复用 Core 值对象，省略时保留原值；API Key 凭据轮换可携带相同设置。写入仍使用现有事务、脱敏审计、Provider 失效与快照发布链路。`ProviderQuota.protection_used_percent` 由 Provider 按自身调度时效投影，管理层传递此事实；读取失败时为空，不根据展示窗口重新解释调度规则。
+**账号养号政策**：`UpdateAccount` 和 `BatchUpdateAccounts` 的可选 `quota_protection` 复用 Core 值对象，包含总开关、5小时/7天阈值和其它窗口legacy阈值，省略时保留原值；API Key 凭据轮换可携带相同设置。写入仍使用现有事务、脱敏审计、Provider 失效与快照发布链路。`ProviderQuota.protection_usage` 由 Provider 按自身调度时效投影短期、周及其它周期使用率，管理层传递此事实；读取失败时保持未知，不根据展示窗口重新解释调度规则。
 
 **初始化**（`src/lib.rs::initialize`）：校验 `AdminConfig`（用户名、会话 TTL、初始密码强度，弱口令/含 `$` 拒绝）与 `ClientConfig`；建立 `ProviderAdminRegistry`（必须含 openai 与 xai）；创建默认管理员（幂等，`ensure_default_admin`）；组装 `AdminServices`（14 个 service 句柄，API 只通过 accessor 取用）；返回 Bundle，附带 Worker 贡献。
 

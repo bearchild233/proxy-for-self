@@ -487,7 +487,7 @@ config 返回 `{ name, plaintextKey }`，仅读取服务端会话绑定的当前
 - `sortBy`: `email`、`status`、`planType`、`usage`、`lastUsedAt`、`expiresAt`；
 - `sortDirection`: `asc`、`desc`。
 
-养号配置为 `quotaProtection: { enabled, usedPercentLimit }`，默认关闭、使用上限 90，阈值只允许 1–99 的整数。更新省略此字段保留原配置，关闭仍保存阈值；API Key rotation 的 `settings` 使用同一合同。账号详情和列表的 `quotaProtectionReached` 单独表示已触发本地保护，官方状态及额度窗口不变。网关根据有效账号级额度阻止新调度，保留现有额度耗尽错误合同；未知或过期额度不能保证预留，在途与观测延迟可能导致超过阈值。
+养号配置为 `quotaProtection: { enabled, usedPercentLimit, shortTermUsedPercentLimit, weeklyUsedPercentLimit }`，共用一个总开关，默认关闭、各阈值 90，只允许 1–99 的整数。OpenAI 的 `shortTermUsedPercentLimit` 与 `weeklyUsedPercentLimit` 分别对应实际周期约5小时和7天的账号级额度，任一有效窗口达到自己的阈值即暂停新调度；不能用 primary/secondary 槽位推断周期。`usedPercentLimit` 保留为 xAI 账期、月度和其它周期的上限。旧对象只提供 `enabled` 与 `usedPercentLimit` 时，两项新阈值均继承原值；新阈值必须同时提供，不允许 null。响应总返回完整四字段。更新省略整个字段保留原配置，关闭仍保存各阈值；API Key rotation 的 `settings` 使用同一合同。账号详情和列表的 `quotaProtectionReached` 单独表示已触发本地保护，官方状态及额度窗口不变。保留现有额度耗尽错误合同；未知或过期额度不能保证预留，在途与观测延迟可能导致超过阈值。
 
 账号限流详情在 `quota` 中返回：`rateLimitReason` 为 `upstream_rate_limit`（上游临时限流）、
 `capacity_freeze`（容量错误触发自动冻结）或 `null`。`recoveryProbeRequired` 表示解除冻结是否需要成功探测；

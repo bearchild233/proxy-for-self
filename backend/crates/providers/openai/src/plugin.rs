@@ -126,10 +126,11 @@ impl PluginUpstream for OpenAiPluginUpstream {
             self.quota
                 .prepare_scheduling(std::slice::from_ref(&account))
                 .await;
-            if account.quota_protection().reached(
+            if account.quota_protection().reached_usage(
                 self.quota
                     .scheduling_signals(&account)
-                    .and_then(|signals| signals.protection_used_percent()),
+                    .map(|signals| signals.protection_usage())
+                    .unwrap_or_default(),
             ) {
                 return Err(RpcError::new(UNAVAILABLE, "quota_exhausted"));
             }

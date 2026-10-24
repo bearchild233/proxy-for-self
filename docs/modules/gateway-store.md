@@ -12,7 +12,7 @@ PostgreSQL、Redis、S3/R2 与 `pg_dump` 的适配层：把 Core / Admin / Provi
 
 ## 实现逻辑
 
-**养号配置持久化**：迁移 0025 为 `provider_accounts` 追加独立的 `quota_protection_json`，默认关闭、阈值 90，并校验开关、整数类型与 1–99 范围。Core 与 Admin 的列表、详情、可调度目录、分组成员共享解析都读取该列；单个、批量和 API Key 凭据轮换与原设置、revision、审计处于同一事务。省略字段以及重新导入保留既有配置，不写入上游额度。槽启动仍严格比较全部迁移，0025 后不能用只含 0024 的旧二进制冷启动；新增列不是可直接滚动迁移的保证。
+**养号配置持久化**：迁移0025的独立 `quota_protection_json` 默认关闭/90，SQL校验legacy字段；分周期扩展复用该列，不改冻结SQL或schema清单。Core decoder验证新字段并将旧值映射到5小时/7天。列表、详情、可调度目录与分组成员共享解析，单个、批量和API Key轮换与原设置、revision、审计同事务。`quota_protection_storage_json` 在三项阈值相同时只存旧两字段，有差异才存完整四字段，避免A/B重叠期间旧UI写入破坏旧槽读取。API响应仍为完整字段。省略和重导入保留政策及备注。新UI在旧槽完全停止后部署；保存不同阈值后不能直接回退旧decoder，槽启动仍严格核对迁移清单。
 
 **启动**（`src/bundle.rs::initialize`）：
 1. 校验配置；非槽模式 `connect_and_migrate`（sqlx 迁移，已应用迁移的字节必须与 `_sqlx_migrations` 一致），槽模式（`deployment_slot: a|b`）只 `connect_for_slot` 校验 schema、不运行迁移，并获取每槽独立锁和共享存活锁（`PgSlotGuard`）。非槽模式持有会话级排他实例锁，冷启动执行中断恢复（`recover_after_restart`）。

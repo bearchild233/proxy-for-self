@@ -543,8 +543,10 @@ impl CodexCredentialSelector {
                         .with_rate_limit(rate_limits.get(account.id()).copied().flatten())
                         .with_runtime_health(health.0, health.1);
                     let reached = !diagnostic
-                        && account.quota_protection().reached(
-                            quota_signals.and_then(|signals| signals.protection_used_percent()),
+                        && account.quota_protection().reached_usage(
+                            quota_signals
+                                .map(|signals| signals.protection_usage())
+                                .unwrap_or_default(),
                         );
                     let account = account.with_quota_protection_reached(reached);
                     AccountCandidate { account, signals }

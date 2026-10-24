@@ -320,6 +320,37 @@ async fn quota_protection_reserves_usage_without_changing_official_quota() {
 }
 
 #[tokio::test]
+async fn quota_protection_keeps_billing_on_legacy_limit_when_window_limits_differ() {
+    for (usage, blocked) in [(89.999, false), (90.0, true), (94.0, true)] {
+        let fixture = SelectorFixture::new(&["protected"]).await;
+        let id = account_id("protected");
+        fixture.store.set_quota_protection(
+            &id,
+            gateway_core::account::AccountQuotaProtection::new(true, 90)
+                .unwrap()
+                .with_window_limits(95, 97)
+                .unwrap(),
+        );
+        fixture
+            .seed_quota(&id, usage, Duration::from_secs(600))
+            .await;
+        let result = fixture
+            .selector
+            .select(fixture.request(BTreeSet::new()))
+            .await;
+        if blocked {
+            assert!(matches!(
+                result,
+                Err(GrokSessionSelectorError::QuotaExhausted)
+            ));
+            assert!(fixture.coordinator.requests.lock().unwrap().is_empty());
+        } else {
+            assert!(result.is_ok(), "usage {usage}: {result:?}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn quota_protection_selects_an_alternative_but_preserves_the_required_owner() {
     let fixture = SelectorFixture::new(&["protected", "available"]).await;
     let id = account_id("protected");

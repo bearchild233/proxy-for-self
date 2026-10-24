@@ -12,7 +12,7 @@
 
 ## 实现逻辑
 
-**养号 HTTP 合同**：账号详情与列表返回 `quotaProtection { enabled, usedPercentLimit }` 和独立的 `quotaProtectionReached`。单个更新、批量更新与 API Key 轮换设置接受完整政策对象，阈值只允许 1–99 的整数，省略字段保留配置。展示投影只消费 Provider 给出的有效使用率，不改写上游 `quota` 或账号五态。请求校验测试覆盖单个更新、只改政策的批量更新、范围、类型、缺失成员和未知成员。
+**养号 HTTP 合同**：账号详情与列表返回 `quotaProtection { enabled, usedPercentLimit, shortTermUsedPercentLimit, weeklyUsedPercentLimit }` 和独立的 `quotaProtectionReached`，展示通过Core同一 `reached_usage` 判断三路有效使用率。总开关统一，5小时/7天阈值独立；旧请求仅给legacy阈值时映射到两项，新字段必须成对提供。单个更新、批量更新与 API Key 轮换设置接受同一政策对象，阈值只允许1–99整数，省略整个字段保留配置。投影不改写上游 `quota` 或账号五态，测试覆盖新旧格式、单项缺失、null、范围、类型和未知成员。
 
 **Router 装配**（`src/lib.rs::initialize`）：`/healthz`、OpenAI 数据面（`/v1/*`）、管理面（`/api/admin/*`）、统一登录（`/api/auth/*`）、Key 自助用量（`/api/key-usage/*`）、插件控制面（`/api/plugins*`、`/api/plugin-devices/*`），其余走静态资源（`ServeDir` + `index.html` 回退，目录来自配置或 `CPR_WEB_DIST_DIR`）。外层依次叠加：可选 CORS（仅 GET/POST、显式头）、可选请求超时、trace（info span 带 request_id）、请求 ID 生成与回传、来源解析中间件。
 

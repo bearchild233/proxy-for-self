@@ -411,6 +411,7 @@ async fn xai_quota_protection_presentation_shares_provider_observation_and_perio
     .unwrap();
     let now = SystemTime::now();
     for (age, reset_after, used, expected) in [
+        (0, Some(600), Some(94.0), Some(94.0)),
         (0, Some(600), Some(95.0), Some(95.0)),
         (660, Some(600), Some(95.0), None),
         (0, Some(-60), Some(95.0), None),
@@ -454,8 +455,19 @@ async fn xai_quota_protection_presentation_shares_provider_observation_and_perio
                 panic!("age {age}, reset {reset_after:?}, usage {used:?}: {error:?}")
             });
         assert_eq!(
-            view.protection_used_percent, expected,
+            view.protection_usage.other_used_percent(),
+            expected,
             "age {age}, reset {reset_after:?}, usage {used:?}"
+        );
+        assert_eq!(view.protection_usage.short_term_used_percent(), None);
+        assert_eq!(view.protection_usage.weekly_used_percent(), None);
+        let policy = gateway_core::account::AccountQuotaProtection::new(true, 90)
+            .unwrap()
+            .with_window_limits(95, 97)
+            .unwrap();
+        assert_eq!(
+            policy.reached_usage(view.protection_usage),
+            expected.is_some_and(|used| used >= 90.0)
         );
     }
 }

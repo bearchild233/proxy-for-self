@@ -1173,7 +1173,7 @@ fn project_quota(
 ) -> ProviderQuota {
     let Some(snapshot) = snapshot else {
         return ProviderQuota {
-            protection_used_percent: None,
+            protection_usage: Default::default(),
             credits: None,
             plan_type: None,
             observed_at: None,
@@ -1247,9 +1247,10 @@ fn project_quota(
         }
     };
     ProviderQuota {
-        protection_used_percent: snapshot
+        protection_usage: snapshot
             .scheduling_signals()
-            .and_then(|signals| signals.protection_used_percent()),
+            .map(|signals| signals.protection_usage())
+            .unwrap_or_default(),
         credits: None,
         plan_type: billing.plan_type().map(str::to_owned),
         observed_at: Some(snapshot.observed_at()),

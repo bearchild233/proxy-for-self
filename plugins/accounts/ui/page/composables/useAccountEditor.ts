@@ -1,5 +1,5 @@
 import type { Ref } from 'vue'
-import type { AccountModelAccess, ApiKeyConfiguration, getAccounts } from '@/api'
+import type { AccountModelAccess, AccountQuotaProtection, ApiKeyConfiguration, getAccounts } from '@/api'
 
 import { computed, ref, shallowRef, watch } from 'vue'
 import { batchUpdateAccounts, getAccountDetail, updateAccount, updateAccountApiKey } from '@/api'
@@ -7,7 +7,7 @@ import { toast } from '@/components/base/BaseToast'
 import { useAsyncAction } from '@/composables/useAsyncAction'
 import { useRequestState } from '@/composables/useRequestState'
 import { accountModelAccessError } from '../utils/modelAccess'
-import { parseQuotaProtection, quotaProtectionMatches, supportsQuotaProtection } from '../utils/quotaProtection'
+import { parseQuotaProtection, quotaProtectionMatches, supportsQuotaProtection, supportsSplitQuotaProtection } from '../utils/quotaProtection'
 import { concurrencyLimitInput, parseAccountSchedulingForm } from '../utils/schedulingForm'
 import { apiKeyAccountError, emptyApiKeyAccountForm } from '../utils/upstreamApiKey'
 
@@ -26,6 +26,9 @@ export function useAccountEditor(options: {
   const quotaProtectionSupported = shallowRef(false)
   const quotaProtectionEnabled = shallowRef(false)
   const quotaProtectionLimit = shallowRef('90')
+  const quotaProtectionShortTermLimit = shallowRef('90')
+  const quotaProtectionWeeklyLimit = shallowRef('90')
+  const quotaProtectionSplit = shallowRef(false)
   const concurrencyLimit = shallowRef('')
   const weight = shallowRef('1')
   const modelAccess = ref<AccountModelAccess | undefined>()
@@ -42,11 +45,16 @@ export function useAccountEditor(options: {
   let originalSettings = ''
   let originalGroups = ''
   let originalQuotaProtection = ''
-  let savedQuotaProtectionLimit = 90
+  let savedQuotaProtection: AccountQuotaProtection = { enabled: false, usedPercentLimit: 90 }
 
   function quotaProtectionSettings() {
     // 关闭时不提交隐藏输入，保留打开表单时已保存的阈值。
-    return parseQuotaProtection(quotaProtectionEnabled.value, quotaProtectionEnabled.value ? quotaProtectionLimit.value : String(savedQuotaProtectionLimit))
+    if (!quotaProtectionEnabled.value)
+      return { ...savedQuotaProtection, enabled: false }
+    if (quotaProtectionSplit.value)
+      return parseQuotaProtection(true, String(savedQuotaProtection.usedPercentLimit), quotaProtectionShortTermLimit.value, quotaProtectionWeeklyLimit.value)
+    const parsed = parseQuotaProtection(true, quotaProtectionLimit.value)
+    return parsed ? { ...savedQuotaProtection, ...parsed } : null
   }
 
   function settingsFingerprint() {
@@ -100,10 +108,15 @@ export function useAccountEditor(options: {
     proxyMode.value = 'preserve'
     proxyId.value = ''
     schedulingEnabled.value = account.enabled
-    quotaProtectionSupported.value = supportsQuotaProtection(account.quotaProtection)
+    quotaProtectionSplit.value = account.provider === 'openai'
+    quotaProtectionSupported.value = quotaProtectionSplit.value
+      ? supportsSplitQuotaProtection(account.quotaProtection)
+      : supportsQuotaProtection(account.quotaProtection)
     quotaProtectionEnabled.value = account.quotaProtection?.enabled ?? false
     quotaProtectionLimit.value = String(account.quotaProtection?.usedPercentLimit ?? 90)
-    savedQuotaProtectionLimit = quotaProtectionSupported.value ? account.quotaProtection!.usedPercentLimit : 90
+    quotaProtectionShortTermLimit.value = String(account.quotaProtection?.shortTermUsedPercentLimit ?? account.quotaProtection?.usedPercentLimit ?? 90)
+    quotaProtectionWeeklyLimit.value = String(account.quotaProtection?.weeklyUsedPercentLimit ?? account.quotaProtection?.usedPercentLimit ?? 90)
+    savedQuotaProtection = supportsQuotaProtection(account.quotaProtection) ? { ...account.quotaProtection } : { enabled: false, usedPercentLimit: 90 }
     originalQuotaProtection = JSON.stringify(quotaProtectionSettings())
     concurrencyLimit.value = concurrencyLimitInput(account.concurrencyLimit)
     weight.value = String(account.weight)
@@ -227,6 +240,9 @@ export function useAccountEditor(options: {
     quotaProtectionSupported.value = false
     quotaProtectionEnabled.value = false
     quotaProtectionLimit.value = '90'
+    quotaProtectionShortTermLimit.value = '90'
+    quotaProtectionWeeklyLimit.value = '90'
+    quotaProtectionSplit.value = false
     concurrencyLimit.value = ''
     weight.value = '1'
     modelAccess.value = undefined
@@ -234,7 +250,7 @@ export function useAccountEditor(options: {
     originalSettings = ''
     originalGroups = ''
     originalQuotaProtection = ''
-    savedQuotaProtectionLimit = 90
+    savedQuotaProtection = { enabled: false, usedPercentLimit: 90 }
   })
 
   return {
@@ -249,6 +265,8 @@ export function useAccountEditor(options: {
     quotaProtectionSupported,
     quotaProtectionEnabled,
     quotaProtectionLimit,
+    quotaProtectionShortTermLimit,
+    quotaProtectionWeeklyLimit,
     concurrencyLimit,
     weight,
     modelAccess,

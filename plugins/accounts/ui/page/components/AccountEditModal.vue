@@ -36,6 +36,8 @@ const notes = defineModel<string>('notes', { required: true })
 const enabled = defineModel<boolean>('enabled', { required: true })
 const quotaProtectionEnabled = defineModel<boolean>('quotaProtectionEnabled', { required: true })
 const quotaProtectionLimit = defineModel<string>('quotaProtectionLimit', { required: true })
+const quotaProtectionShortTermLimit = defineModel<string>('quotaProtectionShortTermLimit', { required: true })
+const quotaProtectionWeeklyLimit = defineModel<string>('quotaProtectionWeeklyLimit', { required: true })
 const concurrencyLimit = defineModel<string>('concurrencyLimit', { required: true })
 const modelAccess = defineModel<AccountModelAccess | undefined>('modelAccess', { required: true })
 const weight = defineModel<string>('weight', { required: true })
@@ -112,6 +114,9 @@ const selectedGroupIds = defineModel<string[]>('selectedGroupIds', { required: t
       <AccountQuotaProtectionFields
         v-model:enabled="quotaProtectionEnabled"
         v-model:used-percent-limit="quotaProtectionLimit"
+        v-model:short-term-used-percent-limit="quotaProtectionShortTermLimit"
+        v-model:weekly-used-percent-limit="quotaProtectionWeeklyLimit"
+        :split="account.provider === 'openai'"
         :supported="quotaProtectionSupported"
         :disabled="saving"
       />

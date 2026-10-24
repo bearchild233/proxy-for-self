@@ -1088,7 +1088,7 @@ fn account_matches_record(account: &ProviderAccount, record: &AccountRecord) -> 
 
 fn empty_quota() -> ProviderQuota {
     ProviderQuota {
-        protection_used_percent: None,
+        protection_usage: Default::default(),
         credits: None,
         plan_type: None,
         observed_at: None,
@@ -1151,9 +1151,10 @@ fn project_quota_snapshot(snapshot: CodexAccountQuotaSnapshot) -> ProviderQuota 
     // 在窗口全部过期后继续维持限流。
     let limit_reached = quota_windows_limit_reached(&windows);
     ProviderQuota {
-        protection_used_percent: snapshot
+        protection_usage: snapshot
             .scheduling_signals()
-            .and_then(|signals| signals.protection_used_percent()),
+            .map(|signals| signals.protection_usage())
+            .unwrap_or_default(),
         credits: snapshot.credits().map(|credits| {
             // 官方 Codex 与 API 标准 Token 单价对应 25 Credits / USD；仅展示等值。
             // 无限或未知余额不伪造美元金额，也不改变调度判断。

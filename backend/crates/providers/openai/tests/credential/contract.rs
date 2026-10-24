@@ -120,6 +120,79 @@ fn quota_protection_reserves_quota_at_the_threshold_without_mutating_upstream_ac
 }
 
 #[test]
+fn quota_protection_uses_actual_window_kind_and_distinct_limits_for_ordinary_and_required_accounts()
+{
+    for (weekly_primary, short_used, weekly_used, blocked) in [
+        (false, 94.999, 96.999, false),
+        (false, 95.0, 96.0, true),
+        (false, 94.0, 97.0, true),
+        (true, 94.999, 96.999, false),
+        (true, 95.0, 96.0, true),
+        (true, 94.0, 97.0, true),
+    ] {
+        for required in [false, true] {
+            let store = Arc::new(MemoryAccountStore::default());
+            create_account(&store, "acct_primary", "at-primary");
+            store.set_quota_protection(
+                "acct_primary",
+                gateway_core::account::AccountQuotaProtection::new(true, 90)
+                    .unwrap()
+                    .with_window_limits(95, 97)
+                    .unwrap(),
+            );
+            let account = store.account("acct_primary").unwrap();
+            let now = SystemTime::now();
+            let reset = (now + Duration::from_secs(3600))
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let short = json!({"used_percent": short_used, "limit_window_seconds": 18_000, "reset_at": reset});
+            let weekly = json!({"used_percent": weekly_used, "limit_window_seconds": 604_800, "reset_at": reset});
+            let (primary, secondary) = if weekly_primary {
+                (weekly, short)
+            } else {
+                (short, weekly)
+            };
+            block_on(store.compare_and_swap_quota(QuotaObservation {
+                plan_type: None,
+                account_id: account.id().clone(),
+                expected_revision: account.revision(),
+                quota: OpaqueProviderData::new(json!({"rate_limit": {
+                    "allowed": true, "primary_window": primary, "secondary_window": secondary
+                }}).as_object().unwrap().clone()),
+                observed_at: now,
+                state: QuotaState::allowed(now),
+            })).unwrap();
+            let selector = selector(&store, Arc::new(TestLeaseCoordinator::default()));
+            let context =
+                attempt_with_required(BTreeSet::new(), required.then(|| account.id().clone()));
+            let result = block_on(selector.select(&SelectCodexCredential {
+                upstream_model: "gpt-5.4",
+                request_url:
+                    &Url::parse("https://chatgpt.com/backend-api/codex/responses").unwrap(),
+                attempt: &context,
+                session_affinity_key: None,
+            }));
+            if blocked {
+                assert!(
+                    matches!(result, Err(CredentialSelectionError::QuotaExhausted)),
+                    "weekly primary {weekly_primary}, short {short_used}, weekly {weekly_used}, required {required}: {result:?}"
+                );
+            } else {
+                assert!(
+                    result.is_ok(),
+                    "weekly primary {weekly_primary}, short {short_used}, weekly {weekly_used}, required {required}: {result:?}"
+                );
+            }
+            assert_eq!(
+                store.account("acct_primary").unwrap().quota().access(),
+                QuotaAccessState::Allowed
+            );
+        }
+    }
+}
+
+#[test]
 fn quota_protection_uses_an_available_alternative_but_never_escapes_a_required_account() {
     let store = Arc::new(MemoryAccountStore::default());
     create_account(&store, "acct_primary", "at-primary");

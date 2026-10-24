@@ -292,7 +292,7 @@ async fn protection_signal_ignores_independent_review_bucket_but_preserves_its_r
             quota: OpaqueProviderData::new(
                 json!({
                     "rate_limit": {"allowed": true, "primary_window": {
-                        "used_percent": 89.999, "reset_at": reset
+                        "used_percent": 89.999, "reset_at": reset, "limit_window_seconds": 18_000
                     }},
                     "code_review_rate_limit": {"allowed": false, "limit_reached": true,
                         "primary_window": {"used_percent": 100, "reset_at": reset}}
@@ -317,11 +317,16 @@ async fn protection_signal_ignores_independent_review_bucket_but_preserves_its_r
         Some(0),
         "existing rank still includes review"
     );
-    assert_eq!(signals.protection_used_percent(), Some(89.0));
+    assert_eq!(
+        signals.protection_usage().short_term_used_percent(),
+        Some(89.0)
+    );
+    assert_eq!(signals.protection_usage().weekly_used_percent(), None);
+    assert_eq!(signals.protection_usage().other_used_percent(), None);
     assert!(
         !gateway_core::account::AccountQuotaProtection::new(true, 90)
             .unwrap()
-            .reached(signals.protection_used_percent())
+            .reached_usage(signals.protection_usage())
     );
     assert_eq!(
         store
@@ -398,6 +403,43 @@ async fn protection_signal_for_undated_windows_expires_independently_of_a_live_w
                 .scheduling_signals(&account)
                 .and_then(|signals| signals.protection_used_percent()),
             Some(expected)
+        );
+    }
+}
+
+#[tokio::test]
+async fn protection_usage_groups_by_actual_duration_and_takes_the_max_within_each_kind() {
+    for (primary_seconds, secondary_seconds, expected) in [
+        (18_000, 604_800, (Some(94.0), Some(96.0), None)),
+        (604_800, 18_000, (Some(96.0), Some(94.0), None)),
+        (604_800, 604_800, (None, Some(96.0), None)),
+        (18_000, 18_000, (Some(96.0), None, None)),
+        (2_592_000, 60, (None, None, Some(96.0))),
+    ] {
+        let store = Arc::new(MemoryAccountStore::default());
+        let now = SystemTime::now();
+        let reset = timestamp(now + Duration::from_secs(3600));
+        let account = persist_snapshot(&store, "acct_classified", now, json!({
+            "allowed": true,
+            "primary_window": {"used_percent": 94.999, "limit_window_seconds": primary_seconds, "reset_at": reset},
+            "secondary_window": {"used_percent": 96.999, "limit_window_seconds": secondary_seconds, "reset_at": reset}
+        })).await;
+        let service = quota_service(&store);
+        service
+            .prepare_scheduling(std::slice::from_ref(&account))
+            .await;
+        let usage = service
+            .scheduling_signals(&account)
+            .unwrap()
+            .protection_usage();
+        assert_eq!(
+            (
+                usage.short_term_used_percent(),
+                usage.weekly_used_percent(),
+                usage.other_used_percent()
+            ),
+            expected,
+            "primary {primary_seconds}, secondary {secondary_seconds}"
         );
     }
 }

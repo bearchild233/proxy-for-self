@@ -11,7 +11,7 @@
 
 ## 实现逻辑
 
-**养号设置**：账号编辑弹窗的 `AccountQuotaProtectionFields.vue` 提供每账号开关和 1–99 的整数使用上限，默认 90%，默认关闭；启用时提供 85%、90%、95% 三个常用比例快捷按钮。达到阈值时由网关拒绝新调度，界面通过独立的 `quotaProtectionReached` 标注本地保护，不改写官方额度与状态。关闭时保留打开表单时已保存的阈值，隐藏输入不阻止关闭；未修改养号时省略该字段，分组窄更新与批量普通设置不覆盖它。旧网关缺少合法 `quotaProtection` 时禁用控件；保存后回读验证，无法确认时不显示成功。无有效额度时不能保证预留，在途与观测延迟也可能超过阈值。
+**养号设置**：账号编辑弹窗的 `AccountQuotaProtectionFields.vue` 只提供一个总开关，OpenAI的5小时与7天使用上限分别设置，整数1–99，默认90%，每项均有85%/90%/95%快捷按钮；xAI保留账期阈值。旧配置由网关将原阈值映射到两个周期，编辑OpenAI两项时保留隐藏的legacy阈值。任一有效窗口触发后由网关拒绝新调度，独立的 `quotaProtectionReached` 标注本地保护，不改写官方额度与状态。关闭时保留打开表单时全部已保存阈值，隐藏输入不阻止关闭；未修改养号时省略字段，分组窄更新与批量普通设置不覆盖它。OpenAI旧网关缺少合法两项新字段时禁用设置并提示升级；保存后回读核验所有字段，无法确认时不显示成功。无有效额度时不能保证预留，在途与观测延迟也可能超过阈值。
 
 页面入口 `ui/page/index.vue`：表格列插槽、删除确认框、归档/当前视图切换、批量操作栏；所有数据流经 composables：
 - `useAccountsQuery`：`usePagedQuery` 分页（默认 20 条），参数含 `archived`、搜索、provider、状态、分组、需处理（attention）、排序；30 秒页面可见时后台静默同步，并按需补查订阅（缓存）；`summary` 驱动概览卡。
@@ -21,7 +21,7 @@
 - `useAccountLifecycle`：归档视图“恢复到主列表”（`batch-update {restoreArchived:true}`）与临期优先开关。
 - `useAccountImportTasks`：后台导入任务轮询、详情与停止；`useAccountPersonalInfo` `useAccountSubscriptions` `useAccountQuotaForecast` `useAccountResetCredits`：个人资料、订阅周期、额度预测、重置卡（幂等键、未决消费防重复）。
 
-订阅 / 权重列在权重后为 `quotaProtection.enabled` 的账号显示“养号”标记，悬停展示该账号的停止使用阈值；关闭或旧网关未返回养号设置时不显示。状态列的“养号阈值已达”仍单独表示当前额度观测已触发保护。
+订阅 / 权重列在权重后为 `quotaProtection.enabled` 的账号显示“养号”标记，悬停展示OpenAI的5小时/7天两项阈值或xAI账期阈值；关闭或旧网关未返回养号设置时不显示。状态列的“养号阈值已达”仍单独表示当前额度观测已触发保护。
 
 组件在 `ui/page/components/`，按职责分：`AccountFilters`（筛选与批量按钮，归档视图换成“恢复选中/删除选中”）、`AccountTableActions`（主列表行操作）、`AccountArchivedActions`（归档行：重新授权/恢复/删除）、`AccountStatusBadge/`（状态徽标与 presenter）、`AccountQuotaSummaryCell/`（用量列）、`AccountQuotaPanel/`（展开区额度与重置卡）、`AccountUsagePanel`、`AccountProfileModal/`、`AccountQuotaForecastModal/`、`AccountCreateModal/`（导入与 OAuth）、`AccountImportTasks/`、`AccountModelAccessField` 等。
 

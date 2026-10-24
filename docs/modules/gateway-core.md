@@ -12,7 +12,7 @@
 
 ## 实现逻辑
 
-**账号养号准入**：`account/quota_protection.rs` 的 `AccountQuotaProtection` 保存独立开关与 1–99 整数上限，默认关闭、阈值 90。Provider 从有效账号级额度产生保护使用率，选号时以临时 `QuotaExhausted` 事实阻止新请求，不回写真实额度；停用和认证错误仍优先于额度，额度优先于临时冷却。固定账号、原生续接与插件选定账号使用同一准入事实，既有发送、续接和安全恢复边界保持不变。策略关闭或有效窗口重置后按新事实恢复。
+**账号养号准入**：`account/quota_protection.rs` 的 `AccountQuotaProtection` 保存一个总开关、5小时/7天独立上限和其它窗口legacy上限，均为1–99整数，默认关闭/90。旧对象两项窗口阈值继承legacy；新字段必须成对提供且拒绝null。`AccountQuotaProtectionUsage` 分开承载短期、周及其它有效使用率，向下取整防止临界值提前触发；`reached_usage` 统一用于选号、探测和展示，已分类用量不重复比较legacy。临时 `QuotaExhausted` 阻止新请求，不回写真实额度；停用和认证错误仍优先于额度，额度优先于冷却。固定账号、原生续接与插件选定账号保持既有发送和安全恢复边界。策略关闭或有效窗口重置后按新事实恢复。
 
 **启动**（`src/lib.rs::initialize`）：先按配置恢复 Client Key 准入热状态（`restore_client_admission_startup`，从 `model_requests` 重建 Redis 并发/RPM 计数），再用 `RuntimeSnapshotCompiler` 编译首个 `RuntimeSnapshot`，失败直接拒绝启动；组装 `DefaultExecutionService`，并返回 `CoreBundle`（执行服务、Key 校验器、快照控制、账号探测、健康探针、周期对账 Worker 贡献）。
 

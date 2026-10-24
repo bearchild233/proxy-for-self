@@ -5,7 +5,7 @@ import { stripTypeScriptTypes } from 'node:module'
 // eslint-disable-next-line test/no-import-node-test -- 复用仓库内置 runner
 import test from 'node:test'
 import * as Vue from 'vue'
-import { parseQuotaProtection, QUOTA_PROTECTION_PRESETS, quotaProtectionMatches, supportsQuotaProtection } from '../../plugins/accounts/ui/page/utils/quotaProtection.ts'
+import { parseQuotaProtection, QUOTA_PROTECTION_PRESETS, quotaProtectionMatches, supportsQuotaProtection, supportsSplitQuotaProtection } from '../../plugins/accounts/ui/page/utils/quotaProtection.ts'
 
 function loadComposable(path, name, deps) {
   const code = stripTypeScriptTypes(readFileSync(new URL(path, import.meta.url), 'utf8'), { mode: 'strip' })
@@ -15,17 +15,18 @@ function loadComposable(path, name, deps) {
   return new Function(...entries.map(([key]) => key), `${code}; return ${name}`)(...entries.map(([, value]) => value))
 }
 
-function fixture({ protection = { enabled: false, usedPercentLimit: 90 }, ignore = false, apiKey = false } = {}) {
+function fixture({ protection = { enabled: false, usedPercentLimit: 90 }, ignore = false, apiKey = false, provider = 'xai', readback } = {}) {
   const calls = []
   const messages = []
-  const row = { id: 'test-account', name: '演示', enabled: true, weight: 50, notes: '', groups: [], concurrencyLimit: null, modelAccess: { mode: 'all', models: [] }, authenticationKind: apiKey ? 'api_key' : 'oauth', quotaProtection: protection }
+  const row = { provider, id: 'test-account', name: '演示', enabled: true, weight: 50, notes: '', groups: [], concurrencyLimit: null, modelAccess: { mode: 'all', models: [] }, authenticationKind: apiKey ? 'api_key' : 'oauth', quotaProtection: protection }
   let saved = protection
   const deps = {
     ...Vue,
     parseQuotaProtection,
     quotaProtectionMatches,
     supportsQuotaProtection,
-    getAccountDetail: async () => ({ account: { ...row, quotaProtection: saved }, credentialConfiguration: { base_url: 'https://example.invalid', transport: 'http' } }),
+    supportsSplitQuotaProtection,
+    getAccountDetail: async () => ({ account: { ...row, quotaProtection: readback ? readback(saved) : saved }, credentialConfiguration: { base_url: 'https://example.invalid', transport: 'http' } }),
     updateAccount: async (input) => {
       calls.push(['update', input])
       if (!ignore && input.quotaProtection)
@@ -266,6 +267,132 @@ test('API Key rotation does not rewrite unchanged quota protection', async () =>
     assert.equal(f.calls[0][0], 'rotate')
     assert.equal(f.calls[0][1].settings.quotaProtection, undefined)
     assert.deepEqual(f.savedProtection(), { enabled: true, usedPercentLimit: 80 })
+  }
+  finally { f.stop() }
+})
+
+const splitProtection = { enabled: true, usedPercentLimit: 90, shortTermUsedPercentLimit: 85, weeklyUsedPercentLimit: 95 }
+
+test('OpenAI saves independent window thresholds atomically while retaining fallback', async () => {
+  const f = fixture({ provider: 'openai', protection: splitProtection })
+  try {
+    assert.equal(f.editor.quotaProtectionSupported.value, true)
+    assert.equal(f.editor.quotaProtectionShortTermLimit.value, '85')
+    assert.equal(f.editor.quotaProtectionWeeklyLimit.value, '95')
+    f.editor.name.value = '分周期'
+    f.editor.quotaProtectionShortTermLimit.value = '80'
+    f.editor.quotaProtectionWeeklyLimit.value = '93'
+    await f.editor.save()
+    assert.equal(f.calls.length, 1)
+    assert.deepEqual(f.calls[0][1].quotaProtection, { ...splitProtection, shortTermUsedPercentLimit: 80, weeklyUsedPercentLimit: 93 })
+    assert.equal(f.messages[0][0], 'success')
+  }
+  finally { f.stop() }
+})
+
+test('OpenAI legacy thresholds map to both windows but cannot be edited on legacy gateways', async () => {
+  for (const protection of [
+    { enabled: true, usedPercentLimit: 85 },
+    { ...splitProtection, shortTermUsedPercentLimit: undefined },
+    { ...splitProtection, weeklyUsedPercentLimit: 90.5 },
+  ]) {
+    const f = fixture({ provider: 'openai', protection })
+    try {
+      assert.equal(f.editor.quotaProtectionSupported.value, false)
+      if (!Object.hasOwn(protection, 'shortTermUsedPercentLimit')) {
+        assert.equal(f.editor.quotaProtectionShortTermLimit.value, '85')
+        assert.equal(f.editor.quotaProtectionWeeklyLimit.value, '85')
+      }
+      f.editor.quotaProtectionEnabled.value = false
+      await f.editor.save()
+      assert.equal(f.calls.length, 0)
+      assert.match(f.messages[0][1], /不支持/)
+    }
+    finally { f.stop() }
+  }
+})
+
+test('both split thresholds reject invalid inputs before writes', async () => {
+  for (const field of ['quotaProtectionShortTermLimit', 'quotaProtectionWeeklyLimit']) {
+    const f = fixture({ provider: 'openai', protection: splitProtection })
+    try {
+      f.editor[field].value = '90.5'
+      await f.editor.save()
+      assert.equal(f.calls.length, 0)
+      assert.match(f.messages[0][1], /1 至 99/)
+    }
+    finally { f.stop() }
+  }
+})
+
+test('disabling split protection preserves all saved thresholds and ignores hidden invalid drafts', async () => {
+  const f = fixture({ provider: 'openai', protection: splitProtection })
+  try {
+    f.editor.quotaProtectionShortTermLimit.value = 'bad'
+    f.editor.quotaProtectionWeeklyLimit.value = '100'
+    f.editor.quotaProtectionLimit.value = 'bad'
+    f.editor.quotaProtectionEnabled.value = false
+    await f.editor.save()
+    assert.deepEqual(f.calls[0][1].quotaProtection, { ...splitProtection, enabled: false })
+    assert.equal(f.messages[0][0], 'success')
+  }
+  finally { f.stop() }
+})
+
+test('unchanged split protection stays out of unrelated updates and disabled drafts', async () => {
+  for (const enabled of [true, false]) {
+    const f = fixture({ provider: 'openai', protection: { ...splitProtection, enabled } })
+    try {
+      f.editor.name.value = '仅改名称'
+      if (!enabled) {
+        f.editor.quotaProtectionShortTermLimit.value = 'bad'
+        f.editor.quotaProtectionWeeklyLimit.value = '50'
+      }
+      await f.editor.save()
+      assert.equal(f.calls[0][1].quotaProtection, undefined)
+      assert.equal(f.messages[0][0], 'success')
+    }
+    finally { f.stop() }
+  }
+})
+
+test('split save fails readback when any of all four fields differs or disappears', async () => {
+  for (const field of ['enabled', 'usedPercentLimit', 'shortTermUsedPercentLimit', 'weeklyUsedPercentLimit']) {
+    const f = fixture({ provider: 'openai', protection: splitProtection, readback: saved => ({ ...saved, [field]: undefined }) })
+    try {
+      f.editor.quotaProtectionWeeklyLimit.value = '94'
+      await f.editor.save()
+      assert.equal(f.calls.length, 1)
+      assert.equal(f.messages.some(([kind]) => kind === 'success'), false)
+      assert.match(f.messages[0][1], /未确认/)
+      assert.equal(f.editor.showEditModal.value, true)
+    }
+    finally { f.stop() }
+  }
+})
+
+test('API key connection and split policy save share a single rotate request', async () => {
+  const f = fixture({ provider: 'openai', protection: splitProtection, apiKey: true })
+  try {
+    await Vue.nextTick()
+    f.editor.apiKey.value.apiKey = 'fixture-key'
+    f.editor.quotaProtectionWeeklyLimit.value = '92'
+    await f.editor.save()
+    assert.equal(f.calls.length, 1)
+    assert.equal(f.calls[0][0], 'rotate')
+    assert.deepEqual(f.calls[0][1].settings.quotaProtection, { ...splitProtection, weeklyUsedPercentLimit: 92 })
+    assert.equal(f.messages[0][0], 'success')
+  }
+  finally { f.stop() }
+})
+
+test('xAI billing threshold changes retain split fields returned by a new gateway', async () => {
+  const f = fixture({ protection: splitProtection })
+  try {
+    f.editor.quotaProtectionLimit.value = '88'
+    await f.editor.save()
+    assert.deepEqual(f.calls[0][1].quotaProtection, { ...splitProtection, usedPercentLimit: 88 })
+    assert.equal(f.messages[0][0], 'success')
   }
   finally { f.stop() }
 })

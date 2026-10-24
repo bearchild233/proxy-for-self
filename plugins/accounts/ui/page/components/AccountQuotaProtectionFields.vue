@@ -3,15 +3,27 @@ import { computed } from 'vue'
 import BaseButton from '@/components/base/BaseButton.vue'
 import BaseInput from '@/components/base/BaseInput.vue'
 import BaseSwitch from '@/components/base/BaseSwitch.vue'
-import { parseQuotaProtection, QUOTA_PROTECTION_PRESETS } from '../utils/quotaProtection'
+import { parseQuotaProtectionLimit, QUOTA_PROTECTION_PRESETS } from '../utils/quotaProtection'
 
-defineProps<{ supported: boolean, disabled: boolean }>()
+const props = defineProps<{ supported: boolean, disabled: boolean, split: boolean }>()
 const enabled = defineModel<boolean>('enabled', { required: true })
 const usedPercentLimit = defineModel<string>('usedPercentLimit', { required: true })
-const parsed = computed(() => parseQuotaProtection(enabled.value, usedPercentLimit.value))
+const shortTermUsedPercentLimit = defineModel<string>('shortTermUsedPercentLimit', { required: true })
+const weeklyUsedPercentLimit = defineModel<string>('weeklyUsedPercentLimit', { required: true })
+const fields = computed(() => props.split
+  ? [
+      { key: 'shortTerm', label: '5 小时', value: shortTermUsedPercentLimit.value },
+      { key: 'weekly', label: '7 天', value: weeklyUsedPercentLimit.value },
+    ]
+  : [{ key: 'billing', label: '账期', value: usedPercentLimit.value }])
 
-function selectPreset(value: number) {
-  usedPercentLimit.value = String(value)
+function updateLimit(key: string, value: string) {
+  if (key === 'shortTerm')
+    shortTermUsedPercentLimit.value = value
+  else if (key === 'weekly')
+    weeklyUsedPercentLimit.value = value
+  else
+    usedPercentLimit.value = value
 }
 </script>
 
@@ -22,43 +34,47 @@ function selectPreset(value: number) {
       <BaseSwitch v-model="enabled" label="养号" :disabled="disabled || !supported" />
     </div>
     <p v-if="!supported" role="status" class="m-0 text-cp-sm text-cp-text-secondary">
-      当前网关不支持养号设置，请先更新网关；此处无法保存养号设置。
+      当前网关不支持{{ split ? '分周期' : '' }}养号设置，请先更新网关；此处无法保存养号设置。
     </p>
     <template v-else-if="enabled">
-      <div class="flex flex-wrap items-center gap-2 text-cp-sm text-cp-text-secondary">
-        <span>使用达到</span>
-        <BaseInput
-          v-model="usedPercentLimit"
-          class="w-20"
-          aria-label="养号已使用百分比阈值"
-          type="number"
-          min="1"
-          max="99"
-          step="1"
-          :disabled="disabled"
-          :aria-invalid="!parsed"
-        />
-        <span>% 后暂停分配新请求<span v-if="parsed">，目标保留 {{ 100 - parsed.usedPercentLimit }}%</span></span>
+      <div v-for="field in fields" :key="field.key" class="grid gap-2">
+        <div class="flex flex-wrap items-center gap-2 text-cp-sm text-cp-text-secondary">
+          <span>{{ field.label }}使用达到</span>
+          <BaseInput
+            :model-value="field.value"
+            class="w-20"
+            :aria-label="`${field.label}养号已使用百分比阈值`"
+            type="number"
+            min="1"
+            max="99"
+            step="1"
+            :disabled="disabled"
+            :aria-invalid="parseQuotaProtectionLimit(field.value) === null"
+            @update:model-value="updateLimit(field.key, $event)"
+          />
+          <span>% 后暂停分配新请求<span v-if="parseQuotaProtectionLimit(field.value) !== null">，目标保留 {{ 100 - parseQuotaProtectionLimit(field.value)! }}%</span></span>
+        </div>
+        <div class="flex flex-wrap items-center gap-2 text-cp-sm text-cp-text-secondary">
+          <span>常用比例</span>
+          <BaseButton
+            v-for="preset in QUOTA_PROTECTION_PRESETS"
+            :key="preset"
+            size="sm"
+            :variant="parseQuotaProtectionLimit(field.value) === preset ? 'primary' : 'secondary'"
+            :disabled="disabled"
+            :aria-label="`${field.label}养号阈值 ${preset}%`"
+            :aria-pressed="parseQuotaProtectionLimit(field.value) === preset"
+            @click="updateLimit(field.key, String(preset))"
+          >
+            {{ preset }}%
+          </BaseButton>
+        </div>
+        <p v-if="parseQuotaProtectionLimit(field.value) === null" role="alert" class="m-0 text-cp-sm text-cp-error">
+          {{ field.label }}请输入 1 至 99 的整数百分比。
+        </p>
       </div>
-      <div class="flex flex-wrap items-center gap-2 text-cp-sm text-cp-text-secondary">
-        <span>常用比例</span>
-        <BaseButton
-          v-for="preset in QUOTA_PROTECTION_PRESETS"
-          :key="preset"
-          size="sm"
-          :variant="parsed?.usedPercentLimit === preset ? 'primary' : 'secondary'"
-          :disabled="disabled"
-          :aria-pressed="parsed?.usedPercentLimit === preset"
-          @click="selectPreset(preset)"
-        >
-          {{ preset }}%
-        </BaseButton>
-      </div>
-      <p v-if="!parsed" role="alert" class="m-0 text-cp-sm text-cp-error">
-        请输入 1 至 99 的整数百分比。
-      </p>
       <p class="m-0 text-cp-sm leading-5 text-cp-text-secondary">
-        仅对有效的账号级额度窗口生效；未知额度不保证预留，已发请求继续完成。
+        {{ split ? '任一周期达到阈值即暂停分配新请求。' : '' }}仅对有效的账号级额度窗口生效；未知额度不保证预留，已发请求继续完成。
       </p>
     </template>
   </section>

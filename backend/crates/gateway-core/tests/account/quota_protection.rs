@@ -1,6 +1,7 @@
 use gateway_core::account::{
-    AccountEligibilityPolicy, AccountQuotaProtection, AccountQuotaSignals, AccountSelector,
-    AccountStatus, CredentialState, QuotaAccessState, QuotaState, RotationStrategy,
+    AccountEligibilityPolicy, AccountQuotaProtection, AccountQuotaProtectionUsage,
+    AccountQuotaSignals, AccountSelector, AccountStatus, CredentialState, QuotaAccessState,
+    QuotaState, RotationStrategy,
 };
 use serde_json::json;
 
@@ -14,7 +15,13 @@ fn quota_protection_defaults_and_wire_validation_preserve_a_real_reserve() {
     for limit in [1, 90, 99] {
         let config = AccountQuotaProtection::new(true, limit).expect("valid reserve");
         let wire = json!({"enabled": true, "usedPercentLimit": limit});
-        assert_eq!(serde_json::to_value(config).unwrap(), wire);
+        assert_eq!(
+            serde_json::to_value(config).unwrap(),
+            json!({
+                "enabled": true, "usedPercentLimit": limit,
+                "shortTermUsedPercentLimit": limit, "weeklyUsedPercentLimit": limit
+            })
+        );
         assert_eq!(
             serde_json::from_value::<AccountQuotaProtection>(wire).unwrap(),
             config
@@ -41,6 +48,61 @@ fn quota_protection_defaults_and_wire_validation_preserve_a_real_reserve() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn independent_window_limits_round_trip_and_reject_partial_or_invalid_configuration() {
+    let policy = AccountQuotaProtection::new(true, 80)
+        .unwrap()
+        .with_window_limits(95, 85)
+        .unwrap();
+    let wire = json!({"enabled":true,"usedPercentLimit":80,
+        "shortTermUsedPercentLimit":95,"weeklyUsedPercentLimit":85});
+    assert_eq!(serde_json::to_value(policy).unwrap(), wire);
+    assert_eq!(
+        serde_json::from_value::<AccountQuotaProtection>(wire.clone()).unwrap(),
+        policy
+    );
+    for key in ["shortTermUsedPercentLimit", "weeklyUsedPercentLimit"] {
+        for invalid in [json!(0), json!(100), json!(90.5), json!("90"), json!(null)] {
+            let mut bad = wire.clone();
+            bad[key] = invalid;
+            assert!(serde_json::from_value::<AccountQuotaProtection>(bad).is_err());
+        }
+        let mut partial = wire.clone();
+        partial.as_object_mut().unwrap().remove(key);
+        assert!(serde_json::from_value::<AccountQuotaProtection>(partial).is_err());
+    }
+    for (short, weekly) in [(1, 99), (99, 1)] {
+        assert!(policy.with_window_limits(short, weekly).is_some());
+    }
+    assert!(policy.with_window_limits(0, 90).is_none());
+    assert!(policy.with_window_limits(90, 100).is_none());
+}
+
+#[test]
+fn each_window_uses_its_own_limit_without_the_legacy_limit_interfering() {
+    let policy = AccountQuotaProtection::new(true, 80)
+        .unwrap()
+        .with_window_limits(95, 85)
+        .unwrap();
+    for (short, weekly, other, reached) in [
+        (Some(94.999), Some(84.999), None, false),
+        (Some(95.0), Some(20.0), None, true),
+        (Some(20.0), Some(85.0), None, true),
+        (Some(90.0), Some(82.0), None, false),
+        (None, None, Some(80.0), true),
+        (None, None, Some(79.999), false),
+        (None, None, None, false),
+    ] {
+        let usage = AccountQuotaProtectionUsage::new(short, weekly, other);
+        let signals = AccountQuotaSignals::new(None, Some(1234)).with_protection_usage(usage);
+        assert_eq!(policy.reached_usage(signals.protection_usage()), reached);
+        assert_eq!(signals.remaining_rank(), Some(1234));
+        assert!(!AccountQuotaProtection::default().reached_usage(usage));
+    }
+    let invalid = AccountQuotaProtectionUsage::new(Some(f64::NAN), Some(f64::INFINITY), Some(-1.0));
+    assert_eq!(invalid, AccountQuotaProtectionUsage::UNKNOWN);
 }
 
 #[test]

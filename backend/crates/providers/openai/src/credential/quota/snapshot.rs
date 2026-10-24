@@ -7,8 +7,8 @@ use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Utc};
 use gateway_core::account::{
-    AccountQuotaSignals, CredentialRevision, ProviderAccountId, QuotaEvidence, QuotaObservation,
-    QuotaState,
+    AccountQuotaProtectionUsage, AccountQuotaSignals, CredentialRevision, ProviderAccountId,
+    QuotaEvidence, QuotaObservation, QuotaState,
 };
 use gateway_core::metering::Decimal;
 use serde_json::{Map, Value};
@@ -305,7 +305,9 @@ pub(crate) fn quota_scheduling_signals(
 ) -> Option<AccountQuotaSignals> {
     let now = SystemTime::now();
     let mut remaining_rank: Option<u64> = None;
-    let mut protection_used: Option<f64> = None;
+    let mut short_term_used: Option<f64> = None;
+    let mut weekly_used: Option<f64> = None;
+    let mut other_used: Option<f64> = None;
     let mut reset_at: Option<SystemTime> = None;
     for window in &snapshot.windows {
         if quota_window_ttl(window, snapshot.observed_at(), now).is_none() {
@@ -317,7 +319,13 @@ pub(crate) fn quota_scheduling_signals(
                 .used_percent()
                 .filter(|used| used.is_finite() && *used >= 0.0)
         {
-            protection_used = Some(protection_used.map_or(used, |current| current.max(used)));
+            // 按实际周期分类，不能再次把已分类窗口并入 legacy 阈值。
+            let target = match window.kind() {
+                CodexQuotaWindowKind::ShortTerm => &mut short_term_used,
+                CodexQuotaWindowKind::Weekly => &mut weekly_used,
+                CodexQuotaWindowKind::Monthly | CodexQuotaWindowKind::Other => &mut other_used,
+            };
+            *target = Some(target.map_or(used, |current| current.max(used)));
         }
         let window_reset_at = window.reset_at().map(SystemTime::from);
         if let Some(used) = window
@@ -331,10 +339,15 @@ pub(crate) fn quota_scheduling_signals(
             reset_at = Some(reset_at.map_or(reset, |current| current.min(reset)));
         }
     }
-    if remaining_rank.is_some() || reset_at.is_some() || protection_used.is_some() {
+    let protection_usage =
+        AccountQuotaProtectionUsage::new(short_term_used, weekly_used, other_used);
+    if remaining_rank.is_some()
+        || reset_at.is_some()
+        || protection_usage.max_used_percent().is_some()
+    {
         Some(
             AccountQuotaSignals::new(reset_at, remaining_rank)
-                .with_protection_used_percent(protection_used),
+                .with_protection_usage(protection_usage),
         )
     } else {
         None
@@ -569,7 +582,7 @@ fn parse_rate_limit_windows(
         let limit_reached = optional_bool(window, "limit_reached")?.unwrap_or(false);
         let kind = quota_window_kind(window_seconds);
         // primary/secondary 是协议槽位，不代表固定周期。窗口身份使用上游
-        // limit_id 和实际时长，5h/周/月分类只参与展示。
+        // limit_id 和实际时长，5h/周/月分类用于展示与分周期养号。
         let key = match window_seconds {
             Some(seconds) => format!("{source}:{seconds}s"),
             None => format!("{source}:{name}"),

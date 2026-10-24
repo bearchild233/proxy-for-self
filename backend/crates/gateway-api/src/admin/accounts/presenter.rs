@@ -68,7 +68,7 @@ pub(super) fn account_view(item: AccountDirectoryItem, now: DateTime<Utc>) -> Ac
     // 养号阈值独立展示，不能把本地保护写成上游真正用尽的额度。
     let quota_protection_reached = account
         .quota_protection
-        .reached(quota.protection_used_percent);
+        .reached_usage(quota.protection_usage);
     let status = projection.status.as_str().to_owned();
     let cooldown = projection.cooldown;
     let expires_at = account.access_token_expires_at.as_ref().map(china_rfc3339);

@@ -280,7 +280,9 @@ mod profile_avatar {
 }
 
 mod batch_update {
-    use gateway_api::admin::accounts::{BatchUpdateAccountsRequest, UpdateAccountRequest};
+    use gateway_api::admin::accounts::{
+        BatchUpdateAccountsRequest, RotateAccountRequest, UpdateAccountRequest,
+    };
     use serde_json::json;
 
     #[test]
@@ -291,6 +293,11 @@ mod batch_update {
         });
         let omitted: UpdateAccountRequest = serde_json::from_value(single.clone()).unwrap();
         assert!(omitted.quota_protection.is_none());
+        let omitted_batch: BatchUpdateAccountsRequest = serde_json::from_value(json!({
+            "accountIds": ["acct_protected"], "enabled": true
+        }))
+        .unwrap();
+        assert!(omitted_batch.quota_protection.is_none());
         for enabled in [false, true] {
             for limit in [1, 90, 99] {
                 let policy = json!({"enabled": enabled, "usedPercentLimit": limit});
@@ -299,11 +306,44 @@ mod batch_update {
                 }))
                 .unwrap();
                 batch.validate().expect("policy-only batch mutation");
-                assert_eq!(batch.quota_protection.unwrap().used_percent_limit(), limit);
+                let decoded = batch.quota_protection.unwrap();
+                assert_eq!(decoded.used_percent_limit(), limit);
+                assert_eq!(decoded.short_term_used_percent_limit(), limit);
+                assert_eq!(decoded.weekly_used_percent_limit(), limit);
                 let mut input = single.clone();
                 input["quotaProtection"] = policy;
                 let request: UpdateAccountRequest = serde_json::from_value(input).unwrap();
                 request.validate().expect("single policy mutation");
+                assert_eq!(request.quota_protection, Some(decoded));
+            }
+            for (short_term, weekly) in [(1, 99), (75, 95), (99, 1)] {
+                let policy = json!({
+                    "enabled":enabled,"usedPercentLimit":87,
+                    "shortTermUsedPercentLimit":short_term,"weeklyUsedPercentLimit":weekly
+                });
+                let mut input = single.clone();
+                input["quotaProtection"] = policy.clone();
+                let request: UpdateAccountRequest = serde_json::from_value(input.clone()).unwrap();
+                request.validate().expect("single split policy mutation");
+                let decoded = request.quota_protection.unwrap();
+                assert_eq!(decoded.used_percent_limit(), 87);
+                assert_eq!(decoded.short_term_used_percent_limit(), short_term);
+                assert_eq!(decoded.weekly_used_percent_limit(), weekly);
+                assert_eq!(serde_json::to_value(decoded).unwrap(), policy);
+                let batch: BatchUpdateAccountsRequest = serde_json::from_value(json!({
+                    "accountIds":["acct_protected"], "quotaProtection":policy
+                }))
+                .unwrap();
+                batch.validate().expect("batch split policy mutation");
+                assert_eq!(batch.quota_protection, Some(decoded));
+                let rotation: RotateAccountRequest = serde_json::from_value(json!({
+                    "provider":"openai", "accountId":"acct_protected",
+                    "baseUrl":"https://example.invalid/v1", "apiKey":"test-key",
+                    "transport":"http", "settings":input
+                }))
+                .unwrap();
+                rotation.validate().expect("rotation split policy settings");
+                assert_eq!(rotation.settings.unwrap().quota_protection, Some(decoded));
             }
         }
         for policy in [
@@ -313,13 +353,32 @@ mod batch_update {
             json!({"enabled":true}),
             json!({"enabled":"true","usedPercentLimit":90}),
             json!({"enabled":true,"usedPercentLimit":90,"extra":true}),
+            json!({"enabled":true,"usedPercentLimit":90,"shortTermUsedPercentLimit":75}),
+            json!({"enabled":true,"usedPercentLimit":90,"weeklyUsedPercentLimit":95}),
+            json!({"enabled":true,"usedPercentLimit":90,"shortTermUsedPercentLimit":null,"weeklyUsedPercentLimit":95}),
+            json!({"enabled":true,"usedPercentLimit":90,"shortTermUsedPercentLimit":75,"weeklyUsedPercentLimit":null}),
+            json!({"enabled":false,"usedPercentLimit":90,"shortTermUsedPercentLimit":0,"weeklyUsedPercentLimit":95}),
+            json!({"enabled":true,"usedPercentLimit":90,"shortTermUsedPercentLimit":100,"weeklyUsedPercentLimit":95}),
+            json!({"enabled":true,"usedPercentLimit":90,"shortTermUsedPercentLimit":75,"weeklyUsedPercentLimit":0}),
+            json!({"enabled":false,"usedPercentLimit":90,"shortTermUsedPercentLimit":75,"weeklyUsedPercentLimit":100}),
+            json!({"enabled":true,"usedPercentLimit":90,"shortTermUsedPercentLimit":75.5,"weeklyUsedPercentLimit":95}),
+            json!({"enabled":true,"usedPercentLimit":90,"shortTermUsedPercentLimit":75,"weeklyUsedPercentLimit":"95"}),
+            json!({"enabled":true,"usedPercentLimit":90,"shortTermUsedPercentLimit":true,"weeklyUsedPercentLimit":95}),
+            json!({"enabled":true,"usedPercentLimit":90,"shortTermUsedPercentLimit":75,"weeklyUsedPercentLimit":95,"extra":true}),
         ] {
             let mut input = single.clone();
             input["quotaProtection"] = policy.clone();
-            assert!(serde_json::from_value::<UpdateAccountRequest>(input).is_err());
+            assert!(serde_json::from_value::<UpdateAccountRequest>(input.clone()).is_err());
             assert!(
                 serde_json::from_value::<BatchUpdateAccountsRequest>(json!({
                     "accountIds": ["acct_protected"], "quotaProtection": policy
+                }))
+                .is_err()
+            );
+            assert!(
+                serde_json::from_value::<RotateAccountRequest>(json!({
+                    "provider":"openai", "accountId":"acct_protected",
+                    "baseUrl":"https://example.invalid/v1", "transport":"http", "settings":input
                 }))
                 .is_err()
             );

@@ -2,6 +2,29 @@
 
 use super::*;
 
+fn quota_protection_storage_json(
+    protection: gateway_core::account::AccountQuotaProtection,
+) -> sqlx::types::Json<serde_json::Value> {
+    let legacy = protection.used_percent_limit();
+    // 统一阈值继续落旧格式，避免 A/B 重叠期间旧页面保存使排空中的旧进程无法读行。
+    let value = if protection.short_term_used_percent_limit() == legacy
+        && protection.weekly_used_percent_limit() == legacy
+    {
+        serde_json::json!({
+            "enabled": protection.enabled(),
+            "usedPercentLimit": legacy,
+        })
+    } else {
+        serde_json::json!({
+            "enabled": protection.enabled(),
+            "usedPercentLimit": legacy,
+            "shortTermUsedPercentLimit": protection.short_term_used_percent_limit(),
+            "weeklyUsedPercentLimit": protection.weekly_used_percent_limit(),
+        })
+    };
+    sqlx::types::Json(value)
+}
+
 #[async_trait]
 pub trait ProviderAccountRepository: Send + Sync {
     async fn load_provider_account(&self, id: &str) -> StoreResult<Option<ProviderAccountRecord>>;
@@ -635,7 +658,7 @@ impl ProviderAccountAdminRepository for PgProviderAccountRepository {
                         "update provider_accounts set quota_protection_json=$2 where id=any($1)",
                     )
                     .bind(ids)
-                    .bind(sqlx::types::Json(protection))
+                    .bind(quota_protection_storage_json(protection))
                     .execute(&mut *transaction)
                     .await
                     .map_err(|_| postgres_unavailable("set quota protection"))?;
@@ -703,7 +726,7 @@ impl ProviderAccountAdminRepository for PgProviderAccountRepository {
             .await?;
             if let Some(protection) = command.quota_protection {
                 sqlx::query("update provider_accounts set quota_protection_json=$2 where id=any($1)")
-                    .bind(&command.account_ids).bind(sqlx::types::Json(protection))
+                    .bind(&command.account_ids).bind(quota_protection_storage_json(protection))
                     .execute(&mut *transaction).await
                     .map_err(|_| postgres_unavailable("set quota protection"))?;
             }

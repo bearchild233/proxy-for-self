@@ -129,6 +129,8 @@ export interface AccountModelAccess {
 export interface AccountQuotaProtection {
   enabled: boolean
   usedPercentLimit: number
+  shortTermUsedPercentLimit?: number
+  weeklyUsedPercentLimit?: number
 }
 
 export interface Account {

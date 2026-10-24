@@ -12,7 +12,7 @@
 
 ## 实现逻辑
 
-**账号政策类型**：`frontend/src/api/modules/accounts.ts` 定义可选 `quotaProtection` 与 `quotaProtectionReached`，供账号插件跨版本读取；更新和批量更新允许携带完整的开关及整数阈值。实际编辑、旧网关兼容与保存核验由 accounts 插件负责，主壳不参与选号或额度判定。
+**账号政策类型**：`frontend/src/api/modules/accounts.ts` 定义可选 `quotaProtection` 与 `quotaProtectionReached`；政策保留legacy `usedPercentLimit`，新增可选 `shortTermUsedPercentLimit`、`weeklyUsedPercentLimit` 以兼容旧网关响应。更新和批量更新可携带总开关及完整整数阈值。实际分周期编辑、能力检测与保存回读由accounts插件负责，主壳不参与选号或额度判定。
 
 **启动**（`main.ts`）：注册 `v-loading` 指令、Pinia、`useThemeStore().initializeTheme()`、路由、`authPlugin`（挂载 401 会话失效处理），挂载 `App.vue`。
 

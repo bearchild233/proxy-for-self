@@ -42,6 +42,7 @@ import { useAccountsQuery } from './composables/useAccountsQuery'
 import { useAccountsTable } from './composables/useAccountsTable'
 import { useAccountSubscriptions } from './composables/useAccountSubscriptions'
 import { accountColumns, derivedAccountStatus } from './constants'
+import { quotaProtectionThresholds } from './utils/quotaProtection'
 
 const selectedIds = ref<Set<string>>(new Set())
 const { exportingOAuthIds, exportOAuth } = useAccountOAuthExport()
@@ -176,6 +177,8 @@ const {
   quotaProtectionSupported,
   quotaProtectionEnabled,
   quotaProtectionLimit,
+  quotaProtectionShortTermLimit,
+  quotaProtectionWeeklyLimit,
   concurrencyLimit: editingConcurrencyLimit,
   weight: editingWeight,
   modelAccess: editingModelAccess,
@@ -345,7 +348,7 @@ const singleDeleteDescription = computed(() => pendingDeleteAccount.value?.lifec
               <span
                 v-if="row.quotaProtectionReached"
                 class="mt-1 block text-cp-xs text-cp-warning-text"
-                :title="`养号使用阈值 ${row.quotaProtection?.usedPercentLimit ?? 90}%，已暂停分配新请求；真实上游额度见用量详情`"
+                :title="`养号使用阈值 ${quotaProtectionThresholds(row.provider, row.quotaProtection)}，已暂停分配新请求；真实上游额度见用量详情`"
               >
                 养号阈值已达
               </span>
@@ -363,7 +366,7 @@ const singleDeleteDescription = computed(() => pendingDeleteAccount.value?.lifec
                   <span
                     v-if="row.quotaProtection?.enabled"
                     class="rounded-cp-sm bg-cp-success-container px-1.5 text-cp-success-on-container"
-                    :title="`养号已开启，使用达到 ${row.quotaProtection.usedPercentLimit}% 后暂停分配新请求`"
+                    :title="`养号已开启，使用达到 ${quotaProtectionThresholds(row.provider, row.quotaProtection)} 后暂停分配新请求`"
                   >
                     养号
                   </span>
@@ -472,6 +475,8 @@ const singleDeleteDescription = computed(() => pendingDeleteAccount.value?.lifec
       v-model:enabled="schedulingEnabled"
       v-model:quota-protection-enabled="quotaProtectionEnabled"
       v-model:quota-protection-limit="quotaProtectionLimit"
+      v-model:quota-protection-short-term-limit="quotaProtectionShortTermLimit"
+      v-model:quota-protection-weekly-limit="quotaProtectionWeeklyLimit"
       v-model:concurrency-limit="editingConcurrencyLimit"
       v-model:weight="editingWeight"
       v-model:model-access="editingModelAccess"
