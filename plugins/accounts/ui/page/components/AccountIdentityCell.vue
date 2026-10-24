@@ -1,10 +1,10 @@
 <script setup lang="ts">
 import type { getAccounts } from '@/api'
 import { Grok, Openai } from '@boxicons/vue'
+import AccountPlanBadge from '@kit/accounts/AccountPlanBadge.vue'
 import { CircleHelp } from '@lucide/vue'
 import { computed } from 'vue'
 import AccountNotesPopover from './AccountNotesPopover.vue'
-import AccountPlanBadge from '@kit/accounts/AccountPlanBadge.vue'
 
 type AccountRow = Awaited<ReturnType<typeof getAccounts>>['items'][number]
 type AccountIdentity = Pick<AccountRow, 'id' | 'email' | 'planType' | 'planTypeDisplay' | 'provider'>
@@ -100,8 +100,8 @@ const metaGapClass = computed(() => props.metaSize === 'xs' ? 'gap-1' : 'gap-1.5
         <slot name="meta" />
         <AccountPlanBadge v-if="showPlan" :authentication-kind="account.authenticationKind" :plan-type="account.planType" :plan-type-display="account.planTypeDisplay" :size="metaSize" />
       </div>
-      <AccountNotesPopover v-else-if="visibleNotes" :notes="visibleNotes" class="mt-0.5" />
-      <div v-else-if="secondaryText" class="truncate font-emphasis" :class="secondaryClass">
+      <AccountNotesPopover v-if="visibleNotes" :notes="visibleNotes" class="mt-0.5" />
+      <div v-else-if="secondaryText && !(metaPosition === 'secondary' && (showPlan || $slots.meta))" class="truncate font-emphasis" :class="secondaryClass">
         {{ secondaryText }}
       </div>
     </div>

@@ -23,6 +23,8 @@
 
 组件在 `ui/page/components/`，按职责分：`AccountFilters`（筛选与批量按钮，归档视图换成“恢复选中/删除选中”）、`AccountTableActions`（主列表行操作）、`AccountArchivedActions`（归档行：重新授权/恢复/删除）、`AccountStatusBadge/`（状态徽标与 presenter）、`AccountQuotaSummaryCell/`（用量列）、`AccountQuotaPanel/`（展开区额度与重置卡）、`AccountUsagePanel`、`AccountProfileModal/`、`AccountQuotaForecastModal/`、`AccountCreateModal/`（导入与 OAuth）、`AccountImportTasks/`、`AccountModelAccessField` 等。
 
+账号身份单元格 `AccountIdentityCell` 的套餐/自定义元信息与备注分别渲染：列表把套餐放在次行时，仍展示 API 返回的非空备注，溢出内容由 `AccountNotesPopover` 展开。`showNotes` 控制备注显示；无备注时维持原有邮箱回退与次行元信息布局。备注展示不修改账号数据。
+
 生命周期与归档语义：归档由后端维护任务写入（`lifecycle_json.archived`，账号停用且不参与调度）；恢复只清归档标记并保持停用；重新授权在归档账号上走 `RotateProviderAccount.reactivate_archived`，同一事务内先离开归档并启用再轮换凭据；删除按 provider 分组在事务内级联删除分组绑定。接口字段见 [管理接口](../api.md) 的账号一节。
 
 ## 文件表
@@ -48,4 +50,5 @@
 - 插件组件内任何后代错误（含 `@click` 处理器 rejected Promise）都会被宿主变成“插件运行失败”：事件处理器里的异步调用必须自己 catch（请求层已提示错误）。
 - 新增接口权限要同步 `plugin.json` 能力和 `operations.json`；缺能力的旧平台会拒绝新包，不能删清单声明绕过。
 - 校验：`node scripts/check-plugin.mjs accounts`、`node scripts/build-plugin.mjs accounts`；前端测试 `node --test frontend/tests/account-*.test.mjs`。
+- 备注回归检查：`node --test frontend/tests/account-identity-notes.test.mjs` 编译真实身份组件并执行 Vue SSR，覆盖次行套餐/自定义元信息与备注同时显示、备注开关和无备注时邮箱回退。
 - 后端相关：`backend/crates/gateway-store/src/postgres/provider_accounts/`（分页、批量更新、删除事务）与 `backend/crates/providers/openai/src/credential/profile_statistics.rs`（归档维护）。

@@ -1,6 +1,6 @@
 {
   "id": "accounts",
-  "version": "0.3.12",
+  "version": "0.3.13",
   "protocol": 2,
   "kind": "ui",
   "sdk": 1,
@@ -52,8 +52,9 @@
     "settings.get.admin.settings.client-downloads.codex-desktop.windows",
     "accounts.avatar"
   ],
-  "releasedAt": "2026-10-23T02:00:00Z",
+  "releasedAt": "2026-10-24T03:00:00Z",
   "releaseNotes": [
+    "修复账号列表同时展示套餐信息时备注被隐藏的问题，恢复已有备注显示。",
     "养号阈值支持手动输入，并提供 85%、90%、95% 快捷选择。",
     "账号编辑新增养号开关与已使用百分比阈值；未知额度不保证预留，已发请求继续完成。",
     "真实账号状态与额度保持展示，达到养号阈值时单独标注；旧网关禁用养号设置。",
