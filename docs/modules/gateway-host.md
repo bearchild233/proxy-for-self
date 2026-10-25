@@ -24,7 +24,7 @@
 **插件运行时**（`src/plugin/`，协议见 [kernel-protocol](kernel-protocol.md)，设计见 [微内核设计](../microkernel.md)）：
 - `registry.rs`：`PluginRuntimeConfig`（`registry_path` 与 `ownership_cache_path` 必须成对配置）、注册表 JSON（`id` `enabled` `socket` `uid` `grants` `fetchHosts`）的加载与校验（ID 唯一、socket 绝对路径、能力白名单）；`is_socket_switch_of` 判断“仅 socket 变化”的热更新。
 - `runtime.rs::PluginRuntime`：`start` 恢复归属缓存后启动监督任务（监视注册表变化，为每个启用插件起连接任务）；实现 `PluginHooks`（每次调用在同一把状态锁内选连接并准入，保证 socket 切换时已准入调用排空；`watchers` 按各插件的监控规则 `watch_matches` 汇总）；`admin_call` 供控制面管理连接；`shutdown` 回收全部连接。
-- `connection.rs`：单个插件的连接任务（握手、`ownership.changed` 处理、健康检查、能力请求的授权与分发、切换时旧会话退役排空；`Access::allows`：账号在本插件拥有的分组里直接放行，否则账号不能归任何插件所有并且要命中本插件的监控规则）；`transport.rs`：`Peer`/`Outbound`、请求编号、准入计数；`state.rs`：每个插件的 `Entry` 与快照（`Available` / 不可用 / 未连接）、归属缓存文件读写（`plugin-ownership.json`，两个槽共用）；`capability.rs`：`log` 能力实现。
+- `connection.rs`：单个插件的连接任务（握手、`ownership.changed` 处理、健康检查、能力请求的授权与分发、切换时旧会话退役排空；`Access::allows`：账号在本插件拥有的分组里直接放行，否则账号不能归任何插件所有并且要命中本插件的监控规则）。`account-warmup` 的握手若报告 ownership 或 watchedGroups 会被拒绝，能力调用还会按当前注册表 grants 与活动连接快照双重校验；`transport.rs`：`Peer`/`Outbound`、请求编号、准入计数；`state.rs`：每个插件的 `Entry` 与快照（`Available` / 不可用 / 未连接）、归属缓存文件读写（`plugin-ownership.json`，两个槽共用）；`capability.rs`：`log` 能力实现。
 - 归属语义：已启用但未连接的插件按缓存归属让其分组账号失败关闭；禁用或移除则清除缓存归属，账号交还默认调度。
 
 **外部适配**：`pricing/mod.rs`（models.dev 固定地址、禁止跳转，只读，不进推理路径）、`client_distribution.rs`（RG-Adguard Store 页面解析与官方回退，惰性：仅在管理员打开下载弹窗时请求）、`proxy_probe.rs`（与 Provider 一致的代理协议与超时/大小限制的出口测试）、`plugin_policy.rs`（备份/定价策略进程：环境变量 `CPR_PLUGIN_POLICY_RUNNER` 与 `CPR_PLUGIN_ROOT` 同时设置时，用清空环境的 `python3 -I` 启动 `services/plugin_host/policy_runner.py`，5 秒超时，输出上限 128 KiB）。

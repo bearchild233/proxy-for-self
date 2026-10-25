@@ -38,7 +38,9 @@
       "settings.get.admin.settings",
       "settings.get.admin.settings.admin-api-key",
       "settings.get.admin.settings.client-downloads.codex-desktop.windows",
-      "accounts.avatar"
+      "accounts.avatar",
+      "account-warmup.read",
+      "account-warmup.run"
     ],
     "description": "管理账号、订阅、额度和调度设置；诊断入口由诊断插件提供。",
     "pages": [
@@ -407,6 +409,15 @@
     "capabilities": ["gateway-pool.read","gateway-pool.history.read","gateway-pool.queue.update","gateway-pool.configure","gateway-pool.cooling.reset","account-groups.get.admin.account-groups","accounts.get.admin.accounts"],
     "description": "指定分组按账号与网关轮换，使用打票模型和固定配套材料观察 21／29 实验信号；独立保存退避、恢复与静置统计。",
     "pages": [{"id":"main","title":"网关池","entry":"ui/module.js","roles":["admin"],"route":"/extensions/gateway-pool"}]
+  },
+  "account-warmup": {
+    "name": "账号预热",
+    "required": false,
+    "category": "account-tools",
+    "trustedUi": true,
+    "capabilities": ["account-warmup.read", "account-warmup.configure", "account-warmup.run", "account-warmup.history", "account-warmup.cancel", "accounts.get.admin.accounts", "auth.get.auth.status", "auth.post.auth.logout"],
+    "description": "独立后台插件：为全部或选中账号发送一次hi，支持真实额度重置与每日计划、逐账号时间和模型、随机延迟及持久任务记录。自动预热默认关闭。",
+    "pages": [{"id": "main", "title": "账号预热", "entry": "ui/module.js", "roles": ["admin"], "route": "/extensions/account-warmup"}]
   },
   "account-diagnostics": {
     "name": "账号诊断",

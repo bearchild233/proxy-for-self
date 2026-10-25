@@ -85,9 +85,19 @@ impl PluginRegistry {
                         | "accounts.read"
                         | "groups.move"
                         | "quota.read"
+                        | "accounts.warmup.read"
+                        | "accounts.warmup.run"
                 )
             }) {
                 return Err("unknown plugin capability".into());
+            }
+            if plugin.id != "account-warmup"
+                && plugin
+                    .grants
+                    .iter()
+                    .any(|grant| grant.starts_with("accounts.warmup."))
+            {
+                return Err("account warmup capabilities require account-warmup identity".into());
             }
         }
         Ok(registry)

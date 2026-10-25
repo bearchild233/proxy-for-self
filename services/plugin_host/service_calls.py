@@ -14,6 +14,10 @@ import kernel_protocol  # noqa: E402
 CALL_TIMEOUT_SECONDS = 10
 
 
+class ServiceConflictError(Exception):
+    """服务配置版本冲突；保留草稿，由管理员显式重新读取。"""
+
+
 class ServiceCalls:
     def __init__(self, registry_path):
         self.registry = Path(registry_path)
@@ -35,11 +39,15 @@ class ServiceCalls:
     def call(self, plugin_id, method, params, role):
         path = self.socket(plugin_id)
         try:
-            return kernel_protocol.admin_call(path, method, params, role, CALL_TIMEOUT_SECONDS)
+            return kernel_protocol.admin_call(path, method, params, role, CALL_TIMEOUT_SECONDS, expected_id=plugin_id)
         except kernel_protocol.RpcFailure as error:
             # 插件的错误码映射到控制面的 HTTP 语义：参数错误 400，未实现或禁止 403，其余按暂不可用 503。
             if error.code == 'invalid_params':
                 raise ValueError(error.message) from error
+            if error.code == 'conflict':
+                raise ServiceConflictError('配置已被更新，请重新读取后保存') from error
             if error.code in {'not_supported', 'forbidden'}:
                 raise PermissionError('插件没有此能力') from error
+            raise ConnectionError('插件服务暂不可用') from error
+        except OSError as error:
             raise ConnectionError('插件服务暂不可用') from error

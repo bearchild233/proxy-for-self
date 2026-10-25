@@ -31,7 +31,7 @@
 
 **快照编译与发布细节**（`src/routing/snapshot.rs`、`src/runtime/mod.rs`）：`RuntimeSnapshotCompiler::compile` 读取 Store 的一致性事实（设置、分组、Key 策略、账号、价格覆盖、画像、请求位置），向各 Provider 查询模型目录并要求 generation 稳定（最多重试 4 次，否则放弃本次编译），生成 `RuntimeSnapshot`（公开模型与画像、整对象模型映射、每个 Key 的 `ClientPolicy` 与 `FrozenAccountScope`、Codex 最低版本、`inference_limits`）。`RuntimeSnapshotPublisher` 每 5 秒对账一次（失败从 1 秒指数退避到 30 秒），Redis 变更通知只缩短收敛延迟；对账允许持久 revision 回退（不能只比较大小）；`plan` / `plan_provider_endpoint` 在请求线程内根据快照生成 `RoutingPlan`，不访问外部。
 
-**插件**（`src/plugin/`）：`PluginHooks`（五个钩子 + `ownership`）与 `PluginCapabilities`/`PluginAccounts`/`PluginUpstream` 端口；`capabilities.rs::KernelCapabilities` 做能力分发前的参数校验与按账号授权（`require_account` 与 `accounts.read` 过滤都走 `PluginAccess::allows`；`groups.move` 的增删分组仍须在插件声明的分组里）。监控规则 `watch_matches`：`watchedGroups` 里 `*` 表示所有不归任何插件所有的账号，`!分组` 表示带该分组的账号不监控（优先于其余条目），其余是具体分组；`PluginHooks::watchers(账号分组)` 按它汇总监控者（默认实现只按逐个分组的 `Watched` 汇总）。实现在 `gateway-host`（连接）与 Provider（路由桥）。
+**插件**（`src/plugin/`）：`PluginHooks`（五个钩子 + `ownership`）与 `PluginCapabilities`/`PluginAccounts`/`PluginUpstream` 端口；`capabilities.rs::KernelCapabilities` 做能力分发前的参数校验与按账号授权（`require_account` 与 `accounts.read` 过滤都走 `PluginAccess::allows`；`groups.move` 的增删分组仍须在插件声明的分组里）。`accounts.warmup.read/run` 是只给 `account-warmup` 身份的窄维护能力：只读取安全账号目录，单账号执行固定 `hi`，复用正常资格、额度保护与调度租约，不借用 ownership/watchedGroups。监控规则 `watch_matches`：`watchedGroups` 里 `*` 表示所有不归任何插件所有的账号，`!分组` 表示带该分组的账号不监控（优先于其余条目），其余是具体分组；`PluginHooks::watchers(账号分组)` 按它汇总监控者（默认实现只按逐个分组的 `Watched` 汇总）。实现在 `gateway-host`（连接）与 Provider（路由桥）。
 
 **后台任务契约**（`src/task/mod.rs`）：`WorkerKind` / `WorkerId` / `WorkerSchedule` / `WorkerRunnable`（Scheduled 周期任务或 Daemon）/ leader lease 与 fencing token；各 crate 返回 `WorkerContribution`，由 Host 的 `WorkerSupervisor` 运行。
 
@@ -45,7 +45,7 @@
 | `src/runtime/mod.rs` | 快照句柄、发布器、revision 订阅与对账判定 |
 | `src/account/` | 账号值对象与端口：`model.rs`（账号、并发、权重、凭据状态）、`scope.rs`、`selection.rs`、`quota_protection.rs`（养号准入政策）、`model_access.rs`、`lifecycle.rs`、`proxy.rs`（出口代理值对象）、`location.rs`、`store.rs` |
 | `src/policy/` | Client Key 策略与限额（`mod.rs`）、Codex 最低版本（`client_version.rs`）、入口容量（`inference_limits.rs`） |
-| `src/provider_ports/mod.rs` | Provider 运行时需要的中立存储端口：调度状态、租约、冷却、会话亲和、circuit、凭据状态缓存、运行策略、分组移动等 |
+| `src/provider_ports/mod.rs` | Provider 运行时需要的中立存储端口：调度状态、租约、冷却、会话亲和、circuit、凭据状态缓存、运行策略、账号选择政策、分组移动等 |
 | `src/event.rs` `src/operation/` `src/error.rs` `src/upstream.rs` | canonical event、operation 与能力要求、稳定错误分类、发送状态 |
 | `src/metering/` | 十进制金额、币种、用量与费用估算、`pricing.rs` 价格覆盖合并 |
 | `src/concurrency.rs` | 中立有界 FIFO 等待位置 |

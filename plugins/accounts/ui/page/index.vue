@@ -31,6 +31,7 @@ import AccountStatusBadge from './components/AccountStatusBadge/index.vue'
 import AccountSubscriptionCell from './components/AccountSubscriptionCell.vue'
 import AccountTableActions from './components/AccountTableActions.vue'
 import AccountUsagePanel from './components/AccountUsagePanel.vue'
+import AccountWarmupToolbar from './components/AccountWarmupToolbar.vue'
 import { useAccountBatchEditor } from './composables/useAccountBatchEditor'
 
 import { useAccountEditor } from './composables/useAccountEditor'
@@ -218,6 +219,7 @@ const singleDeleteDescription = computed(() => pendingDeleteAccount.value?.lifec
       description="维护账号池，查看可用性、配额与使用状态"
     >
       <template #actions>
+        <AccountWarmupToolbar :selected-account-ids="[...selectedIds]" :archived="archivedQuery" />
         <BaseButton variant="secondary" :loading="refreshing || subscriptionsRefreshing" :disabled="loading || refreshing || subscriptionsRefreshing" @click="refreshPage">
           <template #icon>
             <RefreshCw class="size-4" />

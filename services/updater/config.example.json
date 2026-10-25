@@ -28,7 +28,8 @@
     "group": "proxy-for-self-plugins",
     "socket_group": "proxy-for-self-plugin-ipc",
     "allow": {
-      "example-echo": {"grants": ["log"], "fetchHosts": []}
+      "example-echo": {"grants": ["log"], "fetchHosts": []},
+      "account-warmup": {"grants": ["accounts.warmup.read", "accounts.warmup.run", "log"], "fetchHosts": []}
     }
   }
 }

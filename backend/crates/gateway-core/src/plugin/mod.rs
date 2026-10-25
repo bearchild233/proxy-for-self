@@ -100,6 +100,10 @@ pub trait PluginCapabilities: Send + Sync {
 /// 每次读取都取当前注册表与归属，排队中的调用不能继续使用已撤销的分组。
 pub trait PluginAccess: Send + Sync {
     fn id(&self) -> &str;
+    /// 维护能力每次按当前注册表重验，不能由分组归属或旧连接隐含授予。
+    fn has_capability(&self, _name: &str) -> bool {
+        false
+    }
     fn groups(&self) -> Vec<String>;
     /// 能力调用能否访问带这些分组的账号；默认按 `groups()` 求交集。
     fn allows(&self, account_groups: &[String]) -> bool {
@@ -120,6 +124,20 @@ pub trait PluginAccounts: Send + Sync {
 
 #[async_trait]
 pub trait PluginUpstream: Send + Sync {
+    async fn warmup_read(
+        &self,
+        _access: &dyn PluginAccess,
+        _params: AccountWarmupReadParams,
+    ) -> Result<AccountWarmupReadResult, RpcError> {
+        Err(RpcError::new(NOT_SUPPORTED, "account warmup unavailable"))
+    }
+    async fn warmup_run(
+        &self,
+        _access: &dyn PluginAccess,
+        _params: AccountWarmupRunParams,
+    ) -> Result<AccountWarmupRunResult, RpcError> {
+        Err(RpcError::new(NOT_SUPPORTED, "account warmup unavailable"))
+    }
     async fn quota(&self, params: QuotaReadParams) -> Result<QuotaReadResult, RpcError>;
     async fn probe(
         &self,

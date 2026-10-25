@@ -8,9 +8,9 @@
 
 - `plugins/sdk/plugin-sdk`：Unix socket 插件运行时。插件实现 `Plugin` trait，SDK 负责监听 socket、握手、帧收发、钩子分发、能力客户端、排空与关停；授权和业务策略不在这里（内核授权，插件自决）。
 - `plugins/sdk/plugin-bench`：基准测量工具（启动 example-echo、统计钩子延迟与 RSS）。
-- 成员还有 `plugins/example-echo/service`（示例）与 `plugins/gateway-pool/service`（网关池，见 [网关池](../gateway-pool.md)）。
+- 成员还有 `plugins/example-echo/service`（示例）、`plugins/gateway-pool/service`（网关池，见 [网关池](../gateway-pool.md)）与 `plugins/account-warmup/service`（账号预热：独立 SQLite 队列、每日/额度重置调度与未知结果不重试）。
 
-依赖 `backend/crates/kernel-protocol`（路径依赖；edition / license / rust-version / lints 从 backend workspace 继承，两个 workspace 各有 `Cargo.lock`）。SDK 版本取 workspace 的 `0.0.0`；协议版本 0.6 由 `kernel-protocol` 决定。
+依赖 `backend/crates/kernel-protocol`（路径依赖；edition / license / rust-version / lints 从 backend workspace 继承，两个 workspace 各有 `Cargo.lock`）。SDK 版本取 workspace 的 `0.0.0`；协议版本 0.7 由 `kernel-protocol` 决定。
 
 ## 实现逻辑
 
@@ -30,6 +30,7 @@
 | `plugins/package.json` | 插件目录的 Node 元数据（私有包标记） |
 | `plugins/sdk/README.md` | SDK 使用说明、基准测量、依赖许可证表 |
 | `plugins/sdk/plugin-sdk/src/lib.rs` `plugin.rs` `runtime.rs` `client.rs` `transport.rs` `testing.rs` | 见上 |
+| `plugins/account-warmup/service/` | 账号预热服务插件：SQLite 持久队列、配置 revision、每日/重置触发和 admin.call |
 | `plugins/sdk/plugin-sdk/tests/runtime.rs` | 运行时契约测试（需要 `testing` feature） |
 | `plugins/sdk/plugin-bench/src/main.rs` | 基准工具 |
 

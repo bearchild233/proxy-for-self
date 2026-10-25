@@ -18,7 +18,7 @@
 
 **路由与登录**（`router/`）：几乎所有受保护路由（`/`、`/accounts`、`/proxies`、`/groups`、`/keys`、`/usage`、`/theme`、`/settings*`、`/extensions/:plugin/:page?`、独立的 `/key-usage`）都指向同一个 `PluginRoute.vue`，由插件页面声明的 `route` 决定显示谁；`/settings/plugins` 是主壳自带的 `PluginManager.vue`。`beforeEach`：先 `checkAuth`（本机预览 origin 下自动走 `/api/plugin-platform/local-login`），未登录跳 `/login`（带 `redirect`），Key 身份只能进 `/key-usage`，管理员访问 `/key-usage` 回仪表盘。管理员与 Key 共用 `/api/auth/*`，Auth Store 只有一份。
 
-**请求层**（`api/request.ts`）：Axios 实例 `withCredentials`；统一信封 `{code,message,data}`，HTTP 成功但业务码失败也拒绝；`ApiError` 带 `status` `code` `requestId` `kind`；错误提示统一在拦截器弹 toast（`silent` 只关提示，不吞异常、不跳过会话失效处理）；业务码 `40101` + 401 触发一次性会话失效处理。`api/modules/*.ts` 是各接口的类型与调用封装（账号、分组、Key、代理、用量、仪表盘、备份、定价、设置、客户端画像、系统更新等），插件直接 `import`。
+**请求层**（`api/request.ts`）：Axios 实例 `withCredentials`；统一信封 `{code,message,data}`，HTTP 成功但业务码失败也拒绝；`ApiError` 带 `status` `code` `requestId` `kind`；错误提示统一在拦截器弹 toast（`silent` 只关提示，不吞异常、不跳过会话失效处理）；业务码 `40101` + 401 触发一次性会话失效处理。`api/modules/*.ts` 是各接口的类型与调用封装（账号、账号预热、分组、Key、代理、用量、仪表盘、备份、定价、设置、客户端画像、系统更新等），插件直接 `import`。`accountWarmup.ts` 只声明预热服务的 read/configure/run/history/cancel 能力，实际执行由宿主桥转发。
 
 **插件运行环境**（`plugins/`）：
 - `platform.ts`：`platformPlugins`（`/api/plugin-platform/catalog` 目录，内容未变化不触发响应式更新）、`openPlugin`（弹出式页面）；`catalog.ts`：原生插件（Excel 等）目录 `/api/plugins`。
@@ -38,7 +38,7 @@
 | --- | --- |
 | `frontend/src/main.ts` `frontend/src/App.vue` | 入口与根组件 |
 | `frontend/src/router/` | 路由表与登录守卫 |
-| `frontend/src/api/` | 请求层、错误规范化、各接口模块 |
+| `frontend/src/api/` | 请求层、错误规范化、各接口模块（含 `accountWarmup.ts`） |
 | `frontend/src/stores/` | Pinia：`auth` `theme` `system-update` `ui` |
 | `frontend/src/plugins/` | 插件平台前端运行时（见上） |
 | `frontend/src/layout/` | 侧边栏布局、系统更新弹窗 |
@@ -55,7 +55,7 @@
 - 构建：`frontend/vite.config.ts`（别名、`/dev` 代理到本机网关、echarts 单独分块）；产物 `frontend/dist` 由 Rust 静态服务或反代提供。
 - 浏览器存储：Pinia 持久化主题与侧边栏状态；页面租约在内存。
 - 与后端的合同：[管理接口](../api.md)、[插件平台](../plugin-migration.md)；插件能力白名单在 `packages/plugin-sdk/operations.json`。
-- 测试：`frontend/tests/*.test.mjs`（`node --test`，覆盖账号归档、额度显示、插件租约/预载/导航等），`pnpm --dir frontend lint|typecheck|build`。
+- 测试：`frontend/tests/*.test.mjs`（`node --test`，覆盖账号归档、额度显示、账号预热设置/提交、插件租约/预载/导航等），`pnpm --dir frontend lint|typecheck|build`。
 
 ## 改动指引
 

@@ -1,6 +1,92 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// 维护能力与普通路由归属授权相互独立，只授予 account-warmup。
+pub const ACCOUNT_WARMUP_PLUGIN: &str = "account-warmup";
+pub const ACCOUNT_WARMUP_READ: &str = "accounts.warmup.read";
+pub const ACCOUNT_WARMUP_RUN: &str = "accounts.warmup.run";
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AccountWarmupReadParams {
+    pub ids: Option<Vec<String>>,
+    pub model: Option<String>,
+    #[serde(default)]
+    pub include_models: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AccountWarmupRunParams {
+    pub account_id: String,
+    pub model: String,
+    pub timeout_ms: u64,
+    pub attempt_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountWarmupShortTerm {
+    pub observed_at: Option<String>,
+    pub window_seconds: u64,
+    pub used_percent: Option<f64>,
+    pub reset_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountWarmupModel {
+    pub id: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountWarmupAccount {
+    pub id: String,
+    pub provider: String,
+    pub authentication_kind: String,
+    pub enabled: bool,
+    pub status: String,
+    pub supported: bool,
+    pub reason_code: Option<String>,
+    pub model_allowed: Option<bool>,
+    pub models: Option<Vec<AccountWarmupModel>>,
+    pub short_term: Option<AccountWarmupShortTerm>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AccountWarmupReadResult {
+    pub accounts: Vec<AccountWarmupAccount>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountWarmupOutcome {
+    Accepted,
+    Skipped,
+    Failed,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountWarmupSendState {
+    NotSent,
+    Sent,
+    Ambiguous,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountWarmupRunResult {
+    pub outcome: AccountWarmupOutcome,
+    pub reason_code: Option<String>,
+    pub status: Option<u16>,
+    pub duration_ms: u64,
+    pub send_state: AccountWarmupSendState,
+    pub short_term: Option<AccountWarmupShortTerm>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpstreamProbeParams {

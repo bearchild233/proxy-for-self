@@ -8,11 +8,11 @@ from pathlib import Path
 import re
 
 # 内核协议已定义的能力名，与 backend/crates/gateway-host/src/plugin/registry.rs 的 grants 白名单一致。
-KERNEL_CAPABILITIES = frozenset({"log", "upstream.probe", "http.fetch", "accounts.read", "groups.move", "quota.read"})
+KERNEL_CAPABILITIES = frozenset({"log", "upstream.probe", "http.fetch", "accounts.read", "groups.move", "quota.read", "accounts.warmup.read", "accounts.warmup.run"})
 # 与 kernel-protocol 的 is_compatible 对齐：内核主版本 0，插件次版本下限 4，上限不超过内核次版本。
 KERNEL_API_MAJOR = 0
 KERNEL_API_MIN_MINOR = 4
-KERNEL_API_MINOR = 6
+KERNEL_API_MINOR = 7
 SERVICE_FIELDS = frozenset({"binary", "kernelApi", "capabilities", "fetchHosts", "memoryMax", "shutdownSeconds"})
 MEMORY_MIN_MIB = 16
 MEMORY_MAX_MIB = 512
@@ -78,6 +78,8 @@ def validate_service(manifest: dict, root: Path) -> dict | None:
     if (not isinstance(capabilities, list) or len(set(capabilities)) != len(capabilities)
             or not all(isinstance(item, str) and item in KERNEL_CAPABILITIES for item in capabilities)):
         raise ValueError("服务申请的能力无效")
+    if manifest.get("id") != "account-warmup" and any(item.startswith("accounts.warmup.") for item in capabilities):
+        raise ValueError("账号预热能力只允许 account-warmup")
 
     hosts = service["fetchHosts"]
     if (not isinstance(hosts, list) or len(set(hosts)) != len(hosts)

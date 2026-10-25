@@ -322,6 +322,7 @@ fn registry_validation_and_disabled_configuration() {
     for bad in [
         json!({"id":"test","enabled":true,"socket":"relative.sock","grants":[]}),
         json!({"id":"test","enabled":true,"socket":"/tmp/test.sock","grants":["unknown"]}),
+        json!({"id":"test","enabled":true,"socket":"/tmp/test.sock","grants":["accounts.warmup.run"]}),
     ] {
         registry(root.path(), vec![bad]);
         assert!(PluginRegistry::load(&root.path().join("registry.json")).is_err());
@@ -1127,6 +1128,95 @@ async fn all_capabilities_require_request_and_registry_intersection() {
         runtime.shutdown().await;
         f.stop().await;
     }
+}
+
+struct DelayedWarmupAuthorization {
+    entered: Notify,
+    proceed: Notify,
+}
+#[async_trait::async_trait]
+impl PluginCapabilities for DelayedWarmupAuthorization {
+    async fn call(
+        &self,
+        access: &dyn gateway_core::plugin::PluginAccess,
+        method: &str,
+        _: Value,
+    ) -> RpcResult<Value> {
+        gateway_core::plugin::require_warmup(access, method)?;
+        self.entered.notify_one();
+        self.proceed.notified().await;
+        gateway_core::plugin::require_warmup(access, method)?;
+        Ok(json!({"accepted":true}))
+    }
+}
+
+#[tokio::test]
+async fn warmup_grant_revocation_rejects_already_queued_maintenance_without_ownership() {
+    let root = tempfile::tempdir().unwrap();
+    let mut desc = descriptor(ACCOUNT_WARMUP_PLUGIN, &[]);
+    desc.capabilities = vec![ACCOUNT_WARMUP_RUN.into()];
+    let f = Fixture::with_descriptor(root.path(), ACCOUNT_WARMUP_PLUGIN, desc);
+    registry(
+        root.path(),
+        vec![registration(
+            root.path(),
+            ACCOUNT_WARMUP_PLUGIN,
+            true,
+            &[ACCOUNT_WARMUP_RUN],
+        )],
+    );
+    let caps = Arc::new(DelayedWarmupAuthorization {
+        entered: Notify::new(),
+        proceed: Notify::new(),
+    });
+    let runtime = PluginRuntime::start(
+        PluginRuntimeConfig {
+            registry_path: Some(root.path().join("registry.json")),
+            ownership_cache_path: Some(root.path().join("plugin-ownership.json")),
+        },
+        KernelInfo {
+            version: "fixture".into(),
+            slot: None,
+        },
+        caps.clone(),
+    )
+    .unwrap()
+    .unwrap();
+    available(&runtime, ACCOUNT_WARMUP_PLUGIN).await;
+    let request = runtime.admin_call(
+        ACCOUNT_WARMUP_PLUGIN,
+        admin(
+            "capability",
+            json!({"method":ACCOUNT_WARMUP_RUN,"params":{}}),
+        ),
+    );
+    tokio::pin!(request);
+    tokio::select! {
+        result = &mut request => panic!("capability returned before authorization gate: {result:?}"),
+        () = caps.entered.notified() => {}
+    }
+    registry(
+        root.path(),
+        vec![registration(root.path(), ACCOUNT_WARMUP_PLUGIN, true, &[])],
+    );
+    until(|| {
+        runtime.snapshot().plugins.iter().any(|plugin| {
+            plugin.id == ACCOUNT_WARMUP_PLUGIN
+                && !plugin
+                    .granted_capabilities
+                    .iter()
+                    .any(|grant| grant == ACCOUNT_WARMUP_RUN)
+        })
+    })
+    .await;
+    caps.proceed.notify_one();
+    assert!(matches!(
+        request.await.unwrap_err().code.as_str(),
+        FORBIDDEN | UNAVAILABLE
+    ));
+    assert_eq!(runtime.ownership("any_group"), Ownership::NotOwned);
+    runtime.shutdown().await;
+    f.stop().await;
 }
 
 #[tokio::test]

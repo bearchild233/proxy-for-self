@@ -86,7 +86,7 @@ class ServiceManifestTests(unittest.TestCase):
     def test_accepts_boundary_values(self):
         self.assertEqual(self.check(memoryMax="16M", shutdownSeconds=5)["memoryMaxMiB"], 16)
         self.assertEqual(self.check(memoryMax="512M", shutdownSeconds=600)["shutdownSeconds"], 600)
-        for minor in (4, 5, 6):
+        for minor in (4, 5, 6, 7):
             self.assertEqual(self.check(kernelApi={"major": 0, "minMinor": minor})["kernelApi"]["minMinor"], minor)
 
     def test_rejects_unknown_capabilities_and_duplicates(self):
@@ -94,13 +94,23 @@ class ServiceManifestTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 self.check(capabilities=value)
 
+    def test_warmup_capabilities_require_the_warmup_identity(self):
+        caps = ["accounts.warmup.read", "accounts.warmup.run"]
+        with self.assertRaises(ValueError):
+            self.check(capabilities=caps)
+        manifest = copy.deepcopy(self.manifest)
+        manifest["id"] = "account-warmup"
+        manifest["service"]["kernelApi"]["minMinor"] = 7
+        manifest["service"]["capabilities"] = caps
+        self.assertEqual(validate_service(manifest, self.root)["capabilities"], caps)
+
     def test_rejects_invalid_hosts(self):
         for value in [["Pool.example.test"], ["a_b.test"], ["-bad.test"], ["x" * 64 + ".test"], "pool.example.test"]:
             with self.subTest(value=value), self.assertRaises(ValueError):
                 self.check(fetchHosts=value)
 
     def test_rejects_incompatible_kernel_api(self):
-        for value in [{"major": 1, "minMinor": 5}, {"major": 0, "minMinor": 3}, {"major": 0, "minMinor": 7},
+        for value in [{"major": 1, "minMinor": 5}, {"major": 0, "minMinor": 3}, {"major": 0, "minMinor": 8},
                       {"major": 0}, {"major": 0, "minMinor": 5, "extra": 1}]:
             with self.subTest(value=value), self.assertRaises(ValueError):
                 self.check(kernelApi=value)

@@ -17,7 +17,7 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from jobs import Jobs
 from lifecycle import Lifecycle
-from service_calls import ServiceCalls
+from service_calls import ServiceCalls, ServiceConflictError
 import tarfile
 import tempfile
 from urllib.parse import urlencode, urlsplit
@@ -158,6 +158,8 @@ class Platform:
             raise PermissionError('插件没有此能力')
         if not isinstance(data, dict):
             raise ValueError('参数必须为对象')
+        if name.startswith('account-warmup.'):
+            return self.warmup_call(plugin_id, name, data, role)
         if name.startswith('gateway-pool.'):
             if role != 'admin' or plugin_id != 'gateway-pool':
                 raise PermissionError('没有网关池管理权限')
@@ -227,6 +229,34 @@ class Platform:
         if spec['method'] == 'GET':
             path += '?' + urlencode({key: str(value).lower() if isinstance(value, bool) else value for key, value in data.items() if value is not None})
         return self.forward(spec['method'], path, cookie, data if spec['method'] == 'POST' else None, origin)
+
+    def warmup_call(self, plugin_id, name, data, role):
+        methods = {'read', 'configure', 'run', 'history', 'cancel'}
+        method = name.removeprefix('account-warmup.')
+        # 只给账号页开放这两项已登记能力，不提供任意跨插件转发。
+        if (role != 'admin' or plugin_id not in {'accounts', 'account-warmup'}
+                or method not in methods or (plugin_id == 'accounts' and method not in {'read', 'run'})):
+            raise PermissionError('没有账号预热管理权限')
+        target = self.store.state('account-warmup')
+        if target.get('enabled') is not True or not target.get('current'):
+            if method == 'read':
+                return 200, json.dumps({'available': False, 'reason': 'plugin_disabled'}).encode(), None
+            raise ConnectionError('请先安装并启用账号预热插件')
+        # 页面可以持有旧租约，执行端始终固定为当前启用的服务版本。
+        manifest = self.store.manifest('account-warmup', target['current'])
+        if manifest.get('service') is None or name not in manifest.get('capabilities', []):
+            raise PermissionError('当前账号预热插件没有此能力')
+        if self.service_calls is None:
+            if method == 'read':
+                return 200, json.dumps({'available': False, 'reason': 'service_unavailable'}).encode(), None
+            raise ConnectionError('账号预热服务暂不可用')
+        try:
+            value = self.service_calls.call('account-warmup', method, data, role)
+        except ConnectionError:
+            if method != 'read':
+                raise
+            return 200, json.dumps({'available': False, 'reason': 'service_unavailable'}).encode(), None
+        return 200, json.dumps(value, ensure_ascii=False).encode(), None
 
     def templates(self, plugin_id, version, value=None):
         path=self.root/'diagnostic-templates.json'
@@ -389,7 +419,7 @@ class Handler(BaseHTTPRequestHandler):
             self.dispatch()
         except PermissionError as error:
             self.reply({'error': str(error)},403)
-        except PluginVersionChangedError as error:
+        except (PluginVersionChangedError, ServiceConflictError) as error:
             self.reply({'error': str(error)},409)
         except (ValueError, KeyError, TypeError, tarfile.TarError):
             self.reply({'error':'参数、插件包或版本无效'},400)

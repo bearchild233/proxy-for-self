@@ -149,6 +149,14 @@ async fn connect(
         if !is_compatible(KernelApi::default(), hello.kernel_api) {
             return Err(internal("incompatible kernel API"));
         }
+        if registration.id == ACCOUNT_WARMUP_PLUGIN
+            && (!hello.owned_groups.is_empty() || !hello.watched_groups.is_empty())
+        {
+            return Err(RpcError::new(
+                FORBIDDEN,
+                "account warmup cannot own or watch routing groups",
+            ));
+        }
         Ok((stream, hello, uid))
     })
     .await
@@ -228,6 +236,14 @@ async fn session(
             Message::Notify { method, params } if method == "ownership.changed" => {
                 let params: OwnershipChangedParams =
                     serde_json::from_value(params).map_err(internal)?;
+                if registration.id == ACCOUNT_WARMUP_PLUGIN
+                    && (!params.owned_groups.is_empty() || !params.watched_groups.is_empty())
+                {
+                    return Err(RpcError::new(
+                        FORBIDDEN,
+                        "account warmup cannot own or watch routing groups",
+                    ));
+                }
                 let mut state = state.lock().expect("plugin state");
                 if is_active(&state, &registration.id, &peer) {
                     state.ownership(&registration.id, params.owned_groups, params.watched_groups);
@@ -323,6 +339,22 @@ struct Access {
 impl PluginAccess for Access {
     fn id(&self) -> &str {
         &self.id
+    }
+    fn has_capability(&self, name: &str) -> bool {
+        self.state
+            .lock()
+            .expect("plugin state")
+            .entries
+            .get(&self.id)
+            .is_some_and(|entry| {
+                entry.registration.enabled
+                    && entry.registration.grants.iter().any(|grant| grant == name)
+                    && entry
+                        .snapshot
+                        .granted_capabilities
+                        .iter()
+                        .any(|grant| grant == name)
+            })
     }
     fn groups(&self) -> Vec<String> {
         self.state

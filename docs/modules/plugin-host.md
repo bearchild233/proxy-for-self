@@ -19,7 +19,8 @@
 - 其余 GET 按静态资源处理（`--assets` 目录，发布目录 symlink 原子切换，路径越界拒绝）；`/api/*` 未知返回 404。
 
 **能力桥**（`Platform.call`）：先校验插件已启用（排空任务例外）、`name` 在该版本清单的 `capabilities` 里，再按名称分派：
-- `<插件ID>.*`（服务插件管理能力，仅管理员）→ `service_calls.py` 读 root 管理的内核注册表取 socket，经管理连接 `admin.call` 转给插件进程，错误码映射为 400/403/503（超时 10 秒）。
+- `<插件ID>.*`（服务插件管理能力，仅管理员）→ `service_calls.py` 读 root 管理的内核注册表取 socket，经管理连接 `admin.call` 转给插件进程，错误码映射为 400/403/503（超时 10 秒）；管理握手把注册表中的插件 ID 与服务 hello 绑定，避免 socket 被替换后串到其他服务。
+- `account-warmup.*`：账号页只允许 `read/run`，预热页允许配置、历史和取消；当前启用版本与清单能力再次校验，read 在服务不可用时返回明确的不可用原因，run 不把连接失败伪装成受理成功。
 - `gateway-pool.*`：仅管理员、仅网关池插件自己；执行后端跟随当前安装版本（页面可能仍租用旧包），带 `service` 段时走上一条，没有服务段的旧包返回 503。
 - `tasks.*` `templates.*` `diagnostics.*`：诊断插件的任务、模板、历史，经 `jobs.py` 启动 Worker 子进程；`pricing.schedule.status` 读定价运行状态；`accounts.avatar`、`excel.status`、`client.models` 是少量内置组合能力。
 - 其余名称查 `operations.json`，校验角色，GET 转查询串、POST 转 JSON，转发到网关管理 API（`display-order.save` 额外限制插件只能改自己的顺序范围）。

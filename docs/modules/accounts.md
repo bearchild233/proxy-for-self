@@ -4,7 +4,7 @@
 
 ## 职责与边界
 
-基础界面插件（`kind: ui`、`runtime: vue-component`、页面 `/accounts`，仅管理员，不可停用/卸载）：账号列表与筛选、导入与 OAuth 授权/重新授权、编辑与批量编辑、额度/用量/订阅展示、个人资料、额度预测与重置卡、导入任务、归档视图。**没有后端进程**：全部数据来自网关管理 API，经平台命名能力调用（`plugin.json` 的 `capabilities` 逐项对应 `packages/plugin-sdk/operations.json`）。
+基础界面插件（`kind: ui`、`runtime: vue-component`、页面 `/accounts`，仅管理员，不可停用/卸载）：账号列表与筛选、导入与 OAuth 授权/重新授权、编辑与批量编辑、额度/用量/订阅展示、个人资料、额度预测与重置卡、导入任务、归档视图，以及账号预热的全部/选中入口。**没有后端进程**：普通数据来自网关管理 API；预热入口只通过显式的 `account-warmup.read/run` 跨插件桥调用独立服务。
 
 - 依赖：`gateway-api` 的 `/api/admin/accounts*`（实现链见 `gateway-api` → `gateway-admin` → `gateway-store`）、主壳基础组件、`packages/ui-kit/accounts`（用量窗口、套餐徽标）。
 - 业务规则（账号状态、归档、调度字段）归后端，这里只展示与发起操作。
@@ -21,6 +21,8 @@
 - `useAccountLifecycle`：归档视图“恢复到主列表”（`batch-update {restoreArchived:true}`）与临期优先开关。
 - `useAccountImportTasks`：后台导入任务轮询、详情与停止；`useAccountPersonalInfo` `useAccountSubscriptions` `useAccountQuotaForecast` `useAccountResetCredits`：个人资料、订阅周期、额度预测、重置卡（幂等键、未决消费防重复）。
 
+**账号预热入口**：`AccountWarmupToolbar.vue` 允许对当前账号池全部账号或跨分页选中账号提交一次 `hi`，提交 ID 在未知网络结果时保留以便回读同一批次；归档视图、插件停用或服务不可用时只显示不可用状态。设置与历史位于独立的 `account-warmup` 页面，入口通过宿主导航打开，不把当前页筛选误当作“全部账号”。
+
 订阅 / 权重列在权重后为 `quotaProtection.enabled` 的账号显示“养号”标记，悬停展示OpenAI的5小时/7天两项阈值或xAI账期阈值；关闭或旧网关未返回养号设置时不显示。状态列的“养号阈值已达”仍单独表示当前额度观测已触发保护。
 
 组件在 `ui/page/components/`，按职责分：`AccountFilters`（筛选与批量按钮，归档视图换成“恢复选中/删除选中”）、`AccountTableActions`（主列表行操作）、`AccountArchivedActions`（归档行：重新授权/恢复/删除）、`AccountStatusBadge/`（状态徽标与 presenter）、`AccountQuotaSummaryCell/`（用量列）、`AccountQuotaPanel/`（展开区额度与重置卡）、`AccountUsagePanel`、`AccountProfileModal/`、`AccountQuotaForecastModal/`、`AccountCreateModal/`（导入与 OAuth）、`AccountImportTasks/`、`AccountModelAccessField` 等。
@@ -33,17 +35,18 @@
 
 | 路径 | 职责 |
 | --- | --- |
-| `plugins/accounts/plugin.json` | 清单：版本、页面 `/accounts`、35 个能力、`vue-component` |
+| `plugins/accounts/plugin.json` | 清单：版本、页面 `/accounts`、37 个能力、`vue-component` |
 | `plugins/accounts/ui/entries.json` | 页面入口声明（`main` → `ui/page/index.vue`） |
 | `plugins/accounts/ui/page/index.vue` | 页面入口 |
 | `plugins/accounts/ui/page/components/` | 表格单元格、弹窗、筛选、操作列 |
+| `plugins/accounts/ui/page/components/AccountWarmupToolbar.vue` | 账号预热全部/选中提交入口与服务可用性轮询 |
 | `plugins/accounts/ui/page/composables/` | 查询、变更、导入、编辑、生命周期、资料/订阅/预测/重置卡 |
 | `plugins/accounts/ui/page/utils/` | 需处理判定、OAuth 导出、刷新页、调度表单、上游 API Key 等纯函数 |
 | `plugins/accounts/ui/page/constants.ts` | 列、选项、常量 |
 
 ## 数据、配置与接口
 
-- 调用的能力：账号列表/详情/导出/导入/导入任务/OAuth/刷新/额度/批量更新/删除/恢复/轮换/重置卡/预测/个人信息、分组列表、代理列表、设置与客户端下载、`display-order.save`（账号顺序）、`accounts.avatar`（控制面把头像读成 data URL）。
+- 调用的能力：账号列表/详情/导出/导入/导入任务/OAuth/刷新/额度/批量更新/删除/恢复/轮换/重置卡/预测/个人信息、分组列表、代理列表、设置与客户端下载、`display-order.save`（账号顺序）、`accounts.avatar`（控制面把头像读成 data URL），以及仅限 `account-warmup.read/run` 的预热桥。
 - 无本地存储；列顺序/显示顺序由后端 `display-order` 保存。
 
 ## 改动指引

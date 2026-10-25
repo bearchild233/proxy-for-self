@@ -17,6 +17,8 @@
 - `packages/plugin-sdk/operations.json`：命名能力 → 网关管理 API 的映射 `{method, path, roles}`，约 100 项，键形如 `accounts.get.admin.accounts.detail`。控制面 `Platform.call`（见 [plugin-host](plugin-host.md)）只转发这里登记且在插件清单 `capabilities` 里声明的能力，并按 `roles` 校验当前登录身份。新增页面需要的后端接口，先在这里加一行。
 - `packages/plugin-sdk/policies.json`：宿主对每个内置插件的策略（`name`、`description`、`category`（basic / extensions / operations / clients / account-tools）、`required` 是否基础模块、`trustedUi` 是否允许 `vue-component`、`worker` 是否允许后台 Worker、`capabilities` / `pages` 上限）。包本身不能提升信任，基础属性由这里决定；控制面 `StaticPluginStore` 用它校验清单。
 
+账号预热是可选的 `account-tools` 策略：`account-warmup` 页面拥有配置、运行、历史和取消能力，`accounts` 基础插件只获显式的 `account-warmup.read/run` 桥。服务插件的方法不经过 `operations.json`，但仍必须同时出现在清单、策略和更新器 grants 中。
+
 **构建期替换**（`scripts/build-plugin.mjs` 的 `isolated-plugin-transport` 插件）：插件源码按主壳习惯写 `@/api/request`、`@/plugins/catalog`、`@/composables/useCopyText` 等，构建时这些模块被本包同名角色的文件替换：
 
 | 主壳模块 | 替换为 | 作用 |

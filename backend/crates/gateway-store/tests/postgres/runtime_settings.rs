@@ -50,6 +50,25 @@ fn runtime_settings_keep_account_rotation_global() {
 }
 
 #[tokio::test]
+async fn maintenance_selection_policy_uses_persisted_global_limits() {
+    use gateway_core::provider_ports::ProviderRuntimePolicyPort;
+    let Some(database) = TestDatabase::create("warmup_policy").await else {
+        return;
+    };
+    let repository = PgRuntimeSettingsRepository::new(database.pool.clone());
+    repository
+        .update_runtime_settings(settings_with_margin(3600))
+        .await
+        .unwrap();
+    let policy = repository.load_account_selection_policy().await.unwrap();
+    assert_eq!(policy.max_concurrent_per_account().get(), 3);
+    assert_eq!(
+        policy.request_interval(),
+        std::time::Duration::from_millis(50)
+    );
+}
+
+#[tokio::test]
 async fn inference_limits_persist_into_snapshot_and_omission_preserves_them() {
     use gateway_store::postgres::{PgRuntimeSnapshotRepository, RuntimeSnapshotRepository};
     let Some(database) = TestDatabase::create("inference_limits").await else {

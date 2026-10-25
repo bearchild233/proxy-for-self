@@ -1,0 +1,34 @@
+{
+  "id": "account-warmup",
+  "version": "0.1.0",
+  "protocol": 2,
+  "kind": "ui",
+  "sdk": 1,
+  "runtime": "vue-component",
+  "hostApi": 1,
+  "pages": [
+    {"id": "main", "title": "账号预热", "entry": "ui/module.js", "roles": ["admin"], "route": "/extensions/account-warmup"}
+  ],
+  "capabilities": [
+    "account-warmup.read",
+    "account-warmup.configure",
+    "account-warmup.run",
+    "account-warmup.history",
+    "account-warmup.cancel",
+    "accounts.get.admin.accounts"
+  ],
+  "service": {
+    "binary": "service/account-warmup",
+    "kernelApi": {"major": 0, "minMinor": 7},
+    "capabilities": ["accounts.warmup.read", "accounts.warmup.run", "log"],
+    "fetchHosts": [],
+    "memoryMax": "64M",
+    "shutdownSeconds": 30
+  },
+  "releasedAt": "2026-10-25T00:00:00+08:00",
+  "releaseNotes": [
+    "新增一次hi账号预热，全部与选中账号共用持久任务队列。",
+    "支持额度重置后与每日定时触发、逐账号时间和模型覆盖及随机延迟。",
+    "自动预热默认关闭，遵守停用、额度与养号限制；未知发送结果不自动重试。"
+  ]
+}

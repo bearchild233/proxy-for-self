@@ -139,11 +139,15 @@ class AdminClientTests(unittest.TestCase):
         value = admin_call(self.fake.path, "echo", {"nested": [1, None, "x"]}, "admin", 5)
         self.assertEqual(value, {"nested": [1, None, "x"]})
 
-    def test_protocol_six_plugin_is_supported_and_future_version_is_refused(self):
-        self.fake.minor = 6
-        self.assertEqual(health(self.fake.path, 5), {"ready": True})
-        self.assertEqual(self.fake.kernel_apis[-1], {"major": 0, "minor": 6})
+    def test_admin_call_checks_identity_when_expected_id_is_supplied(self):
+        with self.assertRaises(ProtocolError):
+            admin_call(self.fake.path, "echo", {}, "admin", 5, expected_id="other-plugin")
+
+    def test_protocol_seven_plugin_is_supported_and_future_version_is_refused(self):
         self.fake.minor = 7
+        self.assertEqual(health(self.fake.path, 5), {"ready": True})
+        self.assertEqual(self.fake.kernel_apis[-1], {"major": 0, "minor": 7})
+        self.fake.minor = 8
         with self.assertRaises(ProtocolError):
             health(self.fake.path, 5)
 

@@ -1,0 +1,8 @@
+{
+  "main": {
+    "source": "page/index.vue",
+    "route": "/extensions/account-warmup",
+    "title": "账号预热",
+    "roles": ["admin"]
+  }
+}

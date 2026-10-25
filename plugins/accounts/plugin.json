@@ -1,6 +1,6 @@
 {
   "id": "accounts",
-  "version": "0.3.15",
+  "version": "0.3.16",
   "protocol": 2,
   "kind": "ui",
   "sdk": 1,
@@ -50,10 +50,13 @@
     "settings.get.admin.settings",
     "settings.get.admin.settings.admin-api-key",
     "settings.get.admin.settings.client-downloads.codex-desktop.windows",
-    "accounts.avatar"
+    "accounts.avatar",
+    "account-warmup.read",
+    "account-warmup.run"
   ],
-  "releasedAt": "2026-10-24T04:39:00Z",
+  "releasedAt": "2026-10-25T00:00:00+08:00",
   "releaseNotes": [
+    "账号管理新增全部或选中账号一键预热及预热插件设置入口；自动计划由独立后台插件执行。",
     "养号保留一个总开关，5小时与7天阈值分别设置，各支持85%、90%、95%快捷选择。",
     "订阅 / 权重栏在权重后显示已开启养号的标记，悬停可查看停止使用阈值。",
     "修复账号列表同时展示套餐信息时备注被隐藏的问题，恢复已有备注显示。",

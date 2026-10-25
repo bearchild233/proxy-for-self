@@ -34,7 +34,7 @@ OpenAI / Codex Provider（crate `provider-openai`）：独占 OpenAI credential 
 
 **其他 transport**：`transport/probe.rs`（受控诊断，头部检测不消费 SSE 正文）、`reset_credits.rs`（主动额度重置卡，UUIDv4 幂等键）、`profile_statistics.rs` / `profile_avatar.rs` / `subscription.rs`（个人信息 HTTP 合同）、`catalog.rs`（官方目录 wire）、`tls.rs`（rustls provider 与自定义 CA）、`downstream/`（对非官方客户端请求的 Codex 兼容：`body.rs` 顶层参数与历史形状、`headers.rs` 环境头过滤）。
 
-**插件能力实现**（`src/plugin.rs`）：`OpenAiPluginUpstream` 实现 `PluginUpstream`：`quota.read`、`upstream.probe`（只读响应头探测，走账号出口，按账号限速；不带会话头，上游请求 ID 用插件传入的 `requestId`，省略时随机生成）、`http.fetch`（白名单主机，直连或账号出口）。
+**插件能力实现**（`src/plugin.rs`、`src/plugin_warmup.rs`）：`OpenAiPluginUpstream` 实现 `PluginUpstream`：`quota.read`、`upstream.probe`（只读响应头探测，走账号出口，按账号限速；不带会话头，上游请求 ID 用插件传入的 `requestId`，省略时随机生成）、`http.fetch`（白名单主机，直连或账号出口），以及账号预热的安全目录与固定一次 `hi`。预热只接受 OpenAI OAuth 账号，复用模型政策、养号保护、冷却和调度租约；不返回 Cookie 或 turn state，发送结果同时带 `sendState`，只有明确的 5 小时额度窗口才产生 `shortTerm.resetAt`。
 
 **后台 Worker**（`src/provider/workers.rs`）：OAuth 刷新（30 秒）、额度与目录健康（30 秒）、模型目录与 ETag、Desktop / CLI 发布检查、账号生命周期维护（60 秒）；owner 常量集中在该文件。
 
@@ -48,7 +48,7 @@ OpenAI / Codex Provider（crate `provider-openai`）：独占 OpenAI credential 
 | `src/provider/` | Provider 适配：`mod.rs`、`execution.rs`、`failure.rs`、`observation.rs`、`plugin_routing.rs`、`replay.rs`、`excel.rs`、`workers.rs` |
 | `src/credential/` | 账号 credential、选号、刷新、额度、目录、资料、OAuth（见上） |
 | `src/transport/` | 上游 transport、画像、协议类型（`protocol/`）、WebSocket |
-| `src/session_transport.rs` `src/plugin.rs` | 见上 |
+| `src/session_transport.rs` `src/plugin.rs` `src/plugin_warmup.rs` | 上游 transport、插件能力与账号预热维护执行 |
 
 ## 数据、配置与接口
 

@@ -946,6 +946,17 @@ fn invalid_refresh_policy(operation: &'static str) -> ProviderStoreError {
 }
 
 pub trait ProviderRuntimePolicyPort: Send + Sync {
+    /// 后台维护沿用真实推理的账号并发与间隔；读取失败禁止退回无限制。
+    fn load_account_selection_policy(
+        &self,
+    ) -> BoxFuture<'_, Result<crate::account::AccountSelectionPolicy, ProviderStoreError>> {
+        Box::pin(async {
+            Err(ProviderStoreError::new(
+                ProviderStoreErrorKind::Unavailable,
+                "account selection policy",
+            ))
+        })
+    }
     /// 仅首次启动写入该 Provider 的默认选择；已保存的管理配置始终优先。
     fn initialize_request_profile<'a>(
         &'a self,

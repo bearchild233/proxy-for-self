@@ -3,6 +3,7 @@
 mod admin;
 pub mod config;
 mod plugin;
+mod plugin_warmup;
 mod provider;
 pub use plugin::OpenAiPluginUpstream;
 mod session_transport;
@@ -186,16 +187,23 @@ pub async fn initialize(
             profile.clone(),
         ),
     ));
-    let plugin_upstream = Arc::new(OpenAiPluginUpstream::new(
-        accounts.clone(),
-        repository.clone(),
-        quota.clone(),
-        transport::CodexBackendClient::new(
-            http.clone(),
-            config.base_url().to_owned(),
-            profile.clone(),
+    let plugin_upstream = Arc::new(
+        OpenAiPluginUpstream::new(
+            accounts.clone(),
+            repository.clone(),
+            quota.clone(),
+            transport::CodexBackendClient::new(
+                http.clone(),
+                config.base_url().to_owned(),
+                profile.clone(),
+            ),
+        )
+        .with_warmup(
+            Arc::clone(&leases),
+            Arc::clone(&runtime_policy),
+            Arc::clone(&catalog),
         ),
-    ));
+    );
     let core_provider = Arc::new(
         CodexProvider::new(
             selector,

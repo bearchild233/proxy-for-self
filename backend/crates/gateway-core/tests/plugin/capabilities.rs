@@ -38,6 +38,27 @@ impl PluginAccounts for Accounts {
 struct Upstream;
 #[async_trait]
 impl PluginUpstream for Upstream {
+    async fn warmup_read(
+        &self,
+        _: &dyn PluginAccess,
+        _: AccountWarmupReadParams,
+    ) -> Result<AccountWarmupReadResult, RpcError> {
+        Ok(AccountWarmupReadResult { accounts: vec![] })
+    }
+    async fn warmup_run(
+        &self,
+        _: &dyn PluginAccess,
+        _: AccountWarmupRunParams,
+    ) -> Result<AccountWarmupRunResult, RpcError> {
+        Ok(AccountWarmupRunResult {
+            outcome: AccountWarmupOutcome::Accepted,
+            reason_code: None,
+            status: Some(200),
+            duration_ms: 1,
+            send_state: AccountWarmupSendState::Sent,
+            short_term: None,
+        })
+    }
     async fn quota(&self, _: QuotaReadParams) -> Result<QuotaReadResult, RpcError> {
         Ok(QuotaReadResult {
             snapshot: json!({"quota":{"remainingPercent":90},"schedulingSignals":{"remainingRank":9000}}),
@@ -93,6 +114,136 @@ impl PluginCapabilities for Log {
     async fn call(&self, _: &dyn PluginAccess, _: &str, _: Value) -> Result<Value, RpcError> {
         Ok(Value::Null)
     }
+}
+
+struct WarmupAccess {
+    id: &'static str,
+    granted: std::sync::atomic::AtomicBool,
+}
+impl PluginAccess for WarmupAccess {
+    fn id(&self) -> &str {
+        self.id
+    }
+    fn has_capability(&self, _: &str) -> bool {
+        self.granted.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn groups(&self) -> Vec<String> {
+        vec![]
+    }
+    fn fetch_hosts(&self) -> Vec<String> {
+        vec![]
+    }
+}
+
+#[test]
+fn warmup_requires_its_own_identity_and_current_grant_without_weakening_groups() {
+    block_on(async {
+        let service = KernelCapabilities {
+            accounts: Arc::new(Accounts(Mutex::new(vec![account("acct_out", G)]))),
+            upstream: Arc::new(Upstream),
+            groups: Arc::new(Move(Mutex::new(vec![]))),
+            log: Arc::new(Log),
+        };
+        let access = WarmupAccess {
+            id: ACCOUNT_WARMUP_PLUGIN,
+            granted: true.into(),
+        };
+        let run =
+            json!({"accountId":"acct_out","model":"m","attemptId":"attempt_1","timeoutMs":15000});
+        assert_eq!(
+            service
+                .call(&access, ACCOUNT_WARMUP_RUN, run.clone())
+                .await
+                .unwrap()["outcome"],
+            "accepted"
+        );
+        assert_eq!(
+            service
+                .call(&access, "accounts.read", json!({}))
+                .await
+                .unwrap()["accounts"],
+            json!([])
+        );
+        assert_eq!(
+            service
+                .call(&access, "quota.read", json!({"accountId":"acct_out"}))
+                .await
+                .unwrap_err()
+                .code,
+            FORBIDDEN
+        );
+        access
+            .granted
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            service
+                .call(&access, ACCOUNT_WARMUP_RUN, run.clone())
+                .await
+                .unwrap_err()
+                .code,
+            FORBIDDEN
+        );
+        let other = WarmupAccess {
+            id: "other",
+            granted: true.into(),
+        };
+        assert_eq!(
+            service
+                .call(&other, ACCOUNT_WARMUP_READ, json!({}))
+                .await
+                .unwrap_err()
+                .code,
+            FORBIDDEN
+        );
+        access
+            .granted
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        for change in [
+            json!({"timeoutMs":15001}),
+            json!({"attemptId":"../bad"}),
+            json!({"prompt":"arbitrary"}),
+        ] {
+            let mut invalid = run.clone();
+            invalid
+                .as_object_mut()
+                .unwrap()
+                .extend(change.as_object().unwrap().clone());
+            assert_eq!(
+                service
+                    .call(&access, ACCOUNT_WARMUP_RUN, invalid)
+                    .await
+                    .unwrap_err()
+                    .code,
+                INVALID_PARAMS
+            );
+        }
+        for params in [
+            json!({"includeModels":true}),
+            json!({"includeModels":true,"ids":[]}),
+            json!({"includeModels":true,"ids":vec!["acct_out";21]}),
+            json!({"ids":vec!["acct_out";501]}),
+            json!({"model":"m".repeat(129)}),
+        ] {
+            assert_eq!(
+                service
+                    .call(&access, ACCOUNT_WARMUP_READ, params)
+                    .await
+                    .unwrap_err()
+                    .code,
+                INVALID_PARAMS
+            );
+        }
+        assert!(
+            service
+                .call(
+                    &access,
+                    ACCOUNT_WARMUP_READ,
+                    json!({"includeModels":true,"ids":["acct_out"]})
+                )
+                .await
+                .is_ok()
+        );
+    });
 }
 fn account(id: &str, group: &str) -> AccountSummary {
     AccountSummary {

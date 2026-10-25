@@ -740,13 +740,15 @@ fn parse_details_from_lookup(
 }
 
 fn rate_limit_id_from_header_name(name: &str) -> Option<String> {
-    const SUFFIXES: [&str; 9] = [
+    const SUFFIXES: [&str; 11] = [
         "-primary-used-percent",
         "-primary-window-minutes",
         "-primary-reset-at",
+        "-primary-reset-after-seconds",
         "-secondary-used-percent",
         "-secondary-window-minutes",
         "-secondary-reset-at",
+        "-secondary-reset-after-seconds",
         "-limit-name",
         "-allowed",
         "-limit-reached",

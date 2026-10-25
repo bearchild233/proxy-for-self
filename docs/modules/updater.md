@@ -34,7 +34,7 @@
 3. `_registration`：能力与 `fetchHosts` 取清单申请值与 `config.allow[插件ID]` 上限的交集；env 文件与 drop-in 写入（`MemoryMax` 等），实例名 `<插件ID>--<内容版本前 12 位>`，单元 `proxy-for-self-plugin@<实例>.service`。
 4. `_start` → `_wait_healthy`（通过 `kernel_protocol.health` 在新 socket 上握手，15 秒）→ `_registry_write` 原子改写内核注册表（root 所有、网关可读）→ 等内核切换连接（10 秒）→ 停旧实例（`shutdownSeconds` 作为停止宽限）→ `_retain` 只保留当前与上一版本实例。
 5. 失败：新实例整体删除，注册表与旧实例不变；`disable` 先在注册表置 `enabled:false` 再停进程；`uninstall` 删注册表条目与实例，数据目录不动。
-状态文件 `service_plugins.state_file`；updater 重启时发现 running 操作则标记 `interrupted` 并要求人工核对（见 README）。`kernel_protocol.py` 是只含 `hello` / `health` / `admin.call` 的最小管理连接客户端。
+状态文件 `service_plugins.state_file`；updater 重启时发现 running 操作则标记 `interrupted` 并要求人工核对（见 README）。`kernel_protocol.py` 是只含 `hello` / `health` / `admin.call` 的最小管理连接客户端，并校验预期插件 ID。账号预热服务的 `accounts.warmup.read/run/log` 只有在配置 allow 与服务清单交集内才会写入注册表。
 
 **登录防护**（`login_security.py`）：`LoginSecurity` 管理固定 jail（`proxy-api-login`、`proxy-panel-login`）的策略（最大失败次数、窗口、封禁时长、上限）与解封；`GuardServer` 是独立只读 socket，Caddy 在登录入口 forward_auth 调用 `check(site, ip)`，失败时阻止登录；封禁镜像用私有 SQLite，跨进程重启保留。
 
@@ -57,7 +57,7 @@
 
 - 配置 `/etc/proxy-for-self/updater.json`（root 0600）；状态文件 `state_file`、服务插件状态、A/B 状态均原子写入；PostgreSQL 密码通过 root 独占的 pgpass 文件。
 - 内核注册表（`service_plugins.registry_file`）：`{"plugins":[{id, enabled, socket, grants, fetchHosts, uid?}]}`，格式由 `gateway-host` 读取（见 [gateway-host](gateway-host.md)）。
-- 协议版本常量 `KERNEL_API_MAJOR/MINOR`（当前 0.6，最低 0.4）与 `KERNEL_CAPABILITIES` 必须与 `backend/crates/kernel-protocol` 保持一致。
+- 协议版本常量 `KERNEL_API_MAJOR/MINOR`（当前 0.7，最低 0.4）与 `KERNEL_CAPABILITIES` 必须与 `backend/crates/kernel-protocol` 保持一致；`accounts.warmup.*` 只允许 `account-warmup` 身份。
 
 ## 改动指引
 

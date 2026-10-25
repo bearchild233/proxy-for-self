@@ -33,7 +33,7 @@ PostgreSQL、Redis、S3/R2 与 `pg_dump` 的适配层：把 Core / Admin / Provi
 
 **Worker**（`src/workers.rs`）：过期请求恢复（30 秒）、保留清理（1 小时）、`model_requests` / Key 用量 / 准入释放 / circuit 反馈的 flush Daemon。`PostgresHealthProbe` 提供健康探针。
 
-**插件账号目录**（`src/plugin.rs`）：`PluginAccountDirectory` 实现 `PluginAccounts`，复用 Admin 账号投影与 `model_access` 判定，不暴露 credential。
+**插件账号目录**（`src/plugin.rs`）：`PluginAccountDirectory` 实现 `PluginAccounts`，复用 Admin 账号投影与 `model_access` 判定，不暴露 credential。账号预热的 read 目录还投影养号保护状态，Provider 通过 `ProviderRuntimePolicyPort` 读取运行时账号选择政策；这次没有新增 PostgreSQL 迁移。
 
 ## 文件表
 

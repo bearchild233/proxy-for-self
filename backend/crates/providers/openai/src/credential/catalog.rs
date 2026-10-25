@@ -472,6 +472,21 @@ impl CodexCredentialCatalogService {
             .map(|models| models.map(<[String]>::to_vec))
     }
 
+    /// 维护入口只读指定账号的真实能力；不换账号、不触发推理请求。
+    pub(crate) async fn warmup_models(
+        &self,
+        account: &ProviderAccount,
+    ) -> Result<Vec<CodexCatalogModel>, CodexCredentialCatalogError> {
+        let client = CodexBackendClient::new(
+            self.http.clone(),
+            self.base_url.clone(),
+            self.profile.clone(),
+        );
+        self.fetch_account_models(&client, account, None)
+            .await
+            .map(|catalog| catalog.models)
+    }
+
     /// 优先读取套餐目录 cache；缺失时才用当前账号所属套餐的有限候选集实时填充。
     pub async fn cached_or_refresh_account_catalog(
         &self,

@@ -24,6 +24,471 @@ use wiremock::{
     matchers::{method, path},
 };
 struct Access(Mutex<bool>);
+
+struct WarmupPolicy;
+impl gateway_core::provider_ports::ProviderRuntimePolicyPort for WarmupPolicy {
+    fn load_account_selection_policy(
+        &self,
+    ) -> futures::future::BoxFuture<
+        '_,
+        Result<
+            gateway_core::account::AccountSelectionPolicy,
+            gateway_core::provider_ports::ProviderStoreError,
+        >,
+    > {
+        Box::pin(async {
+            Ok(gateway_core::account::AccountSelectionPolicy::new(
+                gateway_core::account::RotationStrategy::Smart,
+                gateway_core::account::AccountConcurrency::new(3),
+                Duration::from_millis(17),
+            ))
+        })
+    }
+    fn load_refresh_policy(
+        &self,
+    ) -> futures::future::BoxFuture<
+        '_,
+        Result<
+            gateway_core::provider_ports::ProviderRefreshPolicy,
+            gateway_core::provider_ports::ProviderStoreError,
+        >,
+    > {
+        Box::pin(async { runtime_policy().load_refresh_policy().await })
+    }
+}
+
+struct WarmupAccess(std::sync::atomic::AtomicBool);
+impl WarmupAccess {
+    fn granted() -> Self {
+        Self(true.into())
+    }
+}
+impl PluginAccess for WarmupAccess {
+    fn id(&self) -> &str {
+        ACCOUNT_WARMUP_PLUGIN
+    }
+    fn has_capability(&self, _: &str) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn groups(&self) -> Vec<String> {
+        vec![]
+    }
+    fn fetch_hosts(&self) -> Vec<String> {
+        vec![]
+    }
+}
+
+fn warmup(id: &str) -> AccountWarmupRunParams {
+    AccountWarmupRunParams {
+        account_id: id.into(),
+        model: "gpt-test".into(),
+        timeout_ms: 15000,
+        attempt_id: "warmup_1".into(),
+    }
+}
+
+fn warmup_models_response() -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(json!({"models":[{"slug":"gpt-test","display_name":"Test model","supported_reasoning_levels":[{"effort":"minimal"},{"effort":"high"}]}]}))
+}
+
+async fn mount_warmup_models(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/codex/models"))
+        .respond_with(warmup_models_response())
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn warmup_uses_one_hi_normal_lease_and_real_secondary_five_hour_window() {
+    let server = MockServer::start().await;
+    mount_warmup_models(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/codex/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("x-codex-turn-state", "secret-state")
+                .insert_header("set-cookie", "secret=material")
+                .insert_header("x-codex-primary-used-percent", "5")
+                .insert_header("x-codex-primary-window-minutes", "10080")
+                .insert_header("x-codex-primary-reset-after-seconds", "86400")
+                .insert_header("x-codex-secondary-used-percent", "1")
+                .insert_header("x-codex-secondary-window-minutes", "300")
+                .insert_header("x-codex-secondary-reset-after-seconds", "1200"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let f = Fixture::new(server.uri()).await;
+    let result = f
+        .upstream
+        .warmup_run(&WarmupAccess::granted(), warmup("acct_a"))
+        .await
+        .unwrap();
+    assert_eq!(result.outcome, AccountWarmupOutcome::Accepted);
+    assert_eq!(result.send_state, AccountWarmupSendState::Sent);
+    let short = result.short_term.as_ref().unwrap();
+    assert_eq!(short.window_seconds, 18000);
+    assert_eq!(short.used_percent, Some(1.0));
+    assert!(
+        chrono::DateTime::parse_from_rfc3339(short.reset_at.as_ref().unwrap()).unwrap()
+            > chrono::Utc::now()
+    );
+    let serialized = serde_json::to_string(&result).unwrap();
+    for secret in [
+        "secret-state",
+        "secret=material",
+        "turnState",
+        "setCookies",
+        "rateLimitHeaders",
+    ] {
+        assert!(!serialized.contains(secret));
+    }
+    let requests = server.received_requests().await.unwrap();
+    let posts: Vec<_> = requests
+        .iter()
+        .filter(|request| request.method.as_str() == "POST")
+        .collect();
+    assert_eq!(posts.len(), 1);
+    assert!(posts[0].headers.get("cookie").is_none());
+    assert!(posts[0].headers.get("x-codex-turn-state").is_none());
+    assert!(posts[0].headers.get("session-id").is_none());
+    let body = zstd::stream::decode_all(std::io::Cursor::new(&posts[0].body)).unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["input"][0]["content"][0]["text"], "hi");
+    assert_eq!(body["reasoning"]["effort"], "minimal");
+    assert_eq!(body["store"], false);
+    assert_eq!(body["tools"], json!([]));
+    let leases = f.warmup_leases.requests.lock().unwrap();
+    assert_eq!(leases.len(), 1);
+    assert_eq!(leases[0].account_id().as_str(), "acct_a");
+    assert_eq!(leases[0].max_concurrent().get(), 3);
+    assert_eq!(leases[0].request_interval(), Duration::from_millis(17));
+}
+
+#[tokio::test]
+async fn warmup_skips_disabled_unsupported_and_policy_denied_accounts_without_network() {
+    let server = MockServer::start().await;
+    let f = Fixture::new(server.uri()).await;
+    for (id, reason) in [
+        ("acct_disabled", "disabled"),
+        ("acct_api", "unsupported"),
+        ("acct_xai", "unsupported"),
+        ("acct_restricted", "model_not_allowed"),
+    ] {
+        let result = f
+            .upstream
+            .warmup_run(&WarmupAccess::granted(), warmup(id))
+            .await
+            .unwrap();
+        assert_eq!(result.outcome, AccountWarmupOutcome::Skipped);
+        assert_eq!(result.reason_code.as_deref(), Some(reason));
+        assert_eq!(result.send_state, AccountWarmupSendState::NotSent);
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
+    assert!(f.warmup_leases.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn warmup_honors_cooldown_and_quota_protection_before_catalog_or_send() {
+    let server = MockServer::start().await;
+    let f = Fixture::new(server.uri()).await;
+    let account = f.store.account("acct_a").unwrap();
+    f.quota
+        .apply_rate_limit_429(
+            &account,
+            Some(Duration::from_secs(60)),
+            std::time::SystemTime::now(),
+        )
+        .await
+        .unwrap();
+    let cooled = f
+        .upstream
+        .warmup_run(&WarmupAccess::granted(), warmup("acct_a"))
+        .await
+        .unwrap();
+    assert_eq!(cooled.outcome, AccountWarmupOutcome::Skipped);
+    assert_eq!(cooled.reason_code.as_deref(), Some("rate_limited"));
+    f.store.set_quota_protection(
+        "acct_b",
+        gateway_core::account::AccountQuotaProtection::new(true, 90).unwrap(),
+    );
+    let account = f.store.account("acct_b").unwrap();
+    let now = std::time::SystemTime::now();
+    let reset = (now + Duration::from_secs(600))
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    f.store.compare_and_swap_quota(gateway_core::account::QuotaObservation { plan_type: None, account_id: account.id().clone(), expected_revision: account.revision(), quota: gateway_core::account::OpaqueProviderData::new(json!({"rate_limit":{"allowed":true,"primary_window":{"used_percent":90,"limit_window_seconds":18000,"reset_at":reset}}}).as_object().unwrap().clone()), observed_at: now, state: gateway_core::account::QuotaState::allowed(now) }).await.unwrap();
+    let protected = f
+        .upstream
+        .warmup_run(&WarmupAccess::granted(), warmup("acct_b"))
+        .await
+        .unwrap();
+    assert_eq!(protected.reason_code.as_deref(), Some("quota_protection"));
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn warmup_busy_lease_or_unknown_model_never_sends_and_missing_reset_is_not_invented() {
+    let server = MockServer::start().await;
+    mount_warmup_models(&server).await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let f = Fixture::new(server.uri()).await;
+    *f.warmup_leases.busy.lock().unwrap() = true;
+    let busy = f
+        .upstream
+        .warmup_run(&WarmupAccess::granted(), warmup("acct_a"))
+        .await
+        .unwrap();
+    assert_eq!(busy.reason_code.as_deref(), Some("account_busy"));
+    *f.warmup_leases.busy.lock().unwrap() = false;
+    let mut unsupported = warmup("acct_a");
+    unsupported.model = "gpt-missing".into();
+    let missing = f
+        .upstream
+        .warmup_run(&WarmupAccess::granted(), unsupported)
+        .await
+        .unwrap();
+    assert_eq!(missing.reason_code.as_deref(), Some("model_unsupported"));
+    let result = f
+        .upstream
+        .warmup_run(&WarmupAccess::granted(), warmup("acct_a"))
+        .await
+        .unwrap();
+    assert_eq!(result.outcome, AccountWarmupOutcome::Accepted);
+    assert_eq!(result.short_term, None);
+}
+
+struct RevokeWarmupOnCatalog(Arc<WarmupAccess>);
+impl wiremock::Respond for RevokeWarmupOnCatalog {
+    fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+        self.0.0.store(false, std::sync::atomic::Ordering::Relaxed);
+        warmup_models_response()
+    }
+}
+
+#[tokio::test]
+async fn warmup_rechecks_maintenance_grant_after_catalog_and_lease() {
+    let server = MockServer::start().await;
+    let access = Arc::new(WarmupAccess::granted());
+    Mock::given(method("GET"))
+        .respond_with(RevokeWarmupOnCatalog(access.clone()))
+        .mount(&server)
+        .await;
+    let f = Fixture::new(server.uri()).await;
+    let error = f
+        .upstream
+        .warmup_run(access.as_ref(), warmup("acct_a"))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, FORBIDDEN);
+    assert!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|request| request.method.as_str() == "GET")
+    );
+}
+
+#[tokio::test]
+async fn warmup_timeout_is_unknown_and_429_updates_cooldown_without_retry() {
+    let server = MockServer::start().await;
+    mount_warmup_models(&server).await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(1300)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let f = Fixture::new(server.uri()).await;
+    let mut request = warmup("acct_a");
+    request.timeout_ms = 1000;
+    let result = f
+        .upstream
+        .warmup_run(&WarmupAccess::granted(), request)
+        .await
+        .unwrap();
+    assert_eq!(result.outcome, AccountWarmupOutcome::Unknown);
+    assert_eq!(result.send_state, AccountWarmupSendState::Ambiguous);
+    let limited = MockServer::start().await;
+    mount_warmup_models(&limited).await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "60"))
+        .expect(1)
+        .mount(&limited)
+        .await;
+    let f = Fixture::new(limited.uri()).await;
+    let result = f
+        .upstream
+        .warmup_run(&WarmupAccess::granted(), warmup("acct_a"))
+        .await
+        .unwrap();
+    assert_eq!(result.status, Some(429));
+    assert_eq!(result.outcome, AccountWarmupOutcome::Failed);
+    let again = f
+        .upstream
+        .warmup_run(&WarmupAccess::granted(), warmup("acct_a"))
+        .await
+        .unwrap();
+    assert_eq!(again.outcome, AccountWarmupOutcome::Skipped);
+}
+
+#[tokio::test]
+async fn warmup_directory_has_labels_and_no_personal_or_credential_fields() {
+    let server = MockServer::start().await;
+    mount_warmup_models(&server).await;
+    let f = Fixture::new(server.uri()).await;
+    let result = f
+        .upstream
+        .warmup_read(
+            &WarmupAccess::granted(),
+            AccountWarmupReadParams {
+                ids: Some(vec!["acct_a".into(), "acct_xai".into()]),
+                model: Some("gpt-test".into()),
+                include_models: true,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        result.accounts[0].models.as_ref().unwrap()[0].label,
+        "Test model"
+    );
+    assert!(!result.accounts[1].supported);
+    let serialized = serde_json::to_string(&result).unwrap();
+    for field in [
+        "upstreamAccountId",
+        "userId",
+        "groups",
+        "credential",
+        "fixture-token",
+        "fixture-upstream",
+    ] {
+        assert!(!serialized.contains(field));
+    }
+}
+
+#[tokio::test]
+async fn warmup_rejects_authentication_and_official_quota_and_never_defaults_failed_policy_to_unlimited()
+ {
+    use gateway_core::account::{
+        AccountStateChange, CredentialState, QuotaAccessChange, QuotaEvidence, QuotaState,
+    };
+    let server = MockServer::start().await;
+    let f = Fixture::new(server.uri()).await;
+    let invalid = f.store.account("acct_a").unwrap();
+    f.store
+        .apply_state_change(AccountStateChange {
+            account_id: invalid.id().clone(),
+            expected_revision: invalid.revision(),
+            credential_state: CredentialState::Invalid,
+            observed_at: std::time::SystemTime::now(),
+            error_reason: CredentialState::Invalid.error_reason(),
+            message: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        f.upstream
+            .warmup_run(&WarmupAccess::granted(), warmup("acct_a"))
+            .await
+            .unwrap()
+            .reason_code
+            .as_deref(),
+        Some("error")
+    );
+    let exhausted = f.store.account("acct_b").unwrap();
+    f.store
+        .apply_quota_access(QuotaAccessChange {
+            account_id: exhausted.id().clone(),
+            expected_revision: exhausted.revision(),
+            state: QuotaState::exhausted(
+                QuotaEvidence::AccountLimitReached,
+                std::time::SystemTime::now(),
+                Some(std::time::SystemTime::now() + Duration::from_secs(300)),
+            ),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        f.upstream
+            .warmup_run(&WarmupAccess::granted(), warmup("acct_b"))
+            .await
+            .unwrap()
+            .reason_code
+            .as_deref(),
+        Some("quota_exhausted")
+    );
+    let missing_policy = Fixture::with_warmup_policy(server.uri(), runtime_policy()).await;
+    let result = missing_policy
+        .upstream
+        .warmup_run(&WarmupAccess::granted(), warmup("acct_a"))
+        .await
+        .unwrap();
+    assert_eq!(result.outcome, AccountWarmupOutcome::Skipped);
+    assert_eq!(result.send_state, AccountWarmupSendState::NotSent);
+    assert_eq!(
+        result.reason_code.as_deref(),
+        Some("account_selection_policy")
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn warmup_without_new_window_headers_does_not_confirm_a_preexisting_timer() {
+    let server = MockServer::start().await;
+    mount_warmup_models(&server).await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("x-codex-primary-used-percent", "1")
+                .insert_header("x-codex-primary-window-minutes", "300")
+                .insert_header("x-codex-primary-reset-after-seconds", "1200"),
+        )
+        .mount(&server)
+        .await;
+    let f = Fixture::new(server.uri()).await;
+    let first = f
+        .upstream
+        .warmup_run(&WarmupAccess::granted(), warmup("acct_a"))
+        .await
+        .unwrap();
+    assert!(first.short_term.is_some());
+    server.reset().await;
+    mount_warmup_models(&server).await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut request = warmup("acct_a");
+    request.attempt_id = "warmup_2".into();
+    let second = f
+        .upstream
+        .warmup_run(&WarmupAccess::granted(), request)
+        .await
+        .unwrap();
+    assert_eq!(second.outcome, AccountWarmupOutcome::Accepted);
+    assert_eq!(second.short_term, None);
+    let known = f
+        .upstream
+        .warmup_read(
+            &WarmupAccess::granted(),
+            AccountWarmupReadParams {
+                ids: Some(vec!["acct_a".into()]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(known.accounts[0].short_term.is_some());
+}
 #[tokio::test]
 async fn quota_refresh_if_missing_uses_account_egress_and_preserves_cached_snapshot() {
     let direct = MockServer::start().await;
@@ -120,9 +585,16 @@ struct Fixture {
     store: Arc<MemoryAccountStore>,
     cooldown: Arc<MemoryCooldownPort>,
     quota: Arc<CodexCredentialQuotaService>,
+    warmup_leases: Arc<TestLeaseCoordinator>,
 }
 impl Fixture {
     async fn new(base: String) -> Self {
+        Self::with_warmup_policy(base, Arc::new(WarmupPolicy)).await
+    }
+    async fn with_warmup_policy(
+        base: String,
+        warmup_policy: Arc<dyn gateway_core::provider_ports::ProviderRuntimePolicyPort>,
+    ) -> Self {
         let store = Arc::new(MemoryAccountStore::default());
         for id in [
             "acct_a",
@@ -207,17 +679,31 @@ impl Fixture {
             Arc::new(TestLeaseCoordinator::default()),
             runtime_policy(),
         ));
-        let upstream = Arc::new(OpenAiPluginUpstream::new(
-            store.clone(),
-            store.repository(),
-            quota.clone(),
-            CodexBackendClient::new(http, base, profile),
-        ));
+        let catalog = Arc::new(
+            provider_openai::credential::CodexCredentialCatalogService::new(
+                store.repository(),
+                profile.clone(),
+                http.clone(),
+                base.clone(),
+                crate::support::catalog_cache(),
+            ),
+        );
+        let warmup_leases = Arc::new(TestLeaseCoordinator::default());
+        let upstream = Arc::new(
+            OpenAiPluginUpstream::new(
+                store.clone(),
+                store.repository(),
+                quota.clone(),
+                CodexBackendClient::new(http, base, profile),
+            )
+            .with_warmup(warmup_leases.clone(), warmup_policy, catalog),
+        );
         Self {
             upstream,
             store,
             cooldown,
             quota,
+            warmup_leases,
         }
     }
 }

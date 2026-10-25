@@ -31,6 +31,13 @@ pub fn validate_timeout(timeout_ms: u64) -> Result<(), RpcError> {
     }
     Ok(())
 }
+
+pub fn require_warmup(access: &dyn PluginAccess, capability: &str) -> Result<(), RpcError> {
+    if access.id() != ACCOUNT_WARMUP_PLUGIN || !access.has_capability(capability) {
+        return Err(RpcError::new(FORBIDDEN, "account warmup not granted"));
+    }
+    Ok(())
+}
 /// 账号分组由存储现读，插件分组随后读取，避免沿用握手时的授权快照。
 pub async fn require_account(
     access: &dyn PluginAccess,
@@ -56,6 +63,57 @@ impl PluginCapabilities for KernelCapabilities {
         params: Value,
     ) -> Result<Value, RpcError> {
         match method {
+            ACCOUNT_WARMUP_READ => {
+                require_warmup(access, method)?;
+                let params: AccountWarmupReadParams = decode(params)?;
+                if params.ids.as_ref().is_some_and(|ids| ids.len() > 500) {
+                    return Err(RpcError::new(INVALID_PARAMS, "too many account IDs"));
+                }
+                if params.include_models
+                    && !params
+                        .ids
+                        .as_ref()
+                        .is_some_and(|ids| (1..=20).contains(&ids.len()))
+                {
+                    return Err(RpcError::new(
+                        INVALID_PARAMS,
+                        "model lookup requires 1..20 account IDs",
+                    ));
+                }
+                for id in params.ids.iter().flatten() {
+                    ProviderAccountId::new(id).map_err(|_| RpcError::new(INVALID_PARAMS, "ids"))?;
+                }
+                if let Some(model) = &params.model {
+                    if model.len() > 128 {
+                        return Err(RpcError::new(INVALID_PARAMS, "model"));
+                    }
+                    crate::routing::UpstreamModelId::new(model)
+                        .map_err(|_| RpcError::new(INVALID_PARAMS, "model"))?;
+                }
+                encode(self.upstream.warmup_read(access, params).await?)
+            }
+            ACCOUNT_WARMUP_RUN => {
+                require_warmup(access, method)?;
+                let params: AccountWarmupRunParams = decode(params)?;
+                ProviderAccountId::new(&params.account_id)
+                    .map_err(|_| RpcError::new(INVALID_PARAMS, "accountId"))?;
+                crate::routing::UpstreamModelId::new(&params.model)
+                    .map_err(|_| RpcError::new(INVALID_PARAMS, "model"))?;
+                if params.model.len() > 128 {
+                    return Err(RpcError::new(INVALID_PARAMS, "model"));
+                }
+                if !(1000..=15000).contains(&params.timeout_ms)
+                    || params.attempt_id.is_empty()
+                    || params.attempt_id.len() > 128
+                    || !params
+                        .attempt_id
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                {
+                    return Err(RpcError::new(INVALID_PARAMS, "invalid warmup attempt"));
+                }
+                encode(self.upstream.warmup_run(access, params).await?)
+            }
             "log" => self.log.call(access, method, params).await,
             "accounts.read" => {
                 let params: AccountsReadParams = decode(params)?;

@@ -19,12 +19,13 @@ use std::{
 use tokio::sync::Semaphore;
 
 pub struct OpenAiPluginUpstream {
-    accounts: Arc<dyn ProviderAccountStore>,
-    repository: CodexCredentialRepository,
-    quota: Arc<CodexCredentialQuotaService>,
-    client: CodexBackendClient,
+    pub(crate) accounts: Arc<dyn ProviderAccountStore>,
+    pub(crate) repository: CodexCredentialRepository,
+    pub(crate) quota: Arc<CodexCredentialQuotaService>,
+    pub(crate) client: CodexBackendClient,
     global: Semaphore,
     per_account: Mutex<HashMap<String, Weak<Semaphore>>>,
+    pub(crate) warmup: Option<crate::plugin_warmup::WarmupDependencies>,
 }
 impl OpenAiPluginUpstream {
     pub fn new(
@@ -40,7 +41,22 @@ impl OpenAiPluginUpstream {
             client,
             global: Semaphore::new(8),
             per_account: Mutex::new(HashMap::new()),
+            warmup: None,
         }
+    }
+    /// 维护通道单独注入共享调度能力，旧 probe 的授权与执行语义保持原样。
+    pub fn with_warmup(
+        mut self,
+        leases: Arc<dyn gateway_core::provider_ports::ProviderLeasePort>,
+        policy: Arc<dyn gateway_core::provider_ports::ProviderRuntimePolicyPort>,
+        catalog: Arc<crate::credential::CodexCredentialCatalogService>,
+    ) -> Self {
+        self.warmup = Some(crate::plugin_warmup::WarmupDependencies {
+            leases,
+            policy,
+            catalog,
+        });
+        self
     }
     async fn account(&self, id: &str, openai: bool) -> Result<ProviderAccount, RpcError> {
         let id =
@@ -59,6 +75,20 @@ impl OpenAiPluginUpstream {
 }
 #[async_trait]
 impl PluginUpstream for OpenAiPluginUpstream {
+    async fn warmup_read(
+        &self,
+        access: &dyn PluginAccess,
+        params: AccountWarmupReadParams,
+    ) -> Result<AccountWarmupReadResult, RpcError> {
+        self.read_warmup(access, params).await
+    }
+    async fn warmup_run(
+        &self,
+        access: &dyn PluginAccess,
+        params: AccountWarmupRunParams,
+    ) -> Result<AccountWarmupRunResult, RpcError> {
+        self.run_warmup(access, params).await
+    }
     async fn quota(&self, params: QuotaReadParams) -> Result<QuotaReadResult, RpcError> {
         let account = self.account(&params.account_id, true).await?;
         let mut snapshot = self
@@ -340,7 +370,9 @@ fn no_response(kind: &str, started: tokio::time::Instant) -> UpstreamProbeResult
 }
 
 /// 插件探测用的最小请求：固定提示词、无工具、低推理强度。
-fn hi_request(model: &str) -> Option<crate::transport::protocol::responses::CodexResponsesRequest> {
+pub(crate) fn hi_request(
+    model: &str,
+) -> Option<crate::transport::protocol::responses::CodexResponsesRequest> {
     Some(crate::transport::protocol::responses::CodexResponsesRequest::from_body(
         serde_json::json!({"model":model,"input":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}],"instructions":"Do not use external tools.","tools":[],"stream":true,"store":false,"reasoning":{"effort":"low"}})
             .as_object()
