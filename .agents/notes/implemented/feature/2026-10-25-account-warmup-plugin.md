@@ -57,6 +57,12 @@ accountOverrides元素为`{accountId,enabled:true,dailyTime:null,model:null,rese
 
 已完成的证据包括：账号预热 Rust 服务测试 15 项、clippy `-D warnings`、专属 cargo fmt 检查；Provider warmup 过滤 12 项、Provider plugin 22 项、gateway-core plugin 5 项、gateway-host warmup grant 1 项、kernel-protocol capabilities 4 项；前端预热测试 8 项、控制面桥测试 13 项、service manifest 测试 12 项；两个插件的构建、资源哈希、服务 ELF/清单校验及 tar 路径安全检查。
 
+本机隔离验收使用 WSL 的 PostgreSQL 15432/cpr_plugin_stage、Redis 16380、网关 18336 与控制面 18337。控制面使用正常管理员登录；便捷登录仍限定原有 18335 地址。插件存储位于 WSL 原生目录 `/work/plugin-stage/platform`，由 builder 持有，避免 Windows 挂载目录的属主映射阻断真实写操作。网关的 plugins 注册表和 ownership cache 配置直接保存在隔离配置中，不能先修改后再运行会重新生成配置的通用 stage 启动器。
+
+HTTP 管理调用经过真实控制面、生命周期协调器、updater、ServicePlugins 包校验与私有 Unix socket；只有 systemctl 的进程启停被 WSL 本机进程适配器替代，健康检查和注册表重载等待使用原始实现。22 项接口与生命周期检查通过，覆盖登录与来源、跨插件和非管理员权限、参数校验、配置 revision 冲突、submissionId 幂等、历史、取消、坏包拒绝、真实服务进程更新、旧页租约、回退、停用和再启用。更新及停用期间网关 PID/启动时间不变，251 次健康探测全部通过。机器可读收据位于忽略目录 `.build/plugin-stage/account-warmup-verification.json`；本机验证脚本与进程适配器同样保留在 `.build/`，不进入发布包。
+
+热更新候选为明确标注的合成 UI 内容变更，服务二进制与交付包相同；回退后恢复交付的 account-warmup 0.1.0 内容版本。隔离账号目录为空，所以本轮证明接口连通、持久性与生命周期，没有执行真实账号预热；上游单次 hi、额度、冷却、租约和未知结果语义由已有 Provider/服务测试覆盖。原生 systemd 沙箱与生产账号行为仍需各自的部署后检查，不能由本机进程适配器替代。验收结束恢复原设置，自动预热保持关闭。
+
 ## Consequences
 
 预热仍可能消耗一次额度；只收头不代表生成完整回答，也不承诺上游一定创建5小时窗口。SQLite只用于单机共享插件数据，不支持多机扩容。网关、控制面、updater grants 和服务包必须一起升级，能力缺失时页面明确不可用。大交互改动已生成具体预览；按仓库约定，隔离环境验收后仍需用户确认才能上线生产。
