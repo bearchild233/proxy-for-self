@@ -36,6 +36,8 @@ OpenAI / Codex Provider（crate `provider-openai`）：独占 OpenAI credential 
 
 **插件能力实现**（`src/plugin.rs`、`src/plugin_warmup.rs`）：`OpenAiPluginUpstream` 实现 `PluginUpstream`：`quota.read`、`upstream.probe`（只读响应头探测，走账号出口，按账号限速；不带会话头，上游请求 ID 用插件传入的 `requestId`，省略时随机生成）、`http.fetch`（白名单主机，直连或账号出口），以及账号预热的安全目录与一次文本请求。预热提示词默认 `hi`，原文最多 4096 UTF-8 字节、非空且拒绝除换行/tab外的控制符；强度 `auto` 使用最低受支持档位，显式强度不受目录支持时返回 `skipped/reasoning_unsupported`。目录返回各模型的真实 `reasoningEfforts`。预热只接受 OpenAI OAuth 账号，复用模型政策、养号保护、冷却和调度租约；不返回 Cookie 或 turn state，发送结果同时带 `sendState`，只有明确的 5 小时额度窗口才产生 `shortTerm.resetAt`。
 
+Provider 不查询分组，目录初始 `groups=[]/groupTargetsSupported=false`；由 Core 成功合并现有账号目录中的真实成员关系后声明分组能力，保持 Provider 端口和数据库 SQL 不变。
+
 **后台 Worker**（`src/provider/workers.rs`）：OAuth 刷新（30 秒）、额度与目录健康（30 秒）、模型目录与 ETag、Desktop / CLI 发布检查、账号生命周期维护（60 秒）；owner 常量集中在该文件。
 
 ## 文件表

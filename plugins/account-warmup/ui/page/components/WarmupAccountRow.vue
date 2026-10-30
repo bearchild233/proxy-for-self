@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import type { WarmupAccount, WarmupModel, WarmupOverride, WarmupReasoningEffort, WarmupSettings } from '@/api/modules/accountWarmup'
 import { ChevronDown, RefreshCw } from '@lucide/vue'
-import { computed, ref } from 'vue'
+import { computed, ref, useId } from 'vue'
 import { warmupEffortOptions } from '@/api/modules/accountWarmup'
 import BaseButton from '@/components/base/BaseButton.vue'
 import BaseCheckbox from '@/components/base/BaseCheckbox.vue'
@@ -16,6 +16,7 @@ const props = defineProps<{
   name: string
   settings: WarmupSettings
   selected: boolean
+  showSelection?: boolean
   disabled: boolean
   models: WarmupModel[]
   modelsLoading: boolean
@@ -27,6 +28,7 @@ const emit = defineEmits<{
   models: [accountId: string, model: string]
 }>()
 const expanded = ref(false)
+const timeHelpId = `${useId()}-warmup-time-help`
 const override = computed(() => accountOverride(props.settings, props.account.id))
 const effectiveModel = computed(() => override.value.model ?? props.settings.defaultModel)
 const effectiveEffort = computed(() => override.value.reasoningEffort ?? props.settings.reasoningEffort)
@@ -55,7 +57,7 @@ function toggle() {
 <template>
   <article class="rounded-cp border border-solid border-cp-border-secondary bg-cp-bg-container">
     <div class="flex items-center gap-3 p-4">
-      <BaseCheckbox v-if="settings.targetMode === 'selected'" :model-value="selected" :label="`选择 ${name}`" :disabled="disabled || (!account.supported && !selected)" @update:model-value="emit('select', $event)" />
+      <BaseCheckbox v-if="showSelection || settings.targetMode === 'selected'" :model-value="selected" :label="`选择 ${name}`" :disabled="disabled || (!account.supported && !selected)" @update:model-value="emit('select', $event)" />
       <button type="button" class="flex min-w-0 flex-1 cursor-pointer items-center gap-3 border-0 bg-transparent p-0 text-left text-cp-text" :aria-expanded="expanded" @click="toggle">
         <span class="min-w-0 flex-1">
           <span class="block truncate text-cp font-bold">{{ name }}</span>
@@ -68,35 +70,54 @@ function toggle() {
         <ChevronDown class="size-4 shrink-0 transition-transform" :class="expanded ? 'rotate-180' : ''" />
       </button>
     </div>
-    <div v-if="expanded" class="grid gap-4 border-0 border-t border-solid border-cp-border-secondary bg-cp-fill-quaternary p-4 sm:grid-cols-2">
-      <div class="flex items-center justify-between gap-3 sm:col-span-2">
+    <div v-if="expanded" class="grid items-start gap-4 border-0 border-t border-solid border-cp-border-secondary bg-cp-fill-quaternary p-4 sm:grid-cols-2">
+      <div class="flex flex-wrap items-center justify-between gap-3 sm:col-span-2">
         <BaseSwitch :model-value="override.enabled" :label="`${name} 自动参与`" show-label :disabled="disabled || !account.supported" @update:model-value="update({ enabled: $event })" />
         <span class="text-cp-xs text-cp-text-secondary">关闭仅影响自动任务，手动选择仍可预热</span>
       </div>
-      <BaseFormItem label="每日执行时间" :description="`使用 ${settings.timezone} 时区`">
-        <BaseCheckbox :model-value="override.dailyTime !== null" :label="`${name} 使用独立时间`" show-label :disabled="disabled || !account.supported" @update:model-value="update({ dailyTime: $event ? settings.dailyTime : null })" />
-        <BaseInput v-if="override.dailyTime !== null" class="mt-2" :model-value="override.dailyTime" type="time" :aria-label="`${name} 独立时间`" :disabled="disabled" @update:model-value="update({ dailyTime: $event })" />
-        <p v-else class="mt-2 mb-0 text-cp-xs text-cp-text-secondary">
+      <BaseFormItem label="每日执行时间">
+        <div class="flex min-h-6 items-center">
+          <BaseCheckbox :model-value="override.dailyTime !== null" :label="`${name} 使用独立时间`" show-label :disabled="disabled || !account.supported" @update:model-value="update({ dailyTime: $event ? settings.dailyTime : null })">
+            <template #label>
+              使用独立时间
+            </template>
+          </BaseCheckbox>
+        </div>
+        <BaseInput v-if="override.dailyTime !== null" class="mt-2 w-full" :model-value="override.dailyTime" type="time" :aria-label="`${name} 独立时间`" :aria-describedby="timeHelpId" :disabled="disabled" @update:model-value="update({ dailyTime: $event })" />
+        <p v-else class="mt-2 mb-0 flex h-cp-control items-center text-cp-xs text-cp-text-secondary">
           跟随默认 {{ settings.dailyTime }}
+        </p>
+        <p :id="timeHelpId" class="mt-2 mb-0 text-cp-xs leading-relaxed text-cp-text-secondary">
+          使用 {{ settings.timezone }} 时区
         </p>
       </BaseFormItem>
       <BaseFormItem label="重置后延迟">
-        <BaseCheckbox :model-value="override.resetDelaySeconds !== null" :label="`${name} 使用独立重置延迟`" show-label :disabled="disabled || !account.supported" @update:model-value="update({ resetDelaySeconds: $event ? settings.resetDelaySeconds : null })" />
-        <BaseInput v-if="override.resetDelaySeconds !== null" class="mt-2" :model-value="String(override.resetDelaySeconds)" type="number" min="0" max="86400" :aria-label="`${name} 独立重置延迟秒数`" :disabled="disabled" @update:model-value="update({ resetDelaySeconds: $event === '' ? Number.NaN : Number($event) })" />
-        <p v-else class="mt-2 mb-0 text-cp-xs text-cp-text-secondary">
+        <div class="flex min-h-6 items-center">
+          <BaseCheckbox :model-value="override.resetDelaySeconds !== null" :label="`${name} 使用独立重置延迟`" show-label :disabled="disabled || !account.supported" @update:model-value="update({ resetDelaySeconds: $event ? settings.resetDelaySeconds : null })">
+            <template #label>
+              使用独立重置延迟
+            </template>
+          </BaseCheckbox>
+        </div>
+        <BaseInput v-if="override.resetDelaySeconds !== null" class="mt-2 w-full" :model-value="String(override.resetDelaySeconds)" type="number" min="0" max="86400" :aria-label="`${name} 独立重置延迟秒数`" :disabled="disabled" @update:model-value="update({ resetDelaySeconds: $event === '' ? Number.NaN : Number($event) })" />
+        <p v-else class="mt-2 mb-0 flex h-cp-control items-center text-cp-xs text-cp-text-secondary">
           跟随默认 {{ settings.resetDelaySeconds }} 秒
         </p>
       </BaseFormItem>
       <BaseFormItem label="预热模型" class="sm:col-span-2">
         <div class="flex flex-wrap items-center justify-between gap-2">
-          <BaseCheckbox :model-value="override.model !== null" :label="`${name} 使用独立模型`" show-label :disabled="disabled || !account.supported" @update:model-value="update({ model: $event ? settings.defaultModel : null })" />
+          <BaseCheckbox :model-value="override.model !== null" :label="`${name} 使用独立模型`" show-label :disabled="disabled || !account.supported" @update:model-value="update({ model: $event ? settings.defaultModel : null })">
+            <template #label>
+              使用独立模型
+            </template>
+          </BaseCheckbox>
           <BaseButton size="sm" variant="ghost" :loading="modelsLoading" :disabled="disabled || !account.supported" @click="emit('models', account.id, effectiveModel)">
             <RefreshCw class="size-3.5" /> 模型目录
           </BaseButton>
         </div>
         <div v-if="override.model !== null" class="mt-2 grid gap-2 sm:grid-cols-2">
-          <BaseInput :model-value="override.model" :aria-label="`${name} 独立模型 ID`" :disabled="disabled" @update:model-value="update({ model: $event })" />
-          <BaseSelect :model-value="override.model" searchable :options="modelOptions" :aria-label="`${name} 从目录选择模型`" :disabled="disabled || modelsLoading" @update:model-value="update({ model: $event })" />
+          <BaseInput class="w-full" :model-value="override.model" :aria-label="`${name} 独立模型 ID`" :disabled="disabled" @update:model-value="update({ model: $event })" />
+          <BaseSelect class="w-full" :model-value="override.model" searchable :options="modelOptions" :aria-label="`${name} 从目录选择模型`" :disabled="disabled || modelsLoading" @update:model-value="update({ model: $event })" />
         </div>
         <p v-else class="mt-2 mb-0 text-cp-xs text-cp-text-secondary">
           跟随默认 {{ settings.defaultModel }}
@@ -106,8 +127,12 @@ function toggle() {
         </p>
       </BaseFormItem>
       <BaseFormItem label="推理强度" class="sm:col-span-2">
-        <BaseCheckbox :model-value="override.reasoningEffort !== null" :label="`${name} 使用独立推理强度`" show-label :disabled="disabled || !account.supported" @update:model-value="update({ reasoningEffort: $event ? settings.reasoningEffort : null })" />
-        <BaseSelect v-if="override.reasoningEffort !== null" class="mt-2" :model-value="override.reasoningEffort" :options="effortOptions" :aria-label="`${name} 独立推理强度`" :disabled="disabled || modelsLoading" @update:model-value="updateEffort" />
+        <BaseCheckbox :model-value="override.reasoningEffort !== null" :label="`${name} 使用独立推理强度`" show-label :disabled="disabled || !account.supported" @update:model-value="update({ reasoningEffort: $event ? settings.reasoningEffort : null })">
+          <template #label>
+            使用独立推理强度
+          </template>
+        </BaseCheckbox>
+        <BaseSelect v-if="override.reasoningEffort !== null" class="mt-2 w-full" :model-value="override.reasoningEffort" :options="effortOptions" :aria-label="`${name} 独立推理强度`" :disabled="disabled || modelsLoading" @update:model-value="updateEffort" />
         <p v-else class="mt-2 mb-0 text-cp-xs text-cp-text-secondary">
           跟随默认 {{ effortLabel }}
         </p>

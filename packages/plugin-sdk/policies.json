@@ -415,7 +415,7 @@
     "required": false,
     "category": "account-tools",
     "trustedUi": true,
-    "capabilities": ["account-warmup.read", "account-warmup.configure", "account-warmup.run", "account-warmup.history", "account-warmup.cancel", "accounts.get.admin.accounts", "auth.get.auth.status", "auth.post.auth.logout"],
+    "capabilities": ["account-warmup.read", "account-warmup.configure", "account-warmup.run", "account-warmup.history", "account-warmup.cancel", "accounts.get.admin.accounts", "account-groups.get.admin.account-groups", "auth.get.auth.status", "auth.post.auth.logout"],
     "description": "独立后台插件：为全部或选中账号发送一次hi，支持真实额度重置与每日计划、逐账号时间和模型、随机延迟及持久任务记录。自动预热默认关闭。",
     "pages": [{"id": "main", "title": "自动预热", "entry": "ui/module.js", "roles": ["admin"], "route": "/extensions/account-warmup"}]
   },

@@ -6,7 +6,10 @@ use crate::{
 use async_trait::async_trait;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
-use std::sync::Arc;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 pub struct KernelCapabilities {
     pub accounts: Arc<dyn PluginAccounts>,
@@ -90,7 +93,39 @@ impl PluginCapabilities for KernelCapabilities {
                     crate::routing::UpstreamModelId::new(model)
                         .map_err(|_| RpcError::new(INVALID_PARAMS, "model"))?;
                 }
-                encode(self.upstream.warmup_read(access, params).await?)
+                let mut result = self.upstream.warmup_read(access, params).await?;
+                require_warmup(access, method)?;
+                let ids: BTreeSet<_> = result
+                    .accounts
+                    .iter()
+                    .map(|account| account.id.clone())
+                    .collect();
+                let requested: Vec<_> = ids.iter().cloned().collect();
+                // 维护目录只读取真实成员关系；它不借用路由 ownership/watch 授权。
+                let rows = self.accounts.read(Some(&requested), None).await;
+                require_warmup(access, method)?;
+                let unavailable =
+                    || RpcError::new(UNAVAILABLE, "warmup group directory unavailable");
+                let mut groups = BTreeMap::new();
+                for mut row in rows.map_err(|_| unavailable())? {
+                    if !ids.contains(&row.id) {
+                        continue;
+                    }
+                    row.groups.sort();
+                    row.groups.dedup();
+                    if let Some(previous) = groups.insert(row.id, row.groups.clone())
+                        && previous != row.groups
+                    {
+                        return Err(unavailable());
+                    }
+                }
+                for account in &mut result.accounts {
+                    // 缺失账号不能冒充“真实读取后为空组”，否则分组计划会静默少发。
+                    account.groups = groups.get(&account.id).cloned().ok_or_else(unavailable)?;
+                }
+                result.group_targets_supported = true;
+                require_warmup(access, method)?;
+                encode(result)
             }
             ACCOUNT_WARMUP_RUN => {
                 require_warmup(access, method)?;
@@ -103,6 +138,16 @@ impl PluginCapabilities for KernelCapabilities {
                     return Err(RpcError::new(INVALID_PARAMS, "model"));
                 }
                 if !(1000..=15000).contains(&params.timeout_ms)
+                    || params.prompt.trim().is_empty()
+                    || params.prompt.len() > 4096
+                    || params
+                        .prompt
+                        .chars()
+                        .any(|value| value.is_control() && !matches!(value, '\n' | '\r' | '\t'))
+                    || !matches!(
+                        params.reasoning_effort.as_str(),
+                        "auto" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh"
+                    )
                     || params.attempt_id.is_empty()
                     || params.attempt_id.len() > 128
                     || !params

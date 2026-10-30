@@ -22,6 +22,8 @@
   - `admin.call`：管理面直连，`{method, params, actor.role}`。
 - 能力（`src/capabilities.rs`）：`upstream.probe`（含 `includeAccountCookies`，可选 `requestId`：同一次打票的多次探测共用的上游请求 ID）、`http.fetch`（`Egress::Direct` 或 `Account`）、`accounts.read`（可带 `model`，结果含 `modelAllowed`）、`accounts.warmup.read/run`（安全账号和模型强度目录、有界提示词的一次性维护请求及 `sendState`/`shortTerm` 结果）、`groups.move`、`quota.read`（可带 `refreshIfMissing`）、`log`（通知）。0.8 的预热参数增加 `prompt`/`reasoningEffort`，缺省仍为 `hi`/`auto`，模型目录的 `reasoningEfforts` 缺省为空；其它资格与发送边界不变。
 
+预热目录的账号 `groups` 为真实分组 ID，缺省为空；结果 `groupTargetsSupported` 缺省 false。只有 Core 成功合并内部安全成员目录才声明 true，服务分组模式据此检测能力，不能把旧内核缺字段当作没有分组。
+
 ## 文件表
 
 | 文件 | 职责 |

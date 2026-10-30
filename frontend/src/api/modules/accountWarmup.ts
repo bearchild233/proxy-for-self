@@ -69,8 +69,9 @@ export interface WarmupSettings {
   resetDelaySeconds: number
   jitterMinSeconds: number
   jitterMaxSeconds: number
-  targetMode: 'all' | 'selected'
+  targetMode: 'all' | 'selected' | 'groups'
   accountIds: string[]
+  groupIds: string[]
   defaultModel: string
   prompt: string
   reasoningEffort: WarmupReasoningEffort
@@ -86,6 +87,7 @@ export interface WarmupAccount {
   reasonCode: string | null
   modelAllowed: boolean | null
   models: WarmupModel[] | null
+  groups?: string[]
   shortTerm: { observedAt: string | null, windowSeconds: number | null, usedPercent: number | null, resetAt: string | null } | null
 }
 export interface WarmupRun {
@@ -132,6 +134,7 @@ export interface WarmupAvailable {
   settings: WarmupSettings
   accounts: WarmupAccount[]
   accountStates?: Record<string, WarmupAccountState>
+  groupTargetsSupported?: boolean
   runtime: { ready: boolean, nextRunAt: string | null, nextAutomaticRunAt?: string | null, lastRun: WarmupRun | null }
 }
 export type WarmupRead = WarmupAvailable | { available: false, reason: 'plugin_disabled' | 'service_unavailable' }

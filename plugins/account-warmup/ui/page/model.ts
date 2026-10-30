@@ -1,7 +1,7 @@
 import type { WarmupAccount, WarmupOverride, WarmupSettings, WarmupTask } from '@/api/modules/accountWarmup'
 
 export function defaultWarmupSettings(): WarmupSettings {
-  return { enabled: false, timezone: 'Asia/Shanghai', dailyEnabled: false, dailyTime: '08:00', resetEnabled: true, resetDelaySeconds: 30, jitterMinSeconds: 5, jitterMaxSeconds: 15, targetMode: 'all', accountIds: [], defaultModel: 'gpt-6.1-sol', prompt: 'hi', reasoningEffort: 'auto', accountOverrides: [] }
+  return { enabled: false, timezone: 'Asia/Shanghai', dailyEnabled: false, dailyTime: '08:00', resetEnabled: true, resetDelaySeconds: 30, jitterMinSeconds: 5, jitterMaxSeconds: 15, targetMode: 'all', accountIds: [], groupIds: [], defaultModel: 'gpt-6.1-sol', prompt: 'hi', reasoningEffort: 'auto', accountOverrides: [] }
 }
 export function cloneSettings(value: WarmupSettings): WarmupSettings {
   const cloned = JSON.parse(JSON.stringify(value)) as WarmupSettings
@@ -10,6 +10,7 @@ export function cloneSettings(value: WarmupSettings): WarmupSettings {
     ...cloned,
     prompt: cloned.prompt ?? 'hi',
     reasoningEffort: cloned.reasoningEffort ?? 'auto',
+    groupIds: cloned.groupIds ?? [],
     accountOverrides: cloned.accountOverrides.map(item => ({ ...item, reasoningEffort: item.reasoningEffort ?? null })),
   }
 }
@@ -34,6 +35,10 @@ export function settingsError(value: WarmupSettings) {
     return '随机延迟须为 0 至 300 秒，且最小值不大于最大值'
   if (value.targetMode === 'selected' && (value.accountIds.length === 0 || value.accountIds.length > 500))
     return '指定账号须选择 1 至 500 个账号'
+  if (value.groupIds.length > 500 || new Set(value.groupIds).size !== value.groupIds.length)
+    return '分组选择须为最多 500 个不重复分组'
+  if (value.targetMode === 'groups' && value.groupIds.length === 0)
+    return '请至少选择一个自动预热分组'
   for (const item of value.accountOverrides) {
     if (item.dailyTime !== null && !time(item.dailyTime))
       return '账号独立时间格式为 HH:mm'
@@ -47,6 +52,41 @@ export function settingsError(value: WarmupSettings) {
 export function accountOverride(value: WarmupSettings, accountId: string): WarmupOverride {
   const override = value.accountOverrides.find(item => item.accountId === accountId)
   return override ? { ...override, reasoningEffort: override.reasoningEffort ?? null } : { accountId, enabled: true, dailyTime: null, model: null, resetDelaySeconds: null, reasoningEffort: null }
+}
+export function matchingWarmupAccounts(settings: WarmupSettings, accounts: WarmupAccount[]) {
+  const unique = [...new Map(accounts.map(account => [account.id, account])).values()]
+  if (settings.targetMode === 'selected')
+    return unique.filter(account => settings.accountIds.includes(account.id))
+  if (settings.targetMode === 'groups')
+    return unique.filter(account => account.groups?.some(id => settings.groupIds.includes(id)))
+  return unique
+}
+export function updateWarmupOverrides(settings: WarmupSettings, accountIds: string[], patch: Partial<Omit<WarmupOverride, 'accountId'>>) {
+  const ids = [...new Set(accountIds)]
+  if (!ids.length || ids.length > 500)
+    throw new Error('批量管理须选择 1 至 500 个账号')
+  if (patch.reasoningEffort !== undefined && patch.reasoningEffort !== null && !['auto', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh'].includes(patch.reasoningEffort))
+    throw new Error('请选择有效的推理强度')
+  if (patch.model !== undefined && patch.model !== null && (!patch.model.trim() || new TextEncoder().encode(patch.model).length > 128 || [...patch.model].some((char) => {
+    const code = char.codePointAt(0) ?? 0
+    return code < 32 || (code >= 127 && code <= 159)
+  }))) {
+    throw new Error('请输入有效的预热模型 ID（最多 128 字节）')
+  }
+  const next = cloneSettings(settings)
+  const overrides = new Map(next.accountOverrides.map(item => [item.accountId, item]))
+  for (const id of ids)
+    overrides.set(id, { ...accountOverride(next, id), ...patch, accountId: id })
+  if (overrides.size > 500)
+    throw new Error('账号独立设置最多保留 500 个，请减少所选账号')
+  next.accountOverrides = [...overrides.values()]
+  for (const override of next.accountOverrides) {
+    if (override.dailyTime !== null && !/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(override.dailyTime))
+      throw new Error('账号独立时间格式为 HH:mm')
+    if (override.resetDelaySeconds !== null && (!Number.isSafeInteger(override.resetDelaySeconds) || override.resetDelaySeconds < 0 || override.resetDelaySeconds > 86400))
+      throw new Error('账号独立重置延迟须为 0 至 86400 秒的整数')
+  }
+  return next
 }
 export const reasonLabels: Record<string, string> = {
   unsupported: '暂不支持此账号类型',
@@ -63,6 +103,9 @@ export const reasonLabels: Record<string, string> = {
   model_not_allowed: '账号政策不允许此模型',
   model_denied: '账号政策不允许此模型',
   reasoning_unsupported: '模型目录未确认支持所选推理强度',
+  group_membership_changed: '账号已不在所选预热分组',
+  group_targets_unavailable: '分组目录暂不可用，等待恢复',
+  automation_disabled: '该账号或触发方式已退出自动预热',
   rate_limited: '账号冷却中',
   credential_invalid: '账号需要重新授权',
   credential_expired: '凭据已过期',

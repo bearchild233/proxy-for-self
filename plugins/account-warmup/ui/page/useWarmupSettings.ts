@@ -41,6 +41,10 @@ export function useWarmupSettings() {
   const dirty = computed(() => baseline.value !== '' && JSON.stringify(draft.value) !== baseline.value)
   const validation = computed(() => {
     const value = draft.value
+    if (view.value?.available && !Array.isArray(view.value.settings.groupIds))
+      return '请升级自动预热插件后保存新设置，当前草稿已保留'
+    if (value.targetMode === 'groups' && (!view.value?.available || view.value.groupTargetsSupported !== true))
+      return '当前服务尚未确认动态分组能力，请刷新或升级后保存分组计划'
     const requestError = warmupRequestError({ model: value.defaultModel, prompt: value.prompt, reasoningEffort: value.reasoningEffort })
     if (requestError)
       return requestError

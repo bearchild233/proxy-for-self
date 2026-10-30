@@ -53,10 +53,12 @@ pub fn time(value: &str) -> Option<NaiveTime> {
 
 pub fn validate(settings: &Settings) -> RpcResult<()> {
     ids(&settings.account_ids)?;
+    ids(&settings.group_ids)
+        .map_err(|_| invalid("groupIds must contain at most 500 unique IDs"))?;
     let mut overrides = HashSet::new();
     if settings.timezone.parse::<Tz>().is_err()
         || time(&settings.daily_time).is_none()
-        || !matches!(settings.target_mode.as_str(), "all" | "selected")
+        || !matches!(settings.target_mode.as_str(), "all" | "selected" | "groups")
         || !identifier(&settings.default_model)
         || !prompt(&settings.prompt)
         || !reasoning_effort(&settings.reasoning_effort)
@@ -64,6 +66,7 @@ pub fn validate(settings: &Settings) -> RpcResult<()> {
         || settings.jitter_max_seconds > 300
         || settings.reset_delay_seconds > 86400
         || (settings.target_mode == "selected" && settings.account_ids.is_empty())
+        || (settings.target_mode == "groups" && settings.group_ids.is_empty())
         || (settings.enabled && !settings.daily_enabled && !settings.reset_enabled)
         || settings.account_overrides.len() > 500
     {

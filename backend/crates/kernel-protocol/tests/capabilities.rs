@@ -92,7 +92,7 @@ fn warmup_contract_is_narrow_and_has_no_credential_material() {
         json!({"outcome":"accepted","reasonCode":null,"status":200,"durationMs":8,"sendState":"sent","shortTerm":{"observedAt":"2026-10-25T01:00:00+00:00","windowSeconds":18000,"usedPercent":1.0,"resetAt":"2026-10-25T06:00:00+00:00"}}),
     );
     example::<AccountWarmupReadResult>(
-        json!({"accounts":[{"id":"a","provider":"openai","authenticationKind":"oauth","enabled":true,"status":"normal","supported":true,"reasonCode":null,"modelAllowed":true,"models":[{"id":"m","label":"M","reasoningEfforts":["low","high"]}],"shortTerm":null}]}),
+        json!({"accounts":[{"id":"a","groups":["g"],"provider":"openai","authenticationKind":"oauth","enabled":true,"status":"normal","supported":true,"reasonCode":null,"modelAllowed":true,"models":[{"id":"m","label":"M","reasoningEfforts":["low","high"]}],"shortTerm":null}],"groupTargetsSupported":true}),
     );
 }
 
@@ -107,4 +107,12 @@ fn protocol_eight_warmup_fields_preserve_legacy_defaults() {
     let legacy: AccountWarmupModel = serde_json::from_value(json!({"id":"m","label":"M"})).unwrap();
     assert!(legacy.reasoning_efforts.is_empty());
     example::<AccountWarmupModel>(json!({"id":"plain","label":"Plain","reasoningEfforts":[]}));
+    let legacy: AccountWarmupReadResult = serde_json::from_value(json!({"accounts":[{
+        "id":"a","provider":"openai","authenticationKind":"oauth","enabled":true,
+        "status":"normal","supported":true,"reasonCode":null,"modelAllowed":null,
+        "models":null,"shortTerm":null
+    }]}))
+    .unwrap();
+    assert!(!legacy.group_targets_supported);
+    assert!(legacy.accounts[0].groups.is_empty());
 }

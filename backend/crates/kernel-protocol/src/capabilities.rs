@@ -58,6 +58,8 @@ pub struct AccountWarmupModel {
 #[serde(rename_all = "camelCase")]
 pub struct AccountWarmupAccount {
     pub id: String,
+    #[serde(default)]
+    pub groups: Vec<String>,
     pub provider: String,
     pub authentication_kind: String,
     pub enabled: bool,
@@ -70,8 +72,11 @@ pub struct AccountWarmupAccount {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AccountWarmupReadResult {
     pub accounts: Vec<AccountWarmupAccount>,
+    #[serde(default)]
+    pub group_targets_supported: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

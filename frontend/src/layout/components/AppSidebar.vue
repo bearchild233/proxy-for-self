@@ -2,6 +2,7 @@
 import {
   ArrowUpCircle,
   ChartNoAxesColumn,
+  FlameKindling,
   FolderTree,
   Info,
   KeyRound,
@@ -70,7 +71,7 @@ const navItems = computed(() => [
   { label: '主题设置', icon: Palette, path: '/theme' },
   { label: '系统设置', icon: Settings, path: '/settings' },
   { label: '插件管理', icon: Puzzle, path: '/settings/plugins' },
-  ...platformPlugins.value.flatMap(plugin => plugin.pages.filter(page => page.route?.startsWith('/extensions/')).map(page => ({ label: page.title, icon: Puzzle, path: page.route! }))),
+  ...platformPlugins.value.flatMap(plugin => plugin.pages.filter(page => page.route?.startsWith('/extensions/')).map(page => ({ label: page.title, icon: plugin.id === 'account-warmup' ? FlameKindling : Puzzle, path: page.route! }))),
 ].filter(item => item.path === '/settings/plugins' || platformPlugins.value.some(plugin => plugin.pages.some(page => page.route === item.path))))
 
 function isActive(path: string) {

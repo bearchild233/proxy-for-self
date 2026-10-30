@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import type { WarmupOverride, WarmupReasoningEffort } from '@/api/modules/accountWarmup'
-import { ArrowLeft, Clock3, RefreshCw, Save } from '@lucide/vue'
+import type { WarmupReasoningEffort } from '@/api/modules/accountWarmup'
+import { ArrowLeft, Clock3, FlameKindling, RefreshCw, Save } from '@lucide/vue'
 import { host } from '@sdk/ui'
 import { computed, ref, watch } from 'vue'
 import { warmupEffortOptions, warmupRequestError } from '@/api/modules/accountWarmup'
@@ -9,18 +9,15 @@ import BaseCard from '@/components/base/BaseCard.vue'
 import BaseFormItem from '@/components/base/BaseForm/FormItem.vue'
 import BaseInput from '@/components/base/BaseInput.vue'
 import BasePageHeader from '@/components/base/BasePageHeader.vue'
-import BaseSegmented from '@/components/base/BaseSegmented.vue'
 import BaseSelect from '@/components/base/BaseSelect.vue'
 import BaseSwitch from '@/components/base/BaseSwitch.vue'
 import BaseTextarea from '@/components/base/BaseTextarea.vue'
-import WarmupAccountRow from './components/WarmupAccountRow.vue'
 import WarmupHistory from './components/WarmupHistory.vue'
+import WarmupTargets from './components/WarmupTargets.vue'
 import { formatWarmupTime } from './model'
 import { useWarmupSettings } from './useWarmupSettings'
 
 const { view, draft, dirty, validation, error, namesError, saveError, changedElsewhere, loading, saving, names, runs, items, selectedRunId, historyError, cancelling, models, modelLoading, modelErrors, refresh, refreshNames, save, refreshHistory, selectRun, cancel, loadModels } = useWarmupSettings()
-const search = ref('')
-const page = ref(1)
 const catalogAccountId = ref('')
 const available = computed(() => view.value?.available === true)
 const accounts = computed(() => view.value?.available ? view.value.accounts : [])
@@ -28,13 +25,6 @@ const runtime = computed(() => view.value?.available ? view.value.runtime : unde
 const savedEnabled = computed(() => view.value?.available && view.value.settings.enabled)
 const promptBytes = computed(() => new TextEncoder().encode(draft.value.prompt).length)
 const promptError = computed(() => warmupRequestError({ prompt: draft.value.prompt, reasoningEffort: 'auto' }))
-const filtered = computed(() => {
-  const query = search.value.trim().toLowerCase()
-  return accounts.value.filter(account => `${names.value.get(account.id)?.name ?? ''} ${account.id} ${account.provider}`.toLowerCase().includes(query))
-})
-const pageCount = computed(() => Math.max(1, Math.ceil(filtered.value.length / 20)))
-const currentPage = computed(() => Math.min(page.value, pageCount.value))
-const visibleAccounts = computed(() => filtered.value.slice((currentPage.value - 1) * 20, currentPage.value * 20))
 const catalogOptions = computed(() => [{ value: '', label: '选择账号以读取模型目录' }, ...accounts.value.filter(item => item.supported).map(item => ({ value: item.id, label: names.value.get(item.id)?.name || item.id }))])
 const modelOptions = computed(() => {
   const entries = new Map((models.value[catalogAccountId.value] ?? []).map(item => [item.id, { value: item.id, label: item.label || item.id }]))
@@ -46,16 +36,6 @@ const effortOptions = computed(() => warmupEffortOptions(models.value[catalogAcc
 function setEffort(value: string) {
   if (effortOptions.value.some(item => item.value === value && !item.disabled))
     draft.value.reasoningEffort = value as WarmupReasoningEffort
-}
-function selectAccount(id: string, selected: boolean) {
-  const next = new Set(draft.value.accountIds)
-  if (selected)
-    next.add(id)
-  else next.delete(id)
-  draft.value.accountIds = [...next]
-}
-function updateOverride(value: WarmupOverride) {
-  draft.value.accountOverrides = [...draft.value.accountOverrides.filter(item => item.accountId !== value.accountId), value]
 }
 function setCatalog(id: string) {
   catalogAccountId.value = id
@@ -76,7 +56,11 @@ async function back() {
 
 <template>
   <div class="flex w-full flex-col gap-4 pb-6">
-    <BasePageHeader title="自动预热" description="管理后台自动化计划；手动预热请返回账号管理。">
+    <BasePageHeader title="自动预热">
+      <template #description>
+        <FlameKindling class="size-5 shrink-0 text-cp-warning-text" aria-hidden="true" />
+        <span>管理后台自动化计划；手动预热请返回账号管理。</span>
+      </template>
       <template #actions>
         <BaseButton variant="secondary" @click="back">
           <ArrowLeft class="size-4" /> 返回账号管理
@@ -115,26 +99,39 @@ async function back() {
         <template #actions>
           <BaseSwitch v-model="draft.enabled" label="启用自动预热" show-label :disabled="saving" />
         </template>
-        <div class="grid gap-5 sm:grid-cols-2 lg:grid-cols-3">
-          <BaseFormItem label="额度重置触发" description="仅依据已观测到的真实窗口到期时间。">
-            <BaseSwitch v-model="draft.resetEnabled" label="额度重置后预热" show-label :disabled="saving" />
+        <div class="grid items-start gap-5 sm:grid-cols-2 lg:grid-cols-3">
+          <BaseFormItem label="额度重置触发">
+            <div class="flex h-cp-control w-full items-center">
+              <BaseSwitch v-model="draft.resetEnabled" label="额度重置后预热" show-label :disabled="saving" />
+            </div>
+            <p class="mt-2 mb-0 text-cp-xs leading-relaxed text-cp-text-secondary">
+              仅依据已观测到的真实窗口到期时间。
+            </p>
           </BaseFormItem>
           <BaseFormItem label="重置后延迟（秒）">
-            <BaseInput :model-value="String(draft.resetDelaySeconds)" type="number" min="0" max="86400" aria-label="全局重置后延迟秒数" :disabled="saving" @update:model-value="draft.resetDelaySeconds = $event === '' ? Number.NaN : Number($event)" />
+            <BaseInput class="w-full" :model-value="String(draft.resetDelaySeconds)" type="number" min="0" max="86400" aria-label="全局重置后延迟秒数" :disabled="saving" @update:model-value="draft.resetDelaySeconds = $event === '' ? Number.NaN : Number($event)" />
           </BaseFormItem>
           <BaseFormItem label="每日定时触发">
-            <BaseSwitch v-model="draft.dailyEnabled" label="每天定时预热" show-label :disabled="saving" />
+            <div class="flex h-cp-control w-full items-center">
+              <BaseSwitch v-model="draft.dailyEnabled" label="每天定时预热" show-label :disabled="saving" />
+            </div>
           </BaseFormItem>
           <BaseFormItem label="每日执行时间">
-            <BaseInput v-model="draft.dailyTime" type="time" aria-label="默认每日执行时间" :disabled="saving" />
+            <BaseInput v-model="draft.dailyTime" class="w-full" type="time" aria-label="默认每日执行时间" :disabled="saving" />
           </BaseFormItem>
-          <BaseFormItem label="调度时区" description="每日计划与账号独立时间共用此时区。">
-            <BaseInput v-model="draft.timezone" aria-label="调度时区" placeholder="Asia/Shanghai" :disabled="saving" />
+          <BaseFormItem label="调度时区">
+            <BaseInput v-model="draft.timezone" class="w-full" aria-label="调度时区" aria-describedby="warmup-timezone-help" placeholder="Asia/Shanghai" :disabled="saving" />
+            <p id="warmup-timezone-help" class="mt-2 mb-0 text-cp-xs leading-relaxed text-cp-text-secondary">
+              每日计划与账号独立时间共用此时区。
+            </p>
           </BaseFormItem>
-          <BaseFormItem label="随机延迟（秒）" description="每次计划在范围内取值，排队后保持该延迟。">
-            <div class="flex items-center gap-2">
-              <BaseInput :model-value="String(draft.jitterMinSeconds)" type="number" min="0" max="300" aria-label="随机延迟最小秒数" :disabled="saving" @update:model-value="draft.jitterMinSeconds = $event === '' ? Number.NaN : Number($event)" /><span>至</span><BaseInput :model-value="String(draft.jitterMaxSeconds)" type="number" min="0" max="300" aria-label="随机延迟最大秒数" :disabled="saving" @update:model-value="draft.jitterMaxSeconds = $event === '' ? Number.NaN : Number($event)" />
+          <BaseFormItem label="随机延迟（秒）">
+            <div class="grid h-cp-control grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-2">
+              <BaseInput class="w-full" :model-value="String(draft.jitterMinSeconds)" type="number" min="0" max="300" aria-label="随机延迟最小秒数" aria-describedby="warmup-jitter-help" :disabled="saving" @update:model-value="draft.jitterMinSeconds = $event === '' ? Number.NaN : Number($event)" /><span class="text-cp-sm text-cp-text-secondary">至</span><BaseInput class="w-full" :model-value="String(draft.jitterMaxSeconds)" type="number" min="0" max="300" aria-label="随机延迟最大秒数" aria-describedby="warmup-jitter-help" :disabled="saving" @update:model-value="draft.jitterMaxSeconds = $event === '' ? Number.NaN : Number($event)" />
             </div>
+            <p id="warmup-jitter-help" class="mt-2 mb-0 text-cp-xs leading-relaxed text-cp-text-secondary">
+              每次计划在范围内取值，排队后保持该延迟。
+            </p>
           </BaseFormItem>
         </div>
         <p class="mt-4 mb-0 flex flex-wrap items-center gap-x-4 gap-y-1 text-cp-xs text-cp-text-secondary" role="status">
@@ -147,18 +144,24 @@ async function back() {
             <RefreshCw class="size-3.5" /> 刷新模型目录
           </BaseButton>
         </template>
-        <BaseFormItem label="预热提示词" :description="`最多 4096 字节，可使用多行文本；当前 ${promptBytes} / 4096 字节。`" :error="promptError">
-          <BaseTextarea v-model="draft.prompt" :rows="4" aria-label="自动预热提示词" placeholder="hi" :disabled="saving" />
+        <BaseFormItem label="预热提示词" :error="promptError">
+          <BaseTextarea v-model="draft.prompt" :rows="4" aria-label="自动预热提示词" aria-describedby="warmup-prompt-help" placeholder="hi" :disabled="saving" />
+          <p id="warmup-prompt-help" class="mt-2 mb-0 text-cp-xs leading-relaxed text-cp-text-secondary">
+            最多 4096 字节，可使用多行文本；当前 {{ promptBytes }} / 4096 字节。
+          </p>
         </BaseFormItem>
-        <div class="mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+        <div class="mt-4 grid items-start gap-4 sm:grid-cols-2 lg:grid-cols-3">
           <BaseFormItem label="读取账号模型目录">
-            <BaseSelect :model-value="catalogAccountId" searchable :options="catalogOptions" aria-label="模型目录账号" :disabled="saving" @update:model-value="setCatalog" />
+            <BaseSelect class="w-full" :model-value="catalogAccountId" searchable :options="catalogOptions" aria-label="模型目录账号" :disabled="saving" @update:model-value="setCatalog" />
           </BaseFormItem>
           <BaseFormItem label="默认自动预热模型">
-            <BaseSelect v-model="draft.defaultModel" searchable :options="modelOptions" aria-label="选择默认预热模型" :disabled="saving || modelLoading.has(catalogAccountId)" />
+            <BaseSelect v-model="draft.defaultModel" class="w-full" searchable :options="modelOptions" aria-label="选择默认预热模型" :disabled="saving || modelLoading.has(catalogAccountId)" />
           </BaseFormItem>
-          <BaseFormItem label="默认推理强度" description="自动会选择该模型支持的最低强度。">
-            <BaseSelect :model-value="draft.reasoningEffort" :options="effortOptions" aria-label="自动预热默认推理强度" :disabled="saving" @update:model-value="setEffort" />
+          <BaseFormItem label="默认推理强度">
+            <BaseSelect class="w-full" :model-value="draft.reasoningEffort" :options="effortOptions" aria-label="自动预热默认推理强度" aria-describedby="warmup-effort-help" :disabled="saving" @update:model-value="setEffort" />
+            <p id="warmup-effort-help" class="mt-2 mb-0 text-cp-xs leading-relaxed text-cp-text-secondary">
+              自动会选择该模型支持的最低强度。
+            </p>
           </BaseFormItem>
         </div>
         <p v-if="catalogAccountId && modelErrors[catalogAccountId]" role="alert" class="mt-3 mb-0 text-cp-xs text-cp-error-text">
@@ -168,37 +171,19 @@ async function back() {
           目录属于所选账号，各账号实际权限和支持的强度可能不同；可在下方覆盖各账号的模型与强度。目录不可用时保留已保存的模型，执行前由服务逐项校验。
         </p>
       </BaseCard>
-      <BaseCard title="参与账号" description="这里只选择后台自动计划的目标账号，账号管理中的手动操作使用本次选择的范围。">
-        <template #actions>
-          <span class="text-cp-sm text-cp-text-secondary">指定 {{ draft.accountIds.length }} 个 · 目录 {{ accounts.length }} 个</span>
-        </template>
-        <div class="flex flex-wrap items-center gap-3">
-          <BaseSegmented v-model="draft.targetMode" class="max-w-full" label="自动预热账号范围" :options="[{ label: '全部当前账号', value: 'all' }, { label: '指定账号', value: 'selected' }]" :disabled="saving" />
-          <BaseInput v-model="search" class="min-w-48 flex-1" aria-label="搜索预热账号" placeholder="搜索账号名称或 ID" @update:model-value="page = 1" />
-          <BaseButton size="sm" @click="refreshNames">
-            <RefreshCw class="size-3.5" /> 账号名称
-          </BaseButton>
-        </div>
-        <p v-if="namesError" role="status" class="mt-3 mb-0 text-cp-xs text-cp-warning-text">
-          {{ namesError }}
-        </p>
-        <p class="my-3 text-cp-xs text-cp-text-secondary">
-          停用、归档、不支持或受额度保护的账号会在执行前跳过；展开账号可设置独立时间、模型、推理强度和重置延迟。
-        </p>
-        <div class="grid gap-2">
-          <WarmupAccountRow v-for="account in visibleAccounts" :key="account.id" :account="account" :name="names.get(account.id)?.name || account.id" :settings="draft" :selected="draft.accountIds.includes(account.id)" :disabled="saving" :models="models[account.id] ?? []" :models-loading="modelLoading.has(account.id)" :models-error="modelErrors[account.id] ?? ''" @select="selectAccount(account.id, $event)" @override="updateOverride" @models="loadModels" />
-        </div>
-        <p v-if="!visibleAccounts.length" class="my-4 text-center text-cp-sm text-cp-text-secondary">
-          暂无匹配账号
-        </p>
-        <div v-if="pageCount > 1" class="mt-3 flex items-center justify-end gap-3">
-          <BaseButton size="sm" :disabled="currentPage <= 1" @click="page = currentPage - 1">
-            上一页
-          </BaseButton><span class="text-cp-xs text-cp-text-secondary">{{ currentPage }} / {{ pageCount }}</span><BaseButton size="sm" :disabled="currentPage >= pageCount" @click="page = currentPage + 1">
-            下一页
-          </BaseButton>
-        </div>
-      </BaseCard>
+      <WarmupTargets
+        v-model="draft"
+        :accounts="accounts"
+        :names="names"
+        :names-error="namesError"
+        :disabled="saving"
+        :groups-supported="view?.available === true && view.groupTargetsSupported === true"
+        :models="models"
+        :model-loading="modelLoading"
+        :model-errors="modelErrors"
+        @names="refreshNames"
+        @models="loadModels"
+      />
       <p v-if="validation && dirty" role="alert" class="m-0 text-cp-sm text-cp-error-text">
         {{ validation }}
       </p>

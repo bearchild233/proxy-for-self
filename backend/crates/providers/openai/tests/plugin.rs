@@ -553,11 +553,17 @@ async fn warmup_directory_has_labels_and_no_personal_or_credential_fields() {
         ["minimal", "high"]
     );
     assert!(!result.accounts[1].supported);
+    assert!(!result.group_targets_supported);
+    assert!(
+        result
+            .accounts
+            .iter()
+            .all(|account| account.groups.is_empty())
+    );
     let serialized = serde_json::to_string(&result).unwrap();
     for field in [
         "upstreamAccountId",
         "userId",
-        "groups",
         "credential",
         "fixture-token",
         "fixture-upstream",

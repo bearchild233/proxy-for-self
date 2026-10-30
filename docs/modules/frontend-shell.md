@@ -28,6 +28,8 @@
 
 **布局**（`layout/`）：`index.vue` 侧边栏 + 主区；`layout/components/AppSidebar.vue` 由插件目录生成导航，`SystemUpdateModal/` 系统更新弹窗（`stores/modules/system-update.ts` 管版本、更新详情、SSE 进度）。
 
+侧栏对 `account-warmup` 扩展使用 FlameKindling 图标，其它扩展保留 Puzzle。`accountWarmup.ts` 的设置类型增加 `groups` 范围与 groupIds，read 暴露 `groupTargetsSupported` 和账号真实分组 ID；自动插件负责多选及批量草稿，主壳不解析成员资格或调度。
+
 **主题**（`theme/` + `stores/modules/theme.ts` + `styles/`）：`core/` 常量、规范化、解析（预设色 + 自定义色 + 逐 token 覆盖）、token；`derive/` 由种子派生颜色角色、外观、组件级 token；`theme/runtime/browser.ts` 把解析结果写成 `--cp-*` CSS 变量；store 负责模式（亮/暗/跟随系统）、过渡动画与持久化。完整规则见 [主题文档](../theme.md)。
 
 **其余**：`components/`（`base/` 基础组件 Base*：按钮、表格含列设置/分页/展开动画、表单、弹窗、Toast、选择器等；`charts/`；`client-profile/` 客户端画像编辑器；账号分组/服务商图标等业务无关的共用展示）、`composables/`（`usePagedQuery` / `useStablePagedQuery` 分页、`useVisiblePolling` 页面可见时轮询、`useAsyncAction`、`useSharedOrder` 顺序共享保存等）、`utils/`（日期、数字、代理连接串、Excel 模型目录、请求位置；`ccswitchImport.ts` 与 `codexConfig.ts` 只是对 `plugins/client-access/ui/utils/` 的 re-export）、`directives/loading.ts`、`views/login/` 登录页。

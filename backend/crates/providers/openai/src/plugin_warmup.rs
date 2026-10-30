@@ -239,6 +239,7 @@ impl OpenAiPluginUpstream {
             };
             result.push(AccountWarmupAccount {
                 id: account.id().as_str().into(),
+                groups: Vec::new(),
                 provider: account.provider().as_str().into(),
                 authentication_kind: account.authentication_kind().into(),
                 enabled: account.enabled(),
@@ -260,7 +261,10 @@ impl OpenAiPluginUpstream {
             });
         }
         require_warmup(access, ACCOUNT_WARMUP_READ)?;
-        Ok(AccountWarmupReadResult { accounts: result })
+        Ok(AccountWarmupReadResult {
+            accounts: result,
+            group_targets_supported: false,
+        })
     }
 
     pub(super) async fn run_warmup(

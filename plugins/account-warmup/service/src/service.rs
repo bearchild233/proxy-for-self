@@ -33,6 +33,7 @@ struct Cache {
     accounts: Vec<Account>,
     refreshed: Option<Instant>,
     ready: bool,
+    group_targets_supported: bool,
 }
 
 struct Inner {
@@ -75,7 +76,7 @@ impl WarmupService {
         ids: Option<Vec<String>>,
         model: Option<String>,
         include_models: bool,
-    ) -> RpcResult<Vec<Account>> {
+    ) -> RpcResult<Directory> {
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
         struct Params {
@@ -118,27 +119,44 @@ impl WarmupService {
             }
         }
         cache.ready = true;
-        Ok(result.accounts)
+        cache.group_targets_supported = result.group_targets_supported;
+        Ok(result)
     }
 
     fn cached(&self) -> Vec<Account> {
-        self.0.cache.lock().expect("warmup cache").accounts.clone()
+        self.cache_snapshot().0.accounts
     }
 
-    async fn refresh(&self, kernel: &Kernel, force: bool) -> RpcResult<Vec<Account>> {
-        let needed = force
-            || self
-                .0
-                .cache
-                .lock()
-                .expect("warmup cache")
-                .refreshed
-                .is_none_or(|at| at.elapsed() >= DIRECTORY_TTL);
-        if needed && let Err(error) = self.directory(kernel, None, None, false).await {
-            self.0.cache.lock().expect("warmup cache").ready = false;
-            return Err(error);
+    fn cache_snapshot(&self) -> (Directory, bool) {
+        let cache = self.0.cache.lock().expect("warmup cache");
+        (
+            Directory {
+                accounts: cache.accounts.clone(),
+                group_targets_supported: cache.ready && cache.group_targets_supported,
+            },
+            cache.ready,
+        )
+    }
+
+    async fn refresh(&self, kernel: &Kernel, force: bool) -> RpcResult<Directory> {
+        let needed = {
+            let cache = self.0.cache.lock().expect("warmup cache");
+            force
+                || !cache.ready
+                || cache
+                    .refreshed
+                    .is_none_or(|at| at.elapsed() >= DIRECTORY_TTL)
+        };
+        if needed {
+            return match self.directory(kernel, None, None, false).await {
+                Ok(directory) => Ok(directory),
+                Err(error) => {
+                    self.0.cache.lock().expect("warmup cache").ready = false;
+                    Err(error)
+                }
+            };
         }
-        Ok(self.cached())
+        Ok(self.cache_snapshot().0)
     }
 
     async fn read(&self, kernel: &Kernel, params: ReadParams) -> RpcResult<Value> {
@@ -155,28 +173,62 @@ impl WarmupService {
         let filtered = params.account_ids.is_some()
             || params.include_models == Some(true)
             || params.model.is_some();
-        let accounts = if filtered {
-            self.directory(
-                kernel,
-                params.account_ids,
-                params.model,
-                params.include_models.unwrap_or(false),
+        let group_mode = self
+            .database(|store| Ok(store.settings()?.1.target_mode == "groups"))
+            .await?;
+        // 分组模式的预测也使用完整的新目录，局部模型查询不能冻结其它账号的成员关系。
+        let group_directory = if group_mode {
+            self.refresh(kernel, true).await.ok()
+        } else {
+            None
+        };
+        let (directory, directory_ready) = if filtered {
+            (
+                self.directory(
+                    kernel,
+                    params.account_ids,
+                    params.model,
+                    params.include_models.unwrap_or(false),
+                )
+                .await?,
+                true,
             )
-            .await?
+        } else if group_mode {
+            group_directory
+                .clone()
+                .map(|directory| (directory, true))
+                .unwrap_or_else(|| self.cache_snapshot())
         } else {
             self.refresh(kernel, false)
                 .await
-                .unwrap_or_else(|_| self.cached())
+                .map(|directory| (directory, true))
+                .unwrap_or_else(|_| self.cache_snapshot())
         };
-        let ready = self.0.cache.lock().expect("warmup cache").ready;
-        let runtime_accounts = self.cached();
+        let group_targets_supported = directory.group_targets_supported
+            && (!group_mode
+                || group_directory
+                    .as_ref()
+                    .is_some_and(|directory| directory.group_targets_supported));
+        let ready = directory_ready && (!group_mode || group_targets_supported);
+        let accounts = directory.accounts;
+        let runtime_accounts = if group_mode {
+            group_directory
+                .map(|directory| directory.accounts)
+                .unwrap_or_default()
+        } else {
+            self.cached()
+        };
         let now = Utc::now();
         self.database(move |store| {
             let (revision, settings) = store.settings()?;
-            let mut runtime = store.runtime(now, &runtime_accounts, &settings)?;
+            // 读取期间切到分组时，本轮没有完整分组快照；下一次 read 再强刷。
+            let group_targets_supported = group_targets_supported && (settings.target_mode != "groups" || group_mode);
+            let ready = ready && (settings.target_mode != "groups" || group_targets_supported);
+            let runtime_accounts = if settings.target_mode == "groups" && !group_targets_supported { &[][..] } else { &runtime_accounts };
+            let mut runtime = store.runtime(now, runtime_accounts, &settings)?;
             runtime["ready"] = json!(ready);
             let account_states = store.account_states(now, &accounts)?;
-            Ok(json!({"available":true,"revision":revision,"settings":settings,"accounts":accounts,"accountStates":account_states,"runtime":runtime}))
+            Ok(json!({"available":true,"revision":revision,"settings":settings,"accounts":accounts,"groupTargetsSupported":group_targets_supported,"accountStates":account_states,"runtime":runtime}))
         }).await
     }
 
@@ -188,6 +240,13 @@ impl WarmupService {
             "read" => self.read(kernel, decode(params)?).await,
             "configure" => {
                 let input: ConfigureParams = decode(params)?;
+                schedule::validate(&input.settings)?;
+                if input.settings.target_mode == "groups" {
+                    let directory = self.refresh(kernel, true).await?;
+                    if !directory.group_targets_supported {
+                        return Err(RpcError::new(NOT_SUPPORTED, "group_targets_unavailable"));
+                    }
+                }
                 self.database(move |store| {
                     store.configure(input.expected_revision, &input.settings)
                 })
@@ -238,13 +297,14 @@ impl WarmupService {
                     self.0.wake.notify_one();
                     return Ok(json!({"run":run}));
                 }
-                let mut accounts = self.refresh(kernel, true).await?;
+                let mut accounts = self.refresh(kernel, true).await?.accounts;
                 if input.scope == "selected" {
                     accounts.retain(|account| ids.contains(&account.id));
                     for id in ids {
                         if !accounts.iter().any(|account| account.id == id) {
                             accounts.push(Account {
                                 id,
+                                groups: vec![],
                                 provider: String::new(),
                                 authentication_kind: String::new(),
                                 enabled: false,
@@ -326,20 +386,58 @@ impl WarmupService {
         // 手动任务已经持久化了账号/模型快照；目录短暂不可用时仍应继续
         // 认领这一项，而不是把整个队列卡在刷新上。目录失败只跳过本轮
         // 自动排程，错误在本轮末返回给后台循环以保持退避。
-        let auto_enabled = self
-            .database(|store| Ok(store.settings()?.1.enabled))
+        let (auto_enabled, group_mode) = self
+            .database(|store| {
+                let settings = store.settings()?.1;
+                Ok((settings.enabled, settings.target_mode == "groups"))
+            })
             .await?;
         let mut directory_error = None;
+        let mut group_accounts = None;
         if auto_enabled {
+            // 发现计划沿用目录 TTL；空队列不能每秒重载完整账号目录。
             match self.refresh(kernel, false).await {
-                Ok(accounts) => {
+                Ok(directory) if group_mode && !directory.group_targets_supported => {
+                    directory_error =
+                        Some(RpcError::new(NOT_SUPPORTED, "group_targets_unavailable"));
+                }
+                Ok(directory) => {
+                    let accounts = directory.accounts;
                     self.database(move |store| {
                         let (_, settings) = store.settings()?;
+                        // 配置可能在刷新期间切到分组，下一轮再取得支持分组的目录。
+                        if settings.target_mode == "groups" && !group_mode {
+                            return Ok(());
+                        }
                         store.schedule(&accounts, &settings, now)
                     })
                     .await?;
                 }
                 Err(error) => directory_error = Some(error),
+            }
+            if group_mode
+                && directory_error.is_none()
+                && self
+                    .database(move |store| store.has_due_automatic(now))
+                    .await?
+            {
+                // 仅到期的纯自动任务需要强刷；手动引用可按原快照继续执行。
+                match self.refresh(kernel, true).await {
+                    Ok(directory) if directory.group_targets_supported => {
+                        let accounts = directory.accounts;
+                        group_accounts = Some(accounts.clone());
+                        self.database(move |store| {
+                            let (_, settings) = store.settings()?;
+                            store.schedule(&accounts, &settings, now)
+                        })
+                        .await?;
+                    }
+                    Ok(_) => {
+                        directory_error =
+                            Some(RpcError::new(NOT_SUPPORTED, "group_targets_unavailable"))
+                    }
+                    Err(error) => directory_error = Some(error),
+                }
             }
         }
         if self.0.stopped.load(Ordering::SeqCst) {
@@ -355,7 +453,7 @@ impl WarmupService {
                 if inner.stopped.load(Ordering::SeqCst) {
                     Ok(None)
                 } else {
-                    store.claim(&owner, now)
+                    store.claim_with_accounts(&owner, now, group_accounts.as_deref())
                 }
             })
             .await?;

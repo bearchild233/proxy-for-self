@@ -39,6 +39,7 @@ fn at(value: &str) -> DateTime<Utc> {
 fn account(id: &str) -> Account {
     Account {
         id: id.into(),
+        groups: vec![],
         provider: "openai".into(),
         authentication_kind: "oauth".into(),
         enabled: true,
@@ -594,6 +595,7 @@ fn old_sqlite_settings_and_queued_task_json_keep_hi_auto_defaults() {
     })
     .unwrap();
     old_settings.as_object_mut().unwrap().remove("prompt");
+    old_settings.as_object_mut().unwrap().remove("groupIds");
     old_settings
         .as_object_mut()
         .unwrap()
@@ -615,6 +617,7 @@ fn old_sqlite_settings_and_queued_task_json_keep_hi_auto_defaults() {
     let reopened = fixture.open();
     let mut changed = reopened.settings().unwrap().1;
     assert_eq!(changed.prompt, "hi");
+    assert!(changed.group_ids.is_empty());
     assert_eq!(changed.reasoning_effort, "auto");
     assert_eq!(changed.account_overrides[0].reasoning_effort, None);
     changed.prompt = "new configuration".into();
@@ -1023,5 +1026,298 @@ fn runtime_separates_manual_queues_from_automatic_forecasts_and_due_tasks() {
     assert_eq!(
         at(runtime["nextAutomaticRunAt"].as_str().unwrap()),
         now + chrono::Duration::hours(1)
+    );
+}
+
+fn group_settings() -> Settings {
+    Settings {
+        enabled: true,
+        daily_enabled: true,
+        reset_enabled: false,
+        target_mode: "groups".into(),
+        group_ids: vec!["first".into(), "second".into()],
+        ..settings()
+    }
+}
+
+fn member(id: &str, groups: &[&str]) -> Account {
+    Account {
+        groups: groups.iter().map(|group| (*group).into()).collect(),
+        ..account(id)
+    }
+}
+
+#[test]
+fn group_targets_validate_unique_bounded_ids_and_preserve_manual_scope() {
+    let mut config = group_settings();
+    assert!(validate(&config).is_ok());
+    assert!(config.automatic("both", &["first".into(), "second".into()]));
+    assert!(!config.automatic("outside", &["third".into()]));
+    for ids in [
+        vec![],
+        vec!["same".into(), "same".into()],
+        vec!["".into()],
+        vec!["bad\n".into()],
+        vec!["x".repeat(129)],
+        (0..501).map(|id| id.to_string()).collect(),
+    ] {
+        config.group_ids = ids;
+        assert!(validate(&config).is_err());
+    }
+    config.group_ids = (0..500).map(|id| id.to_string()).collect();
+    assert!(validate(&config).is_ok());
+    config.target_mode = "unsupported".into();
+    assert!(validate(&config).is_err());
+}
+
+#[test]
+fn group_schedule_unions_members_once_and_claim_rechecks_latest_members_without_changing_snapshot()
+{
+    let fixture = Fixture::new();
+    let store = fixture.open();
+    let now = at("2026-10-25T00:00:00Z");
+    let mut config = group_settings();
+    config.prompt = "frozen group prompt".into();
+    config.reasoning_effort = "low".into();
+    let a = member("a", &["first", "second"]);
+    let b = member("b", &["second"]);
+    let outside = member("outside", &["third"]);
+    store.configure(0, &config).unwrap();
+    store
+        .schedule(&[a.clone(), b.clone(), a, outside], &config, now)
+        .unwrap();
+    assert_eq!(
+        store.history(20, None).unwrap()["runs"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(store.claim("unknown-directory", now).unwrap().is_none());
+    assert_eq!(
+        store.runtime(now, &[], &config).unwrap()["nextAutomaticRunAt"],
+        Value::Null
+    );
+    let mut changed = config.clone();
+    changed.prompt = "new prompt".into();
+    changed.default_model = "new-model".into();
+    changed.reasoning_effort = "high".into();
+    store.configure(1, &changed).unwrap();
+    let latest = [member("a", &[]), b];
+    let task = store
+        .claim_with_accounts("fresh", now, Some(&latest))
+        .unwrap()
+        .unwrap();
+    assert_eq!(task.account_id, "b");
+    assert_eq!(task.prompt, "frozen group prompt");
+    assert_eq!(task.model, config.default_model);
+    assert_eq!(task.reasoning_effort, "low");
+    store.finish(&task.id, "fresh", &accepted(), now).unwrap();
+    assert!(
+        store
+            .claim_with_accounts("fresh", now, Some(&latest))
+            .unwrap()
+            .is_none()
+    );
+    let history = store.history(20, None).unwrap();
+    let leaving = history["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|run| {
+            let tasks = items(&store, run["id"].as_str().unwrap());
+            (tasks[0]["accountId"] == "a").then(|| tasks[0].clone())
+        })
+        .unwrap();
+    assert_eq!(leaving["status"], "skipped");
+    assert_eq!(leaving["reasonCode"], "group_membership_changed");
+    let joining = member("new", &["first"]);
+    store
+        .schedule(std::slice::from_ref(&joining), &changed, now)
+        .unwrap();
+    let task = store
+        .claim_with_accounts("fresh", now, Some(&[joining]))
+        .unwrap()
+        .unwrap();
+    assert_eq!(task.account_id, "new");
+    assert_eq!(task.prompt, "new prompt");
+}
+
+#[test]
+fn unknown_group_directory_defers_automatic_tasks_and_continues_manual_and_joined_batches() {
+    let fixture = Fixture::new();
+    let store = fixture.open();
+    let now = at("2026-10-25T00:00:00Z");
+    let config = group_settings();
+    store.configure(0, &config).unwrap();
+    let automatic = member("automatic", &["first"]);
+    store
+        .schedule(std::slice::from_ref(&automatic), &config, now)
+        .unwrap();
+    store
+        .enqueue_manual(
+            "outside-explicit",
+            &[member("outside", &[])],
+            &config,
+            now + chrono::Duration::seconds(1),
+        )
+        .unwrap();
+    let claim_at = now + chrono::Duration::seconds(2);
+    let task = store
+        .claim_with_accounts("worker", claim_at, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(task.account_id, "outside");
+    assert_eq!(task.source, "manual");
+    store
+        .finish(&task.id, "worker", &accepted(), claim_at)
+        .unwrap();
+    assert!(
+        store
+            .claim_with_accounts("worker", claim_at, None)
+            .unwrap()
+            .is_none()
+    );
+    let joined = store
+        .enqueue_manual(
+            "joined-explicit",
+            std::slice::from_ref(&automatic),
+            &config,
+            claim_at,
+        )
+        .unwrap();
+    let task = store
+        .claim_with_accounts("worker", claim_at, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(task.account_id, "automatic");
+    assert_eq!(task.source, "daily");
+    store
+        .finish(&task.id, "worker", &accepted(), claim_at)
+        .unwrap();
+    assert_eq!(
+        store.history(20, Some(&joined.id)).unwrap()["runs"][0]["accepted"],
+        1
+    );
+    let cancelled = member("cancelled-reference", &["first"]);
+    store
+        .schedule(std::slice::from_ref(&cancelled), &config, now)
+        .unwrap();
+    let joined = store
+        .enqueue_manual("cancelled-explicit", &[cancelled], &config, claim_at)
+        .unwrap();
+    store.cancel(&joined.id, claim_at).unwrap();
+    assert!(
+        store
+            .claim_with_accounts("worker", claim_at, None)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn group_runtime_removes_departed_members_and_forecasts_new_members_from_current_directory() {
+    let fixture = Fixture::new();
+    let store = fixture.open();
+    let now = at("2026-10-25T00:00:00Z");
+    let config = group_settings();
+    store.configure(0, &config).unwrap();
+    store
+        .schedule(&[member("leaving", &["first"])], &config, now)
+        .unwrap();
+    let runtime = store
+        .runtime(now, &[member("leaving", &[])], &config)
+        .unwrap();
+    assert_eq!(runtime["nextAutomaticRunAt"], Value::Null);
+    let runtime = store
+        .runtime(
+            now,
+            &[member("leaving", &[]), member("joining", &["second"])],
+            &config,
+        )
+        .unwrap();
+    assert_eq!(
+        at(runtime["nextAutomaticRunAt"].as_str().unwrap()),
+        now + chrono::Duration::days(1)
+    );
+    let mut disabled = config;
+    disabled.enabled = false;
+    assert_eq!(
+        store
+            .runtime(now, &[member("leaving", &["first"])], &disabled)
+            .unwrap()["nextAutomaticRunAt"],
+        Value::Null
+    );
+}
+
+#[test]
+fn manual_reference_to_an_expired_automatic_task_keeps_the_explicit_request_and_frozen_snapshot() {
+    let fixture = Fixture::new();
+    let store = fixture.open();
+    let now = at("2026-10-25T00:00:00Z");
+    let mut config = group_settings();
+    config.prompt = "original automatic".into();
+    store.configure(0, &config).unwrap();
+    let account = member("a", &["first"]);
+    store
+        .schedule(std::slice::from_ref(&account), &config, now)
+        .unwrap();
+    let later = now + chrono::Duration::hours(7);
+    assert!(
+        store
+            .claim_with_accounts("unknown", later, None)
+            .unwrap()
+            .is_none()
+    );
+    config.prompt = "new manual".into();
+    let manual = store
+        .enqueue_manual("explicit-after-expiry", &[account], &config, later)
+        .unwrap();
+    let task = store
+        .claim_with_accounts("explicit", later, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(task.source, "daily");
+    assert_eq!(task.prompt, "original automatic");
+    store
+        .finish(&task.id, "explicit", &accepted(), later)
+        .unwrap();
+    assert_eq!(
+        store.history(20, Some(&manual.id)).unwrap()["runs"][0]["accepted"],
+        1
+    );
+}
+
+#[test]
+fn automatic_directory_probe_respects_global_running_and_persisted_dispatch_gap() {
+    let fixture = Fixture::new();
+    let store = fixture.open();
+    let now = at("2026-10-25T00:00:00Z");
+    let config = Settings {
+        jitter_min_seconds: 10,
+        jitter_max_seconds: 10,
+        ..group_settings()
+    };
+    store.configure(0, &config).unwrap();
+    let members = [member("a", &["first"]), member("b", &["second"])];
+    store.schedule(&members, &config, now).unwrap();
+    assert!(!store.has_due_automatic(now).unwrap());
+    let due = now + chrono::Duration::seconds(10);
+    assert!(store.has_due_automatic(due).unwrap());
+    let task = store
+        .claim_with_accounts("worker", due, Some(&members))
+        .unwrap()
+        .unwrap();
+    assert!(!store.has_due_automatic(due).unwrap());
+    store.finish(&task.id, "worker", &accepted(), due).unwrap();
+    assert!(
+        !store
+            .has_due_automatic(due + chrono::Duration::seconds(9))
+            .unwrap()
+    );
+    assert!(
+        store
+            .has_due_automatic(due + chrono::Duration::seconds(10))
+            .unwrap()
     );
 }

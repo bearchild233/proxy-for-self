@@ -239,7 +239,7 @@ impl Store {
             return Ok(());
         }
         self.write(|transaction| {
-            for account in accounts.iter().filter(|account| settings.automatic(&account.id)) {
+            for account in accounts.iter().filter(|account| settings.automatic(&account.id, &account.groups)) {
                 if settings.daily_enabled {
                     let at = settings.account_override(&account.id).and_then(|item| item.daily_time.as_deref()).unwrap_or(&settings.daily_time);
                     if let Some((nominal, _)) = schedule::daily_points(now, &settings.timezone, at) {
@@ -271,30 +271,53 @@ impl Store {
     }
 
     pub fn claim(&self, owner: &str, now: DateTime<Utc>) -> RpcResult<Option<TaskItem>> {
+        self.claim_with_accounts(owner, now, None)
+    }
+
+    pub fn has_due_automatic(&self, now: DateTime<Utc>) -> RpcResult<bool> {
+        let connection = self.connection.lock().map_err(internal)?;
+        connection.query_row(
+            "SELECT next_at<=? AND NOT EXISTS(SELECT 1 FROM tasks WHERE status='running') AND EXISTS(SELECT 1 FROM tasks t WHERE t.status='queued' AND t.due<=? AND json_extract(t.data,'$.source') IN ('daily','reset') AND NOT EXISTS(SELECT 1 FROM run_tasks rt JOIN runs r ON r.id=rt.run_id WHERE rt.task_id=t.id AND r.source='manual' AND r.cancelled=0)) FROM dispatch_cursor WHERE id=1",
+            params![now.timestamp_millis(), now.timestamp_millis()], |row| row.get(0),
+        ).map_err(internal)
+    }
+
+    /// Some 只能来自本轮强刷且声明支持分组的内核目录。None 不允许自动分组发送。
+    pub fn claim_with_accounts(
+        &self,
+        owner: &str,
+        now: DateTime<Utc>,
+        accounts: Option<&[Account]>,
+    ) -> RpcResult<Option<TaskItem>> {
         self.write(|transaction| {
             recover(transaction, now)?;
             let running: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM tasks WHERE status='running')", [], |row| row.get(0)).map_err(internal)?;
             if running { return Ok(None); }
             let cursor: i64 = transaction.query_row("SELECT next_at FROM dispatch_cursor WHERE id=1", [], |row| row.get(0)).map_err(internal)?;
             if cursor > now.timestamp_millis() { return Ok(None); }
+            let settings_data: String = transaction.query_row("SELECT data FROM settings WHERE id=1", [], |row| row.get(0)).map_err(internal)?;
+            let settings: Settings = decode(settings_data)?;
+            // 目录暂不可用时保留自动任务，不让其挡住后面的显式手动批次。
+            let group_available = settings.target_mode != "groups" || accounts.is_some() || !settings.enabled;
             loop {
-                let found: Option<(String, Option<i64>)> = transaction.query_row("SELECT data,expires FROM tasks WHERE status='queued' AND due<=? ORDER BY due,id LIMIT 1", [now.timestamp_millis()], |row| Ok((row.get(0)?, row.get(1)?))).optional().map_err(internal)?;
+                let found: Option<(String, Option<i64>)> = transaction.query_row("SELECT t.data,t.expires FROM tasks t WHERE t.status='queued' AND t.due<=? AND (? OR json_extract(t.data,'$.source')='manual' OR EXISTS(SELECT 1 FROM run_tasks rt JOIN runs r ON r.id=rt.run_id WHERE rt.task_id=t.id AND r.source='manual' AND r.cancelled=0)) ORDER BY t.due,t.id LIMIT 1", params![now.timestamp_millis(), group_available], |row| Ok((row.get(0)?, row.get(1)?))).optional().map_err(internal)?;
                 let Some((data, expires)) = found else { return Ok(None); };
                 let mut item: TaskItem = decode(data)?;
+                let mut manual = item.source == "manual";
                 if item.source != "manual" {
-                    let settings_data: String = transaction.query_row("SELECT data FROM settings WHERE id=1", [], |row| row.get(0)).map_err(internal)?;
-                    let settings: Settings = decode(settings_data)?;
-                    let manual: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM run_tasks rt JOIN runs r ON r.id=rt.run_id WHERE rt.task_id=? AND r.source='manual' AND r.cancelled=0)", [&item.id], |row| row.get(0)).map_err(internal)?;
+                    manual = transaction.query_row("SELECT EXISTS(SELECT 1 FROM run_tasks rt JOIN runs r ON r.id=rt.run_id WHERE rt.task_id=? AND r.source='manual' AND r.cancelled=0)", [&item.id], |row| row.get(0)).map_err(internal)?;
                     let trigger_enabled = if item.source == "daily" { settings.daily_enabled } else { settings.reset_enabled };
-                    if !manual && (!settings.automatic(&item.account_id) || !trigger_enabled) {
+                    let groups = accounts.and_then(|accounts| accounts.iter().find(|account| account.id == item.account_id)).map(|account| account.groups.as_slice()).unwrap_or_default();
+                    if !manual && (!settings.automatic(&item.account_id, groups) || !trigger_enabled) {
                         item.status = "skipped".into();
-                        item.reason_code = Some("automation_disabled".into());
+                        item.reason_code = Some(if settings.enabled && trigger_enabled && settings.target_mode == "groups" && settings.account_override(&item.account_id).is_none_or(|item| item.enabled) { "group_membership_changed" } else { "automation_disabled" }.into());
                         item.finished_at = Some(now);
                         save_task(transaction, &item)?;
                         continue;
                     }
                 }
-                if expires.is_some_and(|expires| expires < now.timestamp_millis()) {
+                // 显式手动引用仍执行原参数，不能被旧自动任务的补跑期限吞掉。
+                if !manual && expires.is_some_and(|expires| expires < now.timestamp_millis()) {
                     item.status = "skipped".into();
                     item.reason_code = Some("missed_schedule".into());
                     item.finished_at = Some(now);
@@ -546,14 +569,42 @@ impl Store {
             )
             .map_err(internal)?;
         let mut next = next.and_then(DateTime::<Utc>::from_timestamp_millis);
-        let next_automatic: Option<i64> = connection.query_row(
-            "SELECT min(due) FROM tasks WHERE status='queued' AND json_extract(data,'$.source') IN ('daily','reset')",
-            [], |row| row.get(0)).map_err(internal)?;
+        // 排队快照保存请求参数，自动参与范围仍按当前配置与最新分组目录判断。
+        let mut statement = connection.prepare(
+            "SELECT account,due,json_extract(data,'$.source') FROM tasks WHERE status='queued' AND json_extract(data,'$.source') IN ('daily','reset') ORDER BY due,id",
+        ).map_err(internal)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(internal)?;
+        let mut next_automatic = None;
+        for row in rows {
+            let (id, due, source) = row.map_err(internal)?;
+            let groups = accounts
+                .iter()
+                .find(|account| account.id == id)
+                .map(|account| account.groups.as_slice())
+                .unwrap_or_default();
+            let trigger_enabled = if source == "daily" {
+                settings.daily_enabled
+            } else {
+                settings.reset_enabled
+            };
+            if settings.automatic(&id, groups) && trigger_enabled {
+                next_automatic = Some(due);
+                break;
+            }
+        }
         let mut next_automatic = next_automatic.and_then(DateTime::<Utc>::from_timestamp_millis);
         if settings.enabled {
             for account in accounts
                 .iter()
-                .filter(|account| settings.automatic(&account.id))
+                .filter(|account| settings.automatic(&account.id, &account.groups))
             {
                 if settings.daily_enabled {
                     let at = settings

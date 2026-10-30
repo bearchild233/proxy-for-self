@@ -25,6 +25,8 @@ pub struct Settings {
     pub jitter_max_seconds: u32,
     pub target_mode: String,
     pub account_ids: Vec<String>,
+    #[serde(default)]
+    pub group_ids: Vec<String>,
     pub default_model: String,
     #[serde(default = "default_prompt")]
     pub prompt: String,
@@ -46,6 +48,7 @@ impl Default for Settings {
             jitter_max_seconds: 15,
             target_mode: "all".into(),
             account_ids: vec![],
+            group_ids: vec![],
             default_model: "gpt-6.1-sol".into(),
             prompt: default_prompt(),
             reasoning_effort: default_reasoning_effort(),
@@ -73,9 +76,14 @@ impl Settings {
             .unwrap_or(&self.reasoning_effort)
     }
 
-    pub fn automatic(&self, id: &str) -> bool {
+    pub fn automatic(&self, id: &str, groups: &[String]) -> bool {
         self.enabled
-            && (self.target_mode == "all" || self.account_ids.iter().any(|item| item == id))
+            && match self.target_mode.as_str() {
+                "all" => true,
+                "selected" => self.account_ids.iter().any(|item| item == id),
+                "groups" => groups.iter().any(|group| self.group_ids.contains(group)),
+                _ => false,
+            }
             && self.account_override(id).is_none_or(|item| item.enabled)
     }
 }
@@ -115,6 +123,8 @@ impl ShortTerm {
 #[serde(rename_all = "camelCase")]
 pub struct Account {
     pub id: String,
+    #[serde(default)]
+    pub groups: Vec<String>,
     pub provider: String,
     pub authentication_kind: String,
     pub enabled: bool,
@@ -127,8 +137,11 @@ pub struct Account {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Directory {
     pub accounts: Vec<Account>,
+    #[serde(default)]
+    pub group_targets_supported: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

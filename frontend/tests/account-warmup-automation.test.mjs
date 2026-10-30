@@ -53,7 +53,7 @@ const button = vue.defineComponent({ props: ['disabled', 'label'], setup: (props
 const box = vue.defineComponent({ props: ['modelValue', 'label', 'disabled'], emits: ['update:modelValue'], setup: (props, { emit }) => () => vue.h('input', { 'type': 'checkbox', 'aria-label': props.label, 'checked': props.modelValue, 'disabled': props.disabled, 'onChange': e => emit('update:modelValue', e.target.checked) }) })
 const input = vue.defineComponent({ props: ['modelValue', 'disabled'], emits: ['update:modelValue'], setup: (props, { attrs, emit }) => () => vue.h('input', { ...attrs, value: props.modelValue, disabled: props.disabled, onInput: e => emit('update:modelValue', e.target.value) }) })
 const select = vue.defineComponent({ props: ['modelValue', 'options', 'disabled'], emits: ['update:modelValue'], setup: (props, { attrs, emit }) => () => vue.h('select', { ...attrs, value: props.modelValue, disabled: props.disabled, onChange: e => emit('update:modelValue', e.target.value) }, (props.options ?? []).map(option => vue.h('option', { value: option.value, disabled: option.disabled }, option.label))) })
-const wrapper = vue.defineComponent({ props: ['title', 'label', 'description', 'error'], setup: (props, { slots }) => () => vue.h('div', [props.title, props.label, props.description, props.error, slots.actions?.(), slots.default?.()]) })
+const wrapper = vue.defineComponent({ props: ['title', 'label', 'description', 'error'], setup: (props, { slots }) => () => vue.h('div', [props.title, props.label, props.description, slots.description?.(), props.error, slots.actions?.(), slots.default?.()]) })
 const base = {
   '@/components/base/BaseButton.vue': button,
   '@/components/base/BaseCard.vue': wrapper,
@@ -104,6 +104,7 @@ test('legacy settings normalize request fields before dirty tracking and save re
   await settle()
   assert.equal(f.state.draft.value.prompt, 'hi')
   assert.equal(f.state.draft.value.reasoningEffort, 'auto')
+  assert.deepEqual(f.state.draft.value.groupIds, [])
   assert.equal(f.state.draft.value.accountOverrides[0].reasoningEffort, null)
   assert.equal(f.state.dirty.value, false)
   f.state.draft.value.prompt = '  hello\n\tworld\r\n '
@@ -228,10 +229,10 @@ test('automation page edits the automatic request and reads an existing account 
   f.state.models.value[account.id] = [{ id: 'catalog-model', label: 'Catalog model', reasoningEfforts: ['low', 'high'] }]
   const component = sfc('../../plugins/account-warmup/ui/page/index.vue', {
     ...base,
-    '@lucide/vue': { ArrowLeft: icon, Clock3: icon, RefreshCw: icon, Save: icon },
+    '@lucide/vue': { ArrowLeft: icon, Clock3: icon, FlameKindling: icon, RefreshCw: icon, Save: icon },
     '@sdk/ui': { host: async (_, input) => navigation.push(input.path) },
     '@/api/modules/accountWarmup': helpers,
-    './components/WarmupAccountRow.vue': wrapper,
+    './components/WarmupTargets.vue': wrapper,
     './components/WarmupHistory.vue': wrapper,
     './model': model,
     './useWarmupSettings': { useWarmupSettings: () => ({ ...f.state, loadModels: async (...args) => loads.push(args) }) },

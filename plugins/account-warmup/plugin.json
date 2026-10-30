@@ -1,6 +1,6 @@
 {
   "id": "account-warmup",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "protocol": 2,
   "kind": "ui",
   "sdk": 1,
@@ -15,7 +15,8 @@
     "account-warmup.run",
     "account-warmup.history",
     "account-warmup.cancel",
-    "accounts.get.admin.accounts"
+    "accounts.get.admin.accounts",
+    "account-groups.get.admin.account-groups"
   ],
   "service": {
     "binary": "service/account-warmup",
@@ -27,6 +28,8 @@
   },
   "releasedAt": "2026-10-30T00:00:00+08:00",
   "releaseNotes": [
+    "统一表单控件对齐，使用自动预热火焰图标。",
+    "支持多选账号与动态分组范围，批量调整账号独立设置。",
     "账号页显示当前窗口预热状态，支持逐账号手动预热。",
     "支持自定义提示词和推理强度，手动参数只影响本次任务。",
     "自动预热独立设置，遵守停用、额度与养号限制；未知发送结果不自动重试。"

@@ -541,6 +541,8 @@ async fn read_preserves_model_reasoning_efforts_and_accepts_older_directory_entr
     );
     assert_eq!(read["settings"]["prompt"], "hi");
     assert_eq!(read["settings"]["reasoningEffort"], "auto");
+    assert_eq!(read["groupTargetsSupported"], false);
+    assert_eq!(read["accounts"][0]["groups"], json!([]));
     assert!(read["runtime"].get("nextAutomaticRunAt").is_some());
     assert_eq!(
         read["accountStates"]["a"],
@@ -663,4 +665,364 @@ async fn stopping_waits_for_inflight_background_reply_before_closing_kernel_conn
     );
     drop(service);
     std::fs::remove_dir_all(path).unwrap();
+}
+
+fn groups_directory(accounts: &[(&str, &[&str])]) -> Value {
+    let accounts: Vec<Value> = accounts
+        .iter()
+        .map(|(id, groups)| {
+            let mut account = directory()["accounts"][0].clone();
+            account["id"] = json!(id);
+            account["groups"] = json!(groups);
+            account
+        })
+        .collect();
+    json!({"accounts":accounts,"groupTargetsSupported":true})
+}
+
+fn groups_settings(now: chrono::DateTime<Utc>) -> WarmupSettings {
+    WarmupSettings {
+        enabled: true,
+        daily_enabled: true,
+        reset_enabled: false,
+        timezone: "UTC".into(),
+        daily_time: now.format("%H:%M").to_string(),
+        jitter_min_seconds: 0,
+        jitter_max_seconds: 0,
+        target_mode: "groups".into(),
+        group_ids: vec!["first".into(), "second".into()],
+        ..WarmupSettings::default()
+    }
+}
+
+#[tokio::test]
+async fn group_configure_requires_a_fresh_capable_directory_and_does_not_save_on_failure() {
+    let fixture = Fixture::start().await;
+    let current = Arc::new(std::sync::Mutex::new(directory()));
+    let response = current.clone();
+    let reads = Arc::new(AtomicU64::new(0));
+    let called = reads.clone();
+    fixture.peer.set_handler(move |method, _| {
+        assert_eq!(method, "accounts.warmup.read");
+        called.fetch_add(1, Ordering::SeqCst);
+        Some(Ok(response.lock().unwrap().clone()))
+    });
+    let config = groups_settings(Utc::now());
+    let params = json!({"expectedRevision":1,"settings":config});
+    let error = fixture
+        .service
+        .dispatch(&fixture.kernel, "configure", params.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, NOT_SUPPORTED);
+    assert_eq!(error.message, "group_targets_unavailable");
+    assert_eq!(
+        Store::open(&fixture.path.join("data"))
+            .unwrap()
+            .settings()
+            .unwrap()
+            .0,
+        1
+    );
+    *current.lock().unwrap() = groups_directory(&[("a", &["first"])]);
+    fixture
+        .service
+        .dispatch(&fixture.kernel, "configure", params)
+        .await
+        .unwrap();
+    *current.lock().unwrap() = directory();
+    let error = fixture
+        .service
+        .dispatch(
+            &fixture.kernel,
+            "configure",
+            json!({"expectedRevision":2,"settings":config}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, NOT_SUPPORTED);
+    assert_eq!(reads.load(Ordering::SeqCst), 4);
+    let mut invalid = config;
+    invalid.group_ids.clear();
+    assert_eq!(
+        fixture
+            .service
+            .dispatch(
+                &fixture.kernel,
+                "configure",
+                json!({"expectedRevision":2,"settings":invalid})
+            )
+            .await
+            .unwrap_err()
+            .code,
+        INVALID_PARAMS
+    );
+    assert_eq!(reads.load(Ordering::SeqCst), 4);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn group_tick_forces_latest_membership_unions_groups_and_keeps_original_task_parameters() {
+    let fixture = Fixture::start().await;
+    let now = Utc::now();
+    let current = Arc::new(std::sync::Mutex::new(groups_directory(&[
+        ("leaving", &["first", "second"]),
+        ("joining", &[]),
+    ])));
+    let response = current.clone();
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = calls.clone();
+    fixture.peer.set_handler(move |method, params| match method {
+        "accounts.warmup.read" => Some(Ok(response.lock().unwrap().clone())),
+        "accounts.warmup.run" => {
+            captured.lock().unwrap().push(params.clone());
+            Some(Ok(json!({"outcome":"accepted","reasonCode":null,"status":200,"durationMs":1,"sendState":"sent","shortTerm":null})))
+        }
+        _ => None,
+    });
+    let mut config = groups_settings(now);
+    config.prompt = "frozen".into();
+    config.reasoning_effort = "low".into();
+    fixture
+        .service
+        .dispatch(
+            &fixture.kernel,
+            "configure",
+            json!({"expectedRevision":1,"settings":config}),
+        )
+        .await
+        .unwrap();
+    let old_accounts: Vec<Account> =
+        serde_json::from_value(current.lock().unwrap()["accounts"].clone()).unwrap();
+    let store = Store::open(&fixture.path.join("data")).unwrap();
+    store.schedule(&old_accounts, &config, now).unwrap();
+    assert_eq!(
+        store.history(20, None).unwrap()["runs"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    *current.lock().unwrap() =
+        groups_directory(&[("leaving", &[]), ("joining", &["first", "second", "first"])]);
+    fixture.service.tick(&fixture.kernel, now).await.unwrap();
+    fixture.service.tick(&fixture.kernel, now).await.unwrap();
+    let sent = calls.lock().unwrap().clone();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["accountId"], "joining");
+    assert_eq!(sent[0]["prompt"], "frozen");
+    let history = store.history(20, None).unwrap();
+    let leaving = history["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|run| {
+            let history = store.history(20, run["id"].as_str()).unwrap();
+            (history["items"][0]["accountId"] == "leaving").then(|| history["items"][0].clone())
+        })
+        .unwrap();
+    assert_eq!(leaving["status"], "skipped");
+    assert_eq!(leaving["reasonCode"], "group_membership_changed");
+    // read 不等 TTL，成员离组后立即从预测移除。
+    *current.lock().unwrap() = groups_directory(&[("leaving", &[]), ("joining", &[])]);
+    let read = fixture
+        .service
+        .dispatch(&fixture.kernel, "read", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(read["groupTargetsSupported"], true);
+    assert_eq!(read["runtime"]["nextAutomaticRunAt"], Value::Null);
+    drop(store);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn unknown_or_incapable_group_directory_never_sends_automatic_but_does_not_block_manual() {
+    let fixture = Fixture::start().await;
+    let now = Utc::now();
+    let current = Arc::new(std::sync::Mutex::new(groups_directory(&[
+        ("automatic", &["first"]),
+        ("explicit", &[]),
+    ])));
+    let response = current.clone();
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = calls.clone();
+    fixture.peer.set_handler(move |method, params| match method {
+        "accounts.warmup.read" => {
+            let value = response.lock().unwrap().clone();
+            Some(if value.is_null() { Err(RpcError::new(UNAVAILABLE, "directory unavailable")) } else { Ok(value) })
+        }
+        "accounts.warmup.run" => {
+            captured.lock().unwrap().push(params["accountId"].as_str().unwrap().to_string());
+            Some(Ok(json!({"outcome":"accepted","reasonCode":null,"status":200,"durationMs":1,"sendState":"sent","shortTerm":null})))
+        }
+        _ => None,
+    });
+    let config = groups_settings(now);
+    fixture
+        .service
+        .dispatch(
+            &fixture.kernel,
+            "configure",
+            json!({"expectedRevision":1,"settings":config}),
+        )
+        .await
+        .unwrap();
+    let accounts: Vec<Account> =
+        serde_json::from_value(current.lock().unwrap()["accounts"].clone()).unwrap();
+    let store = Store::open(&fixture.path.join("data")).unwrap();
+    store.schedule(&accounts, &config, now).unwrap();
+    fixture
+        .service
+        .dispatch(
+            &fixture.kernel,
+            "run",
+            json!({"submissionId":"explicit","scope":"selected","accountIds":["explicit"]}),
+        )
+        .await
+        .unwrap();
+    *current.lock().unwrap() = Value::Null;
+    assert_eq!(
+        fixture
+            .service
+            .tick(&fixture.kernel, now + chrono::Duration::seconds(2))
+            .await
+            .unwrap_err()
+            .code,
+        UNAVAILABLE
+    );
+    assert_eq!(*calls.lock().unwrap(), vec!["explicit"]);
+    assert!(
+        fixture
+            .service
+            .tick(&fixture.kernel, now + chrono::Duration::seconds(3))
+            .await
+            .is_err()
+    );
+    assert_eq!(*calls.lock().unwrap(), vec!["explicit"]);
+    let mut incapable = groups_directory(&[("automatic", &["first"]), ("explicit", &[])]);
+    incapable["groupTargetsSupported"] = json!(false);
+    *current.lock().unwrap() = incapable;
+    assert_eq!(
+        fixture
+            .service
+            .tick(&fixture.kernel, now + chrono::Duration::seconds(4))
+            .await
+            .unwrap_err()
+            .code,
+        NOT_SUPPORTED
+    );
+    assert_eq!(*calls.lock().unwrap(), vec!["explicit"]);
+    fixture
+        .service
+        .dispatch(
+            &fixture.kernel,
+            "run",
+            json!({"submissionId":"merged-explicit","scope":"selected","accountIds":["automatic"]}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture
+            .service
+            .tick(&fixture.kernel, now + chrono::Duration::seconds(5))
+            .await
+            .unwrap_err()
+            .code,
+        NOT_SUPPORTED
+    );
+    assert_eq!(*calls.lock().unwrap(), vec!["explicit", "automatic"]);
+    drop(store);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn empty_group_queue_discovers_plans_with_ttl_without_reading_directory_each_tick() {
+    let fixture = Fixture::start().await;
+    let reads = Arc::new(AtomicU64::new(0));
+    let called = reads.clone();
+    fixture.peer.set_handler(move |method, _| {
+        assert_eq!(method, "accounts.warmup.read");
+        called.fetch_add(1, Ordering::SeqCst);
+        Some(Ok(groups_directory(&[])))
+    });
+    let now = Utc::now();
+    fixture
+        .service
+        .dispatch(
+            &fixture.kernel,
+            "configure",
+            json!({"expectedRevision":1,"settings":groups_settings(now)}),
+        )
+        .await
+        .unwrap();
+    let configured_reads = reads.load(Ordering::SeqCst);
+    for _ in 0..5 {
+        fixture.service.tick(&fixture.kernel, now).await.unwrap();
+    }
+    assert_eq!(reads.load(Ordering::SeqCst), configured_reads);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn read_invalidates_group_runtime_when_configuration_switches_during_a_filtered_directory_read()
+ {
+    let fixture = Fixture::start().await;
+    let config = groups_settings(Utc::now());
+    let data = fixture.path.join("data");
+    let reads = Arc::new(AtomicU64::new(0));
+    let called = reads.clone();
+    fixture.peer.set_handler(move |method, _| {
+        assert_eq!(method, "accounts.warmup.read");
+        if called.fetch_add(1, Ordering::SeqCst) == 0 {
+            Store::open(&data).unwrap().configure(1, &config).unwrap();
+        }
+        Some(Ok(groups_directory(&[("a", &["first"])])))
+    });
+    let read = fixture
+        .service
+        .dispatch(
+            &fixture.kernel,
+            "read",
+            json!({"accountIds":["a"],"includeModels":true}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(read["settings"]["targetMode"], "groups");
+    assert_eq!(read["groupTargetsSupported"], false);
+    assert_eq!(read["runtime"]["ready"], false);
+    assert_eq!(read["runtime"]["nextAutomaticRunAt"], Value::Null);
+    assert_eq!(reads.load(Ordering::SeqCst), 1);
+    let read = fixture
+        .service
+        .dispatch(&fixture.kernel, "read", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(read["groupTargetsSupported"], true);
+    assert_eq!(read["runtime"]["ready"], true);
+    assert!(read["runtime"]["nextAutomaticRunAt"].is_string());
+    assert_eq!(reads.load(Ordering::SeqCst), 2);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn persisted_group_configuration_is_not_ready_on_an_older_incapable_directory() {
+    let fixture = Fixture::start().await;
+    let store = Store::open(&fixture.path.join("data")).unwrap();
+    store.configure(1, &groups_settings(Utc::now())).unwrap();
+    fixture.peer.set_handler(|method, _| {
+        assert_eq!(method, "accounts.warmup.read");
+        Some(Ok(directory()))
+    });
+    let read = fixture
+        .service
+        .dispatch(&fixture.kernel, "read", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(read["settings"]["enabled"], true);
+    assert_eq!(read["groupTargetsSupported"], false);
+    assert_eq!(read["runtime"]["ready"], false);
+    assert_eq!(read["runtime"]["nextAutomaticRunAt"], Value::Null);
+    drop(store);
+    fixture.finish().await;
 }

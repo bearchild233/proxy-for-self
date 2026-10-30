@@ -35,7 +35,11 @@ impl PluginAccounts for Accounts {
             .collect())
     }
 }
-struct Upstream;
+#[derive(Default)]
+struct Upstream {
+    warmup_accounts: Vec<AccountWarmupAccount>,
+    revoke_read: Option<Arc<WarmupAccess>>,
+}
 #[async_trait]
 impl PluginUpstream for Upstream {
     async fn warmup_read(
@@ -43,7 +47,15 @@ impl PluginUpstream for Upstream {
         _: &dyn PluginAccess,
         _: AccountWarmupReadParams,
     ) -> Result<AccountWarmupReadResult, RpcError> {
-        Ok(AccountWarmupReadResult { accounts: vec![] })
+        if let Some(access) = &self.revoke_read {
+            access
+                .granted
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(AccountWarmupReadResult {
+            accounts: self.warmup_accounts.clone(),
+            group_targets_supported: false,
+        })
     }
     async fn warmup_run(
         &self,
@@ -135,12 +147,203 @@ impl PluginAccess for WarmupAccess {
     }
 }
 
+#[derive(Default)]
+struct WarmupDirectory {
+    rows: Mutex<Vec<AccountSummary>>,
+    requests: Mutex<Vec<AccountsReadParams>>,
+    fail: bool,
+    revoke_read: Option<Arc<WarmupAccess>>,
+}
+#[async_trait]
+impl PluginAccounts for WarmupDirectory {
+    async fn read(
+        &self,
+        ids: Option<&[String]>,
+        model: Option<&str>,
+    ) -> Result<Vec<AccountSummary>, RpcError> {
+        self.requests.lock().unwrap().push(AccountsReadParams {
+            ids: ids.map(<[String]>::to_vec),
+            model: model.map(str::to_owned),
+        });
+        if let Some(access) = &self.revoke_read {
+            access
+                .granted
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        if self.fail {
+            return Err(RpcError::new(INTERNAL, "fixture directory failure"));
+        }
+        Ok(self.rows.lock().unwrap().clone())
+    }
+}
+
+fn warmup_account(id: &str) -> AccountWarmupAccount {
+    AccountWarmupAccount {
+        id: id.into(),
+        groups: vec!["provider-stale".into()],
+        provider: "openai".into(),
+        authentication_kind: "oauth".into(),
+        enabled: true,
+        status: "normal".into(),
+        supported: true,
+        reason_code: None,
+        model_allowed: None,
+        models: None,
+        short_term: None,
+    }
+}
+
+#[test]
+fn warmup_groups_join_current_directory_by_returned_ids_without_expanding_scope() {
+    block_on(async {
+        let mut grouped = account("acct_b", H);
+        grouped.groups = vec![H.into(), G.into(), H.into()];
+        let mut ungrouped = account("acct_a", G);
+        ungrouped.groups.clear();
+        let directory = Arc::new(WarmupDirectory {
+            rows: Mutex::new(vec![
+                ungrouped,
+                account("acct_unreturned", "not-returned"),
+                grouped.clone(),
+                grouped,
+            ]),
+            ..Default::default()
+        });
+        let service = KernelCapabilities {
+            accounts: directory.clone(),
+            upstream: Arc::new(Upstream {
+                warmup_accounts: vec![warmup_account("acct_b"), warmup_account("acct_a")],
+                ..Default::default()
+            }),
+            groups: Arc::new(Move(Mutex::new(vec![]))),
+            log: Arc::new(Log),
+        };
+        let access = WarmupAccess {
+            id: ACCOUNT_WARMUP_PLUGIN,
+            granted: true.into(),
+        };
+        let request = json!({"ids":["acct_a","acct_b","acct_missing"],"model":"m"});
+        let result = service
+            .call(&access, ACCOUNT_WARMUP_READ, request.clone())
+            .await
+            .unwrap();
+        assert_eq!(result["groupTargetsSupported"], true);
+        assert_eq!(result["accounts"][0]["id"], "acct_b");
+        assert_eq!(result["accounts"][0]["groups"], json!([G, H]));
+        assert_eq!(result["accounts"][1]["id"], "acct_a");
+        assert_eq!(result["accounts"][1]["groups"], json!([]));
+        assert_eq!(result["accounts"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            directory.requests.lock().unwrap().as_slice(),
+            &[AccountsReadParams {
+                ids: Some(vec!["acct_a".into(), "acct_b".into()]),
+                model: None,
+            }]
+        );
+        for private in [
+            "upstreamAccountId",
+            "userId",
+            "not-returned",
+            "provider-stale",
+        ] {
+            assert!(!result.to_string().contains(private), "{private}");
+        }
+        directory.rows.lock().unwrap()[2].groups = vec![G.into()];
+        directory.rows.lock().unwrap().remove(3);
+        let changed = service
+            .call(&access, ACCOUNT_WARMUP_READ, request)
+            .await
+            .unwrap();
+        assert_eq!(changed["accounts"][0]["groups"], json!([G]));
+        assert_eq!(
+            service
+                .call(&access, "accounts.read", json!({}))
+                .await
+                .unwrap()["accounts"],
+            json!([])
+        );
+    });
+}
+
+#[test]
+fn warmup_groups_fail_closed_on_missing_conflicting_or_unavailable_directory() {
+    block_on(async {
+        for (rows, fail) in [
+            (vec![], false),
+            (vec![account("acct_a", G), account("acct_a", H)], false),
+            (vec![account("acct_a", G)], true),
+        ] {
+            let service = KernelCapabilities {
+                accounts: Arc::new(WarmupDirectory {
+                    rows: Mutex::new(rows),
+                    fail,
+                    ..Default::default()
+                }),
+                upstream: Arc::new(Upstream {
+                    warmup_accounts: vec![warmup_account("acct_a")],
+                    ..Default::default()
+                }),
+                groups: Arc::new(Move(Mutex::new(vec![]))),
+                log: Arc::new(Log),
+            };
+            let access = WarmupAccess {
+                id: ACCOUNT_WARMUP_PLUGIN,
+                granted: true.into(),
+            };
+            let error = service
+                .call(&access, ACCOUNT_WARMUP_READ, json!({}))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, UNAVAILABLE);
+            assert_eq!(error.message, "warmup group directory unavailable");
+        }
+    });
+}
+
+#[test]
+fn warmup_groups_recheck_grant_after_provider_and_directory_reads() {
+    block_on(async {
+        for revoke_provider in [true, false] {
+            let access = Arc::new(WarmupAccess {
+                id: ACCOUNT_WARMUP_PLUGIN,
+                granted: true.into(),
+            });
+            let directory = Arc::new(WarmupDirectory {
+                rows: Mutex::new(vec![account("acct_a", G)]),
+                revoke_read: (!revoke_provider).then(|| access.clone()),
+                ..Default::default()
+            });
+            let service = KernelCapabilities {
+                accounts: directory.clone(),
+                upstream: Arc::new(Upstream {
+                    warmup_accounts: vec![warmup_account("acct_a")],
+                    revoke_read: revoke_provider.then(|| access.clone()),
+                }),
+                groups: Arc::new(Move(Mutex::new(vec![]))),
+                log: Arc::new(Log),
+            };
+            assert_eq!(
+                service
+                    .call(access.as_ref(), ACCOUNT_WARMUP_READ, json!({}))
+                    .await
+                    .unwrap_err()
+                    .code,
+                FORBIDDEN
+            );
+            assert_eq!(
+                directory.requests.lock().unwrap().len(),
+                usize::from(!revoke_provider)
+            );
+        }
+    });
+}
+
 #[test]
 fn warmup_requires_its_own_identity_and_current_grant_without_weakening_groups() {
     block_on(async {
         let service = KernelCapabilities {
             accounts: Arc::new(Accounts(Mutex::new(vec![account("acct_out", G)]))),
-            upstream: Arc::new(Upstream),
+            upstream: Arc::new(Upstream::default()),
             groups: Arc::new(Move(Mutex::new(vec![]))),
             log: Arc::new(Log),
         };
@@ -201,7 +404,11 @@ fn warmup_requires_its_own_identity_and_current_grant_without_weakening_groups()
         for change in [
             json!({"timeoutMs":15001}),
             json!({"attemptId":"../bad"}),
-            json!({"prompt":"arbitrary"}),
+            json!({"cookie":"arbitrary"}),
+            json!({"prompt":"  \n\t"}),
+            json!({"prompt":"x".repeat(4097)}),
+            json!({"prompt":"hi\u{0000}"}),
+            json!({"reasoningEffort":"unsupported"}),
         ] {
             let mut invalid = run.clone();
             invalid
@@ -217,6 +424,16 @@ fn warmup_requires_its_own_identity_and_current_grant_without_weakening_groups()
                 INVALID_PARAMS
             );
         }
+        let mut customized = run.clone();
+        customized["prompt"] = json!("arbitrary\ntext\twith spaces");
+        customized["reasoningEffort"] = json!("high");
+        assert_eq!(
+            service
+                .call(&access, ACCOUNT_WARMUP_RUN, customized)
+                .await
+                .unwrap()["outcome"],
+            "accepted"
+        );
         for params in [
             json!({"includeModels":true}),
             json!({"includeModels":true,"ids":[]}),
@@ -283,7 +500,7 @@ fn capabilities_enforce_current_account_and_group_scope_and_return_contracts() {
         let mover = Arc::new(Move(Mutex::new(vec![])));
         let service = KernelCapabilities {
             accounts: accounts.clone(),
-            upstream: Arc::new(Upstream),
+            upstream: Arc::new(Upstream::default()),
             groups: mover.clone(),
             log: Arc::new(Log),
         };
@@ -385,7 +602,7 @@ fn fetch_host_scheme_port_size_and_parameter_validation() {
         let access = Access(Mutex::new(vec![G.into()]));
         let service = KernelCapabilities {
             accounts: Arc::new(Accounts(Mutex::new(vec![account("acct_in", G)]))),
-            upstream: Arc::new(Upstream),
+            upstream: Arc::new(Upstream::default()),
             groups: Arc::new(Move(Mutex::new(vec![]))),
             log: Arc::new(Log),
         };
