@@ -2,7 +2,8 @@
 import { ChevronDown, RefreshCw } from '@lucide/vue'
 import { enabled } from '@sdk/catalog'
 import { host } from '@sdk/ui'
-import { computed, ref } from 'vue'
+import { useIntervalFn, useNow } from '@vueuse/core'
+import { computed, reactive, ref } from 'vue'
 
 import AccountGroupMarks from '@/components/AccountGroupMarks.vue'
 import BaseButton from '@/components/base/BaseButton.vue'
@@ -31,10 +32,12 @@ import AccountStatusBadge from './components/AccountStatusBadge/index.vue'
 import AccountSubscriptionCell from './components/AccountSubscriptionCell.vue'
 import AccountTableActions from './components/AccountTableActions.vue'
 import AccountUsagePanel from './components/AccountUsagePanel.vue'
+import AccountWarmupBadge from './components/AccountWarmupBadge.vue'
+import AccountWarmupModal from './components/AccountWarmupModal.vue'
 import AccountWarmupToolbar from './components/AccountWarmupToolbar.vue'
 import { useAccountBatchEditor } from './composables/useAccountBatchEditor'
-
 import { useAccountEditor } from './composables/useAccountEditor'
+
 import { useAccountImportTasks } from './composables/useAccountImportTasks'
 import { useAccountLifecycle } from './composables/useAccountLifecycle'
 import { useAccountMutations } from './composables/useAccountMutations'
@@ -42,6 +45,7 @@ import { useAccountOAuthExport } from './composables/useAccountOAuthExport'
 import { useAccountsQuery } from './composables/useAccountsQuery'
 import { useAccountsTable } from './composables/useAccountsTable'
 import { useAccountSubscriptions } from './composables/useAccountSubscriptions'
+import { useAccountWarmup } from './composables/useAccountWarmup'
 import { accountColumns, derivedAccountStatus } from './constants'
 import { quotaProtectionThresholds } from './utils/quotaProtection'
 
@@ -71,8 +75,10 @@ const {
 } = useAccountsQuery()
 
 const { subscriptionStates, subscriptionsRefreshing, refreshSubscriptions } = useAccountSubscriptions(accounts)
+const warmup = reactive(useAccountWarmup(archivedQuery))
+const warmupNow = useNow({ scheduler: callback => useIntervalFn(callback, 1000) })
 async function refreshPage() {
-  await Promise.all([refreshAccounts(), refreshSubscriptions()])
+  await Promise.all([refreshAccounts(), refreshSubscriptions(), warmup.refresh()])
 }
 
 const {
@@ -219,7 +225,7 @@ const singleDeleteDescription = computed(() => pendingDeleteAccount.value?.lifec
       description="维护账号池，查看可用性、配额与使用状态"
     >
       <template #actions>
-        <AccountWarmupToolbar :selected-account-ids="[...selectedIds]" :archived="archivedQuery" />
+        <AccountWarmupToolbar :selected-account-ids="[...selectedIds]" :archived="archivedQuery" :ready="warmup.ready" :installed="warmup.installed" :submitting="warmup.submitting" :status="warmup.status" @run="warmup.open" />
         <BaseButton variant="secondary" :loading="refreshing || subscriptionsRefreshing" :disabled="loading || refreshing || subscriptionsRefreshing" @click="refreshPage">
           <template #icon>
             <RefreshCw class="size-4" />
@@ -347,6 +353,9 @@ const singleDeleteDescription = computed(() => pendingDeleteAccount.value?.lifec
                 :recovery-probe-required="row.quota.recoveryProbeRequired"
                 :next-refresh-at="row.nextRefreshAt"
               />
+              <div>
+                <AccountWarmupBadge :state="warmup.view?.available ? warmup.view.accountStates?.[row.id] : undefined" :ready="warmup.ready" :now="warmupNow.getTime()" :archived="row.lifecycle.archived" />
+              </div>
               <span
                 v-if="row.quotaProtectionReached"
                 class="mt-1 block text-cp-xs text-cp-warning-text"
@@ -404,6 +413,9 @@ const singleDeleteDescription = computed(() => pendingDeleteAccount.value?.lifec
                 :refreshing="refreshingAccountIds.has(row.id)"
                 :exporting-oauth="exportingOAuthIds.has(row.id)"
                 :testing="false" :diagnostics-enabled="enabled('account-diagnostics')"
+                :warmup-enabled="warmup.canRun(row)"
+                :warming="Boolean(warmup.view?.available && ['queued', 'running'].includes(warmup.view.accountStates?.[row.id]?.status ?? ''))"
+                @warmup="warmup.openAccount"
                 @edit="openAccountEdit"
                 @delete="requestDeleteAccount"
                 @recover="handleRecover"
@@ -441,6 +453,24 @@ const singleDeleteDescription = computed(() => pendingDeleteAccount.value?.lifec
         </div>
       </template>
     </BaseCard>
+
+    <AccountWarmupModal
+      v-model="warmup.request"
+      v-model:open="warmup.dialogOpen"
+      :target-name="warmup.targetName"
+      :ready="warmup.ready && !archivedQuery"
+      :submitting="warmup.submitting"
+      :locked="warmup.requestLocked"
+      :unresolved="Boolean(warmup.pendingSubmission)"
+      :error="warmup.submitError"
+      :accounts="warmup.view?.available ? warmup.view.accounts : []"
+      :models="warmup.models"
+      :catalog-account-id="warmup.modelAccountId"
+      :models-loading="warmup.modelsLoading"
+      :models-error="warmup.modelsError"
+      @catalog="warmup.loadModels"
+      @submit="warmup.submit"
+    />
 
     <AccountImportTasks
       v-model="showImportTasks"

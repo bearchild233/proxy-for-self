@@ -4,7 +4,7 @@
 
 ## 职责与边界
 
-内核与服务插件共同依赖的 wire 合同（`KERNEL_API` 当前 0.7）：消息信封、握手、钩子参数与结果、内核能力参数与结果、帧编解码。叶子 crate，只依赖 serde / serde_json / tokio 的 io-util，不依赖任何 workspace crate，不含调度、授权或连接实现。
+内核与服务插件共同依赖的 wire 合同（`KERNEL_API` 当前 0.8）：消息信封、握手、钩子参数与结果、内核能力参数与结果、帧编解码。叶子 crate，只依赖 serde / serde_json / tokio 的 io-util，不依赖任何 workspace crate，不含调度、授权或连接实现。
 
 使用方：`gateway-core::plugin`（`pub use kernel_protocol::*`，加上钩子与能力端口）、`gateway-host` 的插件运行时（连接、握手、分发）、插件 SDK（`plugins/sdk/plugin-sdk`）。Python 侧 `services/updater/kernel_protocol.py` 是只含管理连接的最小客户端，帧格式与本 crate 一致。设计背景见 [微内核设计](../microkernel.md)。
 
@@ -20,7 +20,7 @@
   - `request.finish`：通知，携带结果（completed/failed/cancelled/interrupted）、耗时、首字节耗时、用量。
   - `response.observe`：观察分组账号的响应头，结果 `accept` 或 `switchAccount`；`canSwitch` 表示内核是否允许换号。
   - `admin.call`：管理面直连，`{method, params, actor.role}`。
-- 能力（`src/capabilities.rs`）：`upstream.probe`（含 `includeAccountCookies`，可选 `requestId`：同一次打票的多次探测共用的上游请求 ID）、`http.fetch`（`Egress::Direct` 或 `Account`）、`accounts.read`（可带 `model`，结果含 `modelAllowed`）、`accounts.warmup.read/run`（安全账号目录、固定一次性维护请求及 `sendState`/`shortTerm` 结果）、`groups.move`、`quota.read`（可带 `refreshIfMissing`）、`log`（通知）。
+- 能力（`src/capabilities.rs`）：`upstream.probe`（含 `includeAccountCookies`，可选 `requestId`：同一次打票的多次探测共用的上游请求 ID）、`http.fetch`（`Egress::Direct` 或 `Account`）、`accounts.read`（可带 `model`，结果含 `modelAllowed`）、`accounts.warmup.read/run`（安全账号和模型强度目录、有界提示词的一次性维护请求及 `sendState`/`shortTerm` 结果）、`groups.move`、`quota.read`（可带 `refreshIfMissing`）、`log`（通知）。0.8 的预热参数增加 `prompt`/`reasoningEffort`，缺省仍为 `hi`/`auto`，模型目录的 `reasoningEfforts` 缺省为空；其它资格与发送边界不变。
 
 ## 文件表
 

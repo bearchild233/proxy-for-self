@@ -20,7 +20,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         kernel_api: PluginApi {
             major: KERNEL_API.0,
-            min_minor: 7,
+            min_minor: 8,
         },
         hooks: vec!["admin.call".into()],
         capabilities: vec![

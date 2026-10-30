@@ -17,6 +17,21 @@ pub fn identifier(value: &str) -> bool {
     !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
 }
 
+pub fn prompt(value: &str) -> bool {
+    !value.trim().is_empty()
+        && value.len() <= 4096
+        && !value
+            .chars()
+            .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+}
+
+pub fn reasoning_effort(value: &str) -> bool {
+    matches!(
+        value,
+        "auto" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh"
+    )
+}
+
 pub fn ids(values: &[String]) -> RpcResult<()> {
     let mut seen = HashSet::new();
     if values.len() > 500
@@ -43,6 +58,8 @@ pub fn validate(settings: &Settings) -> RpcResult<()> {
         || time(&settings.daily_time).is_none()
         || !matches!(settings.target_mode.as_str(), "all" | "selected")
         || !identifier(&settings.default_model)
+        || !prompt(&settings.prompt)
+        || !reasoning_effort(&settings.reasoning_effort)
         || settings.jitter_min_seconds > settings.jitter_max_seconds
         || settings.jitter_max_seconds > 300
         || settings.reset_delay_seconds > 86400
@@ -64,6 +81,10 @@ pub fn validate(settings: &Settings) -> RpcResult<()> {
                 .as_deref()
                 .is_some_and(|value| !identifier(value))
             || item.reset_delay_seconds.is_some_and(|value| value > 86400)
+            || item
+                .reasoning_effort
+                .as_deref()
+                .is_some_and(|value| !reasoning_effort(value))
         {
             return Err(invalid("invalid account override"));
         }

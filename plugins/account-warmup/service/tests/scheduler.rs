@@ -208,6 +208,7 @@ fn manual_scope_ignores_auto_participation_but_preserves_model_and_jitter() {
             enabled: false,
             daily_time: None,
             model: Some("chosen-model".into()),
+            reasoning_effort: None,
             reset_delay_seconds: None,
         }],
         ..Settings::default()
@@ -469,4 +470,558 @@ fn near_five_hour_windows_are_accepted_and_null_observation_never_breaks_directo
     }
     let account: Account = serde_json::from_value(serde_json::json!({"id":"a","provider":"openai","authenticationKind":"oauth","enabled":true,"status":"active","supported":true,"reasonCode":null,"modelAllowed":null,"models":null,"shortTerm":{"observedAt":null,"windowSeconds":18000,"usedPercent":null,"resetAt":"2026-10-25T05:00:00Z"}})).unwrap();
     assert!(account.short_term.unwrap().observed_reset().is_none());
+}
+
+#[test]
+fn prompt_and_reasoning_settings_validate_utf8_bytes_and_preserve_text() {
+    let fixture = Fixture::new();
+    let store = fixture.open();
+    let mut config = settings();
+    for effort in ["auto", "none", "minimal", "low", "medium", "high", "xhigh"] {
+        config.reasoning_effort = effort.into();
+        assert!(validate(&config).is_ok());
+    }
+    for effort in ["", "AUTO", "max", " high", "high "] {
+        config.reasoning_effort = effort.into();
+        assert!(validate(&config).is_err());
+    }
+    config.reasoning_effort = "auto".into();
+    for prompt in [
+        String::new(),
+        " \r\n\t".into(),
+        "x\0".into(),
+        "x\u{000B}".into(),
+        "x\u{0085}".into(),
+        "中".repeat(1366),
+    ] {
+        config.prompt = prompt;
+        assert!(validate(&config).is_err());
+    }
+    config.prompt = "中".repeat(1365) + "a";
+    assert_eq!(config.prompt.len(), 4096);
+    assert!(validate(&config).is_ok());
+    config.prompt.push(' ');
+    assert!(validate(&config).is_err());
+    config.prompt = "  早上好\n第二行\r\n\t结尾  ".into();
+    store.configure(0, &config).unwrap();
+    assert_eq!(fixture.open().settings().unwrap().1.prompt, config.prompt);
+    config.account_overrides = vec![AccountOverride {
+        account_id: "a".into(),
+        enabled: true,
+        daily_time: None,
+        model: None,
+        reasoning_effort: Some("invalid".into()),
+        reset_delay_seconds: None,
+    }];
+    assert!(validate(&config).is_err());
+}
+
+#[test]
+fn manual_and_automatic_tasks_freeze_prompt_and_account_effort_across_configure() {
+    let fixture = Fixture::new();
+    let store = fixture.open();
+    let now = at("2026-10-25T00:00:00Z");
+    let mut config = Settings {
+        enabled: true,
+        daily_enabled: true,
+        reset_enabled: false,
+        prompt: "  original\n\tprompt  ".into(),
+        reasoning_effort: "low".into(),
+        account_overrides: vec![AccountOverride {
+            account_id: "automatic".into(),
+            enabled: true,
+            daily_time: None,
+            model: Some("account-model".into()),
+            reasoning_effort: Some("high".into()),
+            reset_delay_seconds: None,
+        }],
+        ..settings()
+    };
+    store.configure(0, &config).unwrap();
+    let manual = store
+        .enqueue_manual("frozen-manual", &[account("manual")], &config, now)
+        .unwrap();
+    store
+        .schedule(&[account("automatic")], &config, now)
+        .unwrap();
+    config.prompt = "changed".into();
+    config.reasoning_effort = "none".into();
+    config.default_model = "changed-model".into();
+    config.account_overrides[0].reasoning_effort = Some("xhigh".into());
+    config.account_overrides[0].model = Some("changed-account-model".into());
+    store.configure(1, &config).unwrap();
+    let reopened = fixture.open();
+    let first = reopened.claim("executor", now).unwrap().unwrap();
+    assert_eq!(first.prompt, "  original\n\tprompt  ");
+    reopened
+        .finish(&first.id, "executor", &accepted(), now)
+        .unwrap();
+    let second = reopened.claim("executor", now).unwrap().unwrap();
+    assert_eq!(second.prompt, "  original\n\tprompt  ");
+    let (manual_task, automatic_task) = if first.account_id == "manual" {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    assert_eq!(manual_task.reasoning_effort, "low");
+    assert_eq!(automatic_task.reasoning_effort, "high");
+    assert_eq!(automatic_task.model, "account-model");
+    assert_eq!(
+        items(&reopened, &manual.id)[0]["prompt"],
+        "  original\n\tprompt  "
+    );
+    assert_eq!(reopened.settings().unwrap().1, config);
+}
+
+#[test]
+fn old_sqlite_settings_and_queued_task_json_keep_hi_auto_defaults() {
+    let fixture = Fixture::new();
+    let now = at("2026-10-25T00:00:00Z");
+    let store = fixture.open();
+    let run = store
+        .enqueue_manual("old-fixture", &[account("legacy")], &settings(), now)
+        .unwrap();
+    let mut old_settings = serde_json::to_value(Settings {
+        account_overrides: vec![AccountOverride {
+            account_id: "legacy".into(),
+            enabled: true,
+            daily_time: None,
+            model: None,
+            reasoning_effort: None,
+            reset_delay_seconds: None,
+        }],
+        ..settings()
+    })
+    .unwrap();
+    old_settings.as_object_mut().unwrap().remove("prompt");
+    old_settings
+        .as_object_mut()
+        .unwrap()
+        .remove("reasoningEffort");
+    old_settings["accountOverrides"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("reasoningEffort");
+    let mut old_task = items(&store, &run.id).remove(0);
+    old_task.as_object_mut().unwrap().remove("prompt");
+    old_task.as_object_mut().unwrap().remove("reasoningEffort");
+    drop(store);
+    let db = rusqlite::Connection::open(fixture.0.join("state.sqlite3")).unwrap();
+    db.execute("UPDATE settings SET data=?", [old_settings.to_string()])
+        .unwrap();
+    db.execute("UPDATE tasks SET data=?", [old_task.to_string()])
+        .unwrap();
+    drop(db);
+    let reopened = fixture.open();
+    let mut changed = reopened.settings().unwrap().1;
+    assert_eq!(changed.prompt, "hi");
+    assert_eq!(changed.reasoning_effort, "auto");
+    assert_eq!(changed.account_overrides[0].reasoning_effort, None);
+    changed.prompt = "new configuration".into();
+    changed.reasoning_effort = "high".into();
+    reopened.configure(0, &changed).unwrap();
+    let task = reopened.claim("new-service", now).unwrap().unwrap();
+    assert_eq!(task.prompt, "hi");
+    assert_eq!(task.reasoning_effort, "auto");
+}
+
+#[test]
+fn account_states_follow_active_real_current_window_and_expiry() {
+    let fixture = Fixture::new();
+    let store = fixture.open();
+    let now = at("2026-10-25T00:00:00Z");
+    let target = account("a");
+    assert_eq!(
+        store
+            .account_states(now, std::slice::from_ref(&target))
+            .unwrap()["a"]
+            .status,
+        "pending"
+    );
+    store
+        .enqueue_manual("state-one", std::slice::from_ref(&target), &settings(), now)
+        .unwrap();
+    assert_eq!(
+        store
+            .account_states(now, std::slice::from_ref(&target))
+            .unwrap()["a"]
+            .status,
+        "queued"
+    );
+    let task = store.claim("one", now).unwrap().unwrap();
+    assert_eq!(
+        store
+            .account_states(now, std::slice::from_ref(&target))
+            .unwrap()["a"]
+            .status,
+        "running"
+    );
+    store.finish(&task.id, "one", &accepted(), now).unwrap();
+    assert_eq!(
+        store
+            .account_states(now, std::slice::from_ref(&target))
+            .unwrap()["a"]
+            .status,
+        "unconfirmed"
+    );
+    store
+        .enqueue_manual("state-two", std::slice::from_ref(&target), &settings(), now)
+        .unwrap();
+    let task = store.claim("one", now).unwrap().unwrap();
+    let mut confirmed = accepted();
+    confirmed.short_term = Some(ShortTerm {
+        observed_at: Some(now),
+        window_seconds: 18000,
+        used_percent: Some(1.0),
+        reset_at: Some(now + chrono::Duration::hours(5)),
+    });
+    store.finish(&task.id, "one", &confirmed, now).unwrap();
+    let reopened = fixture.open();
+    let states = reopened
+        .account_states(now, std::slice::from_ref(&target))
+        .unwrap();
+    assert_eq!(states["a"].status, "warmed");
+    assert_eq!(states["a"].task_id.as_deref(), Some(task.id.as_str()));
+    assert_eq!(states["a"].reset_at, Some(now + chrono::Duration::hours(5)));
+    let expired = reopened
+        .account_states(now + chrono::Duration::hours(5), &[target])
+        .unwrap();
+    assert_eq!(expired["a"].status, "pending");
+    assert_eq!(expired["a"].reset_at, None);
+}
+
+#[test]
+fn account_states_keep_unknown_and_accept_business_window_without_claiming_manual_success() {
+    let fixture = Fixture::new();
+    let store = fixture.open();
+    let now = at("2026-10-25T00:00:00Z");
+    let mut target = account("a");
+    store
+        .enqueue_manual(
+            "state-unknown",
+            std::slice::from_ref(&target),
+            &settings(),
+            now,
+        )
+        .unwrap();
+    let task = store.claim("lost-executor", now).unwrap().unwrap();
+    store.recover(now + chrono::Duration::seconds(61)).unwrap();
+    let states = store
+        .account_states(
+            now + chrono::Duration::seconds(61),
+            std::slice::from_ref(&target),
+        )
+        .unwrap();
+    assert_eq!(states["a"].status, "unknown");
+    assert_eq!(states["a"].task_id.as_deref(), Some(task.id.as_str()));
+    assert_eq!(
+        states["a"].reason_code.as_deref(),
+        Some("executor_lease_expired")
+    );
+    target.short_term = Some(ShortTerm {
+        observed_at: Some(now),
+        window_seconds: 18000,
+        used_percent: Some(1.0),
+        reset_at: Some(now + chrono::Duration::hours(5)),
+    });
+    let states = store
+        .account_states(
+            now + chrono::Duration::seconds(61),
+            std::slice::from_ref(&target),
+        )
+        .unwrap();
+    assert_eq!(states["a"].status, "warmed");
+    assert_eq!(states["a"].task_id, None);
+    let history = store.history(20, None).unwrap();
+    assert_eq!(history["runs"][0]["unknown"], 1);
+    assert!(
+        store
+            .claim("new", now + chrono::Duration::minutes(10))
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn invalid_or_future_windows_never_confirm_a_timer_or_account_state() {
+    let fixture = Fixture::new();
+    let store = fixture.open();
+    let now = at("2026-10-25T00:00:00Z");
+    for (id, seconds, observed, reset) in [
+        (
+            "future",
+            18000,
+            now + chrono::Duration::seconds(1),
+            now + chrono::Duration::hours(5),
+        ),
+        (
+            "wrong-duration",
+            86400,
+            now,
+            now + chrono::Duration::hours(5),
+        ),
+        ("reversed", 18000, now, now),
+    ] {
+        let mut target = account(id);
+        target.short_term = Some(ShortTerm {
+            observed_at: Some(observed),
+            window_seconds: seconds,
+            used_percent: None,
+            reset_at: Some(reset),
+        });
+        assert_eq!(
+            store
+                .account_states(now, std::slice::from_ref(&target))
+                .unwrap()[id]
+                .status,
+            "pending"
+        );
+        let run = store
+            .enqueue_manual(id, std::slice::from_ref(&target), &settings(), now)
+            .unwrap();
+        let task = store.claim("executor", now).unwrap().unwrap();
+        let mut outcome = accepted();
+        outcome.short_term = target.short_term;
+        store.finish(&task.id, "executor", &outcome, now).unwrap();
+        assert_eq!(items(&store, &run.id)[0]["timerConfirmed"], false);
+        assert_eq!(items(&store, &run.id)[0]["resetAt"], Value::Null);
+    }
+    let future = account("future");
+    assert_eq!(
+        store.account_states(now, &[future]).unwrap()["future"].status,
+        "unconfirmed"
+    );
+    let mut unsupported = account("unsupported");
+    unsupported.supported = false;
+    unsupported.reason_code = Some("unsupported_provider".into());
+    assert_eq!(
+        store.account_states(now, &[unsupported]).unwrap()["unsupported"].status,
+        "unsupported"
+    );
+}
+
+#[test]
+fn history_filters_source_before_limit_and_rejects_a_mismatched_run_id() {
+    let fixture = Fixture::new();
+    let store = fixture.open();
+    let now = at("2026-10-25T00:00:00Z");
+    let config = Settings {
+        enabled: true,
+        daily_enabled: true,
+        reset_enabled: false,
+        ..settings()
+    };
+    store.configure(0, &config).unwrap();
+    store
+        .schedule(&[account("automatic")], &config, now)
+        .unwrap();
+    let auto = store.history_filtered(1, None, Some("automatic")).unwrap()["runs"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for index in 1..=3 {
+        store
+            .enqueue_manual(
+                &format!("manual-{index}"),
+                &[account(&format!("manual-{index}"))],
+                &config,
+                now + chrono::Duration::minutes(index),
+            )
+            .unwrap();
+    }
+    let automatic = store.history_filtered(1, None, Some("automatic")).unwrap();
+    assert_eq!(automatic["runs"].as_array().unwrap().len(), 1);
+    assert_eq!(automatic["runs"][0]["id"], auto);
+    assert_eq!(automatic["runs"][0]["source"], "daily");
+    let manual = store.history_filtered(1, None, Some("manual")).unwrap();
+    assert_eq!(manual["runs"][0]["source"], "manual");
+    assert!(
+        store
+            .history_filtered(20, Some(&auto), Some("manual"))
+            .is_err()
+    );
+    assert!(
+        store
+            .history_filtered(20, manual["runs"][0]["id"].as_str(), Some("automatic"))
+            .is_err()
+    );
+    assert_eq!(
+        store.history(20, None).unwrap()["runs"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+}
+
+#[test]
+fn read_summaries_project_only_state_fields_and_use_account_indexes() {
+    let fixture = Fixture::new();
+    let store = fixture.open();
+    let now = at("2026-10-25T00:00:00Z");
+    let run = store
+        .enqueue_manual("summary-only", &[account("a")], &settings(), now)
+        .unwrap();
+    let task = store.claim("executor", now).unwrap().unwrap();
+    store
+        .finish(&task.id, "executor", &accepted(), now)
+        .unwrap();
+    let db = rusqlite::Connection::open(fixture.0.join("state.sqlite3")).unwrap();
+    // 摘要不能依赖解析整条 TaskItem；提示词列也不应出现在账号 read 的摘要里。
+    db.execute("UPDATE tasks SET data=json_set(data,'$.prompt',42)", [])
+        .unwrap();
+    let plan: String = db.query_row("EXPLAIN QUERY PLAN SELECT id FROM tasks WHERE account='a' AND finished IS NOT NULL ORDER BY finished DESC,id DESC LIMIT 1", [], |row| row.get(3)).unwrap();
+    assert!(plan.contains("task_account_finished"));
+    let states = store.account_states(now, &[account("a")]).unwrap();
+    assert_eq!(states["a"].status, "unconfirmed");
+    assert!(!serde_json::to_string(&states).unwrap().contains("prompt"));
+    assert_eq!(
+        store.runtime(now, &[], &settings()).unwrap()["lastRun"]["id"],
+        run.id
+    );
+}
+
+#[test]
+fn active_tasks_take_priority_over_business_windows_and_terminal_failures_stay_distinct() {
+    let fixture = Fixture::new();
+    let store = fixture.open();
+    let now = at("2026-10-25T00:00:00Z");
+    let mut target = account("a");
+    target.short_term = Some(ShortTerm {
+        observed_at: Some(now),
+        window_seconds: 18000,
+        used_percent: Some(2.0),
+        reset_at: Some(now + chrono::Duration::hours(5)),
+    });
+    store
+        .enqueue_manual(
+            "active-window",
+            std::slice::from_ref(&target),
+            &settings(),
+            now,
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .account_states(now, std::slice::from_ref(&target))
+            .unwrap()["a"]
+            .status,
+        "queued"
+    );
+    let task = store.claim("executor", now).unwrap().unwrap();
+    assert_eq!(
+        store
+            .account_states(now, std::slice::from_ref(&target))
+            .unwrap()["a"]
+            .status,
+        "running"
+    );
+    let mut failure = accepted();
+    failure.outcome = "failed".into();
+    failure.reason_code = Some("upstream_failed".into());
+    store.finish(&task.id, "executor", &failure, now).unwrap();
+    target.short_term = None;
+    let state = store
+        .account_states(now, std::slice::from_ref(&target))
+        .unwrap();
+    assert_eq!(state["a"].status, "failed");
+    assert_eq!(state["a"].reason_code.as_deref(), Some("upstream_failed"));
+    let run = store
+        .enqueue_manual(
+            "cancelled",
+            &[target],
+            &settings(),
+            now + chrono::Duration::seconds(1),
+        )
+        .unwrap();
+    store
+        .cancel(&run.id, now + chrono::Duration::seconds(1))
+        .unwrap();
+    assert_eq!(
+        store
+            .account_states(now + chrono::Duration::seconds(1), &[account("a")])
+            .unwrap()["a"]
+            .status,
+        "skipped"
+    );
+}
+
+#[test]
+fn newer_expired_observations_do_not_revive_an_older_window() {
+    let fixture = Fixture::new();
+    let store = fixture.open();
+    let now = at("2026-10-25T00:00:00Z");
+    let mut target = account("a");
+    target.short_term = Some(ShortTerm {
+        observed_at: Some(now),
+        window_seconds: 18000,
+        used_percent: Some(1.0),
+        reset_at: Some(now + chrono::Duration::hours(5)),
+    });
+    store.observe(std::slice::from_ref(&target)).unwrap();
+    target.short_term.as_mut().unwrap().observed_at = Some(now + chrono::Duration::hours(1));
+    target.short_term.as_mut().unwrap().reset_at = Some(now + chrono::Duration::hours(2));
+    store.observe(std::slice::from_ref(&target)).unwrap();
+    assert_eq!(
+        store
+            .account_states(now + chrono::Duration::minutes(90), &[account("a")])
+            .unwrap()["a"]
+            .status,
+        "warmed"
+    );
+    assert_eq!(
+        store
+            .account_states(now + chrono::Duration::hours(3), &[account("a")])
+            .unwrap()["a"]
+            .status,
+        "pending"
+    );
+}
+
+#[test]
+fn runtime_separates_manual_queues_from_automatic_forecasts_and_due_tasks() {
+    let fixture = Fixture::new();
+    let store = fixture.open();
+    let now = at("2026-10-25T00:00:00Z");
+    store
+        .enqueue_manual("manual-only", &[account("manual")], &settings(), now)
+        .unwrap();
+    let runtime = store
+        .runtime(now, &[account("automatic")], &settings())
+        .unwrap();
+    assert_eq!(at(runtime["nextRunAt"].as_str().unwrap()), now);
+    assert_eq!(runtime["nextAutomaticRunAt"], Value::Null);
+    let config = Settings {
+        enabled: true,
+        daily_enabled: true,
+        reset_enabled: false,
+        daily_time: "09:00".into(),
+        ..settings()
+    };
+    store.configure(0, &config).unwrap();
+    let runtime = store
+        .runtime(now, &[account("automatic")], &config)
+        .unwrap();
+    assert_eq!(
+        at(runtime["nextAutomaticRunAt"].as_str().unwrap()),
+        now + chrono::Duration::hours(1)
+    );
+    store
+        .schedule(
+            &[account("automatic")],
+            &config,
+            now + chrono::Duration::hours(1),
+        )
+        .unwrap();
+    let runtime = store
+        .runtime(
+            now + chrono::Duration::hours(1),
+            &[account("automatic")],
+            &config,
+        )
+        .unwrap();
+    assert_eq!(
+        at(runtime["nextAutomaticRunAt"].as_str().unwrap()),
+        now + chrono::Duration::hours(1)
+    );
 }

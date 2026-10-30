@@ -74,10 +74,16 @@ fn protocol_six_defaults_and_model_fields() {
 fn warmup_contract_is_narrow_and_has_no_credential_material() {
     let params: AccountWarmupReadParams = serde_json::from_value(json!({})).unwrap();
     assert!(!params.include_models);
-    let wire = json!({"accountId":"a","model":"m","timeoutMs":15000,"attemptId":"run_1"});
+    let wire = json!({"accountId":"a","model":"m","prompt":"hello\n\tworld","reasoningEffort":"high","timeoutMs":15000,"attemptId":"run_1"});
     let params: AccountWarmupRunParams = serde_json::from_value(wire.clone()).unwrap();
     assert_eq!(serde_json::to_value(params).unwrap(), wire);
-    for field in ["prompt", "cookie", "turnState", "includeAccountCookies"] {
+    for field in [
+        "body",
+        "tools",
+        "cookie",
+        "turnState",
+        "includeAccountCookies",
+    ] {
         let mut invalid = wire.clone();
         invalid[field] = json!("not-allowed");
         assert!(serde_json::from_value::<AccountWarmupRunParams>(invalid).is_err());
@@ -86,6 +92,19 @@ fn warmup_contract_is_narrow_and_has_no_credential_material() {
         json!({"outcome":"accepted","reasonCode":null,"status":200,"durationMs":8,"sendState":"sent","shortTerm":{"observedAt":"2026-10-25T01:00:00+00:00","windowSeconds":18000,"usedPercent":1.0,"resetAt":"2026-10-25T06:00:00+00:00"}}),
     );
     example::<AccountWarmupReadResult>(
-        json!({"accounts":[{"id":"a","provider":"openai","authenticationKind":"oauth","enabled":true,"status":"normal","supported":true,"reasonCode":null,"modelAllowed":true,"models":[{"id":"m","label":"M"}],"shortTerm":null}]}),
+        json!({"accounts":[{"id":"a","provider":"openai","authenticationKind":"oauth","enabled":true,"status":"normal","supported":true,"reasonCode":null,"modelAllowed":true,"models":[{"id":"m","label":"M","reasoningEfforts":["low","high"]}],"shortTerm":null}]}),
     );
+}
+
+#[test]
+fn protocol_eight_warmup_fields_preserve_legacy_defaults() {
+    let legacy: AccountWarmupRunParams = serde_json::from_value(
+        json!({"accountId":"a","model":"m","timeoutMs":15000,"attemptId":"run_1"}),
+    )
+    .unwrap();
+    assert_eq!(legacy.prompt, "hi");
+    assert_eq!(legacy.reasoning_effort, "auto");
+    let legacy: AccountWarmupModel = serde_json::from_value(json!({"id":"m","label":"M"})).unwrap();
+    assert!(legacy.reasoning_efforts.is_empty());
+    example::<AccountWarmupModel>(json!({"id":"plain","label":"Plain","reasoningEfforts":[]}));
 }

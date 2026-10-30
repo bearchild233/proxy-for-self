@@ -18,11 +18,11 @@ const props = defineProps<{
 const emit = defineEmits<{ select: [id: string], refresh: [], cancel: [] }>()
 const selected = computed(() => props.runs.find(run => run.id === props.selectedId))
 const options = computed(() => props.runs.map(run => ({ value: run.id, label: `${sourceLabels[run.source]} · ${formatWarmupTime(run.createdAt)} · ${run.total} 个账号` })))
-const canCancel = computed(() => selected.value && ['queued', 'running'].includes(selected.value.status) && selected.value.pending > 0)
+const canCancel = computed(() => selected.value && ['daily', 'reset'].includes(selected.value.source) && ['queued', 'running'].includes(selected.value.status) && selected.value.pending > 0)
 </script>
 
 <template>
-  <BaseCard title="最近预热任务" description="仅收到上游响应头时记为受理；是否已开启计时另看真实额度观测。">
+  <BaseCard title="最近自动预热任务" description="仅展示每日计划和额度重置任务。收到上游响应头记为受理；是否已开启计时另看真实额度观测。">
     <template #actions>
       <BaseButton size="sm" @click="emit('refresh')">
         刷新记录
@@ -33,9 +33,9 @@ const canCancel = computed(() => selected.value && ['queued', 'running'].include
     </p>
     <template v-if="runs.length">
       <div class="flex flex-wrap items-center gap-3">
-        <BaseSelect class="min-w-56 flex-1" :model-value="selectedId" :options="options" aria-label="查看预热批次" @update:model-value="emit('select', $event)" />
+        <BaseSelect class="min-w-56 flex-1" :model-value="selectedId" :options="options" aria-label="查看自动预热批次" @update:model-value="emit('select', $event)" />
         <BaseButton v-if="canCancel" size="sm" :loading="cancelling" @click="emit('cancel')">
-          停止未发送项
+          停止该自动批次未发送项
         </BaseButton>
       </div>
       <p v-if="selected" class="my-3 text-cp-sm text-cp-text-secondary" role="status">
@@ -60,6 +60,6 @@ const canCancel = computed(() => selected.value && ['queued', 'running'].include
         该批次暂无逐账号结果
       </p>
     </template>
-    <BaseEmpty v-else title="暂无预热任务" description="从账号管理点击预热，或保存并开启自动计划。" size="sm" surface="none" />
+    <BaseEmpty v-else title="暂无自动预热任务" description="保存并开启自动计划后，此处展示每日和额度重置任务。" size="sm" surface="none" />
   </BaseCard>
 </template>

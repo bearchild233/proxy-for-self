@@ -4,7 +4,7 @@
 
 ## 职责与边界
 
-基础界面插件（`kind: ui`、`runtime: vue-component`、页面 `/accounts`，仅管理员，不可停用/卸载）：账号列表与筛选、导入与 OAuth 授权/重新授权、编辑与批量编辑、额度/用量/订阅展示、个人资料、额度预测与重置卡、导入任务、归档视图，以及账号预热的全部/选中入口。**没有后端进程**：普通数据来自网关管理 API；预热入口只通过显式的 `account-warmup.read/run` 跨插件桥调用独立服务。
+基础界面插件（`kind: ui`、`runtime: vue-component`、页面 `/accounts`，仅管理员，不可停用/卸载）：账号列表与筛选、导入与 OAuth 授权/重新授权、编辑与批量编辑、额度/用量/订阅展示、个人资料、额度预测与重置卡、导入任务、归档视图，以及账号预热状态和单个/全部/选中入口。**没有后端进程**：普通数据来自网关管理 API；预热入口只通过显式的 `account-warmup.read/run` 跨插件桥调用独立服务。
 
 - 依赖：`gateway-api` 的 `/api/admin/accounts*`（实现链见 `gateway-api` → `gateway-admin` → `gateway-store`）、主壳基础组件、`packages/ui-kit/accounts`（用量窗口、套餐徽标）。
 - 业务规则（账号状态、归档、调度字段）归后端，这里只展示与发起操作。
@@ -21,7 +21,7 @@
 - `useAccountLifecycle`：归档视图“恢复到主列表”（`batch-update {restoreArchived:true}`）与临期优先开关。
 - `useAccountImportTasks`：后台导入任务轮询、详情与停止；`useAccountPersonalInfo` `useAccountSubscriptions` `useAccountQuotaForecast` `useAccountResetCredits`：个人资料、订阅周期、额度预测、重置卡（幂等键、未决消费防重复）。
 
-**账号预热入口**：`AccountWarmupToolbar.vue` 允许对当前账号池全部账号或跨分页选中账号提交一次 `hi`，提交 ID 在未知网络结果时保留以便回读同一批次；归档视图、插件停用或服务不可用时只显示不可用状态。设置与历史位于独立的 `account-warmup` 页面，入口通过宿主导航打开，不把当前页筛选误当作“全部账号”。
+**账号预热入口**：`useAccountWarmup` 共用一份 15 秒 read 轮询，状态列的 `AccountWarmupBadge` 区分已预热/待预热/排队/执行/计时待确认/未知/失败/跳过/不支持，真实 5 小时 resetAt 到期后即时撤销已预热。操作列的火焰按钮只预热该账号；工具栏针对全部当前账号池或跨页选中账号。共用 `AccountWarmupModal` 设置本次提示词、模型和推理强度；自动计划独立保存，已有活动任务沿用原参数。网络提交结果未知时保留原范围/参数和 submissionId，关闭弹窗也不丢失，后续点击只核对同一提交。归档视图、插件停用、服务未就绪或旧服务缺新字段时禁用新入口；停用/养号/活动任务/不支持的账号禁用逐行按钮。自动设置及自动历史由独立插件页面拥有，齿轮通过宿主导航打开。
 
 订阅 / 权重列在权重后为 `quotaProtection.enabled` 的账号显示“养号”标记，悬停展示OpenAI的5小时/7天两项阈值或xAI账期阈值；关闭或旧网关未返回养号设置时不显示。状态列的“养号阈值已达”仍单独表示当前额度观测已触发保护。
 
@@ -39,7 +39,10 @@
 | `plugins/accounts/ui/entries.json` | 页面入口声明（`main` → `ui/page/index.vue`） |
 | `plugins/accounts/ui/page/index.vue` | 页面入口 |
 | `plugins/accounts/ui/page/components/` | 表格单元格、弹窗、筛选、操作列 |
-| `plugins/accounts/ui/page/components/AccountWarmupToolbar.vue` | 账号预热全部/选中提交入口与服务可用性轮询 |
+| `plugins/accounts/ui/page/components/AccountWarmupToolbar.vue` | 全部/选中手动预热入口及自动设置导航 |
+| `plugins/accounts/ui/page/components/AccountWarmupBadge.vue` | 当前 5 小时窗口及逐账号任务状态 |
+| `plugins/accounts/ui/page/components/AccountWarmupModal.vue` | 手动请求的提示词、模型、强度与提交结果核对 |
+| `plugins/accounts/ui/page/composables/useAccountWarmup.ts` | 共享状态轮询、模型目录、手动范围与幂等提交 |
 | `plugins/accounts/ui/page/composables/` | 查询、变更、导入、编辑、生命周期、资料/订阅/预测/重置卡 |
 | `plugins/accounts/ui/page/utils/` | 需处理判定、OAuth 导出、刷新页、调度表单、上游 API Key 等纯函数 |
 | `plugins/accounts/ui/page/constants.ts` | 列、选项、常量 |

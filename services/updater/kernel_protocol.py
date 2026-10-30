@@ -14,7 +14,7 @@ import time
 MAX_FRAME_BYTES = 1_048_576
 KERNEL_API_MAJOR = 0
 KERNEL_API_MIN_MINOR = 4
-KERNEL_API_MINOR = 7
+KERNEL_API_MINOR = 8
 # 握手中报告给插件的内核版本。TODO(design): 任务未规定握手版本字符串，此处使用固定占位值。
 KERNEL_VERSION = "updater"
 

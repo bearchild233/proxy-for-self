@@ -1,13 +1,13 @@
 {
   "id": "account-warmup",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "protocol": 2,
   "kind": "ui",
   "sdk": 1,
   "runtime": "vue-component",
   "hostApi": 1,
   "pages": [
-    {"id": "main", "title": "账号预热", "entry": "ui/module.js", "roles": ["admin"], "route": "/extensions/account-warmup"}
+    {"id": "main", "title": "自动预热", "entry": "ui/module.js", "roles": ["admin"], "route": "/extensions/account-warmup"}
   ],
   "capabilities": [
     "account-warmup.read",
@@ -19,16 +19,16 @@
   ],
   "service": {
     "binary": "service/account-warmup",
-    "kernelApi": {"major": 0, "minMinor": 7},
+    "kernelApi": {"major": 0, "minMinor": 8},
     "capabilities": ["accounts.warmup.read", "accounts.warmup.run", "log"],
     "fetchHosts": [],
     "memoryMax": "64M",
     "shutdownSeconds": 30
   },
-  "releasedAt": "2026-10-25T00:00:00+08:00",
+  "releasedAt": "2026-10-30T00:00:00+08:00",
   "releaseNotes": [
-    "新增一次hi账号预热，全部与选中账号共用持久任务队列。",
-    "支持额度重置后与每日定时触发、逐账号时间和模型覆盖及随机延迟。",
-    "自动预热默认关闭，遵守停用、额度与养号限制；未知发送结果不自动重试。"
+    "账号页显示当前窗口预热状态，支持逐账号手动预热。",
+    "支持自定义提示词和推理强度，手动参数只影响本次任务。",
+    "自动预热独立设置，遵守停用、额度与养号限制；未知发送结果不自动重试。"
   ]
 }

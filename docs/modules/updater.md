@@ -57,7 +57,7 @@
 
 - 配置 `/etc/proxy-for-self/updater.json`（root 0600）；状态文件 `state_file`、服务插件状态、A/B 状态均原子写入；PostgreSQL 密码通过 root 独占的 pgpass 文件。
 - 内核注册表（`service_plugins.registry_file`）：`{"plugins":[{id, enabled, socket, grants, fetchHosts, uid?}]}`，格式由 `gateway-host` 读取（见 [gateway-host](gateway-host.md)）。
-- 协议版本常量 `KERNEL_API_MAJOR/MINOR`（当前 0.7，最低 0.4）与 `KERNEL_CAPABILITIES` 必须与 `backend/crates/kernel-protocol` 保持一致；`accounts.warmup.*` 只允许 `account-warmup` 身份。
+- 协议版本常量 `KERNEL_API_MAJOR/MINOR`（当前 0.8，最低 0.4）与 `KERNEL_CAPABILITIES` 必须与 `backend/crates/kernel-protocol` 保持一致；`accounts.warmup.*` 只允许 `account-warmup` 身份。预热 0.2.0 服务要求最低 0.8；升级与回退均需核对运行中网关实际版本，保存新设置后的旧服务回退必须配套 SQLite/配置恢复。
 
 ## 改动指引
 

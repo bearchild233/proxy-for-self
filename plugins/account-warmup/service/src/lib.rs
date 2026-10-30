@@ -5,7 +5,8 @@ mod service;
 mod store;
 
 pub use model::{
-    Account, AccountOverride, Directory, Model, Outcome, RunSummary, Settings, ShortTerm, TaskItem,
+    Account, AccountOverride, AccountState, Directory, Model, Outcome, RunSummary, Settings,
+    ShortTerm, TaskItem,
 };
 pub use schedule::{daily_points, jitter, validate};
 pub use service::WarmupService;

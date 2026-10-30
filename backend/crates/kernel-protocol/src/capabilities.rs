@@ -20,8 +20,20 @@ pub struct AccountWarmupReadParams {
 pub struct AccountWarmupRunParams {
     pub account_id: String,
     pub model: String,
+    #[serde(default = "default_warmup_prompt")]
+    pub prompt: String,
+    #[serde(default = "default_warmup_reasoning_effort")]
+    pub reasoning_effort: String,
     pub timeout_ms: u64,
     pub attempt_id: String,
+}
+
+fn default_warmup_prompt() -> String {
+    "hi".into()
+}
+
+fn default_warmup_reasoning_effort() -> String {
+    "auto".into()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -34,9 +46,12 @@ pub struct AccountWarmupShortTerm {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AccountWarmupModel {
     pub id: String,
     pub label: String,
+    #[serde(default)]
+    pub reasoning_efforts: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

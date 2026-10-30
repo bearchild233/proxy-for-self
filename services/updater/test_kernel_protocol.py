@@ -143,11 +143,12 @@ class AdminClientTests(unittest.TestCase):
         with self.assertRaises(ProtocolError):
             admin_call(self.fake.path, "echo", {}, "admin", 5, expected_id="other-plugin")
 
-    def test_protocol_seven_plugin_is_supported_and_future_version_is_refused(self):
-        self.fake.minor = 7
-        self.assertEqual(health(self.fake.path, 5), {"ready": True})
-        self.assertEqual(self.fake.kernel_apis[-1], {"major": 0, "minor": 7})
-        self.fake.minor = 8
+    def test_protocol_eight_and_older_plugins_are_supported_and_future_version_is_refused(self):
+        for minor in (7, 8):
+            self.fake.minor = minor
+            self.assertEqual(health(self.fake.path, 5), {"ready": True})
+            self.assertEqual(self.fake.kernel_apis[-1], {"major": 0, "minor": 8})
+        self.fake.minor = 9
         with self.assertRaises(ProtocolError):
             health(self.fake.path, 5)
 

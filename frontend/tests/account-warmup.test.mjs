@@ -60,38 +60,75 @@ const base = {
   '@/components/base/BaseInput.vue': input,
   '@/components/base/BaseSelect.vue': input,
   '@/components/base/BaseForm/FormItem.vue': wrapper,
+  '@/components/base/BaseTextarea.vue': input,
+  '@/components/base/BaseModal/index.vue': vue.defineComponent({ props: ['modelValue'], setup: (props, { slots }) => () => props.modelValue ? vue.h('section', [slots.default?.(), slots.footer?.()]) : null }),
 }
+const requestHelpers = evaluate(read('../src/api/modules/accountWarmup.ts'), { '@sdk/ui': { call() {} } }, 'warmupRequestError,warmupEffortOptions')
 const run = { id: 'run-1', source: 'manual', status: 'queued', createdAt: '2026-10-25T00:00:00Z', finishedAt: null, total: 2, accepted: 0, failed: 0, skipped: 0, unknown: 0, pending: 2 }
 const account = { id: 'page-2-account', provider: 'openai', authenticationKind: 'oauth', enabled: true, status: 'normal', supported: true, reasonCode: null, modelAllowed: true, models: null, shortTerm: null }
-const snapshot = (revision = 1) => ({ available: true, revision, settings: model.defaultWarmupSettings(), accounts: [account], runtime: { ready: true, nextRunAt: null, lastRun: null } })
+const snapshot = (revision = 1) => ({ available: true, revision, settings: model.defaultWarmupSettings(), accounts: [account], accountStates: {}, runtime: { ready: true, nextRunAt: null, lastRun: null } })
 async function settle() { for (let i = 0; i < 8; i++) await vue.nextTick() }
 
 function mountToolbar(api, props = {}) {
-  const component = sfc('../../plugins/accounts/ui/page/components/AccountWarmupToolbar.vue', {
+  const modules = {
     ...base,
     '@lucide/vue': { ChevronDown: icon, Flame: icon, Settings2: icon },
     '@sdk/catalog': { enabled: () => true },
     '@sdk/polling': { usePluginPolling() {} },
     '@sdk/ui': { host: async () => true },
-    '@/api/modules/accountWarmup': { readAccountWarmup: async () => snapshot(), ...api },
+    '@/api/modules/accountWarmup': { ...requestHelpers, readAccountWarmup: async () => snapshot(), ...api },
     '@/components/base/BasePopover.vue': vue.defineComponent({ setup: (_, { slots }) => () => vue.h('div', [slots.trigger?.({ open: true }), slots.default?.({ close() {} })]) }),
-  })
+  }
+  const component = sfc('../../plugins/accounts/ui/page/components/AccountWarmupToolbar.vue', modules)
+  const modal = sfc('../../plugins/accounts/ui/page/components/AccountWarmupModal.vue', modules)
+  const { useAccountWarmup } = evaluate(read('../../plugins/accounts/ui/page/composables/useAccountWarmup.ts'), modules, 'useAccountWarmup')
   const r = renderer()
   const state = vue.reactive({ selectedAccountIds: ['page-1-account', 'page-2-account'], archived: false, ...props })
-  const app = r.runtime.createApp({ render: () => vue.h(component, state) })
+  let controller
+  const app = r.runtime.createApp({ setup() {
+    controller = vue.reactive(useAccountWarmup(vue.toRef(state, 'archived')))
+    return () => vue.h('div', [
+      vue.h(component, { ...state, ready: controller.ready, installed: controller.installed, submitting: controller.submitting, status: controller.status, onRun: ids => controller.open(ids) }),
+      vue.h(modal, {
+        'open': controller.dialogOpen,
+        'onUpdate:open': value => controller.dialogOpen = value,
+        'modelValue': controller.request,
+        'onUpdate:modelValue': value => controller.request = value,
+        'targetName': controller.targetName,
+        'ready': controller.ready && !state.archived,
+        'locked': controller.requestLocked,
+        'unresolved': Boolean(controller.pendingSubmission),
+        'submitting': controller.submitting,
+        'error': controller.submitError,
+        'models': controller.models,
+        'accounts': controller.view?.available ? controller.view.accounts : [],
+        'catalogAccountId': controller.modelAccountId,
+        'modelsLoading': controller.modelsLoading,
+        'modelsError': controller.modelsError,
+        'onCatalog': controller.loadModels,
+        'onSubmit': controller.submit,
+      }),
+    ])
+  } })
   app.mount(r.root)
-  return { ...r, app, state }
+  return { ...r, app, state, controller }
 }
 test('real toolbar submits all cross-page selected IDs and an explicit all scope', async () => {
   const calls = []
   const f = mountToolbar({ runAccountWarmup: async (input) => { calls.push(input); return { run } } })
   await settle()
   await all(f.root, n => n.type === 'button' && text(n).includes('预热选中 (2)'))[0].props.onClick()
+  await settle()
+  await all(f.root, n => n.type === 'button' && text(n).includes('开始预热'))[0].props.onClick()
+  await settle()
   assert.deepEqual(calls[0].accountIds, ['page-1-account', 'page-2-account'])
   assert.equal(calls[0].scope, 'selected')
   assert.match(text(f.root), /已加入预热队列/)
   assert.doesNotMatch(text(f.root), /预热成功/)
   await all(f.root, n => n.type === 'button' && text(n).includes('预热全部当前账号'))[0].props.onClick()
+  await settle()
+  await all(f.root, n => n.type === 'button' && text(n).includes('开始预热'))[0].props.onClick()
+  await settle()
   assert.equal(calls[1].scope, 'all')
   assert.equal(Object.hasOwn(calls[1], 'accountIds'), false)
   f.app.unmount()
@@ -103,13 +140,19 @@ test('real toolbar retains submission ID after an unknown network result and blo
       throw new Error('网络断开'); return { run }
   } })
   await settle()
-  const click = () => all(f.root, n => n.type === 'button' && text(n).includes('预热选中 (2)'))[0].props.onClick()
-  await click()
-  await click()
+  await all(f.root, n => n.type === 'button' && text(n).includes('预热选中 (2)'))[0].props.onClick()
+  await settle()
+  await all(f.root, n => n.type === 'button' && text(n).includes('开始预热'))[0].props.onClick()
+  await settle()
+  assert.equal(f.controller.requestLocked, true)
+  f.controller.dialogOpen = false
+  f.controller.open(['a-different-account'])
+  await settle()
+  await all(f.root, n => n.type === 'button' && text(n).includes('核对提交结果'))[0].props.onClick()
   assert.equal(calls[0].submissionId, calls[1].submissionId)
   f.state.archived = true
   await settle()
-  await click()
+  await f.controller.submit()
   assert.equal(calls.length, 2)
   assert.match(text(f.root), /归档账号不参与预热/)
   f.app.unmount()
@@ -121,9 +164,110 @@ test('unavailable service is an ordinary disabled toolbar state', async () => {
   assert.equal(all(f.root, n => n.type === 'button' && text(n).includes('预热选中 (2)'))[0].props.disabled, true)
   f.app.unmount()
 })
+test('legacy services cannot submit new request fields and invalid model text is rejected before submission', async () => {
+  const legacy = snapshot()
+  delete legacy.settings.prompt
+  delete legacy.settings.reasoningEffort
+  delete legacy.accountStates
+  const f = mountToolbar({ readAccountWarmup: async () => legacy, runAccountWarmup: async () => assert.fail() })
+  await settle()
+  assert.equal(f.controller.ready, false)
+  assert.match(text(f.root), /请升级预热插件/)
+  f.controller.open([account.id])
+  assert.equal(f.controller.dialogOpen, false)
+  assert.match(requestHelpers.warmupRequestError({ model: 'gpt\t6', prompt: 'hi', reasoningEffort: 'auto' }), /模型 ID/)
+  f.app.unmount()
+})
+test('a newer batch replaces a stale manual summary instead of leaving it queued forever', async () => {
+  let current = snapshot()
+  const f = mountToolbar({ readAccountWarmup: async () => current, runAccountWarmup: async () => ({ run }) })
+  await settle()
+  f.controller.open([account.id])
+  await f.controller.submit()
+  assert.match(f.controller.status, /已加入预热队列/)
+  current = { ...snapshot(), runtime: { ready: true, nextRunAt: null, lastRun: { ...run, id: 'new-automatic', source: 'daily', status: 'completed' } } }
+  await f.controller.refresh()
+  assert.equal(f.controller.result, undefined)
+  assert.match(f.controller.status, /最近预热已结束/)
+  f.app.unmount()
+})
+test('single account manual request freezes the chosen prompt, model and effort without editing automation', async () => {
+  const calls = []
+  const current = snapshot()
+  current.settings.reasoningEffort = 'low'
+  const f = mountToolbar({
+    readAccountWarmup: async () => current,
+    runAccountWarmup: async (value) => { calls.push(value); return { run } },
+  })
+  await settle()
+  f.controller.openAccount({ ...account, name: '单账号', lifecycle: { archived: false } })
+  await settle()
+  all(f.root, n => n.props['aria-label'] === '本次预热提示词')[0].props.onInput({ target: { value: 'Hello\n请简短回复' } })
+  all(f.root, n => n.props['aria-label'] === '本次预热推理强度')[0].props.onInput({ target: { value: 'high' } })
+  await settle()
+  await f.controller.submit()
+  assert.deepEqual(calls[0].accountIds, [account.id])
+  assert.equal(calls[0].prompt, 'Hello\n请简短回复')
+  assert.equal(calls[0].reasoningEffort, 'high')
+  assert.equal(calls[0].model, current.settings.defaultModel)
+  assert.equal(current.settings.prompt, 'hi')
+  assert.equal(current.settings.reasoningEffort, 'low')
+  f.app.unmount()
+})
+test('account controls block active, archived, quota-protected and unsupported accounts', async () => {
+  const current = snapshot()
+  const row = { ...account, lifecycle: { archived: false } }
+  const f = mountToolbar({ readAccountWarmup: async () => current })
+  await settle()
+  assert.equal(f.controller.canRun(row), true)
+  assert.equal(f.controller.canRun({ ...row, provider: 'xai' }), false)
+  assert.equal(f.controller.canRun({ ...row, status: 'disabled' }), false)
+  assert.equal(f.controller.canRun({ ...row, quotaProtectionReached: true }), false)
+  assert.equal(f.controller.canRun({ ...row, lifecycle: { archived: true } }), false)
+  for (const status of ['queued', 'running']) {
+    current.accountStates[account.id] = { status }
+    await f.controller.refresh()
+    assert.equal(f.controller.canRun(row), false)
+  }
+  f.app.unmount()
+})
+test('a background status refresh preserves the model catalog and rejects unsupported manual effort', async () => {
+  const calls = []
+  const catalog = [{ id: 'gpt-6.1-sol', label: '模型', reasoningEfforts: ['low'] }]
+  const f = mountToolbar({
+    readAccountWarmup: async (input = {}) => ({ ...snapshot(), accounts: [{ ...account, models: input.includeModels ? catalog : null }] }),
+    runAccountWarmup: async (value) => { calls.push(value); return { run } },
+  })
+  await settle()
+  f.controller.open([account.id])
+  await settle()
+  await f.controller.refresh()
+  assert.deepEqual(JSON.parse(JSON.stringify(f.controller.models)), catalog)
+  f.controller.request.reasoningEffort = 'high'
+  await f.controller.submit()
+  assert.match(f.controller.submitError, /不支持/)
+  assert.equal(calls.length, 0)
+  assert.equal(f.controller.pendingSubmission, undefined)
+  f.app.unmount()
+})
+test('warmup badges expire the current window and never turn acceptance or missing data into warmed', async () => {
+  const component = sfc('../../plugins/accounts/ui/page/components/AccountWarmupBadge.vue', { '@lucide/vue': { Flame: icon } })
+  const now = Date.parse('2026-10-30T08:00:00Z')
+  const render = (state, ready = true) => renderToString(vue.createSSRApp({ render: () => vue.h(component, { state, ready, now }) }))
+  const current = await render({ status: 'warmed', resetAt: '2026-10-30T09:00:00Z' })
+  assert.match(current, /已预热/)
+  assert.match(current, /当前 5 小时额度窗口已启动/)
+  const expired = await render({ status: 'warmed', resetAt: '2026-10-30T08:00:00Z' })
+  assert.match(expired, /待预热/)
+  assert.doesNotMatch(expired, /已预热/)
+  assert.match(await render({ status: 'unconfirmed', resetAt: null }), /计时待确认/)
+  assert.match(await render({ status: 'unknown', resetAt: null }), /结果未知/)
+  assert.match(await render(undefined), /状态不可用/)
+  assert.match(await render({ status: 'pending' }, false), /状态不可用/)
+})
 test('real expanded account fields keep independent overrides and null inheritance', async () => {
   const state = vue.reactive({ settings: model.defaultWarmupSettings() })
-  const component = sfc('../../plugins/account-warmup/ui/page/components/WarmupAccountRow.vue', { ...base, '@lucide/vue': { ChevronDown: icon, RefreshCw: icon }, '../model': model })
+  const component = sfc('../../plugins/account-warmup/ui/page/components/WarmupAccountRow.vue', { ...base, '@lucide/vue': { ChevronDown: icon, RefreshCw: icon }, '@/api/modules/accountWarmup': requestHelpers, '../model': model })
   const r = renderer()
   const app = r.runtime.createApp({ render: () => vue.h(component, { account, name: '测试账号', settings: state.settings, selected: true, disabled: false, models: [], modelsLoading: false, modelsError: '', onOverride: (value) => { state.settings.accountOverrides = [value] } }) })
   app.mount(r.root)
@@ -152,6 +296,7 @@ test('polling preserves dirty settings and revision conflicts retain the draft',
     '@sdk/polling': { usePluginPolling() {} },
     '@/api/modules/accounts': { getAccounts: async () => ({ items: [], page: { totalPages: 1 } }) },
     '@/api/modules/accountWarmup': {
+      ...requestHelpers,
       readAccountWarmup: async () => current,
       accountWarmupHistory: async () => ({ runs: [], items: [] }),
       cancelAccountWarmup: async () => ({ run }),
@@ -206,6 +351,7 @@ test('a poll started during save cannot replace the newly saved settings', async
     '@sdk/polling': { usePluginPolling() {} },
     '@/api/modules/accounts': { getAccounts: async () => ({ items: [], page: { totalPages: 1 } }) },
     '@/api/modules/accountWarmup': {
+      ...requestHelpers,
       readAccountWarmup: async () => ++reads === 1 ? snapshot() : new Promise((resolve) => { resolvePoll = resolve }),
       accountWarmupHistory: async () => ({ runs: [], items: [] }),
       cancelAccountWarmup: async () => ({ run }),

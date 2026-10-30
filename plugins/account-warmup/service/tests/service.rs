@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use account_warmup::{Account, Settings as WarmupSettings, Store, WarmupService};
+use account_warmup::{Account, AccountOverride, Settings as WarmupSettings, Store, WarmupService};
 use chrono::Utc;
 use plugin_sdk::{
     Context, Descriptor, Kernel, Plugin, RpcResult, Server, Settings, protocol::*,
@@ -30,7 +30,7 @@ fn descriptor() -> Descriptor {
         },
         kernel_api: PluginApi {
             major: 0,
-            min_minor: 7,
+            min_minor: 8,
         },
         hooks: vec!["admin.call".into()],
         capabilities: vec!["accounts.warmup.read".into(), "accounts.warmup.run".into()],
@@ -127,6 +127,8 @@ async fn manual_all_is_resolved_in_service_and_unsupported_is_visible() {
         "accounts.warmup.run" => {
             assert_eq!(params["accountId"], "a");
             assert_eq!(params["timeoutMs"], 15000);
+            assert_eq!(params["prompt"], "hi");
+            assert_eq!(params["reasoningEffort"], "auto");
             sent.fetch_add(1, Ordering::SeqCst);
             Some(Ok(json!({"outcome":"accepted","reasonCode":null,"status":200,"durationMs":3,"sendState":"sent","shortTerm":null})))
         }
@@ -211,12 +213,184 @@ async fn interrupted_run_is_unknown_and_same_submission_never_resends() {
         .await
         .unwrap();
     assert_eq!(result["run"]["unknown"], 1);
+    let read = fixture
+        .service
+        .dispatch(&fixture.kernel, "read", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(read["accountStates"]["a"]["status"], "unknown");
+    assert!(read["accountStates"]["a"].get("prompt").is_none());
     fixture
         .service
         .tick(&fixture.kernel, Utc::now())
         .await
         .unwrap();
     assert_eq!(sends.load(Ordering::SeqCst), 1);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn manual_overrides_replace_each_target_snapshot_and_leave_automatic_settings_unchanged() {
+    let fixture = Fixture::start().await;
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = calls.clone();
+    fixture.peer.set_handler(move |method, params| match method {
+        "accounts.warmup.read" => Some(Ok(directory())),
+        "accounts.warmup.run" => {
+            captured.lock().unwrap().push(params.clone());
+            Some(Ok(json!({"outcome":"accepted","reasonCode":null,"status":200,"durationMs":3,"sendState":"sent","shortTerm":null})))
+        }
+        _ => None,
+    });
+    let automatic = WarmupSettings {
+        prompt: "automatic prompt".into(),
+        reasoning_effort: "low".into(),
+        jitter_min_seconds: 0,
+        jitter_max_seconds: 0,
+        account_overrides: vec![AccountOverride {
+            account_id: "a".into(),
+            enabled: true,
+            daily_time: None,
+            model: Some("account-model".into()),
+            reasoning_effort: Some("medium".into()),
+            reset_delay_seconds: None,
+        }],
+        ..WarmupSettings::default()
+    };
+    fixture
+        .service
+        .dispatch(
+            &fixture.kernel,
+            "configure",
+            json!({"expectedRevision":1,"settings":automatic}),
+        )
+        .await
+        .unwrap();
+    let run = fixture
+        .service
+        .dispatch(
+            &fixture.kernel,
+            "run",
+            json!({
+                "submissionId":"explicit-settings", "scope":"selected", "accountIds":["a"],
+                "model":"manual-model", "prompt":"  manual\n\tprompt  ", "reasoningEffort":"high"
+            }),
+        )
+        .await
+        .unwrap();
+    let read = fixture
+        .service
+        .dispatch(&fixture.kernel, "read", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(read["settings"], serde_json::to_value(&automatic).unwrap());
+    assert_eq!(read["revision"], 2);
+    assert_eq!(read["accountStates"]["a"]["status"], "queued");
+    let mut changed = automatic;
+    changed.prompt = "new automatic prompt".into();
+    changed.reasoning_effort = "none".into();
+    fixture
+        .service
+        .dispatch(
+            &fixture.kernel,
+            "configure",
+            json!({"expectedRevision":2,"settings":changed}),
+        )
+        .await
+        .unwrap();
+    fixture
+        .service
+        .tick(&fixture.kernel, Utc::now())
+        .await
+        .unwrap();
+    let sent = calls.lock().unwrap().clone();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["model"], "manual-model");
+    assert_eq!(sent[0]["prompt"], "  manual\n\tprompt  ");
+    assert_eq!(sent[0]["reasoningEffort"], "high");
+    let history = fixture
+        .service
+        .dispatch(
+            &fixture.kernel,
+            "history",
+            json!({"runId":run["run"]["id"],"source":"manual"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(history["items"][0]["prompt"], sent[0]["prompt"]);
+    assert!(
+        fixture
+            .service
+            .dispatch(
+                &fixture.kernel,
+                "history",
+                json!({"runId":run["run"]["id"],"source":"automatic"})
+            )
+            .await
+            .is_err()
+    );
+    let read = fixture
+        .service
+        .dispatch(&fixture.kernel, "read", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(read["settings"], serde_json::to_value(&changed).unwrap());
+    fixture
+        .service
+        .dispatch(
+            &fixture.kernel,
+            "run",
+            json!({"submissionId":"inherited-settings","scope":"selected","accountIds":["a"]}),
+        )
+        .await
+        .unwrap();
+    fixture
+        .service
+        .tick(&fixture.kernel, Utc::now())
+        .await
+        .unwrap();
+    let sent = calls.lock().unwrap().clone();
+    assert_eq!(sent[1]["model"], "account-model");
+    assert_eq!(sent[1]["prompt"], "new automatic prompt");
+    assert_eq!(sent[1]["reasoningEffort"], "medium");
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn invalid_manual_prompt_effort_and_history_source_fail_before_kernel_calls() {
+    let fixture = Fixture::start().await;
+    fixture
+        .peer
+        .set_handler(|_, _| panic!("invalid parameters must not call the kernel"));
+    for patch in [
+        json!({"prompt":" \n\t"}),
+        json!({"prompt":"x\u{0001}"}),
+        json!({"prompt":"中".repeat(1366)}),
+        json!({"reasoningEffort":"max"}),
+        json!({"model":""}),
+    ] {
+        let mut params = json!({"submissionId":"invalid","scope":"all"});
+        params
+            .as_object_mut()
+            .unwrap()
+            .extend(patch.as_object().unwrap().clone());
+        assert_eq!(
+            fixture
+                .service
+                .dispatch(&fixture.kernel, "run", params)
+                .await
+                .unwrap_err()
+                .code,
+            INVALID_PARAMS
+        );
+    }
+    assert!(
+        fixture
+            .service
+            .dispatch(&fixture.kernel, "history", json!({"source":"daily"}))
+            .await
+            .is_err()
+    );
     fixture.finish().await;
 }
 
@@ -314,7 +488,7 @@ async fn lazy_models_translate_account_ids_and_reject_invalid_admin_input() {
             .dispatch(
                 &fixture.kernel,
                 "run",
-                json!({"submissionId":"bad","scope":"all","prompt":"unsafe"})
+                json!({"submissionId":"bad","scope":"all","prompt":"\u{0001}"})
             )
             .await
             .is_err()
@@ -332,6 +506,47 @@ async fn lazy_models_translate_account_ids_and_reject_invalid_admin_input() {
         )
         .await;
     assert_eq!(denied.unwrap_err().code, FORBIDDEN);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn read_preserves_model_reasoning_efforts_and_accepts_older_directory_entries() {
+    let fixture = Fixture::start().await;
+    fixture.peer.set_handler(|method, params| {
+        assert_eq!(method, "accounts.warmup.read");
+        assert_eq!(params["includeModels"], true);
+        let mut response = directory();
+        response["accounts"][0]["models"] = json!([
+            {"id":"supported-model","label":"Supported","reasoningEfforts":["none","low","high"]},
+            {"id":"legacy-model","label":"Legacy"}
+        ]);
+        Some(Ok(response))
+    });
+    let read = fixture
+        .service
+        .dispatch(
+            &fixture.kernel,
+            "read",
+            json!({"accountIds":["a"],"includeModels":true}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        read["accounts"][0]["models"][0]["reasoningEfforts"],
+        json!(["none", "low", "high"])
+    );
+    assert_eq!(
+        read["accounts"][0]["models"][1]["reasoningEfforts"],
+        json!([])
+    );
+    assert_eq!(read["settings"]["prompt"], "hi");
+    assert_eq!(read["settings"]["reasoningEffort"], "auto");
+    assert!(read["runtime"].get("nextAutomaticRunAt").is_some());
+    assert_eq!(
+        read["accountStates"]["a"],
+        json!({"status":"pending","taskId":null,"updatedAt":null,"resetAt":null,"reasonCode":null})
+    );
+    assert_eq!(read["accountStates"]["b"]["status"], "unsupported");
     fixture.finish().await;
 }
 

@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import type { WarmupAccount, WarmupOverride, WarmupSettings } from '@/api/modules/accountWarmup'
+import type { WarmupAccount, WarmupModel, WarmupOverride, WarmupReasoningEffort, WarmupSettings } from '@/api/modules/accountWarmup'
 import { ChevronDown, RefreshCw } from '@lucide/vue'
 import { computed, ref } from 'vue'
+import { warmupEffortOptions } from '@/api/modules/accountWarmup'
 import BaseButton from '@/components/base/BaseButton.vue'
 import BaseCheckbox from '@/components/base/BaseCheckbox.vue'
 import BaseFormItem from '@/components/base/BaseForm/FormItem.vue'
@@ -16,7 +17,7 @@ const props = defineProps<{
   settings: WarmupSettings
   selected: boolean
   disabled: boolean
-  models: { id: string, label: string }[]
+  models: WarmupModel[]
   modelsLoading: boolean
   modelsError: string
 }>()
@@ -28,6 +29,9 @@ const emit = defineEmits<{
 const expanded = ref(false)
 const override = computed(() => accountOverride(props.settings, props.account.id))
 const effectiveModel = computed(() => override.value.model ?? props.settings.defaultModel)
+const effectiveEffort = computed(() => override.value.reasoningEffort ?? props.settings.reasoningEffort)
+const effortOptions = computed(() => warmupEffortOptions(props.models.find(item => item.id === effectiveModel.value), effectiveEffort.value))
+const effortLabel = computed(() => effortOptions.value.find(item => item.value === effectiveEffort.value)?.label ?? effectiveEffort.value)
 const modelOptions = computed(() => {
   const entries = new Map(props.models.map(item => [item.id, { value: item.id, label: item.label || item.id }]))
   if (effectiveModel.value && !entries.has(effectiveModel.value))
@@ -36,6 +40,10 @@ const modelOptions = computed(() => {
 })
 function update(value: Partial<WarmupOverride>) {
   emit('override', { ...override.value, ...value })
+}
+function updateEffort(value: string) {
+  if (effortOptions.value.some(item => item.value === value && !item.disabled))
+    update({ reasoningEffort: value as WarmupReasoningEffort })
 }
 function toggle() {
   expanded.value = !expanded.value
@@ -55,7 +63,7 @@ function toggle() {
         </span>
         <span class="hidden text-right text-cp-xs text-cp-text-secondary sm:block">
           {{ override.enabled ? (override.dailyTime ?? `默认 ${settings.dailyTime}`) : '不自动参与' }}
-          <span class="mt-1 block max-w-52 truncate">{{ effectiveModel }}</span>
+          <span class="mt-1 block max-w-52 truncate">{{ effectiveModel }} · {{ effortLabel }}</span>
         </span>
         <ChevronDown class="size-4 shrink-0 transition-transform" :class="expanded ? 'rotate-180' : ''" />
       </button>
@@ -95,6 +103,13 @@ function toggle() {
         </p>
         <p v-if="modelsError" role="alert" class="mt-2 mb-0 text-cp-xs text-cp-error-text">
           {{ modelsError }}
+        </p>
+      </BaseFormItem>
+      <BaseFormItem label="推理强度" class="sm:col-span-2">
+        <BaseCheckbox :model-value="override.reasoningEffort !== null" :label="`${name} 使用独立推理强度`" show-label :disabled="disabled || !account.supported" @update:model-value="update({ reasoningEffort: $event ? settings.reasoningEffort : null })" />
+        <BaseSelect v-if="override.reasoningEffort !== null" class="mt-2" :model-value="override.reasoningEffort" :options="effortOptions" :aria-label="`${name} 独立推理强度`" :disabled="disabled || modelsLoading" @update:model-value="updateEffort" />
+        <p v-else class="mt-2 mb-0 text-cp-xs text-cp-text-secondary">
+          跟随默认 {{ effortLabel }}
         </p>
       </BaseFormItem>
       <p class="m-0 text-cp-xs text-cp-text-secondary sm:col-span-2">

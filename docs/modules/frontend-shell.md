@@ -18,7 +18,7 @@
 
 **路由与登录**（`router/`）：几乎所有受保护路由（`/`、`/accounts`、`/proxies`、`/groups`、`/keys`、`/usage`、`/theme`、`/settings*`、`/extensions/:plugin/:page?`、独立的 `/key-usage`）都指向同一个 `PluginRoute.vue`，由插件页面声明的 `route` 决定显示谁；`/settings/plugins` 是主壳自带的 `PluginManager.vue`。`beforeEach`：先 `checkAuth`（本机预览 origin 下自动走 `/api/plugin-platform/local-login`），未登录跳 `/login`（带 `redirect`），Key 身份只能进 `/key-usage`，管理员访问 `/key-usage` 回仪表盘。管理员与 Key 共用 `/api/auth/*`，Auth Store 只有一份。
 
-**请求层**（`api/request.ts`）：Axios 实例 `withCredentials`；统一信封 `{code,message,data}`，HTTP 成功但业务码失败也拒绝；`ApiError` 带 `status` `code` `requestId` `kind`；错误提示统一在拦截器弹 toast（`silent` 只关提示，不吞异常、不跳过会话失效处理）；业务码 `40101` + 401 触发一次性会话失效处理。`api/modules/*.ts` 是各接口的类型与调用封装（账号、账号预热、分组、Key、代理、用量、仪表盘、备份、定价、设置、客户端画像、系统更新等），插件直接 `import`。`accountWarmup.ts` 只声明预热服务的 read/configure/run/history/cancel 能力，实际执行由宿主桥转发。
+**请求层**（`api/request.ts`）：Axios 实例 `withCredentials`；统一信封 `{code,message,data}`，HTTP 成功但业务码失败也拒绝；`ApiError` 带 `status` `code` `requestId` `kind`；错误提示统一在拦截器弹 toast（`silent` 只关提示，不吞异常、不跳过会话失效处理）；业务码 `40101` + 401 触发一次性会话失效处理。`api/modules/*.ts` 是各接口的类型与调用封装（账号、账号预热、分组、Key、代理、用量、仪表盘、备份、定价、设置、客户端画像、系统更新等），插件直接 `import`。`accountWarmup.ts` 声明预热 read/configure/run/history/cancel、按账号状态摘要、自动来源筛选以及提示词/模型/推理强度的统一类型与前端校验；实际执行由宿主桥转发。模型强度选项遵循目录能力，未知目录交给执行时校验，明确不支持的当前值保留展示但禁选。
 
 **插件运行环境**（`plugins/`）：
 - `platform.ts`：`platformPlugins`（`/api/plugin-platform/catalog` 目录，内容未变化不触发响应式更新）、`openPlugin`（弹出式页面）；`catalog.ts`：原生插件（Excel 等）目录 `/api/plugins`。

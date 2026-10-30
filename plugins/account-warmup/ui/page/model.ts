@@ -1,9 +1,18 @@
 import type { WarmupAccount, WarmupOverride, WarmupSettings, WarmupTask } from '@/api/modules/accountWarmup'
 
 export function defaultWarmupSettings(): WarmupSettings {
-  return { enabled: false, timezone: 'Asia/Shanghai', dailyEnabled: false, dailyTime: '08:00', resetEnabled: true, resetDelaySeconds: 30, jitterMinSeconds: 5, jitterMaxSeconds: 15, targetMode: 'all', accountIds: [], defaultModel: 'gpt-6.1-sol', accountOverrides: [] }
+  return { enabled: false, timezone: 'Asia/Shanghai', dailyEnabled: false, dailyTime: '08:00', resetEnabled: true, resetDelaySeconds: 30, jitterMinSeconds: 5, jitterMaxSeconds: 15, targetMode: 'all', accountIds: [], defaultModel: 'gpt-6.1-sol', prompt: 'hi', reasoningEffort: 'auto', accountOverrides: [] }
 }
-export const cloneSettings = (value: WarmupSettings): WarmupSettings => JSON.parse(JSON.stringify(value))
+export function cloneSettings(value: WarmupSettings): WarmupSettings {
+  const cloned = JSON.parse(JSON.stringify(value)) as WarmupSettings
+  // 旧服务返回的配置没有请求字段；补齐默认值后再建立草稿基线。
+  return {
+    ...cloned,
+    prompt: cloned.prompt ?? 'hi',
+    reasoningEffort: cloned.reasoningEffort ?? 'auto',
+    accountOverrides: cloned.accountOverrides.map(item => ({ ...item, reasoningEffort: item.reasoningEffort ?? null })),
+  }
+}
 export function settingsError(value: WarmupSettings) {
   const time = (input: string) => /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(input)
   const seconds = (input: number) => Number.isSafeInteger(input) && input >= 0 && input <= 86400
@@ -36,7 +45,8 @@ export function settingsError(value: WarmupSettings) {
   return ''
 }
 export function accountOverride(value: WarmupSettings, accountId: string): WarmupOverride {
-  return value.accountOverrides.find(item => item.accountId === accountId) ?? { accountId, enabled: true, dailyTime: null, model: null, resetDelaySeconds: null }
+  const override = value.accountOverrides.find(item => item.accountId === accountId)
+  return override ? { ...override, reasoningEffort: override.reasoningEffort ?? null } : { accountId, enabled: true, dailyTime: null, model: null, resetDelaySeconds: null, reasoningEffort: null }
 }
 export const reasonLabels: Record<string, string> = {
   unsupported: '暂不支持此账号类型',
@@ -52,6 +62,7 @@ export const reasonLabels: Record<string, string> = {
   quota_protection_reached: '已达到养号阈值',
   model_not_allowed: '账号政策不允许此模型',
   model_denied: '账号政策不允许此模型',
+  reasoning_unsupported: '模型目录未确认支持所选推理强度',
   rate_limited: '账号冷却中',
   credential_invalid: '账号需要重新授权',
   credential_expired: '凭据已过期',

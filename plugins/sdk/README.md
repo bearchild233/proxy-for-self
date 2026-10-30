@@ -1,9 +1,11 @@
-# Rust 插件 SDK（kernelApi 0.6）
+# Rust 插件 SDK（kernelApi 0.8）
 
 `plugins/Cargo.toml` 是独立 workspace。`kernel-protocol` 是 backend workspace 成员，
 插件通过路径依赖使用它；其 edition、license、rust-version 与 lints 从所属的 backend
 workspace 继承，不从消费它的 plugins workspace 继承。两个 workspace 各自维护 Cargo.lock。
 插件构建镜像保留 backend workspace 元数据和成员，Cargo 不构建无关 backend crate。
+
+账号预热 0.2.0 声明 `minMinor: 8`，支持有界 `prompt`、`reasoningEffort` 与模型目录强度。旧参数缺字段继续默认 `hi/auto`；服务插件按自身实际使用的能力声明最低次版本。
 
 ## 编写插件
 

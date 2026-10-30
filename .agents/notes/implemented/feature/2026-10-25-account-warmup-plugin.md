@@ -8,6 +8,8 @@ Status: implemented
 
 ## Decision
 
+请求字段、账号状态标签与手动/自动页面职责由[账号预热交互与请求设置](2026-10-30-account-warmup-controls.md)部分取代；本文保留初始固定 hi 契约的理由以及仍适用的服务所有权、队列、授权和恢复边界。
+
 采用独立Rust常驻`account-warmup`插件和自有SQLite配置、队列、结果及设置页。账号管理保留列表、备注和养号逻辑，只添加预热全部/选中及设置入口。内核提供两个窄维护能力，后续业务规则和页面随插件更新，不新增PostgreSQL迁移。
 
 内核协议0.7新增`accounts.warmup.read`和`accounts.warmup.run`，只允许显式授权的`account-warmup`身份。维护范围不借用业务ownership/watchedGroups，也不改变原有分组授权。run固定单账号、hi、最低受支持推理强度、只读响应头、单次发送、不换号、不传出Cookie/state或任意提示词。复用账号出口及被动额度观测，发送前验证停用、认证、冷却、官方额度、养号、模型政策和共享账号调度租约。首版仅OpenAI OAuth可用；其它类型明示不支持，不伪报成功。返回accepted只表示上游收头成功，另以真实短窗口resetAt表示计时已确认。

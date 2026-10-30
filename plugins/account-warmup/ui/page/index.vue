@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import type { WarmupOverride } from '@/api/modules/accountWarmup'
+import type { WarmupOverride, WarmupReasoningEffort } from '@/api/modules/accountWarmup'
 import { ArrowLeft, Clock3, RefreshCw, Save } from '@lucide/vue'
 import { host } from '@sdk/ui'
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
+import { warmupEffortOptions, warmupRequestError } from '@/api/modules/accountWarmup'
 import BaseButton from '@/components/base/BaseButton.vue'
 import BaseCard from '@/components/base/BaseCard.vue'
 import BaseFormItem from '@/components/base/BaseForm/FormItem.vue'
@@ -11,6 +12,7 @@ import BasePageHeader from '@/components/base/BasePageHeader.vue'
 import BaseSegmented from '@/components/base/BaseSegmented.vue'
 import BaseSelect from '@/components/base/BaseSelect.vue'
 import BaseSwitch from '@/components/base/BaseSwitch.vue'
+import BaseTextarea from '@/components/base/BaseTextarea.vue'
 import WarmupAccountRow from './components/WarmupAccountRow.vue'
 import WarmupHistory from './components/WarmupHistory.vue'
 import { formatWarmupTime } from './model'
@@ -24,6 +26,8 @@ const available = computed(() => view.value?.available === true)
 const accounts = computed(() => view.value?.available ? view.value.accounts : [])
 const runtime = computed(() => view.value?.available ? view.value.runtime : undefined)
 const savedEnabled = computed(() => view.value?.available && view.value.settings.enabled)
+const promptBytes = computed(() => new TextEncoder().encode(draft.value.prompt).length)
+const promptError = computed(() => warmupRequestError({ prompt: draft.value.prompt, reasoningEffort: 'auto' }))
 const filtered = computed(() => {
   const query = search.value.trim().toLowerCase()
   return accounts.value.filter(account => `${names.value.get(account.id)?.name ?? ''} ${account.id} ${account.provider}`.toLowerCase().includes(query))
@@ -38,6 +42,11 @@ const modelOptions = computed(() => {
     entries.set(draft.value.defaultModel, { value: draft.value.defaultModel, label: `${draft.value.defaultModel}（已设置）` })
   return [...entries.values()]
 })
+const effortOptions = computed(() => warmupEffortOptions(models.value[catalogAccountId.value]?.find(item => item.id === draft.value.defaultModel), draft.value.reasoningEffort))
+function setEffort(value: string) {
+  if (effortOptions.value.some(item => item.value === value && !item.disabled))
+    draft.value.reasoningEffort = value as WarmupReasoningEffort
+}
 function selectAccount(id: string, selected: boolean) {
   const next = new Set(draft.value.accountIds)
   if (selected)
@@ -53,6 +62,10 @@ function setCatalog(id: string) {
   if (id)
     void loadModels(id, draft.value.defaultModel)
 }
+watch(accounts, (value) => {
+  if (!value.some(item => item.id === catalogAccountId.value && item.supported))
+    setCatalog(value.find(item => item.supported)?.id ?? '')
+}, { immediate: true })
 async function back() {
   try {
     await host('navigate', { path: '/accounts' })
@@ -63,7 +76,7 @@ async function back() {
 
 <template>
   <div class="flex w-full flex-col gap-4 pb-6">
-    <BasePageHeader title="账号预热" description="发送一次 hi，按真实额度观测安排下一次预热">
+    <BasePageHeader title="自动预热" description="管理后台自动化计划；手动预热请返回账号管理。">
       <template #actions>
         <BaseButton variant="secondary" @click="back">
           <ArrowLeft class="size-4" /> 返回账号管理
@@ -77,7 +90,7 @@ async function back() {
       </template>
     </BasePageHeader>
     <p class="m-0 rounded-cp bg-cp-primary-container px-4 py-3 text-cp-sm leading-relaxed text-cp-primary-on-container">
-      每个目标账号发送一次 hi，仅收取响应头。上游受理不代表已开启 5 小时计时；只有观测到真实短窗口 resetAt 才显示“计时已确认”。首版支持 OpenAI OAuth，沿用账号出口、额度和养号保护。
+      本页设置每日计划和额度重置后的自动任务，关闭浏览器后仍会执行。每次发送一条预热请求，仅收取响应头；上游受理不代表已开启 5 小时计时，只有真实额度观测才能确认。支持 OpenAI OAuth，沿用账号出口、额度和养号保护。
     </p>
     <div v-if="error || (view && !view.available)" role="alert" class="rounded-cp bg-cp-error-container p-4 text-cp-sm text-cp-error-text">
       {{ error || (view && !view.available && view.reason === 'plugin_disabled' ? '预热插件未安装或未启用，请在插件管理中启用。' : '预热服务尚未就绪，请稍后刷新。') }}
@@ -125,29 +138,37 @@ async function back() {
           </BaseFormItem>
         </div>
         <p class="mt-4 mb-0 flex flex-wrap items-center gap-x-4 gap-y-1 text-cp-xs text-cp-text-secondary" role="status">
-          <span><Clock3 class="mr-1 inline size-3.5" /> {{ savedEnabled ? (runtime?.ready ? '自动预热已开启' : '服务尚未就绪') : '自动预热已关闭' }}{{ dirty ? ' · 草稿待保存' : '' }}</span><span>下次任务：{{ formatWarmupTime(runtime?.nextRunAt) }}</span><span>最近批次：{{ runtime?.lastRun ? formatWarmupTime(runtime.lastRun.createdAt) : '—' }}</span>
+          <span><Clock3 class="mr-1 inline size-3.5" /> {{ savedEnabled ? (runtime?.ready ? '自动预热已开启' : '服务尚未就绪') : '自动预热已关闭' }}{{ dirty ? ' · 草稿待保存' : '' }}</span><span>下次自动任务：{{ formatWarmupTime(runtime?.nextAutomaticRunAt) }}</span><span>最近自动批次：{{ formatWarmupTime(runs[0]?.createdAt) }}</span>
         </p>
       </BaseCard>
-      <BaseCard title="预热模型" description="手动预热使用已保存配置；每个账号可在下方覆盖默认模型。">
-        <div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          <BaseFormItem label="默认模型 ID">
-            <BaseInput v-model="draft.defaultModel" aria-label="默认预热模型 ID" :disabled="saving" />
-          </BaseFormItem>
+      <BaseCard title="自动预热请求" description="提示词、默认模型和推理强度仅用于后台自动任务，不修改账号管理中手动预热的本次参数。">
+        <template #actions>
+          <BaseButton v-if="catalogAccountId" size="sm" :loading="modelLoading.has(catalogAccountId)" :disabled="saving" @click="loadModels(catalogAccountId, draft.defaultModel)">
+            <RefreshCw class="size-3.5" /> 刷新模型目录
+          </BaseButton>
+        </template>
+        <BaseFormItem label="预热提示词" :description="`最多 4096 字节，可使用多行文本；当前 ${promptBytes} / 4096 字节。`" :error="promptError">
+          <BaseTextarea v-model="draft.prompt" :rows="4" aria-label="自动预热提示词" placeholder="hi" :disabled="saving" />
+        </BaseFormItem>
+        <div class="mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
           <BaseFormItem label="读取账号模型目录">
             <BaseSelect :model-value="catalogAccountId" searchable :options="catalogOptions" aria-label="模型目录账号" :disabled="saving" @update:model-value="setCatalog" />
           </BaseFormItem>
-          <BaseFormItem v-if="catalogAccountId" label="从模型目录选择">
+          <BaseFormItem label="默认自动预热模型">
             <BaseSelect v-model="draft.defaultModel" searchable :options="modelOptions" aria-label="选择默认预热模型" :disabled="saving || modelLoading.has(catalogAccountId)" />
+          </BaseFormItem>
+          <BaseFormItem label="默认推理强度" description="自动会选择该模型支持的最低强度。">
+            <BaseSelect :model-value="draft.reasoningEffort" :options="effortOptions" aria-label="自动预热默认推理强度" :disabled="saving" @update:model-value="setEffort" />
           </BaseFormItem>
         </div>
         <p v-if="catalogAccountId && modelErrors[catalogAccountId]" role="alert" class="mt-3 mb-0 text-cp-xs text-cp-error-text">
           {{ modelErrors[catalogAccountId] }}
         </p>
         <p class="mt-3 mb-0 text-cp-xs text-cp-text-secondary">
-          目录属于所选账号，各账号实际权限可能不同；执行前由服务逐项校验，未授权的模型会跳过。
+          目录属于所选账号，各账号实际权限和支持的强度可能不同；可在下方覆盖各账号的模型与强度。目录不可用时保留已保存的模型，执行前由服务逐项校验。
         </p>
       </BaseCard>
-      <BaseCard title="参与账号" description="自动计划的账号范围独立于主列表勾选；手动预热以点击时的全部或选中范围为准。">
+      <BaseCard title="参与账号" description="这里只选择后台自动计划的目标账号，账号管理中的手动操作使用本次选择的范围。">
         <template #actions>
           <span class="text-cp-sm text-cp-text-secondary">指定 {{ draft.accountIds.length }} 个 · 目录 {{ accounts.length }} 个</span>
         </template>
@@ -162,7 +183,7 @@ async function back() {
           {{ namesError }}
         </p>
         <p class="my-3 text-cp-xs text-cp-text-secondary">
-          停用、归档、不支持或受额度保护的账号会在执行前跳过；展开账号可设置独立时间、模型和重置延迟。
+          停用、归档、不支持或受额度保护的账号会在执行前跳过；展开账号可设置独立时间、模型、推理强度和重置延迟。
         </p>
         <div class="grid gap-2">
           <WarmupAccountRow v-for="account in visibleAccounts" :key="account.id" :account="account" :name="names.get(account.id)?.name || account.id" :settings="draft" :selected="draft.accountIds.includes(account.id)" :disabled="saving" :models="models[account.id] ?? []" :models-loading="modelLoading.has(account.id)" :models-error="modelErrors[account.id] ?? ''" @select="selectAccount(account.id, $event)" @override="updateOverride" @models="loadModels" />

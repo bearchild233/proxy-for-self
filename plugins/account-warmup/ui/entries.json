@@ -2,7 +2,7 @@
   "main": {
     "source": "page/index.vue",
     "route": "/extensions/account-warmup",
-    "title": "账号预热",
+    "title": "自动预热",
     "roles": ["admin"]
   }
 }

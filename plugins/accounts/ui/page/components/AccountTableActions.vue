@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import type { AccountRow } from '../constants'
 import type { OAuthExportFormat } from '../utils/oauthExport'
-import { Download, KeyRound, MoreHorizontal, Pencil, RefreshCw, RotateCcw, Trash2, Wifi } from '@lucide/vue'
+import { Download, Flame, KeyRound, MoreHorizontal, Pencil, RefreshCw, RotateCcw, Trash2, Wifi } from '@lucide/vue'
 
 import BaseIconButton from '@/components/base/BaseIconButton.vue'
 import BaseMenuItem from '@/components/base/BaseMenuItem.vue'
@@ -15,6 +15,8 @@ defineProps<{
   testing: boolean
   diagnosticsEnabled: boolean
   exportingOauth: boolean
+  warmupEnabled: boolean
+  warming: boolean
 }>()
 
 const emit = defineEmits<{
@@ -25,11 +27,22 @@ const emit = defineEmits<{
   refresh: [accountId: string]
   reauthorize: [account: AccountRow]
   exportOauth: [account: AccountRow, format: OAuthExportFormat]
+  warmup: [account: AccountRow]
 }>()
 </script>
 
 <template>
   <div class="relative flex items-center justify-start gap-1">
+    <BaseIconButton
+      variant="ghost"
+      size="sm"
+      :label="warming ? '账号正在预热' : '手动预热账号'"
+      :disabled="!warmupEnabled || warming"
+      @click.stop="emit('warmup', account)"
+    >
+      <Flame class="size-3.5 text-cp-warning-text" :class="warming ? 'animate-pulse motion-reduce:animate-none' : ''" />
+    </BaseIconButton>
+
     <BaseIconButton
       variant="ghost"
       size="sm"

@@ -82,6 +82,8 @@ fn warmup(id: &str) -> AccountWarmupRunParams {
     AccountWarmupRunParams {
         account_id: id.into(),
         model: "gpt-test".into(),
+        prompt: "hi".into(),
+        reasoning_effort: "auto".into(),
         timeout_ms: 15000,
         attempt_id: "warmup_1".into(),
     }
@@ -164,6 +166,192 @@ async fn warmup_uses_one_hi_normal_lease_and_real_secondary_five_hour_window() {
     assert_eq!(leases[0].account_id().as_str(), "acct_a");
     assert_eq!(leases[0].max_concurrent().get(), 3);
     assert_eq!(leases[0].request_interval(), Duration::from_millis(17));
+}
+
+#[tokio::test]
+async fn warmup_preserves_custom_prompt_and_every_explicit_supported_effort() {
+    let server = MockServer::start().await;
+    let efforts = ["none", "minimal", "low", "medium", "high", "xhigh"];
+    Mock::given(method("GET"))
+        .and(path("/codex/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"models":[{
+            "slug":"gpt-test",
+            "display_name":"Test model",
+            "supported_reasoning_levels": efforts.map(|effort| json!({"effort":effort}))
+        }]})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/codex/responses"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(efforts.len() as u64)
+        .mount(&server)
+        .await;
+    let f = Fixture::new(server.uri()).await;
+    let boundary = format!("{}a", "你".repeat(1365));
+    assert_eq!(boundary.len(), 4096);
+    let multiline = "  自定义预热\n\t保留原文\r\n  ";
+    for (index, effort) in efforts.into_iter().enumerate() {
+        let mut params = warmup("acct_a");
+        params.prompt = if index == 0 { &boundary } else { multiline }.into();
+        params.reasoning_effort = effort.into();
+        params.attempt_id = format!("warmup_{index}");
+        let result = f
+            .upstream
+            .warmup_run(&WarmupAccess::granted(), params)
+            .await
+            .unwrap();
+        assert_eq!(result.outcome, AccountWarmupOutcome::Accepted, "{result:?}");
+        assert_eq!(result.send_state, AccountWarmupSendState::Sent);
+    }
+    let requests = server.received_requests().await.unwrap();
+    let posts: Vec<_> = requests
+        .iter()
+        .filter(|request| request.method.as_str() == "POST")
+        .collect();
+    assert_eq!(posts.len(), efforts.len());
+    for (index, (post, effort)) in posts.iter().zip(efforts).enumerate() {
+        let body = zstd::stream::decode_all(std::io::Cursor::new(&post.body)).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body["input"][0]["content"][0]["text"],
+            if index == 0 { &boundary } else { multiline }
+        );
+        assert_eq!(body["reasoning"]["effort"], effort);
+        assert_eq!(body["tools"], json!([]));
+        assert_eq!(body["store"], false);
+    }
+}
+
+#[tokio::test]
+async fn warmup_invalid_prompt_or_effort_never_reaches_network_or_lease() {
+    let server = MockServer::start().await;
+    let f = Fixture::new(server.uri()).await;
+    let mut invalid = Vec::new();
+    for prompt in [
+        String::new(),
+        " \n\r\t ".into(),
+        "a".repeat(4097),
+        "你".repeat(1366),
+        format!(" {} ", "a".repeat(4096)),
+        "hi\0".into(),
+        "\u{b}hi".into(),
+        "hi\u{7f}".into(),
+        "hi\u{85}".into(),
+        "hi\u{1b}".into(),
+    ] {
+        let mut params = warmup("acct_a");
+        params.prompt = prompt;
+        invalid.push(params);
+    }
+    for effort in ["", "Auto", " high ", "max", "unknown"] {
+        let mut params = warmup("acct_a");
+        params.reasoning_effort = effort.into();
+        invalid.push(params);
+    }
+    for params in invalid {
+        let error = f
+            .upstream
+            .warmup_run(&WarmupAccess::granted(), params)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, INVALID_PARAMS);
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
+    assert!(f.warmup_leases.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn warmup_requires_explicit_reasoning_evidence_and_auto_keeps_legacy_behavior() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/codex/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"models":[
+            {"slug":"gpt-test","display_name":"Test model","supported_reasoning_levels":[{"effort":"minimal"},{"effort":"high"}]},
+            {"slug":"gpt-plain","display_name":"Plain model","supported_reasoning_levels":[]},
+            {"slug":"gpt-unknown","display_name":"Unknown model"}
+        ]})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/codex/responses"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let f = Fixture::new(server.uri()).await;
+    for (model, effort) in [
+        ("gpt-test", "low"),
+        ("gpt-plain", "none"),
+        ("gpt-unknown", "high"),
+    ] {
+        let mut params = warmup("acct_a");
+        params.model = model.into();
+        params.reasoning_effort = effort.into();
+        let result = f
+            .upstream
+            .warmup_run(&WarmupAccess::granted(), params)
+            .await
+            .unwrap();
+        assert_eq!(result.outcome, AccountWarmupOutcome::Skipped);
+        assert_eq!(result.reason_code.as_deref(), Some("reasoning_unsupported"));
+        assert_eq!(result.send_state, AccountWarmupSendState::NotSent);
+    }
+    assert!(f.warmup_leases.requests.lock().unwrap().is_empty());
+    let directory = f
+        .upstream
+        .warmup_read(
+            &WarmupAccess::granted(),
+            AccountWarmupReadParams {
+                ids: Some(vec!["acct_a".into()]),
+                model: None,
+                include_models: true,
+            },
+        )
+        .await
+        .unwrap();
+    let models = directory.accounts[0].models.as_ref().unwrap();
+    assert!(
+        models
+            .iter()
+            .find(|model| model.id == "gpt-plain")
+            .unwrap()
+            .reasoning_efforts
+            .is_empty()
+    );
+    assert!(
+        models
+            .iter()
+            .find(|model| model.id == "gpt-unknown")
+            .unwrap()
+            .reasoning_efforts
+            .is_empty()
+    );
+    for model in ["gpt-plain", "gpt-unknown"] {
+        let mut params = warmup("acct_a");
+        params.model = model.into();
+        let result = f
+            .upstream
+            .warmup_run(&WarmupAccess::granted(), params)
+            .await
+            .unwrap();
+        assert_eq!(result.outcome, AccountWarmupOutcome::Accepted);
+    }
+    let requests = server.received_requests().await.unwrap();
+    let posts: Vec<_> = requests
+        .iter()
+        .filter(|request| request.method.as_str() == "POST")
+        .collect();
+    assert_eq!(posts.len(), 2);
+    for post in posts {
+        let body = zstd::stream::decode_all(std::io::Cursor::new(&post.body)).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        if body["model"] == "gpt-plain" {
+            assert!(body.get("reasoning").is_none());
+        } else {
+            assert_eq!(body["reasoning"]["effort"], "low");
+        }
+    }
 }
 
 #[tokio::test]
@@ -359,6 +547,10 @@ async fn warmup_directory_has_labels_and_no_personal_or_credential_fields() {
     assert_eq!(
         result.accounts[0].models.as_ref().unwrap()[0].label,
         "Test model"
+    );
+    assert_eq!(
+        result.accounts[0].models.as_ref().unwrap()[0].reasoning_efforts,
+        ["minimal", "high"]
     );
     assert!(!result.accounts[1].supported);
     let serialized = serde_json::to_string(&result).unwrap();

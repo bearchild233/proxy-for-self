@@ -13,7 +13,7 @@
 | 路径 | 职责 | 文档 |
 | --- | --- | --- |
 | `backend/apps/gateway` | 唯一组合根：读取顶层配置，按 Host → Store → Provider → Core → Admin → API → Worker 顺序初始化并监听；另含 `backend/Cargo.toml`（workspace、lints、release 配置）与 `backend/rust-toolchain.toml` | [gateway-app](modules/gateway-app.md) |
-| `backend/crates/kernel-protocol` | 内核与服务插件共享的 0.7 wire 合同：帧、消息、握手、钩子、能力；叶子 crate | [kernel-protocol](modules/kernel-protocol.md) |
+| `backend/crates/kernel-protocol` | 内核与服务插件共享的 0.8 wire 合同：帧、消息、握手、钩子、能力；叶子 crate | [kernel-protocol](modules/kernel-protocol.md) |
 | `backend/crates/gateway-protocol` | 跨层共享的 OpenAI wire 编解码：SSE、用量与限流解析、Codex 请求语义、传输头分类；叶子 crate | [gateway-protocol](modules/gateway-protocol.md) |
 | `backend/crates/gateway-core` | 数据面核心：operation、canonical event、运行时快照、路由计划、账号选择、准入与限额、attempt 协调与提交边界、计量、Worker 契约、插件端口 | [gateway-core](modules/gateway-core.md) |
 | `backend/crates/gateway-admin` | 管理控制面语义层：Command/Result、用例（账号、分组、Key、代理、设置、观测、备份、系统）、外部能力端口，以及备份 / 定价同步 / 冻结恢复三个后台任务 | [gateway-admin](modules/gateway-admin.md) |

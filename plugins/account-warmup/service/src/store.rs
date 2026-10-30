@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     path::Path,
     sync::{
         Mutex,
@@ -18,7 +18,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 use crate::{
-    model::{Account, Outcome, RunSummary, Settings, TaskItem},
+    model::{Account, AccountState, Outcome, RunSummary, Settings, TaskItem},
     schedule,
 };
 
@@ -78,9 +78,16 @@ impl Store {
              CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY,account TEXT NOT NULL,status TEXT NOT NULL,due INTEGER NOT NULL,expires INTEGER,owner TEXT,lease INTEGER,finished INTEGER,data TEXT NOT NULL);
              CREATE UNIQUE INDEX IF NOT EXISTS active_account ON tasks(account) WHERE status IN ('queued','running');
              CREATE INDEX IF NOT EXISTS task_due ON tasks(status,due);
+             CREATE INDEX IF NOT EXISTS task_automatic_due ON tasks(due) WHERE status='queued' AND json_extract(data,'$.source') IN ('daily','reset');
+             CREATE INDEX IF NOT EXISTS task_account_finished ON tasks(account,finished DESC,id DESC);
+             CREATE INDEX IF NOT EXISTS task_account_status_finished ON tasks(account,status,finished DESC,id DESC);
+             CREATE INDEX IF NOT EXISTS task_confirmed_reset ON tasks(account,json_extract(data,'$.resetAt'),finished DESC,id DESC) WHERE status='accepted' AND json_extract(data,'$.timerConfirmed')=1;
              CREATE TABLE IF NOT EXISTS run_tasks(run_id TEXT NOT NULL,task_id TEXT NOT NULL,PRIMARY KEY(run_id,task_id));
+             CREATE INDEX IF NOT EXISTS run_source_created ON runs(source,created DESC,id DESC);
+             CREATE INDEX IF NOT EXISTS run_created ON runs(created DESC,id DESC);
              CREATE TABLE IF NOT EXISTS occurrences(key TEXT PRIMARY KEY,task_id TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS reset_observations(account TEXT NOT NULL,reset_at INTEGER NOT NULL,observed INTEGER NOT NULL,PRIMARY KEY(account,reset_at));
+             CREATE INDEX IF NOT EXISTS reset_observation_latest ON reset_observations(account,observed DESC,reset_at DESC);
              CREATE TABLE IF NOT EXISTS dispatch_cursor(id INTEGER PRIMARY KEY CHECK(id=1),next_at INTEGER NOT NULL);
              INSERT OR IGNORE INTO dispatch_cursor VALUES(1,0);"
         ).map_err(internal)?;
@@ -208,7 +215,7 @@ impl Store {
                 {
                     transaction
                         .execute(
-                            "INSERT OR IGNORE INTO reset_observations VALUES(?,?,?)",
+                            "INSERT INTO reset_observations VALUES(?,?,?) ON CONFLICT(account,reset_at) DO UPDATE SET observed=max(observed,excluded.observed)",
                             params![
                                 account.id,
                                 reset.timestamp_millis(),
@@ -343,8 +350,26 @@ impl Store {
             item.reset_at = outcome
                 .short_term
                 .as_ref()
-                .and_then(|window| window.observed_reset());
-            item.timer_confirmed = item.reset_at.is_some();
+                .and_then(|window| window.observed_reset_at(now))
+                .filter(|reset| *reset > now);
+            item.timer_confirmed = item.status == "accepted" && item.reset_at.is_some();
+            if let Some(reset) = item.reset_at
+                && let Some(observed) = outcome
+                    .short_term
+                    .as_ref()
+                    .and_then(|window| window.observed_at)
+            {
+                transaction
+                    .execute(
+                        "INSERT INTO reset_observations VALUES(?,?,?) ON CONFLICT(account,reset_at) DO UPDATE SET observed=max(observed,excluded.observed)",
+                        params![
+                            item.account_id,
+                            reset.timestamp_millis(),
+                            observed.timestamp_millis()
+                        ],
+                    )
+                    .map_err(internal)?;
+            }
             save_task(transaction, &item)?;
             advance_dispatch(transaction, &item, now)
         })
@@ -368,19 +393,38 @@ impl Store {
     }
 
     pub fn history(&self, limit: u32, run_id: Option<&str>) -> RpcResult<Value> {
+        self.history_filtered(limit, run_id, None)
+    }
+
+    pub fn history_filtered(
+        &self,
+        limit: u32,
+        run_id: Option<&str>,
+        source: Option<&str>,
+    ) -> RpcResult<Value> {
         let connection = self.connection.lock().map_err(internal)?;
-        let run_ids: Vec<String> = if let Some(id) = run_id {
-            vec![id.into()]
-        } else {
-            let mut statement = connection
-                .prepare("SELECT id FROM runs ORDER BY created DESC,id DESC LIMIT ?")
-                .map_err(internal)?;
-            statement
-                .query_map([limit], |row| row.get(0))
-                .map_err(internal)?
-                .collect::<Result<_, _>>()
-                .map_err(internal)?
+        if source.is_some_and(|source| !matches!(source, "automatic" | "manual")) {
+            return Err(schedule::invalid("invalid history source"));
+        }
+        // 先过滤来源再 LIMIT；指定批次时也必须匹配，避免自动化页混入手动批次。
+        let source_filter = match source {
+            Some("automatic") => "source IN ('daily','reset')",
+            Some("manual") => "source='manual'",
+            _ => "1",
         };
+        let id_filter = if run_id.is_some() { "id=?1" } else { "1" };
+        let sql = format!(
+            "SELECT id FROM runs WHERE {id_filter} AND {source_filter} ORDER BY created DESC,id DESC LIMIT ?2"
+        );
+        let mut statement = connection.prepare(&sql).map_err(internal)?;
+        let run_ids: Vec<String> = statement
+            .query_map(params![run_id, limit], |row| row.get(0))
+            .map_err(internal)?
+            .collect::<Result<_, _>>()
+            .map_err(internal)?;
+        if run_id.is_some() && run_ids.is_empty() {
+            return Err(schedule::invalid("run_not_found"));
+        }
         let mut runs = Vec::new();
         let mut items: Vec<TaskItem> = Vec::new();
         for id in run_ids {
@@ -394,6 +438,90 @@ impl Store {
             }
         }
         Ok(json!({"runs":runs,"items":items}))
+    }
+
+    /// 账号页仅查询索引命中的摘要，不读取任务提示词或加载全部历史。
+    pub fn account_states(
+        &self,
+        now: DateTime<Utc>,
+        accounts: &[Account],
+    ) -> RpcResult<BTreeMap<String, AccountState>> {
+        let connection = self.connection.lock().map_err(internal)?;
+        let mut states = BTreeMap::new();
+        for account in accounts {
+            let current_window = current_window(&connection, account, now)?;
+            let state = if let Some(active) = task_state(
+                &connection,
+                "account=? AND status IN ('queued','running') LIMIT 1",
+                [&account.id],
+            )? {
+                active
+            } else if !account.supported {
+                AccountState {
+                    status: "unsupported".into(),
+                    task_id: None,
+                    updated_at: None,
+                    reset_at: None,
+                    reason_code: account
+                        .reason_code
+                        .clone()
+                        .or_else(|| Some("unsupported".into())),
+                }
+            } else if let Some((observed, reset)) = current_window {
+                let confirmed = task_state(
+                    &connection,
+                    "account=? AND status='accepted' AND json_extract(data,'$.timerConfirmed')=1 AND json_extract(data,'$.resetAt')=? ORDER BY finished DESC,id DESC LIMIT 1",
+                    params![
+                        account.id,
+                        reset.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
+                    ],
+                )?;
+                // 有真实业务窗口也表示本窗口已开始；不能据此把 unknown 的手动请求报成功。
+                let mut state = confirmed.unwrap_or(AccountState {
+                    status: "warmed".into(),
+                    task_id: None,
+                    updated_at: Some(observed),
+                    reset_at: Some(reset),
+                    reason_code: None,
+                });
+                state.status = "warmed".into();
+                state.reset_at = Some(reset);
+                state
+            } else {
+                let last = task_state(
+                    &connection,
+                    "account=? AND finished IS NOT NULL ORDER BY finished DESC,id DESC LIMIT 1",
+                    [&account.id],
+                )?;
+                match last {
+                    Some(mut state) => {
+                        state.status = match state.status.as_str() {
+                            "accepted" if state.reset_at.is_some_and(|reset| reset <= now) => {
+                                "pending"
+                            }
+                            "accepted" => "unconfirmed",
+                            "unknown" => "unknown",
+                            "failed" => "failed",
+                            "skipped" | "cancelled" => "skipped",
+                            _ => "pending",
+                        }
+                        .into();
+                        // 过期记录可用于定位最后一次任务，但不能暴露成当前计时。
+                        state.reset_at = None;
+                        state
+                    }
+                    None => AccountState {
+                        status: "pending".into(),
+                        task_id: None,
+                        updated_at: None,
+                        reset_at: None,
+                        reason_code: None,
+                    },
+                }
+            };
+            states.insert(account.id.clone(), state);
+        }
+        Ok(states)
     }
 
     pub fn runtime(
@@ -418,6 +546,10 @@ impl Store {
             )
             .map_err(internal)?;
         let mut next = next.and_then(DateTime::<Utc>::from_timestamp_millis);
+        let next_automatic: Option<i64> = connection.query_row(
+            "SELECT min(due) FROM tasks WHERE status='queued' AND json_extract(data,'$.source') IN ('daily','reset')",
+            [], |row| row.get(0)).map_err(internal)?;
+        let mut next_automatic = next_automatic.and_then(DateTime::<Utc>::from_timestamp_millis);
         if settings.enabled {
             for account in accounts
                 .iter()
@@ -430,6 +562,8 @@ impl Store {
                         .unwrap_or(&settings.daily_time);
                     if let Some((_, daily)) = schedule::daily_points(now, &settings.timezone, at) {
                         next = Some(next.map_or(daily, |current| current.min(daily)));
+                        next_automatic =
+                            Some(next_automatic.map_or(daily, |current| current.min(daily)));
                     }
                 }
                 if settings.reset_enabled {
@@ -441,6 +575,8 @@ impl Store {
                     if let Some(reset) = reset.and_then(DateTime::<Utc>::from_timestamp_millis) {
                         let reset = reset + chrono::Duration::seconds(i64::from(delay));
                         next = Some(next.map_or(reset, |current| current.min(reset)));
+                        next_automatic =
+                            Some(next_automatic.map_or(reset, |current| current.min(reset)));
                     }
                 }
             }
@@ -457,7 +593,10 @@ impl Store {
         let next = next.map(|next| {
             DateTime::from_timestamp_millis(cursor).map_or(next, |cursor| next.max(cursor))
         });
-        Ok(json!({"nextRunAt":next,"lastRun":last}))
+        let next_automatic = next_automatic.map(|next| {
+            DateTime::from_timestamp_millis(cursor).map_or(next, |cursor| next.max(cursor))
+        });
+        Ok(json!({"nextRunAt":next,"nextAutomaticRunAt":next_automatic,"lastRun":last}))
     }
 }
 
@@ -565,6 +704,8 @@ fn insert_task(
             account_id: account.id.clone(),
             source: source.into(),
             model: settings.model(&account.id).into(),
+            prompt: settings.prompt.clone(),
+            reasoning_effort: settings.reasoning_effort(&account.id).into(),
             status: if reason.is_some() {
                 "skipped"
             } else {
@@ -654,6 +795,52 @@ fn query_tasks<P: rusqlite::Params>(
     rows.map(|value| decode(value.map_err(internal)?)).collect()
 }
 
+fn task_state<P: rusqlite::Params>(
+    connection: &Connection,
+    condition: &str,
+    parameters: P,
+) -> RpcResult<Option<AccountState>> {
+    let sql = format!(
+        "SELECT json_object('status',status,'taskId',id,'updatedAt',coalesce(json_extract(data,'$.finishedAt'),json_extract(data,'$.startedAt'),json_extract(data,'$.scheduledAt')),'resetAt',CASE WHEN json_extract(data,'$.timerConfirmed')=1 THEN json_extract(data,'$.resetAt') ELSE NULL END,'reasonCode',json_extract(data,'$.reasonCode')) FROM tasks WHERE {condition}"
+    );
+    let data: Option<String> = connection
+        .query_row(&sql, parameters, |row| row.get(0))
+        .optional()
+        .map_err(internal)?;
+    data.map(decode).transpose()
+}
+
+fn current_window(
+    connection: &Connection,
+    account: &Account,
+    now: DateTime<Utc>,
+) -> RpcResult<Option<(DateTime<Utc>, DateTime<Utc>)>> {
+    let directory = account
+        .short_term
+        .as_ref()
+        .and_then(|window| Some((window.observed_at?, window.observed_reset_at(now)?)));
+    let saved: Option<(i64, i64)> = connection.query_row(
+        "SELECT observed,reset_at FROM reset_observations WHERE account=? AND observed<=? AND reset_at>observed ORDER BY observed DESC,reset_at DESC LIMIT 1",
+        params![account.id, now.timestamp_millis()], |row| Ok((row.get(0)?, row.get(1)?))).optional().map_err(internal)?;
+    let saved = saved.and_then(|(observed, reset)| {
+        Some((
+            DateTime::from_timestamp_millis(observed)?,
+            DateTime::from_timestamp_millis(reset)?,
+        ))
+    });
+    // 以最近一次真实观测为准，包括它已到期的情况；不能从更老记录复活旧窗口。
+    let latest = match (directory, saved) {
+        (Some(directory), Some(saved)) => Some(if directory.0 >= saved.0 {
+            directory
+        } else {
+            saved
+        }),
+        (Some(window), None) | (None, Some(window)) => Some(window),
+        (None, None) => None,
+    };
+    Ok(latest.filter(|(_, reset)| *reset > now))
+}
+
 fn summary(connection: &Connection, id: &str) -> RpcResult<RunSummary> {
     let row: Option<(String, i64, bool)> = connection
         .query_row(
@@ -666,20 +853,28 @@ fn summary(connection: &Connection, id: &str) -> RpcResult<RunSummary> {
     let Some((source, created, cancelled)) = row else {
         return Err(schedule::invalid("run_not_found"));
     };
-    let tasks = query_tasks(
-        connection,
-        "SELECT t.data FROM tasks t JOIN run_tasks rt ON rt.task_id=t.id WHERE rt.run_id=?",
-        [id],
-    )?;
-    let count = |status: &str| {
-        u32::try_from(tasks.iter().filter(|item| item.status == status).count()).unwrap_or(u32::MAX)
-    };
+    let mut statement = connection.prepare("SELECT t.status,count(*),max(t.finished) FROM tasks t JOIN run_tasks rt ON rt.task_id=t.id WHERE rt.run_id=? GROUP BY t.status").map_err(internal)?;
+    let rows = statement
+        .query_map([id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, u32>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+            ))
+        })
+        .map_err(internal)?;
+    let mut counts = BTreeMap::new();
+    let mut finished_at: Option<i64> = None;
+    for row in rows {
+        let (status, count, last) = row.map_err(internal)?;
+        counts.insert(status, count);
+        finished_at = finished_at.max(last);
+    }
+    let count = |status: &str| counts.get(status).copied().unwrap_or(0);
     let pending = count("queued") + count("running");
     let finished = if pending == 0 {
-        tasks
-            .iter()
-            .filter_map(|item| item.finished_at)
-            .max()
+        finished_at
+            .and_then(DateTime::from_timestamp_millis)
             .or_else(|| DateTime::from_timestamp_millis(created))
     } else {
         None
@@ -699,7 +894,7 @@ fn summary(connection: &Connection, id: &str) -> RpcResult<RunSummary> {
         .into(),
         created_at: DateTime::from_timestamp_millis(created).ok_or_else(|| internal("created"))?,
         finished_at: finished,
-        total: u32::try_from(tasks.len()).unwrap_or(u32::MAX),
+        total: counts.values().copied().sum(),
         accepted: count("accepted"),
         failed: count("failed"),
         skipped: count("skipped") + count("cancelled"),

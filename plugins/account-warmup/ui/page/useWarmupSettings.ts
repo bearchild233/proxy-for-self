@@ -1,9 +1,9 @@
 import type { Account } from '@/api/modules/accounts'
-import type { WarmupRead, WarmupRun, WarmupTask } from '@/api/modules/accountWarmup'
+import type { WarmupModel, WarmupRead, WarmupRun, WarmupTask } from '@/api/modules/accountWarmup'
 import { usePluginPolling } from '@sdk/polling'
 import { computed, onMounted, onScopeDispose, ref, shallowRef } from 'vue'
 import { getAccounts } from '@/api/modules/accounts'
-import { accountWarmupHistory, cancelAccountWarmup, configureAccountWarmup, readAccountWarmup } from '@/api/modules/accountWarmup'
+import { accountWarmupHistory, cancelAccountWarmup, configureAccountWarmup, readAccountWarmup, warmupRequestError } from '@/api/modules/accountWarmup'
 import { toast } from '@/components/base/BaseToast'
 import { cloneSettings, defaultWarmupSettings, settingsError } from './model'
 
@@ -39,8 +39,19 @@ export function useWarmupSettings() {
   const historyError = shallowRef('')
   const cancelling = shallowRef(false)
   const dirty = computed(() => baseline.value !== '' && JSON.stringify(draft.value) !== baseline.value)
-  const validation = computed(() => settingsError(draft.value))
-  const models = ref<Record<string, { id: string, label: string }[]>>({})
+  const validation = computed(() => {
+    const value = draft.value
+    const requestError = warmupRequestError({ model: value.defaultModel, prompt: value.prompt, reasoningEffort: value.reasoningEffort })
+    if (requestError)
+      return requestError
+    for (const item of value.accountOverrides) {
+      const overrideError = warmupRequestError({ model: item.model ?? value.defaultModel, prompt: value.prompt, reasoningEffort: item.reasoningEffort ?? value.reasoningEffort })
+      if (overrideError)
+        return `账号独立设置：${overrideError}`
+    }
+    return settingsError(value)
+  })
+  const models = ref<Record<string, WarmupModel[]>>({})
   const modelLoading = ref(new Set<string>())
   const modelErrors = ref<Record<string, string>>({})
   const modelSequence = new Map<string, number>()
@@ -54,8 +65,9 @@ export function useWarmupSettings() {
     if (!next.available)
       return
     if (replace || (!dirty.value && !saving.value)) {
-      draft.value = cloneSettings(next.settings)
-      baseline.value = JSON.stringify(next.settings)
+      const normalized = cloneSettings(next.settings)
+      draft.value = normalized
+      baseline.value = JSON.stringify(normalized)
       revision.value = next.revision
       changedElsewhere.value = false
     }
@@ -125,16 +137,24 @@ export function useWarmupSettings() {
   async function refreshHistory() {
     const sequence = ++historySequence
     try {
-      const result = await accountWarmupHistory({ limit: 20 })
+      const result = await accountWarmupHistory({ limit: 20, source: 'automatic' })
       if (sequence !== historySequence || disposed)
         return
-      runs.value = result.runs
-      if (!selectedRunId.value || !result.runs.some(item => item.id === selectedRunId.value))
-        selectedRunId.value = result.runs[0]?.id ?? ''
+      // 服务在限量前过滤来源，客户端再守住自动化页面的展示与取消边界。
+      const automatic = result.runs.filter(item => item.source === 'daily' || item.source === 'reset')
+      runs.value = automatic
+      if (!selectedRunId.value || !automatic.some(item => item.id === selectedRunId.value))
+        selectedRunId.value = automatic[0]?.id ?? ''
       if (selectedRunId.value) {
-        const details = await accountWarmupHistory({ runId: selectedRunId.value })
+        const runId = selectedRunId.value
+        const details = await accountWarmupHistory({ runId, source: 'automatic' })
         if (sequence !== historySequence || disposed)
           return
+        if (!details.runs.some(item => item.id === runId && (item.source === 'daily' || item.source === 'reset'))) {
+          items.value = []
+          throw new Error('自动预热批次来源不匹配，请刷新记录')
+        }
+        // 自动批次可复用已存在的手动任务，来源边界由批次守住，不能丢掉合并任务。
         items.value = details.items
       }
       else {
@@ -148,12 +168,15 @@ export function useWarmupSettings() {
     }
   }
   function selectRun(id: string) {
+    if (!runs.value.some(item => item.id === id && (item.source === 'daily' || item.source === 'reset')))
+      return
     selectedRunId.value = id
     items.value = []
     void refreshHistory()
   }
   async function cancel() {
-    if (!selectedRunId.value || cancelling.value)
+    const selected = runs.value.find(item => item.id === selectedRunId.value)
+    if (!selected || !['daily', 'reset'].includes(selected.source) || !['queued', 'running'].includes(selected.status) || selected.pending <= 0 || cancelling.value)
       return
     cancelling.value = true
     try {

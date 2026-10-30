@@ -227,6 +227,10 @@ impl OpenAiPluginUpstream {
                             .map(|model| AccountWarmupModel {
                                 id: model.request_model().as_str().into(),
                                 label: model.display_name().into(),
+                                reasoning_efforts: model
+                                    .capabilities()
+                                    .reasoning_efforts()
+                                    .to_vec(),
                             })
                             .collect()
                     })
@@ -268,6 +272,16 @@ impl OpenAiPluginUpstream {
         if !(1000..=15000).contains(&params.timeout_ms)
             || params.model.is_empty()
             || params.model.len() > 128
+            || params.prompt.trim().is_empty()
+            || params.prompt.len() > 4096
+            || params
+                .prompt
+                .chars()
+                .any(|value| value.is_control() && !matches!(value, '\n' | '\r' | '\t'))
+            || !matches!(
+                params.reasoning_effort.as_str(),
+                "auto" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh"
+            )
             || params.attempt_id.is_empty()
             || params.attempt_id.len() > 128
             || !params
@@ -402,10 +416,27 @@ impl OpenAiPluginUpstream {
                 ));
             };
             let efforts = model.capabilities().reasoning_efforts();
-            let effort = ["none", "minimal", "low", "medium", "high", "xhigh"]
-                .into_iter()
-                .find(|effort| efforts.iter().any(|value| value == effort))
-                .unwrap_or("low");
+            let reasoning_unsupported = model.capabilities().reasoning()
+                == CodexCatalogCapabilityEvidence::DeclaredUnsupported;
+            // 显式强度必须有目录证据，不能通过删字段或降档伪装成已生效。
+            let effort = if params.reasoning_effort == "auto" {
+                ["none", "minimal", "low", "medium", "high", "xhigh"]
+                    .into_iter()
+                    .find(|effort| efforts.iter().any(|value| value == effort))
+                    .unwrap_or("low")
+            } else if reasoning_unsupported
+                || !efforts
+                    .iter()
+                    .any(|value| value == &params.reasoning_effort)
+            {
+                return Ok(terminal(
+                    AccountWarmupOutcome::Skipped,
+                    "reasoning_unsupported",
+                    started,
+                ));
+            } else {
+                params.reasoning_effort.as_str()
+            };
             let deadline_at = SystemTime::now()
                 .checked_add(deadline.saturating_duration_since(tokio::time::Instant::now()))
                 .ok_or_else(|| RpcError::new(INTERNAL, "warmup deadline"))?;
@@ -493,9 +524,11 @@ impl OpenAiPluginUpstream {
                 .map_err(|_| RpcError::new(UNAVAILABLE, "account egress unavailable"))?;
             let mut request =
                 hi_request(&params.model).ok_or_else(|| RpcError::new(INVALID_PARAMS, "model"))?;
-            if model.capabilities().reasoning()
-                == CodexCatalogCapabilityEvidence::DeclaredUnsupported
-            {
+            request.body_mut().insert(
+                "input".into(),
+                json!([{"role":"user","content":[{"type":"input_text","text":params.prompt}]}]),
+            );
+            if reasoning_unsupported {
                 request.body_mut().remove("reasoning");
             } else {
                 request

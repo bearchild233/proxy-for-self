@@ -175,7 +175,8 @@ impl WarmupService {
             let (revision, settings) = store.settings()?;
             let mut runtime = store.runtime(now, &runtime_accounts, &settings)?;
             runtime["ready"] = json!(ready);
-            Ok(json!({"available":true,"revision":revision,"settings":settings,"accounts":accounts,"runtime":runtime}))
+            let account_states = store.account_states(now, &accounts)?;
+            Ok(json!({"available":true,"revision":revision,"settings":settings,"accounts":accounts,"accountStates":account_states,"runtime":runtime}))
         }).await
     }
 
@@ -206,6 +207,18 @@ impl WarmupService {
                 let input: RunParams = decode(params)?;
                 if !schedule::identifier(&input.submission_id)
                     || !matches!(input.scope.as_str(), "all" | "selected")
+                    || input
+                        .model
+                        .as_deref()
+                        .is_some_and(|value| !schedule::identifier(value))
+                    || input
+                        .prompt
+                        .as_deref()
+                        .is_some_and(|value| !schedule::prompt(value))
+                    || input
+                        .reasoning_effort
+                        .as_deref()
+                        .is_some_and(|value| !schedule::reasoning_effort(value))
                 {
                     return Err(schedule::invalid("invalid run parameters"));
                 }
@@ -247,7 +260,23 @@ impl WarmupService {
                 }
                 let run = self
                     .database(move |store| {
-                        let (_, settings) = store.settings()?;
+                        // 手动参数只覆盖本次入队快照，不写回自动设置或账号覆盖。
+                        let (_, mut settings) = store.settings()?;
+                        if let Some(model) = input.model {
+                            settings.default_model = model;
+                            for item in &mut settings.account_overrides {
+                                item.model = None;
+                            }
+                        }
+                        if let Some(prompt) = input.prompt {
+                            settings.prompt = prompt;
+                        }
+                        if let Some(effort) = input.reasoning_effort {
+                            settings.reasoning_effort = effort;
+                            for item in &mut settings.account_overrides {
+                                item.reasoning_effort = None;
+                            }
+                        }
                         store.enqueue_manual(&input.submission_id, &accounts, &settings, Utc::now())
                     })
                     .await?;
@@ -262,11 +291,17 @@ impl WarmupService {
                         .run_id
                         .as_deref()
                         .is_some_and(|id| !schedule::identifier(id))
+                    || input
+                        .source
+                        .as_deref()
+                        .is_some_and(|source| !matches!(source, "automatic" | "manual"))
                 {
                     return Err(schedule::invalid("invalid history parameters"));
                 }
-                self.database(move |store| store.history(limit, input.run_id.as_deref()))
-                    .await
+                self.database(move |store| {
+                    store.history_filtered(limit, input.run_id.as_deref(), input.source.as_deref())
+                })
+                .await
             }
             "cancel" => {
                 let input: CancelParams = decode(params)?;
@@ -328,7 +363,7 @@ impl WarmupService {
             return directory_error.map_or(Ok(()), Err);
         };
         // 从 claim 开始到结果持久化都不在停止信号上 select，已认领的发送在预算内收尾。
-        let result: RpcResult<Outcome> = kernel.call("accounts.warmup.run", &json!({"accountId":item.account_id,"model":item.model,"timeoutMs":15000,"attemptId":item.id}), EXECUTION_BUDGET).await;
+        let result: RpcResult<Outcome> = kernel.call("accounts.warmup.run", &json!({"accountId":item.account_id,"model":item.model,"prompt":item.prompt,"reasoningEffort":item.reasoning_effort,"timeoutMs":15000,"attemptId":item.id}), EXECUTION_BUDGET).await;
         let outcome = result.unwrap_or_else(|_| Outcome {
             outcome: "unknown".into(),
             reason_code: Some("kernel_call_interrupted".into()),
